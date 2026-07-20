@@ -22,6 +22,7 @@ from pathlib import Path
 import sys
 
 root = Path(sys.argv[1])
+validator = (root / 'scripts/validate.sh').resolve()
 errors = []
 
 def expect(value, message):
@@ -44,7 +45,11 @@ expect('refusing to run as root' in runner, 'root execution refusal missing')
 expect('AGENT_RUNNER_CONFIG' in runner and 'localRepoPath' in runner, 'standalone project config boundary missing')
 expect('/home/gp/.local/state/agent-runner/' in (root / 'config/modelspend.example.json').read_text(), 'XDG state path missing')
 
-all_text = '\n'.join(p.read_text(errors='replace') for p in root.rglob('*') if p.is_file() and '.git' not in p.parts)
+all_text = '\n'.join(
+    p.read_text(errors='replace')
+    for p in root.rglob('*')
+    if p.is_file() and '.git' not in p.parts and p.resolve() != validator
+)
 for forbidden in ['sk-ant-', 'ghp_', 'github_pat_', 'ANTHROPIC_API_KEY=']:
     expect(forbidden not in all_text, f'potential secret material committed: {forbidden}')
 
