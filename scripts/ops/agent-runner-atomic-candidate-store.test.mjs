@@ -110,9 +110,10 @@ test('candidate pause is audited without opening systemic health', () => {
   assert.equal(raw.calls.some(([kind]) => kind === 'health'), false);
 });
 
-test('canonical scheduler entrypoint installs the gate around the preserved base scheduler', () => {
-  const source = readFileSync(new URL('./claude-runner-cron.mjs', import.meta.url), 'utf8');
+test('standalone atomic scheduler adapter wraps the immutable imported scheduler', () => {
+  const source = readFileSync(new URL('./agent-runner-atomic-cron.mjs', import.meta.url), 'utf8');
   assert.match(source, /createAtomicAdmissionStore/);
   assert.match(source, /admissionBoundary: 'recordRecoveryAttempt'/);
   assert.match(source, /schedulerMain\(argv, env/);
+  assert.match(source, /from '\.\/claude-runner-cron\.mjs'/);
 });
