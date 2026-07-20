@@ -36,6 +36,7 @@ const ALLOWED_NON_RELATIVE_IMPORTS = new Set([
   'node:assert/strict',
   'node:child_process',
   'node:crypto',
+  'node:events',
   'node:fs',
   'node:fs/promises',
   'node:http',
