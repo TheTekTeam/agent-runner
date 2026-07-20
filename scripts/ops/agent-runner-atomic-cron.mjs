@@ -8,9 +8,9 @@ import {
   runAtomicCandidateRevalidation,
 } from './agent-runner-atomic-candidate-store.mjs';
 import { openRunnerStateStore } from './claude-runner-state.mjs';
-import { main as schedulerMain } from './claude-runner-cron-base.mjs';
+import { main as schedulerMain } from './claude-runner-cron.mjs';
 
-export * from './claude-runner-cron-base.mjs';
+export * from './claude-runner-cron.mjs';
 
 export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
   const pauseState = { result: null };
