@@ -55,6 +55,13 @@ expect('/home/gp/.local/state/agent-runner/' in config, 'XDG state path missing'
 expect('--config "$CONFIG_FILE"' not in publisher, 'dashboard publisher passes unsupported --config argument')
 expect('--db "$STATE_DB"' in publisher and '--strict' in publisher, 'dashboard publisher does not use the bounded supported CLI')
 
+runner_unit = installer.split('cat > "$USER_UNIT_DIR/$RUN_SERVICE" <<UNIT', 1)[1].split('\nUNIT', 1)[0]
+dashboard_unit = installer.split('cat > "$USER_UNIT_DIR/$DASH_SERVICE" <<UNIT', 1)[1].split('\nUNIT', 1)[0]
+expect('ProtectSystem=full' in runner_unit, 'runner execution service must protect system paths while preserving normal user-home writes')
+expect('ProtectHome=read-only' not in runner_unit, 'runner execution service must not block Claude/Codex user-state writes')
+expect('NoNewPrivileges=true' in runner_unit and 'PrivateTmp=true' in runner_unit, 'runner execution service hardening regressed')
+expect('ProtectSystem=strict' in dashboard_unit and 'ProtectHome=read-only' in dashboard_unit, 'read-only dashboard service sandbox regressed')
+
 all_text = '\n'.join(
     p.read_text(errors='replace')
     for p in root.rglob('*')

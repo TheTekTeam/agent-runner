@@ -20,6 +20,15 @@ The ModelSpend execution checkout remains separate, normally:
 /home/gp/projects/modelspend-runner-live
 ```
 
+## Service sandbox boundary
+
+The execution and dashboard services intentionally use different systemd sandboxes:
+
+- the **runner execution service** uses `ProtectSystem=full`, `NoNewPrivileges=true` and `PrivateTmp=true`, while retaining normal operator-home writes required by Claude, Codex and future agent CLIs for their authenticated user-state, caches and session metadata;
+- the **dashboard publisher** remains more restrictive with `ProtectSystem=strict` and `ProtectHome=read-only`, because it needs only the runner state and the bounded dashboard output directory.
+
+Do not add `ProtectHome=read-only` to the runner execution service without first proving every configured agent works with explicit writable state directories. A unit that starts successfully but prevents an agent CLI from maintaining its normal user state is not a valid hardening improvement.
+
 ## 1. Import the proven source boundary
 
 Run from a clean Agent Runner checkout after the portable-entrypoint change in ModelSpend has been reviewed:
