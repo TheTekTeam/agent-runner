@@ -42,7 +42,7 @@ test('malformed approvers are rejected deterministically', () => {
     argv: ['--execute'],
     env: {
       CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true',
-      CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola,Not Valid',
+      CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola,not_valid',
     },
   });
   assert.equal(result.allowed, false);
