@@ -23,7 +23,6 @@ json_value() {
 STATE_DB="$(json_value stateDbPath)"
 mkdir -p "$OUT_DIR"
 exec node "$ROOT/scripts/ops/claude-runner-dashboard-local.mjs" \
-  --config "$CONFIG_FILE" \
   --db "$STATE_DB" \
   --out-dir "$OUT_DIR" \
   --history-limit 100 \
