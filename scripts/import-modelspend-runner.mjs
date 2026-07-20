@@ -109,6 +109,7 @@ function initialSelection(files) {
     }
     if (/^scripts\/ops\/(?:agent-runner|claude-runner)[^/]*\.(?:mjs|sh)$/.test(path)) selected.add(path);
     if (/^scripts\/ops\/(?:agent-runner|claude-runner)[^/]*\.test\.mjs$/.test(path)) selected.add(path);
+    if (/^scripts\/ops\/fixtures\/claude-event-array-(?:299|550|658)\.json$/.test(path)) selected.add(path);
     if (path === 'scripts/ops/jobs/run-claude-runner.sh') selected.add(path);
     if (/^scripts\/ops\/install-claude-runner[^/]*\.(?:sh|mjs)$/.test(path)) selected.add(path);
     if (/^docs\/ops\/(?:AGENT-RUNNER|CLAUDE-RUNNER)[^/]*\.md$/.test(path)) selected.add(path);
