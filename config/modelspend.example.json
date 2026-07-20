@@ -3,6 +3,7 @@
   "displayName": "ModelSpend",
   "githubRepo": "TheTekTeam/modelspend",
   "localRepoPath": "/home/gp/projects/modelspend-runner-live",
+  "legacyStateRoot": "/home/gp/projects/modelspend/.var/claude-runner",
   "outputDir": "/home/gp/.local/state/agent-runner/modelspend",
   "stateDbPath": "/home/gp/.local/state/agent-runner/modelspend/runner-state.sqlite",
   "acceptedAgentLabels": [
