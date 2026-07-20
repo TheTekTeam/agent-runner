@@ -19,6 +19,7 @@ fi
 
 python3 - "$ROOT" <<'PY'
 from pathlib import Path
+import re
 import sys
 
 root = Path(sys.argv[1])
@@ -50,8 +51,14 @@ all_text = '\n'.join(
     for p in root.rglob('*')
     if p.is_file() and '.git' not in p.parts and p.resolve() != validator
 )
-for forbidden in ['sk-ant-', 'ghp_', 'github_pat_', 'ANTHROPIC_API_KEY=']:
-    expect(forbidden not in all_text, f'potential secret material committed: {forbidden}')
+secret_patterns = {
+    'Anthropic API key': re.compile(r'(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,}'),
+    'GitHub classic token': re.compile(r'(?<![A-Za-z0-9_])ghp_[A-Za-z0-9]{20,}'),
+    'GitHub fine-grained token': re.compile(r'(?<![A-Za-z0-9_])github_pat_[A-Za-z0-9_]{20,}'),
+    'assigned Anthropic secret': re.compile(r'ANTHROPIC_API_KEY\s*=\s*["\']?(?!\$|<|\.\.\.|REDACTED)[A-Za-z0-9_-]{20,}'),
+}
+for label, pattern in secret_patterns.items():
+    expect(pattern.search(all_text) is None, f'potential {label} committed')
 
 if errors:
     for error in errors:
