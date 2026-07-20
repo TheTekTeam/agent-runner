@@ -45,7 +45,7 @@ json_value() {
   node -e 'const fs=require("node:fs"); const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const path=process.argv[2].split("."); let x=v; for (const key of path) x=x?.[key]; if (typeof x!=="string" || !x) process.exit(2); process.stdout.write(x);' "$CONFIG_FILE" "$1"
 }
 legacy_state_root() {
-  printf '%s/.var/claude-runner\n' "$(json_value localRepoPath)"
+  json_value legacyStateRoot
 }
 standalone_state_root() {
   dirname "$(json_value stateDbPath)"
@@ -148,13 +148,15 @@ verify() {
   require_file "$ROOT/scripts/ops/claude-runner-dashboard-local.mjs"
   require_file "$ROOT/bin/run-project.sh"
   require_file "$ROOT/bin/publish-dashboard.sh"
-  local project state_db
+  local project state_db legacy_root
   project="$(json_value localRepoPath)"
   state_db="$(json_value stateDbPath)"
+  legacy_root="$(legacy_state_root)"
   git -C "$project" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
     echo "Configured project checkout is invalid: $project" >&2
     exit 1
   }
+  case "$legacy_root" in /*) ;; *) echo "legacyStateRoot must be absolute: $legacy_root" >&2; exit 1 ;; esac
   [ -f "$state_db" ] || { echo "Migrated state DB is missing: $state_db" >&2; exit 1; }
   node --input-type=module - "$state_db" <<'NODE'
 import { DatabaseSync } from 'node:sqlite';
