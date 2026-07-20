@@ -2,7 +2,9 @@
 
 Private standalone GitHub-issue-driven agent runner for TheTekTeam projects.
 
-This repository is being populated from the proven portable runner boundary tracked by `TheTekTeam/modelspend#658` and the standalone extraction/cutover tracked by `TheTekTeam/modelspend#686`.
+The canonical runner implementation has been imported from the proven portable boundary in `TheTekTeam/modelspend` at source commit `4d19c27af1d7ed8626848d3ac6ed1f0c94867fbf`. `MIGRATION-MANIFEST.json` records the exact 65-file closure, source commit, file modes and SHA-256 provenance.
+
+The standalone extraction and Dell cutover remain tracked by `TheTekTeam/modelspend#686`. Source ownership has moved here; live execution is not cut over until dry-run equivalence, state migration, independent systemd installation and rollback validation pass.
 
 ## Intended Dell layout
 
@@ -15,4 +17,10 @@ This repository is being populated from the proven portable runner boundary trac
 
 ModelSpend is a configured project consumed by this runner. It is not the canonical owner of the runner implementation.
 
-No live cutover should occur until dry-run equivalence, state migration, systemd installation and rollback validation pass.
+## Validation
+
+```bash
+bash scripts/validate.sh
+```
+
+With the migration manifest present, validation checks every imported file hash, JavaScript syntax, the focused runner test suite, safe missing-state behaviour, installer/state-migration contracts and repository secret boundaries.
