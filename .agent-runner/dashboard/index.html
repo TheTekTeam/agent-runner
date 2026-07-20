@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Runner Dashboard</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <header class="hero">
+    <div>
+      <p class="eyebrow">Local Agent Runner</p>
+      <h1>Runner dashboard</h1>
+      <p class="subtitle">Scheduler health, issue execution, quota and queue history from the local SQLite state store.</p>
+    </div>
+    <dl class="status-strip" aria-label="Dashboard status">
+      <div><dt>State database</dt><dd id="status-value">Loading</dd></div>
+      <div><dt>Generated</dt><dd id="generated-at">—</dd></div>
+      <div><dt>Database path</dt><dd id="db-path">—</dd></div>
+    </dl>
+  </header>
+
+  <main>
+    <section class="panel attention" aria-labelledby="attention-heading">
+      <h2 id="attention-heading">Attention required</h2>
+      <p id="attention-summary">No persisted attention events.</p>
+      <div class="table-wrap"><table><thead><tr><th>Issue / agent</th><th>Reason</th><th>Recovery</th><th>Evidence</th><th>Retry / notification</th><th>Safe next action</th></tr></thead><tbody id="attention-rows"></tbody></table></div>
+    </section>
+    <section id="diagnostics" class="panel diagnostics" hidden></section>
+
+    <section id="empty-state" class="panel empty" hidden>
+      <h2>No runner state yet</h2>
+      <p>The dashboard loaded successfully, but the local runner database is missing or has no recorded history. Run the Agent Runner cron once, or regenerate this page after the state DB exists.</p>
+    </section>
+
+    <section class="grid summary-grid" aria-label="Summary metrics">
+      <article class="card"><span class="label">Issue executions</span><strong id="metric-runs">0</strong><small id="metric-runs-detail">—</small></article>
+      <article class="card"><span class="label">Scheduler polls</span><strong id="metric-polls">0</strong><small id="metric-polls-detail">—</small></article>
+      <article class="card"><span class="label">Quota</span><strong id="metric-quota">—</strong><small id="metric-quota-detail">—</small></article>
+      <article class="card"><span class="label">Queue skips</span><strong id="metric-skips">0</strong><small id="metric-skips-detail">—</small></article>
+      <article class="card"><span class="label">ETA</span><strong id="metric-eta">—</strong><small id="metric-eta-detail">—</small></article>
+    </section>
+
+    <section class="grid two-col">
+      <article class="panel" id="current-issue-panel">
+        <h2>Runner activity</h2>
+        <div id="current-issue"></div>
+      </article>
+      <article class="panel">
+        <h2>Quota trend</h2>
+        <div id="quota-chart" class="chart" aria-live="polite"></div>
+      </article>
+    </section>
+
+    <section class="grid chart-grid">
+      <article class="panel">
+        <h2>Recent scheduler history</h2>
+        <p class="muted chart-intro">Each block is one persisted scheduler result, ordered oldest to newest.</p>
+        <div id="run-chart" class="chart" aria-live="polite"></div>
+      </article>
+      <article class="panel">
+        <h2>Queue skip distribution</h2>
+        <div id="skip-chart" class="chart" aria-live="polite"></div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <h2>Recent scheduler results</h2>
+      <div id="run-history"></div>
+    </section>
+
+    <section class="grid two-col">
+      <article class="panel">
+        <h2>Quota history</h2>
+        <div id="quota-history"></div>
+      </article>
+      <article class="panel">
+        <h2>Skipped queue reasons</h2>
+        <div id="skip-reasons"></div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <h2>Generated preflight fingerprints</h2>
+      <p class="muted">These are deterministic local packets, not ChatGPT or Claude model calls.</p>
+      <div id="preflight-fingerprints"></div>
+    </section>
+  </main>
+
+  <script src="./dashboard-data.js"></script>
+  <script src="./dashboard.js"></script>
+</body>
+</html>
