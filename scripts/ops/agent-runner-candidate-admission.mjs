@@ -37,6 +37,23 @@ export function candidateSnapshot(selected = {}) {
   };
 }
 
+export function normalizeCandidateSnapshot(snapshot = {}) {
+  const commandIdentity = normalizeCommentIdentity(snapshot.commandIdentity || snapshot.commandRevision);
+  const preflightIdentity = normalizeCommentIdentity(snapshot.preflightIdentity || snapshot.preflightRevision);
+  return {
+    issueNumber: snapshot.issueNumber || null,
+    statusLabel: snapshot.statusLabel || null,
+    agentLabel: snapshot.agentLabel || null,
+    selectionMode: snapshot.selectionMode || null,
+    commandKind: snapshot.commandKind || null,
+    commandIdentity,
+    commandRevision: commentRevision(commandIdentity),
+    preflightIdentity,
+    preflightRevision: commentRevision(preflightIdentity),
+    preflightAuthor: snapshot.preflightAuthor ? String(snapshot.preflightAuthor).trim().toLowerCase() : null,
+  };
+}
+
 export function commandRevisionChanged(initial, current) {
   if (current.selectionMode === 'preflight-direct') {
     return initial.commandKind !== null
@@ -96,41 +113,54 @@ export function candidatePausePayload(admission, snapshot) {
   };
 }
 
-export async function admitCurrentCandidate({ argv = [], env = process.env, select } = {}) {
+async function selectorFor({ argv, env, select }) {
+  if (select) return select;
+  const moduleUrl = env.AGENT_RUNNER_CANDIDATE_CRON_MODULE || './claude-runner-cron.mjs';
+  const cron = await import(moduleUrl);
+  const args = cron.parseArgs([...argv, '--dry-run', '--skip-quota-preflight'], env);
+  return () => cron.selectIssue(args);
+}
+
+function approverPolicy(env) {
   const { approvers, invalid } = normalizeImplementationApprovers(env.CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS);
   if (invalid.length || approvers.length === 0) {
+    return { approvers, admission: { allowed: false, reason: 'candidate-approver-policy-invalid' } };
+  }
+  return { approvers, admission: null };
+}
+
+export async function admitExpectedCandidate({ expected, argv = [], env = process.env, select } = {}) {
+  const policy = approverPolicy(env);
+  if (policy.admission) return { admission: policy.admission, initial: normalizeCandidateSnapshot(expected), current: {} };
+  const selector = await selectorFor({ argv, env, select });
+  const initial = normalizeCandidateSnapshot(expected);
+  const current = candidateSnapshot(await selector());
+  return { admission: evaluateCandidateAdmission({ initial, current, approvers: policy.approvers }), initial, current };
+}
+
+export async function admitCurrentCandidate({ argv = [], env = process.env, select } = {}) {
+  const policy = approverPolicy(env);
+  if (policy.admission) {
     const current = {};
-    return { admission: { allowed: false, reason: 'candidate-approver-policy-invalid' }, initial: current, current };
+    return { admission: policy.admission, initial: current, current };
   }
-
-  let selector = select;
-  let args;
-  if (!selector) {
-    const cron = await import('./claude-runner-cron.mjs');
-    args = cron.parseArgs([...argv, '--dry-run', '--skip-quota-preflight'], env);
-    selector = () => cron.selectIssue(args);
-  }
-
-  const initialSelection = await selector();
-  const initial = candidateSnapshot(initialSelection);
-  const currentSelection = await selector();
-  const current = candidateSnapshot(currentSelection);
-  return { admission: evaluateCandidateAdmission({ initial, current, approvers }), initial, current };
+  const selector = await selectorFor({ argv, env, select });
+  const initial = candidateSnapshot(await selector());
+  const current = candidateSnapshot(await selector());
+  return { admission: evaluateCandidateAdmission({ initial, current, approvers: policy.approvers }), initial, current };
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env, logger = console) {
-  const result = await admitCurrentCandidate({ argv, env });
-  if (result.admission.allowed) {
-    logger.log(JSON.stringify({
-      candidateAdmitted: true,
-      selectedIssue: result.current.issueNumber,
-      candidateRevision: result.current.preflightRevision,
-      selectionMode: result.current.selectionMode,
-    }));
-    return 0;
+  let result;
+  if (env.AGENT_RUNNER_ATOMIC_EXPECTED_JSON) {
+    const expected = JSON.parse(env.AGENT_RUNNER_ATOMIC_EXPECTED_JSON);
+    const atomicArgv = env.AGENT_RUNNER_ATOMIC_ARGV_JSON ? JSON.parse(env.AGENT_RUNNER_ATOMIC_ARGV_JSON) : argv;
+    result = await admitExpectedCandidate({ expected, argv: atomicArgv, env });
+  } else {
+    result = await admitCurrentCandidate({ argv, env });
   }
-  logger.log(JSON.stringify(candidatePausePayload(result.admission, result.current), null, 2));
-  return CANDIDATE_PAUSED_EXIT_CODE;
+  logger.log(JSON.stringify(result));
+  return result.admission.allowed ? 0 : CANDIDATE_PAUSED_EXIT_CODE;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
