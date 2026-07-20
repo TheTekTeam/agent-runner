@@ -8,7 +8,7 @@ export function main(argv = process.argv.slice(2), env = process.env, dependenci
   return runPortableEntrypoint({
     scriptUrl: import.meta.url,
     scriptName: 'runner-cron.mjs',
-    legacyModuleUrl: new URL('../../scripts/ops/agent-runner-atomic-cron.mjs', import.meta.url).href,
+    legacyModuleUrl: new URL('../../scripts/ops/claude-runner-cron.mjs', import.meta.url).href,
     argv,
     env,
     dependencies,
