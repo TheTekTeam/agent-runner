@@ -17,7 +17,7 @@ jobs:
     timeout-minutes: 10
     env:
       # Ephemeral, already-expiring transfer URL; this workflow deletes itself after use.
-      SOURCE_URL: "https://sdmntprnortheu.oaiusercontent.com/files/00000000-c9f8-81f4-8db6-1de40e259dfc/raw?se=2026-07-20T20:09:02Z&sp=r&sv=2026-02-06&sr=b&scid=dd753517-9450-58f3-bbd9-c8c0dad46b83&skoid=56822d8b-6cfd-42ed-a00d-1452dca42036&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-07-20T19:13:51Z&ske=2026-07-22T19:13:51Z&sks=b&skv=2026-02-06&sig=zzcSMfrjhTvcFw37rbjwYQm6qmOvweX/0mI75MQAy5M%3D"
+      SOURCE_URL: "https://sdmntprnortheu.oaiusercontent.com/files/00000000-3044-81f4-a2f0-31c9590eabdc/raw?se=2026-07-20T20:10:18Z&sp=r&sv=2026-02-06&sr=b&scid=f38f0341-e3be-5d88-9725-bf38c1f52a0e&skoid=56822d8b-6cfd-42ed-a00d-1452dca42036&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-07-20T00:22:22Z&ske=2026-07-22T00:22:22Z&sks=b&skv=2026-02-06&sig=t3ARM4GLNX5OdNc2RQOec/NgnrwhrZ/5VHqCtwDw9KY%3D"
       EXPECTED_SOURCE_COMMIT: 4d19c27af1d7ed8626848d3ac6ed1f0c94867fbf
       TARGET_BRANCH: claude/standalone-runner-686
     steps:
@@ -58,8 +58,10 @@ jobs:
       - name: Apply source and provenance
         shell: bash
         run: |
-          set -euo pipefail
-          python3 - <<'PY'
+          set -o pipefail
+          {
+            set -euo pipefail
+            python3 - <<'PY'
           import json
           import shutil
           from pathlib import Path
@@ -76,10 +78,23 @@ jobs:
           shutil.copyfile(source / 'MIGRATION-MANIFEST.json', target / 'MIGRATION-MANIFEST.json')
           (target / 'MIGRATION-MANIFEST.json').chmod(0o644)
           PY
-          rm -f .github/workflows/apply-reviewed-source.yml
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git diff --cached --check
-          git commit -m 'Import canonical runner implementation from ModelSpend'
-          git push origin HEAD:"$TARGET_BRANCH"
+            rm -f .github/workflows/apply-reviewed-source.yml
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add -A
+            git diff --cached --check
+            git commit -m 'Import canonical runner implementation from ModelSpend'
+            git push origin HEAD:"$TARGET_BRANCH"
+          } > /tmp/agent-runner-apply.log 2>&1 || {
+            cat /tmp/agent-runner-apply.log >&2
+            exit 1
+          }
+          cat /tmp/agent-runner-apply.log
+      - name: Upload apply diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-runner-apply-log
+          path: /tmp/agent-runner-apply.log
+          if-no-files-found: warn
+          retention-days: 30
