@@ -66,6 +66,22 @@ if [ -n "${AGENT_RUNNER_ARGS:-${CLAUDE_RUNNER_ARGS:-}}" ]; then
 fi
 
 if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
+  # Machine/profile policy is admitted before candidate discovery. A handled
+  # refusal must not query, claim, relabel, comment on, or consume any issue.
+  # Automatic/generated preflight implementation remains prohibited by owner
+  # decision; only an existing normal-ChatGPT manager packet may be consumed.
+  export CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT=true
+  export CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=false
+  set +e
+  node "$ROOT/scripts/ops/agent-runner-admission.mjs" "${ARGS[@]}"
+  ADMISSION_STATUS=$?
+  set -e
+  case "$ADMISSION_STATUS" in
+    0) ;;
+    3) echo "[agent-runner] machine profile paused; no candidate selected or mutated"; exit 0 ;;
+    *) echo "[agent-runner] ERROR: admission check failed with exit $ADMISSION_STATUS" >&2; exit "$ADMISSION_STATUS" ;;
+  esac
+
   set +e
   node "$ROOT/scripts/ops/claude-runner-candidate-probe.mjs" "${ARGS[@]}"
   PROBE_STATUS=$?
