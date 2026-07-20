@@ -42,8 +42,12 @@ node "$ROOT/.agent-runner/scripts/runner-cron.mjs" --help >/tmp/agent-runner-cro
 echo "Checking safe missing-state dashboard response..."
 node "$ROOT/scripts/ops/claude-runner-dashboard-api.mjs" \
   --db "$ROOT/.tmp-missing-runner-state.sqlite" >/tmp/agent-runner-dashboard-missing.json
-node -e 'const fs=require("node:fs"); const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if(v.ok!==false || !v.diagnostics?.some(x=>x.code==="state-db-missing")) process.exit(1)' \
-  /tmp/agent-runner-dashboard-missing.json
+node -e '
+  const fs = require("node:fs");
+  const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const hasDiagnostic = value.diagnostics?.some((item) => item.code === "state-db-missing" && item.level === "warn");
+  if (value.ok !== true || value.status !== "missing" || !hasDiagnostic) process.exit(1);
+' /tmp/agent-runner-dashboard-missing.json
 rm -f /tmp/agent-runner-help.out /tmp/agent-runner-help.err \
   /tmp/agent-runner-cron-help.out /tmp/agent-runner-cron-help.err \
   /tmp/agent-runner-dashboard-missing.json
