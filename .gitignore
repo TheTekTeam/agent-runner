@@ -1,0 +1,16 @@
+node_modules/
+.env
+.env.*
+!.env.example
+config/*.json
+!config/*.example.json
+state/
+.var/
+.agent-runner/config.json
+.agent-runner/dashboard/dashboard-data.js
+coverage/
+dist/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.log

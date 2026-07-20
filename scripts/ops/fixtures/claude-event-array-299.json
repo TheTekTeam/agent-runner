@@ -1,0 +1,50 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "<redacted>",
+    "permissionMode": "plan"
+  },
+  {
+    "type": "rate_limit_event",
+    "rate_limit_info": {
+      "status": "allowed",
+      "utilization": 0
+    }
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "content": [
+        {
+          "type": "tool_use",
+          "name": "Grep",
+          "input": {
+            "pattern": "billing_quota_exceeded|quota_exceeded|429|Retry-After"
+          }
+        }
+      ]
+    }
+  },
+  {
+    "type": "user",
+    "message": {
+      "content": [
+        {
+          "type": "tool_result",
+          "content": "packages/execution-bridge/src/providerError.ts: billing_quota_exceeded"
+        }
+      ]
+    }
+  },
+  {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "duration_ms": 22741,
+    "num_turns": 3,
+    "result": "Repository inspection completed.",
+    "session_id": "<redacted>",
+    "total_cost_usd": 0.118
+  }
+]

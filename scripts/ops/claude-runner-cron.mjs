@@ -1,0 +1,2850 @@
+#!/usr/bin/env node
+
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync, openSync, closeSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { dirname, join as joinPath } from 'node:path';
+
+import { loadAgentRunnerConfig, stripConfigArgs } from './agent-runner-config.mjs';
+import {
+  agentRunMetadata,
+  allAgentLabels,
+  resolveAgentForLabels,
+  unsupportedAgentSkip,
+} from './agent-runner-agents.mjs';
+
+import {
+  RUNNER_STARTED_HEADING,
+  STATUS_IN_PROGRESS,
+  STATUS_READY,
+  commandAlreadyClaimed,
+  commentTime,
+  hasManagerPreflight,
+  invalidatesManagerPreflight,
+  latestManagerPreflightComment,
+  preflightAlreadyClaimed,
+  resolveIssueSelection,
+  runnableCommandForIssue,
+} from './claude-runner-selection.mjs';
+import {
+  commentRevision,
+  deserializeCommentIdentity,
+  normalizeCommentIdentity,
+  requireRestCommentDatabaseId,
+  sameCommentIdentity,
+} from './claude-runner-comment-identity.mjs';
+import { findLinkedOpenPullRequests } from './claude-runner-review-followup.mjs';
+import { resolvePreflightAction } from './claude-runner-preflight.mjs';
+import { defaultRunnerStateDbPath, openRunnerStateStore } from './claude-runner-state.mjs';
+import {
+  RECOVERY_POLICY_REVISION,
+  backoffDeadline,
+  buildAttentionEvent,
+  decideRecovery,
+  dispatchRecoveryAction,
+  evaluateRecoveryRevalidation,
+  normalizeTerminalOutcome,
+  recoveryAttemptCapForOutcome,
+} from './claude-runner-recovery.mjs';
+import {
+  decorateIssueWithMetadata,
+  priorityRank as metadataPriorityRank,
+  statusRank as metadataStatusRank,
+} from './issue-metadata.mjs';
+import {
+  detectClaudeResumeCliCapability,
+  readRestrictedRecoveryHandle,
+  restrictedHandleBindingDigest,
+  restrictedHandleDigest,
+  verifyPreservedWorktree,
+} from './claude-runner-recovery-adapter.mjs';
+import { redactExecutableArgs } from './lib/redact.mjs';
+
+const DEFAULT_REPO = 'TheTekTeam/modelspend';
+const DEFAULT_LOCK = '.var/claude-runner/cron.lock';
+const DEFAULT_OUTPUT = '.var/claude-runner';
+const DEFAULT_AGENT_LABELS = allAgentLabels({ includeFuture: false });
+const DEFAULT_LIMIT = 100;
+const DEFAULT_WATCHDOG_INTERVAL_MS = 10 * 60_000;
+const DEFAULT_STALLED_PASS_LIMIT = 2;
+const STATUS_BLOCKED = 'status:blocked';
+export const RUNNER_ATTENTION_MARKER = '<!-- agent-runner:attention:v1 -->';
+
+export {
+  RUNNER_STARTED_HEADING,
+  commandAlreadyClaimed,
+  hasManagerPreflight,
+  latestManagerPreflightComment,
+  preflightAlreadyClaimed,
+  resolvePreflightAction,
+  runnableCommandForIssue,
+};
+
+export function truthy(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function githubTokenFromGh() {
+  return execFileSync('gh', ['auth', 'token'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+}
+
+export function resolveGithubAuthEnv(env = process.env, tokenResolver = githubTokenFromGh) {
+  if (env.GITHUB_TOKEN || env.GH_TOKEN) return { ...env };
+
+  let token = '';
+  try {
+    token = String(tokenResolver?.() || '').trim();
+  } catch {
+    token = '';
+  }
+
+  if (!token) return null;
+  return { ...env, GH_TOKEN: token };
+}
+
+/**
+ * Ranking now flows through the issue-metadata adapter so a supplied Status /
+ * Priority field wins over the compatibility label. Decorated candidates carry
+ * a `metadata` object; undecorated issues (e.g. direct callers) fall back to
+ * the raw issue, from which the adapter still derives values via labels and the
+ * transport `statusLabel`.
+ */
+function priorityRank(issue) {
+  return metadataPriorityRank(issue?.metadata || issue);
+}
+
+function statusRank(issue) {
+  return metadataStatusRank(issue?.metadata || issue);
+}
+
+/**
+ * Metadata field/label disagreements for one issue, safe to spread into skip or
+ * selection payloads only when non-empty so existing exact-shape assertions on
+ * conflict-free issues stay green.
+ */
+export function issueMetadataConflicts(issue) {
+  return issue?.metadata?.conflicts || issue?.metadataConflicts || [];
+}
+
+export function metadataConflictSkip(issue) {
+  const conflicts = issueMetadataConflicts(issue);
+  const blockingConflicts = conflicts.filter((conflict) => conflict.key === 'status');
+  if (blockingConflicts.length === 0) return null;
+  return {
+    issue: issue.number,
+    statusLabel: issue.statusLabel,
+    reason: 'metadata-conflict',
+    metadataConflicts: blockingConflicts,
+  };
+}
+
+function compareIssues(left, right) {
+  const statusDelta = statusRank(left) - statusRank(right);
+  if (statusDelta !== 0) return statusDelta;
+
+  const priorityDelta = priorityRank(left) - priorityRank(right);
+  if (priorityDelta !== 0) return priorityDelta;
+
+  return String(right.updatedAt || '').localeCompare(String(left.updatedAt || ''));
+}
+
+export function parseAgentLabels(value) {
+  const raw = Array.isArray(value) ? value : String(value || '').split(',');
+  const labels = raw.map((label) => String(label).trim()).filter(Boolean);
+  return [...new Set(labels)];
+}
+
+export function parseArgs(argv = process.argv.slice(2), env = process.env) {
+  const config = loadAgentRunnerConfig({ argv, env });
+  argv = stripConfigArgs(argv);
+  const outputDir = env.CLAUDE_RUNNER_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT;
+  const args = {
+    repo: env.GITHUB_REPOSITORY || config.githubRepo || DEFAULT_REPO,
+    lockPath: env.CLAUDE_RUNNER_CRON_LOCK || config.runner?.lockPath || DEFAULT_LOCK,
+    outputDir,
+    stateDbPath: env.CLAUDE_RUNNER_STATE_DB || config.stateDbPath || defaultRunnerStateDbPath(outputDir),
+    agentLabels: parseAgentLabels(env.CLAUDE_RUNNER_CRON_AGENT_LABELS || config.acceptedAgentLabels || DEFAULT_AGENT_LABELS),
+    execute: truthy(env.CLAUDE_RUNNER_CRON_EXECUTE),
+    allowRoot: truthy(env.CLAUDE_RUNNER_CRON_ALLOW_ROOT),
+    includeInProgress: !truthy(env.CLAUDE_RUNNER_CRON_DISABLE_CONTINUE),
+    claimOnExecute: !truthy(env.CLAUDE_RUNNER_CRON_DISABLE_CLAIM),
+    quotaPreflight: !truthy(env.CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT),
+    requireManagerPreflight: config.runner?.requireManagerPreflight !== false && !truthy(env.CLAUDE_RUNNER_CRON_SKIP_MANAGER_PREFLIGHT),
+    // preflightDirectMode: dispatch directly from a manager preflight packet
+    // when a status:ready issue has no Claude proceed command (Agent Runner
+    // v2). `CLAUDE_RUNNER_CRON_DISABLE_AUTO_PROCEED`/`--no-auto-proceed` are
+    // kept as compatibility aliases for the pre-v2 flag name.
+    preflightDirectMode: config.runner?.autoProceedFromPreflight !== false && !truthy(env.CLAUDE_RUNNER_CRON_DISABLE_PREFLIGHT_DIRECT) && !truthy(env.CLAUDE_RUNNER_CRON_DISABLE_AUTO_PROCEED),
+    // autoPreflightMode: generate a local `## Manager preflight packet` for a
+    // status:ready issue that has no proceed command and no existing
+    // preflight (Agent Runner v2.2), instead of skipping it forever with
+    // `missing manager preflight packet`.
+    autoPreflightMode: !truthy(env.CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT),
+    // #698 round 5, finding 4: native_resume/same_agent_continuation fail
+    // closed for this release regardless of installed CLI capability. This
+    // is deliberately an env-only, machine-local opt-in (never a repo-
+    // tracked config value) — a supervised positive test on a specific
+    // machine, after the CLI is upgraded, is what would justify setting it
+    // there; it must not spread by being committed or copied between
+    // machines.
+    nativeResumeEnabled: truthy(env.CLAUDE_RUNNER_ENABLE_NATIVE_RESUME),
+    limit: Number.parseInt(env.CLAUDE_RUNNER_CRON_LIMIT || String(config.runner?.candidateLimit || DEFAULT_LIMIT), 10),
+    watchdogIntervalMs: Number.parseInt(env.CLAUDE_RUNNER_WATCHDOG_INTERVAL_MS || String(config.runner?.watchdogIntervalMs || DEFAULT_WATCHDOG_INTERVAL_MS), 10),
+    stalledPassLimit: Number.parseInt(env.CLAUDE_RUNNER_STALLED_PASS_LIMIT || String(config.runner?.stalledPassLimit || DEFAULT_STALLED_PASS_LIMIT), 10),
+    project: {
+      id: config.projectId,
+      displayName: config.displayName,
+      repo: config.githubRepo,
+      localRepoPath: config.localRepoPath,
+    },
+  };
+
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
+    const next = () => {
+      const value = argv[i + 1];
+      if (!value || value.startsWith('--')) throw new Error(`${arg} requires a value`);
+      i += 1;
+      return value;
+    };
+    if (arg === '--execute') args.execute = true;
+    else if (arg === '--dry-run') args.execute = false;
+    else if (arg === '--allow-root') args.allowRoot = true;
+    else if (arg === '--no-continue') args.includeInProgress = false;
+    else if (arg === '--no-claim') args.claimOnExecute = false;
+    else if (arg === '--skip-quota-preflight') args.quotaPreflight = false;
+    else if (arg === '--skip-manager-preflight') args.requireManagerPreflight = false;
+    else if (arg === '--no-preflight-direct' || arg === '--no-auto-proceed') args.preflightDirectMode = false;
+    else if (arg === '--no-auto-preflight') args.autoPreflightMode = false;
+    else if (arg === '--repo') args.repo = next();
+    else if (arg === '--lock-path') args.lockPath = next();
+    else if (arg === '--output-dir') {
+      args.outputDir = next();
+      if (!env.CLAUDE_RUNNER_STATE_DB) args.stateDbPath = defaultRunnerStateDbPath(args.outputDir);
+    }
+    else if (arg === '--state-db') args.stateDbPath = next();
+    else if (arg === '--limit') args.limit = Number.parseInt(next(), 10);
+    else if (arg === '--agent-label') args.agentLabels = parseAgentLabels([...args.agentLabels, next()]);
+    else if (arg === '--agent-labels') args.agentLabels = parseAgentLabels(next());
+    else if (arg === '--help' || arg === '-h') args.help = true;
+    else throw new Error(`Unknown argument: ${arg}`);
+  }
+
+  if (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 200) throw new Error('--limit must be 1..200');
+  if (!Number.isInteger(args.watchdogIntervalMs) || args.watchdogIntervalMs < 1_000) throw new Error('watchdog interval must be at least 1000ms');
+  if (!Number.isInteger(args.stalledPassLimit) || args.stalledPassLimit < 2 || args.stalledPassLimit > 20) throw new Error('stalled pass limit must be 2..20');
+  if (args.agentLabels.length === 0) throw new Error('at least one agent label is required');
+  return args;
+}
+
+export function printHelp() {
+  console.log(`Claude runner scheduled wrapper\n\nUsage:\n  node scripts/ops/claude-runner-cron.mjs [--execute]\n\nDefault: dry-run. Selects at most one Claude issue and delegates to scripts/ops/claude-runner.mjs. In --execute mode it first runs a conservative Claude /usage preflight and refuses to start work when the current session is exhausted or too close to exhaustion.\n\nEligible first-run issue labels:\n  status:ready\n  agent:claude or agent:claude-code-cli\n\nEligible continuation issue labels:\n  status:in-progress\n  agent:claude or agent:claude-code-cli\n  plus a fresh ## Claude continue command not already claimed by this runner\n\nRequired manager preflight:\n  The latest Claude proceed/continue command, or (for direct dispatch) the issue itself, must have a ChatGPT/manager preflight marker, for example:\n  ## Manager preflight packet\n  This prevents Claude from spending tokens on repo-discovery/preflight work that ChatGPT should have already done.\n\nAgent Runner v2 dual dispatch:\n  proceed-command  compatibility mode — a Claude proceed/continue command drives selection, unchanged.\n  preflight-direct default for a status:ready issue with a manager preflight packet but no proceed command. No synthetic proceed comment is posted; scripts/ops/claude-runner.mjs builds the Claude prompt directly from the issue and the preflight packet.\n\nAgent Runner v2.2 local preflight generation:\n  When --execute is set and a status:ready issue has no proceed command and no manager preflight packet, the runner deterministically generates one (no external AI calls), posts it, then immediately re-evaluates selection so preflight-direct dispatch can proceed in the same run. Duplicate posts are prevented by a fingerprint embedded in the comment; unsafe/ambiguous issues are skipped with reason preflight-generation-needs-manager instead of a guess. Disable with --no-auto-preflight or CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT=true.\n\nAgent Runner v3 local state:\n  Each cron run also writes a SQLite state database for durable queue, quota, preflight, selection, claim and run-result history. JSON logs are still written as before.\n\nSelf-healing selection:\n  The queue scans up to 100 candidates by default and sorts by status, priority labels, then recency.\n\nOptions:\n  --config <path>         Agent Runner project config JSON (or AGENT_RUNNER_CONFIG).
+  --agent-label <label>    Add one accepted Claude agent label.\n  --agent-labels <labels>  Replace accepted Claude agent labels with a comma-separated list.\n  --limit <n>              Candidate scan limit, default ${DEFAULT_LIMIT}, max 200.\n  --state-db <path>        SQLite state DB path, default ${defaultRunnerStateDbPath(DEFAULT_OUTPUT)} or CLAUDE_RUNNER_STATE_DB.\n  --no-continue           Do not scan in-progress issues for continue commands.\n  --no-claim              Do not mutate ready labels or post runner-start comments before execution.\n  --no-preflight-direct   Disable direct dispatch from a manager preflight packet; require a literal proceed command (alias: --no-auto-proceed).\n  --no-auto-preflight     Disable local generation of manager preflight packets; keep skipping ready issues that have none.\n  --skip-quota-preflight  Do not run the Claude /usage preflight before --execute. Not recommended.\n  --skip-manager-preflight Emergency override for missing ChatGPT/manager preflight packet. Not recommended.\n`);
+}
+
+export function rootBlocked(uid = process.getuid?.(), allowRoot = false) {
+  return uid === 0 && !allowRoot;
+}
+
+/**
+ * Parse the child claude-runner.mjs stdout (its final console.log JSON
+ * payload) so the cron wrapper can confirm a real per-run log was written,
+ * not just trust a clean exit code.
+ */
+export function parseChildRunnerOutput(stdout) {
+  try {
+    const parsed = JSON.parse(stdout || '');
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The child-runner contract: in --execute mode, a clean exit code is only
+ * trustworthy if the child also reported the per-run log it wrote and did
+ * not flag its own execution as a no-op or a plan-only run (see #660 —
+ * `claude-runner.mjs` normally signals plan-only via a non-zero exit code
+ * already, but this stays defensive in case a clean exit ever carries the
+ * flag). Anything else — unparseable output, a missing logPath, an explicit
+ * executionNoop flag, or an awaitingPlanApproval flag — means the child
+ * never completed real implementation work, so treat it as a failure even
+ * though the process exit code was 0.
+ */
+export function evaluateChildRunResult({ execute, exitCode, childPayload }) {
+  if (!execute) return { failed: false, reason: null };
+  if (exitCode !== 0) {
+    const reason = childPayload?.awaitingPlanApproval
+      ? 'awaiting-plan-approval'
+      : childPayload?.failureReason || childPayload?.outcomeReason || `child-exit-${exitCode ?? 'unknown'}`;
+    return { failed: true, reason };
+  }
+  if (!childPayload) return { failed: true, reason: 'child-output-unparseable' };
+  if (!childPayload.logPath) return { failed: true, reason: 'child-produced-no-run-log' };
+  if (childPayload.blocked) return { failed: true, reason: childPayload.reason || 'child-policy-blocked' };
+  if (childPayload.failureReason) return { failed: true, reason: childPayload.failureReason };
+  if (childPayload.executionNoop) return { failed: true, reason: childPayload.executionNoopReason || 'child-execution-noop' };
+  if (childPayload.awaitingPlanApproval) return { failed: true, reason: 'awaiting-plan-approval' };
+  return { failed: false, reason: null };
+}
+
+export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeSessionId } = {}) {
+  const out = ['scripts/ops/claude-runner.mjs', '--issue', String(issueNumber), '--output-dir', args.outputDir];
+  if (args.execute) out.push('--execute');
+  // attemptId lets the child write its restricted recovery handle (session
+  // id, worktree/branch identity) under the same attempt row the scheduler
+  // already owns, so a later native_resume/same_agent_continuation for this
+  // exact attempt can read it back. recoveryMode/resumeSessionId are only
+  // ever set by the adapter-built invocations in dispatchRecoveryAction's
+  // callers below, never derived from issue/comment text.
+  if (attemptId) out.push('--attempt-id', String(attemptId));
+  if (recoveryMode) out.push('--recovery-mode', recoveryMode);
+  if (resumeSessionId) out.push('--resume-session', String(resumeSessionId));
+  return out;
+}
+
+export function quotaPreflightArgs(args) {
+  return ['scripts/ops/claude-runner.mjs', '--check-quota', '--force-quota-check', '--output-dir', args.outputDir];
+}
+
+function gh(jsonArgs) {
+  return execFileSync('gh', jsonArgs, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+}
+
+function preferIssue(left, right) {
+  if (!left) return right;
+  return compareIssues(left, right) <= 0 ? left : right;
+}
+
+export function mergeIssuesByNumber(groups) {
+  const byNumber = new Map();
+  for (const group of groups) {
+    for (const issue of group) {
+      byNumber.set(issue.number, preferIssue(byNumber.get(issue.number), issue));
+    }
+  }
+  return [...byNumber.values()].sort(compareIssues);
+}
+
+/**
+ * Build the `gh issue list` args used to find candidate issues for one
+ * status/agent label pair. Selection is driven entirely by the current
+ * `status:` and `agent:` labels — it does not require (or filter on) the
+ * retired `devplan` label.
+ */
+export function buildIssueListArgs(repo, limit, statusLabel, agentLabel) {
+  return ['issue', 'list', '--repo', repo, '--state', 'open', '--label', statusLabel, '--label', agentLabel, '--limit', String(limit), '--json', 'number,title,body,url,updatedAt,labels'];
+}
+
+function listIssuesForStatusAndAgentLabel(repo, limit, statusLabel, agentLabel, ghRunner = gh) {
+  const raw = ghRunner(buildIssueListArgs(repo, limit, statusLabel, agentLabel));
+  // The queried `status:` label stays the authoritative transport for claim
+  // logic (`claimIssueForExecution` still flips labels), but the adapter
+  // attaches canonical metadata + conflict diagnostics for ranking/reporting.
+  return JSON.parse(raw || '[]').map((issue) => ({
+    ...decorateIssueWithMetadata(issue, { statusFallbackLabel: statusLabel }),
+    statusLabel,
+    agentLabel,
+  }));
+}
+
+export function listCandidateIssues(repo, limit, agentLabels, includeInProgress = true, ghRunner = gh) {
+  const statusLabels = includeInProgress ? [STATUS_READY, STATUS_IN_PROGRESS] : [STATUS_READY];
+  const groups = [];
+  for (const statusLabel of statusLabels) {
+    for (const agentLabel of agentLabels) groups.push(listIssuesForStatusAndAgentLabel(repo, limit, statusLabel, agentLabel, ghRunner));
+  }
+  return mergeIssuesByNumber(groups).slice(0, limit);
+}
+
+function readIssueComments(repo, issueNumber, ghRunner = gh) {
+  const raw = ghRunner(['issue', 'view', String(issueNumber), '--repo', repo, '--comments', '--json', 'comments']);
+  return JSON.parse(raw || '{}').comments || [];
+}
+
+export function listOpenPullRequests(repo, ghRunner = gh) {
+  const raw = ghRunner(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100', '--json', 'number,title,body,url,headRefName']);
+  return JSON.parse(raw || '[]').map((pr) => ({ ...pr, state: 'open' }));
+}
+
+function recoveryCommentTime(comment) {
+  return comment?.createdAt || comment?.created_at || null;
+}
+
+export function parseManagerRecoveryAuthorization(comment) {
+  const body = String(comment?.body || '');
+  if (!/^## Manager recovery authorization\s*$/im.test(body)) return null;
+  const fields = {};
+  for (const line of body.split(/\r?\n/)) {
+    const match = line.match(/^\s*-\s*([^:]+):\s*(.*?)\s*$/);
+    if (match) fields[match[1].trim().toLowerCase().replaceAll(' ', '_')] = match[2].trim().replace(/^`|`$/g, '');
+  }
+  if (!fields.attempt || !fields.action || !fields.claim_revision || !fields.preflight_revision) return null;
+  const claimIdentity = normalizeCommentIdentity(fields.claim_revision);
+  const preflightIdentity = normalizeCommentIdentity(fields.preflight_revision);
+  if (!claimIdentity || !preflightIdentity) return null;
+  return {
+    identity: normalizeCommentIdentity(comment),
+    id: commentRevision(comment),
+    createdAt: recoveryCommentTime(comment),
+    attemptId: fields.attempt,
+    action: fields.action,
+    claimRevision: fields.claim_revision,
+    preflightRevision: fields.preflight_revision,
+    claimIdentity,
+    preflightIdentity,
+    agent: fields.agent || null,
+    model: fields.model || null,
+    harness: fields.harness || null,
+    policyApproved: /^(?:yes|true|approved)$/i.test(fields.policy_approved || ''),
+    comment,
+  };
+}
+
+export function latestManagerRecoveryAuthorization(comments = []) {
+  return comments.map(parseManagerRecoveryAuthorization).filter(Boolean)
+    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')))[0] || null;
+}
+
+function issueLabels(issue) {
+  return (issue?.labels || []).map((label) => String(label?.name || label || '').trim()).filter(Boolean);
+}
+
+export function readRecoveryIssue(repo, issueNumber, ghRunner = gh) {
+  const issue = JSON.parse(ghRunner(['issue', 'view', String(issueNumber), '--repo', repo, '--json', 'number,state,title,body,url,updatedAt,labels,comments']) || '{}');
+  const labels = issueLabels(issue);
+  return {
+    ...issue,
+    labels,
+    comments: issue.comments || [],
+    statusLabel: labels.filter((label) => label.startsWith('status:'))[0] || null,
+    agentLabel: labels.filter((label) => label.startsWith('agent:'))[0] || null,
+  };
+}
+
+/**
+ * `ownArtifact` (only ever supplied for `native_resume`/
+ * `same_agent_continuation`, and only from the attempt's own verified
+ * restricted handle — never from GitHub or issue-number text) is the exact
+ * branch/worktree this attempt itself preserved for resumption. It is
+ * excluded from the conflict scan; every *other* branch or worktree
+ * referencing this issue number — including a stray leftover from a
+ * different or previous attempt — still counts as a conflict. `fresh_retry`
+ * and `retry_after_quota_preflight` never pass an `ownArtifact`, so any
+ * matching branch/worktree, including this attempt's own preserved one,
+ * remains a conflict for those actions unless a future policy field
+ * explicitly permits reuse (#698 finding 1).
+ */
+export function localRecoveryConflicts(issueNumber, cwd, ownArtifact = null) {
+  if (!cwd) return { noConflictingBranch: false, noConflictingWorktree: false };
+  try {
+    const token = new RegExp(`(?:^|[^0-9])${Number(issueNumber)}(?:[^0-9]|$)`);
+    const branches = String(execFileSync('git', ['branch', '--format=%(refname:short)'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }))
+      .split(/\r?\n/).filter(Boolean);
+    const worktrees = String(execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }))
+      .split(/\n\s*\n/).filter(Boolean);
+    const isOwnBranch = (branch) => Boolean(ownArtifact?.branch) && branch.trim() === ownArtifact.branch;
+    const isOwnWorktree = (entry) => Boolean(ownArtifact?.worktreePath)
+      && entry.split(/\r?\n/).some((line) => line.trim() === `worktree ${ownArtifact.worktreePath}`);
+    return {
+      noConflictingBranch: !branches.some((branch) => token.test(branch) && !isOwnBranch(branch)),
+      noConflictingWorktree: !worktrees.some((entry) => token.test(entry) && !isOwnWorktree(entry)),
+    };
+  } catch {
+    return { noConflictingBranch: false, noConflictingWorktree: false };
+  }
+}
+
+function sameAgent(left, right) {
+  const normalize = (value) => ['claude', 'claude-code-cli'].includes(String(value || '')) ? 'claude-code-cli' : String(value || '');
+  return Boolean(left && right) && normalize(left) === normalize(right);
+}
+
+export async function collectRecoveryRevalidation({
+  stage,
+  action,
+  attempt,
+  args,
+  ghRunner = gh,
+  state,
+  processProbe = probeProcessIdentity,
+  currentProcessIdentity,
+  repositoryEvidence,
+  checkedAt = new Date().toISOString(),
+  restrictedHandleReader = readRestrictedRecoveryHandle,
+  cliCapabilityProbe = detectClaudeResumeCliCapability,
+  worktreeVerifier = verifyPreservedWorktree,
+} = {}) {
+  const issue = readRecoveryIssue(args.repo, attempt.issue_number, ghRunner);
+  const comments = issue.comments || [];
+  const authorization = latestManagerRecoveryAuthorization(comments);
+  const originalAction = action || attempt.claimed_recovery_action || attempt.recovery_action;
+  const claimIdentity = deserializeCommentIdentity(attempt.claim_identity_json || attempt.claim_id, 'recovery-claim');
+  const preflightIdentity = deserializeCommentIdentity(attempt.preflight_identity_json || attempt.preflight_revision, 'recovery-preflight');
+  const claimRevision = commentRevision(claimIdentity);
+  const preflightRevision = commentRevision(preflightIdentity);
+  const expectedAuthorizationIdentity = deserializeCommentIdentity(
+    attempt.recovery_authorization_identity_json || attempt.recovery_authorization_id,
+    'recovery-authorization',
+  );
+  const expectedAuthorizationId = commentRevision(expectedAuthorizationIdentity);
+  const authMatches = Boolean(authorization?.id
+    && authorization.attemptId === String(attempt.attempt_id)
+    && authorization.action === originalAction
+    && sameCommentIdentity(authorization.claimIdentity, claimIdentity)
+    && sameCommentIdentity(authorization.preflightIdentity, preflightIdentity)
+    && sameAgent(authorization.agent, attempt.agent)
+    && authorization.model === attempt.model
+    && authorization.harness === attempt.harness);
+  const terminalAt = Date.parse(attempt.finished_at || '');
+  const authorizationAt = Date.parse(authorization?.createdAt || '');
+  const authorizationFresh = stage === 'pre_claim'
+    ? authMatches && Number.isFinite(terminalAt) && Number.isFinite(authorizationAt) && authorizationAt > terminalAt
+    : authMatches && expectedAuthorizationId !== null && sameCommentIdentity(authorization.identity, expectedAuthorizationIdentity);
+  const statusLabels = issueLabels(issue).filter((label) => label.startsWith('status:'));
+  const agentLabels = issueLabels(issue).filter((label) => label.startsWith('agent:'));
+  const issueAgent = resolveAgentForLabels(agentLabels);
+  const linkedPrs = findLinkedOpenPullRequests({ issueNumber: issue.number, pullRequests: listOpenPullRequests(args.repo, ghRunner) });
+  const handoffPresent = comments.some((comment) => /^## (?:Manager|Agent) handoff\s*$/im.test(String(comment?.body || '')));
+  // Read the restricted handle before scanning for local conflicts (not
+  // after, as before) so its exact preserved worktree/branch identity can be
+  // excluded from the conflict scan for native_resume/same_agent_continuation
+  // only — never for fresh_retry/retry_after_quota_preflight, which must
+  // still forbid any preserved mutation artifact (#698 finding 1).
+  let restrictedHandle = null;
+  let restrictedHandlePermissionSafe = true;
+  if (originalAction === 'native_resume' || originalAction === 'same_agent_continuation') {
+    const read = restrictedHandleReader(args.outputDir, attempt.attempt_id);
+    restrictedHandle = read.handle;
+    restrictedHandlePermissionSafe = read.permissionSafe;
+  }
+  const ownHandleVerified = restrictedHandle && restrictedHandlePermissionSafe
+    && restrictedHandle.attemptId === String(attempt.attempt_id)
+    && Boolean(restrictedHandle.worktreeName) && Boolean(restrictedHandle.expectedBranch);
+  const ownArtifact = ownHandleVerified && args.project?.localRepoPath
+    ? { branch: restrictedHandle.expectedBranch, worktreePath: joinPath(args.project.localRepoPath, '.claude', 'worktrees', restrictedHandle.worktreeName) }
+    : null;
+  const local = repositoryEvidence || localRecoveryConflicts(issue.number, args.project?.localRepoPath, ownArtifact);
+  const activeRows = state.invoke('activeRecoveryAttempts', args.repo) || [];
+  const otherLease = activeRows.some((row) => row.attempt_id !== attempt.attempt_id && row.issue_number === attempt.issue_number);
+  let processCurrent = false;
+  try {
+    const identity = {
+      processId: attempt.process_id,
+      processBootId: attempt.process_boot_id,
+      processStartTicks: attempt.process_start_ticks,
+      systemdInvocationId: attempt.systemd_invocation_id,
+    };
+    const live = await processProbe(identity);
+    const stableIdentityPresent = Boolean(identity.processId && identity.processBootId && identity.processStartTicks);
+    // pre_claim and transition_reconcile both check a *prior* attempt's
+    // recorded process identity for absence of a still-live conflicting
+    // process; only pre_launch/pre_transition check identity against the
+    // *current* live process (this one).
+    processCurrent = (stage === 'pre_claim' || stage === 'transition_reconcile')
+      ? stableIdentityPresent && live === false
+      : stableIdentityPresent && live === true && currentProcessIdentity?.processId === identity.processId
+        && currentProcessIdentity?.processBootId === identity.processBootId
+        && String(currentProcessIdentity?.processStartTicks || '') === String(identity.processStartTicks || '');
+  } catch {
+    processCurrent = false;
+  }
+  // Restricted resume/continuation evidence (#698 finding 2) — the handle
+  // was already read above (before the conflict scan) so its own identity
+  // could be excluded there; only the derived booleans below leave this
+  // function, so a restricted reference can never reach the persisted
+  // revalidation row.
+  const preservedWorktree = restrictedHandle && restrictedHandlePermissionSafe
+    ? worktreeVerifier({ handle: restrictedHandle, repoRoot: args.project?.localRepoPath })
+    : { preservedWorktreeCurrent: false, checkpointCurrent: false };
+  const resumeCliCapability = originalAction === 'native_resume'
+    ? cliCapabilityProbe({ claudeBin: args.claudeBin || process.env.CLAUDE_BIN || 'claude' })
+    : null;
+
+  const evidence = {
+    issueOpen: String(issue.state || '').toUpperCase() === 'OPEN',
+    expectedStatusCurrent: statusLabels.length === 1 && statusLabels[0] === STATUS_BLOCKED,
+    agentOwnershipCurrent: agentLabels.length === 1 && sameAgent(issueAgent?.agentId, attempt.agent),
+    claimRevisionCurrent: Boolean(claimIdentity) && comments.some((comment) => sameCommentIdentity(comment, claimIdentity)),
+    preflightRevisionCurrent: Boolean(preflightIdentity)
+      && sameCommentIdentity(latestManagerPreflightComment(comments), preflightIdentity),
+    authorizationFresh,
+    authorizationCurrent: authMatches && (expectedAuthorizationIdentity === null
+      || sameCommentIdentity(authorization.identity, expectedAuthorizationIdentity)),
+    noConflictingPr: linkedPrs.length === 0,
+    noConflictingBranch: local.noConflictingBranch === true,
+    noConflictingWorktree: local.noConflictingWorktree === true,
+    noHandoff: !handoffPresent,
+    noConflictingProcess: processCurrent,
+    noConflictingLease: !otherLease && ((stage === 'pre_claim' || stage === 'transition_reconcile')
+      || (Boolean(attempt.recovery_lease_id) && attempt.recovery_lease_id === currentProcessIdentity?.recoveryLeaseId)),
+    agentCompatible: issueAgent?.implemented === true && sameAgent(issueAgent.agentId, attempt.agent),
+    modelCompatible: Boolean(attempt.model) && authorization?.model === attempt.model && issueAgent?.controls?.model?.supported === true,
+    harnessCompatible: Boolean(attempt.harness) && authorization?.harness === attempt.harness && issueAgent?.type === attempt.harness,
+    sameRecoveryClaim: stage !== 'pre_transition' || (Boolean(attempt.recovery_lease_id) && attempt.recovery_lease_id === currentProcessIdentity?.recoveryLeaseId),
+    sameRecoveryAgent: stage !== 'pre_transition' || sameAgent(issueAgent?.agentId, attempt.agent),
+    noNewerManagerAction: stage !== 'pre_transition'
+      || sameCommentIdentity(authorization?.identity, expectedAuthorizationIdentity),
+    knownQuotaResetReached: originalAction !== 'retry_after_quota_preflight'
+      || (Boolean(attempt.retry_at) && Date.parse(checkedAt) >= Date.parse(attempt.retry_at)),
+    freshQuotaPreflightPassed: originalAction !== 'retry_after_quota_preflight'
+      || (args.currentQuotaPreflight?.blocked === false && args.currentQuotaPreflight?.skipped === false),
+    restrictedResumeHandleAvailable: originalAction === 'native_resume' && restrictedHandlePermissionSafe
+      && Boolean(restrictedHandle?.sessionId) && restrictedHandle?.attemptId === String(attempt.attempt_id),
+    resumeCliSupportVerified: originalAction === 'native_resume' && resumeCliCapability?.supported === true,
+    preservedWorktreeCurrent: (originalAction === 'native_resume' || originalAction === 'same_agent_continuation')
+      && restrictedHandlePermissionSafe && preservedWorktree.preservedWorktreeCurrent === true,
+    checkpointCurrent: (originalAction === 'native_resume' || originalAction === 'same_agent_continuation')
+      && restrictedHandlePermissionSafe && preservedWorktree.checkpointCurrent === true,
+    // Independently recomputes the write-once binding digest from the
+    // *persisted attempt row's* identity (agent/model/harness) plus the
+    // freshly re-read handle's checkpoint fields, and compares it to the
+    // digest persisted at capture time. A missing persisted digest, a
+    // missing handle, or any mismatch fails closed — this is what actually
+    // proves the restricted handle still belongs to this exact attempt,
+    // not merely that a same-attemptId handle file exists on disk (#698
+    // finding 8).
+    restrictedHandleBindingVerified: (originalAction === 'native_resume' || originalAction === 'same_agent_continuation')
+      && restrictedHandlePermissionSafe && Boolean(restrictedHandle) && Boolean(attempt.restricted_handle_digest)
+      && restrictedHandleBindingDigest({
+        attemptId: attempt.attempt_id, agent: attempt.agent, model: attempt.model, harness: attempt.harness,
+        checkpointHead: restrictedHandle?.checkpointHead, checkpointStatusFingerprint: restrictedHandle?.checkpointStatusFingerprint,
+      }) === attempt.restricted_handle_digest,
+    explicitContinuationPolicyApproval: authorization?.policyApproved === true,
+  };
+  const decision = evaluateRecoveryRevalidation({ stage, action: originalAction, evidence, checkedAt });
+  return {
+    ...decision,
+    evidence,
+    issue,
+    authorizationId: authorization?.id || null,
+    authorizationIdentity: authorization?.identity || null,
+    authorization,
+    linkedPrs,
+  };
+}
+
+/**
+ * Post a locally-generated `## Manager preflight packet` comment and return
+ * a synthetic comment object (same shape `gh issue view --json comments`
+ * would return) so the caller can re-run selection against an in-memory
+ * comment list without a second GitHub round-trip.
+ */
+export function postGeneratedPreflightComment(args, issue, packetBody, ghRunner = gh) {
+  const output = ghRunner(['issue', 'comment', String(issue.number), '--repo', args.repo, '--body', packetBody]);
+  const url = String(output || '').trim() || null;
+  const commentIdentity = normalizeCommentIdentity({ url });
+  return {
+    id: commentRevision(commentIdentity),
+    commentIdentity,
+    url,
+    body: packetBody,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function acquireLock(path) {
+  mkdirSync(dirname(path), { recursive: true });
+  const fd = openSync(path, 'wx');
+  writeFileSync(fd, `${process.pid}\n${new Date().toISOString()}\n`);
+  return () => {
+    try { closeSync(fd); } catch { /* ignore */ }
+    try { rmSync(path); } catch { /* ignore */ }
+  };
+}
+
+function writeLog(outputDir, payload) {
+  mkdirSync(outputDir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const path = `${outputDir}/cron-${stamp}.json`;
+  writeFileSync(path, `${JSON.stringify(payload, null, 2)}\n`);
+  return path;
+}
+
+export function createStateRecorder(args, openStore = openRunnerStateStore) {
+  const errors = [];
+  // Task-local faults (a single issue's GitHub comment/label delivery
+  // failing, one attempt's watchdog reconcile pass hitting an unexpected
+  // exception) must never flip `healthy` false and trigger a systemic pause
+  // of the whole queue — only genuine store-integrity failures (open,
+  // migrate, read/write, atomic claim) belong in `errors` (#698 finding 5).
+  // `taskErrors` is a parallel, unbounded-cause diagnostic channel that
+  // never gates `healthy` or `emitSystemicStatePause`.
+  const taskErrors = [];
+  let store = null;
+  try {
+    store = openStore(args.stateDbPath || defaultRunnerStateDbPath(args.outputDir));
+  } catch (error) {
+    errors.push({ stage: 'open', message: String(error?.message || error) });
+  }
+
+  return {
+    errors,
+    taskErrors,
+    recordTaskError(stage, error) {
+      taskErrors.push({ stage: String(stage || 'unknown'), message: String(error?.message || error) });
+    },
+    get available() { return Boolean(store); },
+    get healthy() { return Boolean(store) && errors.length === 0; },
+    record(method, payload) {
+      if (!store) return false;
+      try {
+        store[method](payload);
+        return true;
+      } catch (error) {
+        errors.push({ stage: method, message: String(error?.message || error) });
+        return false;
+      }
+    },
+    invoke(method, ...values) {
+      if (!store) return null;
+      try { return store[method](...values); } catch (error) {
+        errors.push({ stage: method, message: String(error?.message || error) });
+        return null;
+      }
+    },
+    ensureWritable(stage = 'write-probe') {
+      if (!store) return false;
+      try {
+        store.assertWritable();
+        return true;
+      } catch (error) {
+        errors.push({ stage, message: String(error?.message || error) });
+        return false;
+      }
+    },
+    close() {
+      if (!store) return;
+      try {
+        store.close();
+      } catch (error) {
+        errors.push({ stage: 'close', message: String(error?.message || error) });
+      }
+    },
+  };
+}
+
+function boundedStateErrors(errors = []) {
+  return errors.slice(0, 5).map((error) => ({
+    stage: String(error?.stage || 'unknown').slice(0, 80),
+    message: String(error?.message || 'runner state failure').slice(0, 300),
+  }));
+}
+
+export function emitSystemicStatePause(args, state, stage, { now = () => new Date().toISOString(), logger = console } = {}) {
+  const detectedAt = now();
+  const payload = {
+    dryRun: !args.execute,
+    systemicPause: true,
+    reason: 'runner_state_unavailable',
+    stage,
+    detectedAt,
+    selectedIssue: null,
+    safeNextAction: 'Repair and verify the SQLite runner state store before dispatching or mutating any issue.',
+    restrictedStateErrors: boundedStateErrors(state.errors),
+  };
+  if (state.available) {
+    state.record('recordQueueEvent', {
+      repo: args.repo,
+      eventType: 'systemic-pause',
+      reason: payload.reason,
+      payload: { reason: payload.reason, stage, detectedAt, safeNextAction: payload.safeNextAction },
+    });
+    // #698 round 5, finding 3: the current, resolvable health condition —
+    // `queue_events` above remains the historical audit record, but the
+    // operator-facing "are we paused right now" truth comes from this
+    // table, resolved explicitly once a pass proves the store healthy
+    // again (see `main()`), not inferred from a latest-N event window that
+    // could keep showing a cleared pause indefinitely.
+    state.record('openHealthCondition', {
+      repo: args.repo, conditionType: 'systemic_pause', reason: payload.reason,
+      safeNextAction: payload.safeNextAction, payload: { stage, detectedAt }, at: detectedAt,
+    });
+  }
+  let logPath = null;
+  try { logPath = writeLog(args.outputDir, payload); } catch { /* stderr remains the last safe diagnostic channel */ }
+  logger.error(JSON.stringify({ ...payload, restrictedStateErrors: '<restricted local log>', logPath }, null, 2));
+  return { exitCode: 1, payload, logPath };
+}
+
+function recordSelectionState(state, args, plan) {
+  let persisted = state.record('recordIssueSelection', {
+    repo: args.repo,
+    issueNumber: plan.selectedIssue,
+    statusLabel: plan.selectedStatusLabel,
+    selectionMode: plan.selectionMode,
+    commandKind: plan.selectedCommandKind,
+    sourceCommentId: plan.sourceCommentId,
+    sourcePreflightCommentId: plan.sourcePreflightCommentId,
+    sourceCommentIdentity: plan.sourceCommentIdentity,
+    sourcePreflightCommentIdentity: plan.sourcePreflightCommentIdentity,
+    dryRun: plan.dryRun,
+    payload: plan,
+  });
+
+  for (const skip of plan.skipped || []) {
+    persisted = state.record('recordQueueEvent', {
+      repo: args.repo,
+      eventType: 'skip',
+      issueNumber: skip.issue,
+      statusLabel: skip.statusLabel,
+      reason: skip.reason,
+      payload: skip,
+    }) && persisted;
+  }
+
+  for (const generated of plan.generatedPreflights || []) {
+    persisted = state.record('recordPreflightPacket', {
+      repo: args.repo,
+      issueNumber: generated.issue,
+      sourceCommentId: generated.sourceCommentId,
+      sourceCommentIdentity: generated.sourceCommentIdentity,
+      fingerprint: generated.fingerprint,
+      stale: generated.stale,
+      action: 'generated',
+      payload: generated,
+    }) && persisted;
+  }
+  return persisted;
+}
+
+function persistRecoveryRevalidation(state, attempt, result, recoveryLeaseId = null) {
+  return state.record('recordRecoveryRevalidation', {
+    attemptId: attempt.attempt_id,
+    stage: result.stage,
+    checkedAt: result.checkedAt,
+    action: result.action,
+    allowed: result.allowed,
+    authorizationId: result.authorizationId,
+    authorizationIdentity: result.authorizationIdentity,
+    recoveryLeaseId,
+    evidence: { ...result.evidence, failedChecks: result.failedChecks },
+  });
+}
+
+async function revalidateRecoverySafely(revalidator, input) {
+  let raw;
+  try {
+    raw = await revalidator(input);
+  } catch (error) {
+    raw = { evidence: {}, authorizationId: null, issue: null, collectionError: String(error?.message || error) };
+  }
+  const checkedAt = raw?.checkedAt || input.checkedAt;
+  const evaluated = evaluateRecoveryRevalidation({
+    stage: input.stage,
+    action: input.action,
+    evidence: raw?.evidence || {},
+    checkedAt,
+  });
+  return {
+    ...raw,
+    ...evaluated,
+    evidence: evaluated.evidence,
+    authorizationId: raw?.authorizationId || null,
+    issue: raw?.issue || null,
+  };
+}
+
+function blockRecoveryBeforeLaunch(state, args, attempt, result, now, ghRunner = gh) {
+  const finishedAt = attempt.finished_at || now();
+  const event = buildAttentionEvent({
+    repository: args.repo,
+    project: args.project?.id,
+    issueNumber: attempt.issue_number,
+    attemptId: attempt.attempt_id,
+    reason: attempt.outcome || 'unknown_failure',
+    agent: attempt.agent,
+    startedAt: attempt.started_at,
+    finishedAt,
+    recoveryStatus: 'forbidden',
+    nextAction: `Recovery ${result.stage || 'dispatch'} failed closed: ${(result.failedChecks || [result.reason || 'incomplete evidence']).join(', ')}. Obtain a fresh manager authorization after resolving the evidence.`,
+  });
+  const attemptPersisted = state.record('recordRecoveryAttempt', {
+    attemptId: attempt.attempt_id,
+    repo: attempt.repo,
+    project: attempt.project,
+    issueNumber: attempt.issue_number,
+    claimId: attempt.claim_id,
+    preflightRevision: attempt.preflight_revision,
+    phase: 'recovery-revalidation-blocked',
+    agent: attempt.agent,
+    model: attempt.model,
+    harness: attempt.harness,
+    startedAt: attempt.started_at,
+    finishedAt,
+    outcome: attempt.outcome || 'unknown_failure',
+    recoveryEligible: false,
+    recoveryAction: 'attention_required',
+    recoveryAttemptCount: attempt.recovery_attempt_count,
+    retryAt: attempt.retry_at,
+    attentionStatus: 'attention_required',
+    attentionDedupeKey: event.dedupeKey,
+    resolutionState: 'unresolved',
+    processId: attempt.process_id,
+    processBootId: attempt.process_boot_id,
+    processStartTicks: attempt.process_start_ticks,
+    systemdInvocationId: attempt.systemd_invocation_id,
+    restrictedEvidence: { stage: result.stage || 'dispatch', failedChecks: result.failedChecks || [result.reason] },
+  });
+  const attention = state.invoke('upsertAttentionEvent', event);
+  // Every blocked recovery stage (pre-claim, post-claim, dispatch, immediate
+  // pre-launch) must publish/update the single sanitized GitHub attention
+  // marker when the persisted state materially changed, not only local
+  // SQLite state (#698 finding 3). A delivery failure here stays task-local:
+  // it is recorded, but this function's blocking callers already return a
+  // nonzero exit code regardless of whether the GitHub write succeeded.
+  let attentionPublish = null;
+  if (attention?.materiallyChanged) {
+    try {
+      attentionPublish = upsertGitHubAttentionComment(args, { number: attempt.issue_number }, event, ghRunner);
+    } catch (error) {
+      state.recordTaskError('recovery-block-attention-comment', error);
+      attentionPublish = { error: String(error?.message || error) };
+    }
+  }
+  return { persisted: attemptPersisted && Boolean(attention), event, attention, attentionPublish };
+}
+
+/**
+ * Build the restricted `nativeResume`/`continuation` dispatch options for
+ * `dispatchRecoveryAction()` from the verified adapter boundary (#698
+ * finding 2). The restricted handle (session id, worktree/branch identity)
+ * is read here and used only to build the invocation args array — it is
+ * never assigned to anything returned from `main()`, logged, or persisted.
+ * Exact evidence booleans come from the same revalidation the scheduler
+ * already fail-closed-gates the recovery on, so a dispatch here can never
+ * be more permissive than the revalidation stage that authorized it.
+ */
+function buildRestrictedRecoveryDispatch({ recoveryPreLaunch, issueNumber, attemptId, args, authEnv, dependencies = {} }) {
+  const restrictedRead = (dependencies.readRestrictedRecoveryHandle || readRestrictedRecoveryHandle)(args.outputDir, attemptId);
+  const handle = restrictedRead.permissionSafe ? restrictedRead.handle : null;
+  const nativeResumeInvocation = handle?.sessionId
+    ? { command: process.execPath, args: runnerArgs(issueNumber, args, { attemptId, recoveryMode: 'native_resume', resumeSessionId: handle.sessionId }), env: authEnv }
+    : null;
+  const continuationInvocation = handle
+    ? { command: process.execPath, args: runnerArgs(issueNumber, args, { attemptId, recoveryMode: 'same_agent_continuation' }), env: authEnv }
+    : null;
+  // #698 round 5, finding 4: an explicit machine-local enablement gate,
+  // independent of CLI capability — see `dispatchRecoveryAction()` in
+  // claude-runner-recovery.mjs, the sole boundary that actually enforces it.
+  const enablementGateOpen = args.nativeResumeEnabled === true;
+  return {
+    nativeResume: {
+      restrictedHandle: restrictedRead.permissionSafe && Boolean(handle),
+      checkpointCurrent: recoveryPreLaunch.evidence?.checkpointCurrent === true,
+      cliSupportVerified: recoveryPreLaunch.evidence?.resumeCliSupportVerified === true,
+      enablementGateOpen,
+      invocation: nativeResumeInvocation,
+    },
+    continuation: {
+      preservedWorktreeCurrent: recoveryPreLaunch.evidence?.preservedWorktreeCurrent === true,
+      checkpointCurrent: recoveryPreLaunch.evidence?.checkpointCurrent === true,
+      policyApproved: recoveryPreLaunch.evidence?.explicitContinuationPolicyApproval === true,
+      enablementGateOpen,
+      invocation: continuationInvocation,
+    },
+  };
+}
+
+/**
+ * Runner-start claim marker. Records which dual-dispatch mode selected this
+ * issue and the source comment it came from — a proceed/continue command
+ * comment id in compatibility mode, or a manager preflight packet comment id
+ * in Agent Runner v2 preflight-direct mode.
+ */
+export function runnerStartedCommentBody(selection, action, args) {
+  const sourceLine = selection.mode === 'preflight-direct'
+    ? `- Source preflight comment: ${commentRevision(selection.preflight) || 'unknown'}`
+    : `- Source command comment: ${selection.command.sourceCommentId}`;
+  const commandKindLine = selection.mode === 'preflight-direct'
+    ? '- Command kind: (none — preflight-direct)'
+    : `- Command kind: ${selection.command.kind}`;
+  return `${RUNNER_STARTED_HEADING}\n\n- Runner action: ${action}\n- Selection mode: ${selection.mode}\n${sourceLine}\n${commandKindLine}\n- Started at: ${new Date().toISOString()}\n- Output directory: ${args.outputDir}\n\nThis marker prevents the scheduled runner from executing the same Claude command/preflight again. Add a new \`## Claude continue command\` comment if continuation is needed.`;
+}
+
+function postRunnerStartedComment(args, issue, selection, action, ghRunner = gh) {
+  const body = runnerStartedCommentBody(selection, action, args);
+  const output = ghRunner(['issue', 'comment', String(issue.number), '--repo', args.repo, '--body', body]);
+  return normalizeCommentIdentity({ url: String(output || '').trim() });
+}
+
+export function claimIssueForExecution(args, issue, selection, ghRunner = gh) {
+  const action = issue.statusLabel === STATUS_READY ? 'claim-ready-issue' : 'continue-in-progress-issue';
+  if (issue.statusLabel === STATUS_READY) {
+    ghRunner(['issue', 'edit', String(issue.number), '--repo', args.repo, '--remove-label', STATUS_READY, '--add-label', STATUS_IN_PROGRESS]);
+  }
+  const runnerStartedCommentIdentity = postRunnerStartedComment(args, issue, selection, action, ghRunner);
+  const sourceCommentIdentity = selection.command?.sourceCommentIdentity || null;
+  const sourcePreflightCommentIdentity = selection.preflight ? normalizeCommentIdentity(selection.preflight) : null;
+  return {
+    action,
+    statusLabel: issue.statusLabel,
+    selectionMode: selection.mode,
+    sourceCommentId: selection.command?.sourceCommentId || null,
+    sourceCommentIdentity,
+    sourcePreflightCommentIdentity,
+    sourcePreflightCommentId: commentRevision(sourcePreflightCommentIdentity),
+    runnerStartedCommentIdentity,
+  };
+}
+
+export function runnerAttentionCommentBody(issue, failure = {}) {
+  const outcome = normalizeTerminalOutcome(failure.reason);
+  const finishedAt = failure.detectedAt || failure.finishedAt || failure.startedAt || 'unknown';
+  const recoveryStatus = String(failure.recoveryStatus || 'forbidden');
+  const nextAction = String(failure.nextAction || 'Inspect the sanitized failure evidence and provide an explicit manager decision.');
+  const completed = outcome === 'completed';
+  const heading = completed ? '## Agent runner attention resolved' : '## Agent runner attention required';
+  const queueAction = completed
+    ? 'this issue remains open and returns from `status:blocked` to `status:in-progress`; merge and closure remain explicit human actions.'
+    : 'this task remains task-local; the runner will continue with other eligible work where policy permits.';
+  const footer = completed
+    ? 'Recovery completed without auto-closing the issue.'
+    : 'This is a task-local failure, not a reason to idle the runner.';
+  return `${RUNNER_ATTENTION_MARKER}
+
+${heading}
+
+- Issue: #${issue.number}
+- Outcome: \`${outcome}\`
+- Detected at: ${finishedAt}
+- Recovery status: \`${recoveryStatus}\`
+- Policy revision: \`${failure.policyRevision || 'runner-recovery-v1'}\`
+- Safe next action: ${nextAction}
+- Queue action: ${queueAction}
+- Recovery rule: retry or hand off only from a safe checkpoint. Do not blind-retry a fresh session.
+
+${footer}`;
+}
+
+export function waitForExplicitPlanApproval(args, issue, failure, ghRunner = gh) {
+  const errors = [];
+  let statusUpdated = false;
+  let attentionPosted = false;
+  let attentionResult = null;
+  try {
+    ghRunner(['issue', 'edit', String(issue.number), '--repo', args.repo, '--remove-label', STATUS_IN_PROGRESS, '--add-label', STATUS_BLOCKED]);
+    statusUpdated = true;
+  } catch (error) {
+    errors.push({ stage: 'status-update', message: String(error?.message || error) });
+  }
+  try {
+    attentionResult = upsertGitHubAttentionComment(args, issue, failure, ghRunner);
+    attentionPosted = Boolean(attentionResult?.posted || attentionResult?.updated || attentionResult?.deduplicated);
+  } catch (error) {
+    errors.push({ stage: 'attention-comment', message: String(error?.message || error) });
+  }
+  return {
+    issue: issue.number,
+    reason: 'plan_only_awaiting_approval',
+    awaitingExplicitApproval: true,
+    quarantined: false,
+    statusUpdated,
+    attentionPosted,
+    attentionResult,
+    queueReleased: true,
+    errors,
+  };
+}
+
+export function restoreIssueAfterSuccessfulRecovery(args, issue, ghRunner = gh) {
+  ghRunner(['issue', 'edit', String(issue.number), '--repo', args.repo, '--remove-label', STATUS_BLOCKED, '--add-label', STATUS_IN_PROGRESS]);
+  return {
+    issue: issue.number,
+    fromStatus: STATUS_BLOCKED,
+    toStatus: STATUS_IN_PROGRESS,
+    issueClosed: false,
+  };
+}
+
+export function upsertGitHubAttentionComment(args, issue, failure, ghRunner = gh) {
+  const body = runnerAttentionCommentBody(issue, failure);
+  const existing = readIssueComments(args.repo, issue.number, ghRunner)
+    .filter((comment) => String(comment?.body || '').includes(RUNNER_ATTENTION_MARKER))
+    .sort((a, b) => String(commentTime(b)).localeCompare(String(commentTime(a))))[0];
+  if (existing?.body === body) return { posted: false, updated: false, deduplicated: true };
+  if (existing) {
+    const databaseId = requireRestCommentDatabaseId(existing, 'attention-comment-update');
+    ghRunner(['api', '--method', 'PATCH', `repos/${args.repo}/issues/comments/${databaseId}`, '-f', `body=${body}`]);
+    return {
+      posted: false,
+      updated: true,
+      deduplicated: false,
+      commentIdentity: normalizeCommentIdentity(existing),
+    };
+  }
+  const output = ghRunner(['issue', 'comment', String(issue.number), '--repo', args.repo, '--body', body]);
+  const commentIdentity = normalizeCommentIdentity({ url: String(output || '').trim() });
+  return { posted: true, updated: false, deduplicated: false, commentIdentity };
+}
+
+export function quarantineIssueAfterFailedRun(args, issue, failure, ghRunner = gh) {
+  const errors = [];
+  let statusUpdated = false;
+  let attentionPosted = false;
+  let attentionResult = null;
+
+  try {
+    ghRunner(['issue', 'edit', String(issue.number), '--repo', args.repo, '--remove-label', STATUS_IN_PROGRESS, '--add-label', STATUS_BLOCKED]);
+    statusUpdated = true;
+  } catch (error) {
+    errors.push({ stage: 'status-update', message: String(error?.message || error) });
+  }
+
+  try {
+    attentionResult = upsertGitHubAttentionComment(args, issue, failure, ghRunner);
+    attentionPosted = Boolean(attentionResult?.posted || attentionResult?.updated || attentionResult?.deduplicated);
+  } catch (error) {
+    errors.push({ stage: 'attention-comment', message: String(error?.message || error) });
+  }
+
+  return {
+    issue: issue.number,
+    reason: failure.reason,
+    statusUpdated,
+    attentionPosted,
+    attentionResult,
+    queueReleased: true,
+    errors,
+  };
+}
+
+export function latestRunnerStartedComment(comments = []) {
+  return [...comments]
+    .filter((comment) => String(comment?.body || '').includes(RUNNER_STARTED_HEADING))
+    .sort((left, right) => String(commentTime(right)).localeCompare(String(commentTime(left))))[0] || null;
+}
+
+function runnerStartedMarkerClaimRevision(marker) {
+  const body = String(marker?.body || '');
+  return body.match(/Source command comment:\s*(\S+)/)?.[1]
+    || body.match(/Source preflight comment:\s*(\S+)/)?.[1]
+    || null;
+}
+
+function classifyManagerTimelineComment(comment) {
+  const body = String(comment?.body || '');
+  if (invalidatesManagerPreflight(body)) return 'revocation';
+  if (hasManagerPreflight(body)) return 'preflight';
+  if (/^## Claude (?:proceed|continue) command\b/im.test(body)) return 'command';
+  if (/^## Manager recovery authorization\b/im.test(body)) return 'authorization';
+  if (/^## (?:Manager|Agent) handoff\s*$/im.test(body)) return 'handoff';
+  if (body.includes(RUNNER_STARTED_HEADING)) return 'runner-start';
+  return null;
+}
+
+/**
+ * One deterministic, tested resolver over the ordered manager-issue
+ * timeline — preflights, commands, recovery authorizations, handoffs,
+ * revocations, and runner-start claims — so the mere *existence* of an old
+ * claim/preflight/authorization comment is never mistaken for *current*
+ * authority (#698 finding 7). Every prior call site parsed this timeline
+ * piecemeal and ad hoc (`latestManagerPreflightComment`,
+ * `latestManagerRecoveryAuthorization`, `latestRunnerStartedComment`,
+ * inline handoff regexes); this walks the full comment list once, in
+ * chronological order, and folds each event into the running "what is
+ * current right now" state:
+ *
+ *  - `preflight`/`command` establish a new claimable revision and clear any
+ *    prior revocation.
+ *  - `revocation` (a `## Manager preflight packet — stale/invalid/revoked/
+ *    superseded` marker) invalidates the current claim revision's
+ *    authorization state without erasing the claim revision itself — the
+ *    revision id is still useful for cross-referencing, but `revoked` must
+ *    gate any caller that would otherwise treat it as live authority.
+ *  - `handoff` marks the current authorization as no longer sufficient
+ *    (a manager/agent handoff supersedes it) until a fresh authorization
+ *    or runner-start event appears after it.
+ *  - `authorization` becomes the current recovery authorization and clears
+ *    a pending handoff.
+ *  - `runner-start` clears a pending handoff (the runner has since acted).
+ *
+ * Deliberately narrow in scope: this resolves *authority currency* over an
+ * already-fetched comment list, not issue selection eligibility, quota,
+ * agent compatibility, or dispatch. It is compatible with — but does not
+ * implement — #719's broader selection redesign; it is a shared, tested
+ * primitive #719 (or any other consumer) can build on rather than
+ * re-deriving the same ad hoc comment scanning again.
+ */
+export function resolveManagerTimelineAuthority(comments = []) {
+  const timeline = [...(comments || [])]
+    .map((comment) => {
+      const identity = normalizeCommentIdentity(comment);
+      return {
+        comment,
+        type: classifyManagerTimelineComment(comment),
+        identity,
+        revision: commentRevision(identity),
+        createdAt: commentTime(comment),
+      };
+    })
+    .filter((event) => event.type !== null)
+    .sort((left, right) => String(left.createdAt || '').localeCompare(String(right.createdAt || '')));
+
+  let currentClaimRevision = null;
+  let currentClaimIdentity = null;
+  let currentClaimType = null;
+  let currentAuthorizationId = null;
+  let currentAuthorizationIdentity = null;
+  let revoked = false;
+  let handoffPending = false;
+
+  for (const event of timeline) {
+    if (event.type === 'preflight' || event.type === 'command') {
+      currentClaimRevision = event.revision;
+      currentClaimIdentity = event.identity;
+      currentClaimType = event.type;
+      revoked = false;
+    } else if (event.type === 'revocation') {
+      revoked = true;
+    } else if (event.type === 'handoff') {
+      handoffPending = true;
+      currentAuthorizationId = null;
+      currentAuthorizationIdentity = null;
+    } else if (event.type === 'authorization') {
+      currentAuthorizationId = event.revision;
+      currentAuthorizationIdentity = event.identity;
+      handoffPending = false;
+    } else if (event.type === 'runner-start') {
+      handoffPending = false;
+    }
+  }
+
+  return Object.freeze({
+    timeline: Object.freeze(timeline.map((event) => Object.freeze({
+      type: event.type,
+      identity: event.identity,
+      revision: event.revision,
+      createdAt: event.createdAt,
+    }))),
+    currentClaimRevision,
+    currentClaimIdentity,
+    currentClaimType,
+    currentAuthorizationId,
+    currentAuthorizationIdentity,
+    revoked,
+    handoffPending,
+  });
+}
+
+/**
+ * Whether `claimRevision` (a comment id extracted from durable state or a
+ * marker body) is still the *current* claim revision per the ordered
+ * timeline — not merely a revision that was once claimable. A newer
+ * preflight/command comment since posted, or an intervening revocation,
+ * means it is no longer current (#698 finding 7).
+ */
+export function claimRevisionIsCurrent(comments, claimRevision) {
+  if (!claimRevision) return false;
+  const authority = resolveManagerTimelineAuthority(comments);
+  return !authority.revoked
+    && sameCommentIdentity(authority.currentClaimIdentity, claimRevision);
+}
+
+/**
+ * A `## Claude runner started` marker alone used to reserve an issue
+ * forever: the mere presence of the comment blocked selection with no
+ * cross-check against whether anything is actually still running. A crash
+ * between posting the marker and any later state write left the issue
+ * silently stuck with no attention signal (#698 finding 6).
+ *
+ * When `state`/`repo` are supplied, the marker is cross-checked against
+ * durable evidence — an active (unfinished) attempt row for this issue,
+ * matching claim revision, and a live process identity. Only a full match
+ * still reserves the issue. Anything else (no matching row, stale claim
+ * revision, or a dead process) is classified `orphaned-runner-started-marker`
+ * — a durable attention event is persisted and the caller still skips this
+ * one issue for the current pass (it does not reclaim it outright, since a
+ * fresh claim requires the normal claim path), but never blocks scanning of
+ * unrelated ready work, which the caller already guarantees by `continue`-ing
+ * its loop either way.
+ *
+ * Without `state`/`repo` (e.g. call sites that have not been updated to
+ * supply durable state), this fails closed exactly as before: the marker
+ * alone still reserves the issue.
+ */
+export async function activeRunBlockForIssue(issue, comments = [], selectionReason = null, { state = null, repo = null, processProbe = probeProcessIdentity } = {}) {
+  if (issue?.statusLabel !== STATUS_IN_PROGRESS) return null;
+  if (selectionReason !== 'missing continue command') return null;
+
+  const marker = latestRunnerStartedComment(comments);
+  if (!marker) return null;
+
+  const base = {
+    issue: issue.number,
+    statusLabel: issue.statusLabel,
+    runnerStartedCommentId: commentRevision(marker),
+    runnerStartedAt: commentTime(marker),
+  };
+
+  if (!state || !repo) {
+    return {
+      ...base,
+      reason: 'active-runner-started-issue',
+      detail: 'A prior Claude runner-started issue is still status:in-progress and has no unclaimed Claude continue command. Reserving only this task while the scheduler continues scanning ready work.',
+    };
+  }
+
+  const claimRevision = runnerStartedMarkerClaimRevision(marker);
+  const activeRows = (state.invoke('activeRecoveryAttempts', repo) || []).filter((row) => row.issue_number === issue.number);
+  let liveMatch = null;
+  for (const row of activeRows) {
+    const persistedClaimIdentity = deserializeCommentIdentity(row.claim_identity_json || row.claim_id, 'active-attempt-claim');
+    if (claimRevision && !sameCommentIdentity(persistedClaimIdentity, claimRevision)) continue;
+    let live = false;
+    try {
+      live = await processProbe({
+        processId: row.process_id, processBootId: row.process_boot_id,
+        processStartTicks: row.process_start_ticks, systemdInvocationId: row.systemd_invocation_id,
+      });
+    } catch { live = false; }
+    if (live === true) { liveMatch = row; break; }
+  }
+
+  // A live, durably-matching attempt is not enough on its own: the claim
+  // revision it matched against must still be *current* authority per the
+  // ordered manager timeline, not merely a revision that existed at some
+  // point (#698 finding 7) — a newer preflight/command since posted, or an
+  // intervening revocation, means this live process is running under
+  // superseded authority and belongs in front of an operator, not silently
+  // trusted to keep reserving the issue.
+  if (liveMatch && (!claimRevision || claimRevisionIsCurrent(comments, claimRevision))) {
+    return {
+      ...base,
+      reason: 'active-runner-started-issue',
+      detail: 'A prior Claude runner-started issue is still status:in-progress with a live, durably-verified attempt (matching claim revision and process identity). Reserving only this task while the scheduler continues scanning ready work.',
+      attemptId: liveMatch.attempt_id,
+    };
+  }
+
+  const nextAction = liveMatch
+    ? 'A `## Claude runner started` marker matches a live, durably-verified attempt, but its claim revision is no longer current manager authority (superseded by a later preflight/command, or revoked). Verify manually; the scheduler no longer treats this marker alone as reserving the issue.'
+    : 'A `## Claude runner started` marker exists with no durable evidence (active attempt row, matching claim revision, live process) confirming it is still running. Verify manually; the scheduler no longer treats this marker alone as reserving the issue.';
+  const event = buildAttentionEvent({
+    repository: repo, issueNumber: issue.number, attemptId: liveMatch ? String(liveMatch.attempt_id) : `marker-${commentRevision(marker)}`,
+    reason: 'unknown_failure', recoveryStatus: 'orphaned', finishedAt: new Date().toISOString(),
+    nextAction, dashboardReference: `issue-${issue.number}`,
+  });
+  state.invoke('upsertAttentionEvent', event);
+
+  return {
+    ...base,
+    reason: 'orphaned-runner-started-marker',
+    orphaned: true,
+    detail: 'A `## Claude runner started` marker exists but no durable evidence (matching active attempt row, current claim revision, live process) confirms it is still running under current authority. Treated as orphaned; unrelated ready work continues to be scanned.',
+  };
+}
+
+// The governing correctness invariant (#698 round 3): after every scheduler
+// pass, crash, or restart, every attempt must be durably and unambiguously
+// in exactly one of these five row-level states (a sixth, "runnable", is a
+// property of an *issue with no in-flight attempt row* and so is not a
+// `recovery_attempts.resolution_state` this classifier can observe) — never
+// silent limbo. `classifyAttemptLivenessState()` makes that invariant
+// executable: any row whose classification comes back `'ambiguous'` is a
+// bug, not a valid resting state, and every fault-injection scenario in
+// claude-runner-fault-injection.test.mjs asserts this never happens.
+//
+// #698 round 4, finding 1: a bare `resolution_state` enum is not sufficient
+// evidence of `actively_owned`/`delayed_bounded_retry` — a row can say
+// `active` while its process is dead, its lease superseded, its manager
+// authority stale, or its progress stalled past the configured window,
+// and a row can say `unresolved`/`recovery_eligible` while its retry
+// deadline is missing, expired, or its bounded-attempt cap already spent.
+// `classifyAttemptLivenessState()` therefore takes an independently
+// assembled `evidence` bundle (computed by `computeAttemptLivenessEvidence()`
+// below, or supplied directly by a test) and only returns the permissive
+// buckets when every required fact is proven true. Missing, stale,
+// contradictory, or simply unsupplied evidence is treated identically to
+// disproven evidence — it demotes to `task_local_attention`/`operator_held`,
+// never silently to `actively_owned`/`delayed_bounded_retry`.
+//
+// This pair is an executable invariant *oracle*, exercised by
+// claude-runner-fault-injection.test.mjs against the real production
+// scheduler/state-store paths — it is not itself wired into any live
+// dispatch decision or the dashboard. No scheduler code path currently
+// calls `classifyAttemptLivenessState()`/`computeAttemptLivenessEvidence()`
+// to decide whether to claim, retry, or block an attempt; they exist so a
+// test (or a future operator tool) can prove any given persisted row is in
+// exactly one governing-invariant bucket.
+export const ATTEMPT_LIVENESS_STATES = Object.freeze([
+  'actively_owned', 'delayed_bounded_retry', 'task_local_attention', 'operator_held', 'resolved',
+]);
+
+const TRANSITION_RESOLUTION_STATES = Object.freeze([
+  'transition_pending', 'transition_uncertain', 'attention_resolution_pending',
+]);
+
+export function classifyAttemptLivenessState(row, evidence = {}) {
+  if (!row) return null;
+  switch (row.resolution_state) {
+    case 'resolved':
+      return 'resolved';
+    case 'operator_attention_required':
+      return 'operator_held';
+    case 'active': {
+      const activelyOwnedProven = evidence.liveProcess === true
+        && evidence.leaseCurrent === true
+        && evidence.authorityCurrent === true
+        && evidence.progressWithinStallWindow === true;
+      return activelyOwnedProven ? 'actively_owned' : 'task_local_attention';
+    }
+    default:
+      if (TRANSITION_RESOLUTION_STATES.includes(row.resolution_state)) {
+        // #698 round 5 final-head fix: transition rows now get the same
+        // authoritative persisted schedule as any other bounded retry
+        // (`incrementTransitionMutationCount()` sets `next_retry_at`/
+        // `retry_attempt`/`retry_cap`/`retry_reason` before each retried
+        // mutation) — bounded mutation-cap headroom alone is not a retry
+        // schedule, so a transition row must prove both a valid future
+        // deadline and cap headroom before reading as `delayed_bounded_retry`.
+        return evidence.retryDeadlineValid === true
+          && evidence.boundedRetryPolicyProven === true
+            ? 'delayed_bounded_retry'
+            : 'task_local_attention';
+      }
+      if (row.resolution_state === 'unresolved') {
+        if (!row.recovery_eligible) return 'task_local_attention';
+        const boundedRetryProven = evidence.retryDeadlineValid === true && evidence.boundedRetryPolicyProven === true;
+        return boundedRetryProven ? 'delayed_bounded_retry' : 'task_local_attention';
+      }
+      return 'ambiguous';
+  }
+}
+
+/**
+ * Assembles the evidence bundle `classifyAttemptLivenessState()` requires,
+ * from a persisted `recovery_attempts` row plus live inputs (process probe,
+ * the issue's current comment timeline, and the clock). Kept as a distinct
+ * async boundary so the classifier itself stays a pure, synchronous,
+ * trivially-testable function — fault-injection tests can drive the
+ * classifier directly with hand-built evidence, or drive this assembler with
+ * a broken probe/empty timeline/malformed row to prove the whole pipeline
+ * fails closed end-to-end (#698 round 4, finding 1).
+ */
+export async function computeAttemptLivenessEvidence(row, {
+  processProbe = probeProcessIdentity,
+  comments = [],
+  otherLease = false,
+  now = () => new Date().toISOString(),
+  stallPassLimit = DEFAULT_STALLED_PASS_LIMIT,
+  policy,
+} = {}) {
+  if (!row) return {};
+  // `liveProcessRaw` preserves the probe's tri-state result (true/false/
+  // null) for callers that must distinguish confirmed-dead from ambiguous
+  // (e.g. to label an outcome `orphaned_active_claim` vs. `unknown_failure`
+  // — both are equally "not proven live" for classification, which is what
+  // the strict boolean `liveProcess` below is for, but they are diagnostically
+  // distinct facts worth preserving).
+  let liveProcessRaw = null;
+  try {
+    const identity = {
+      processId: row.process_id, processBootId: row.process_boot_id,
+      processStartTicks: row.process_start_ticks, systemdInvocationId: row.systemd_invocation_id,
+    };
+    const probed = await processProbe(identity);
+    liveProcessRaw = probed === true ? true : probed === false ? false : null;
+  } catch {
+    liveProcessRaw = null;
+  }
+  const liveProcess = liveProcessRaw === true;
+  // "Current exclusive lease" means no other active attempt row conflicts
+  // for the same issue — checked here via `otherLease`, computed by the
+  // caller across the full active set. `recovery_lease_id` alone is not a
+  // universal signal: only attempts claimed through the bounded-recovery
+  // path (`claimRecovery()`) ever get one populated — an ordinary first-run
+  // issue attempt never does, so requiring it unconditionally would demote
+  // every ordinary attempt regardless of exclusivity.
+  const leaseCurrent = otherLease !== true;
+  const claimIdentity = deserializeCommentIdentity(row.claim_identity_json || row.claim_id, 'liveness-claim');
+  const authorityCurrent = Boolean(claimIdentity) && claimRevisionIsCurrent(comments, claimIdentity);
+  const progressWithinStallWindow = (row.stalled_passes || 0) < stallPassLimit;
+  // #698 round 5, finding 2: a bounded retry now requires the authoritative
+  // persisted schedule (`next_retry_at`/`retry_attempt`/`retry_cap`/
+  // `retry_reason`), not `retry_at`/`recovery_attempt_count`/a recomputed
+  // cap, and not mutation-count headroom alone. `retry_reason` must be set
+  // (populated at every write site that also sets the deadline/attempt/cap)
+  // as the marker that this row genuinely went through retry-schedule
+  // persistence — a legacy or never-scheduled row (both read as
+  // `next_retry_at IS NULL`) must never be treated as having a real
+  // schedule just because a count-cap happens to be null.
+  const hasRetrySchedule = Boolean(row.retry_reason) && Boolean(row.next_retry_at);
+  const nextRetryAtMs = Date.parse(row.next_retry_at || '');
+  const nowMs = Date.parse(now());
+  const retryDeadlineValid = hasRetrySchedule && Number.isFinite(nextRetryAtMs) && Number.isFinite(nowMs) && nextRetryAtMs > nowMs;
+  const boundedRetryPolicyProven = row.retry_cap == null
+    ? hasRetrySchedule
+    : hasRetrySchedule && (row.retry_attempt || 0) < row.retry_cap;
+  return {
+    liveProcess, liveProcessRaw, leaseCurrent, authorityCurrent, progressWithinStallWindow,
+    retryDeadlineValid, boundedRetryPolicyProven,
+  };
+}
+
+function readBootId(reader = readFileSync) {
+  return String(reader('/proc/sys/kernel/random/boot_id', 'utf8')).trim();
+}
+
+function readProcessStartTicks(processId, reader = readFileSync) {
+  const path = processId === process.pid ? '/proc/self/stat' : `/proc/${processId}/stat`;
+  const stat = String(reader(path, 'utf8'));
+  const close = stat.lastIndexOf(')');
+  if (close < 0) throw new Error('invalid proc stat');
+  const fieldsAfterCommand = stat.slice(close + 2).trim().split(/\s+/);
+  const startTicks = fieldsAfterCommand[19];
+  if (!startTicks) throw new Error('missing proc start time');
+  return startTicks;
+}
+
+export function captureProcessIdentity(processId = process.pid, env = process.env, reader = readFileSync) {
+  return {
+    processId,
+    processBootId: readBootId(reader),
+    processStartTicks: readProcessStartTicks(processId, reader),
+    systemdInvocationId: String(env.INVOCATION_ID || '').trim() || null,
+  };
+}
+
+export function probeProcessIdentity(identity, { reader = readFileSync, signalProbe = (pid) => process.kill(pid, 0) } = {}) {
+  const processId = Number(identity?.processId);
+  if (!Number.isInteger(processId) || processId < 1) return false;
+  if (!identity?.processBootId || !identity?.processStartTicks) return null;
+  try { signalProbe(processId); } catch { return false; }
+  try {
+    if (readBootId(reader) !== identity.processBootId) return false;
+    if (readProcessStartTicks(processId, reader) !== String(identity.processStartTicks)) return false;
+    return true;
+  } catch {
+    return null;
+  }
+}
+
+function processProgressRecord(processId, reader = readFileSync) {
+  const stat = String(reader(`/proc/${processId}/stat`, 'utf8'));
+  const close = stat.lastIndexOf(')');
+  if (close < 0) throw new Error('invalid proc stat');
+  const fields = stat.slice(close + 2).trim().split(/\s+/);
+  const io = String(reader(`/proc/${processId}/io`, 'utf8'));
+  const ioValue = (name) => io.match(new RegExp(`^${name}:\\s*(\\d+)$`, 'm'))?.[1] || '0';
+  return [String(processId), fields[11] || '0', fields[12] || '0', ioValue('read_bytes'), ioValue('write_bytes')].join(':');
+}
+
+/**
+ * A content-free progress token for the wrapper child and its live descendants.
+ * CPU and kernel I/O counters change while the real CLI child works, even
+ * though the singleton cron process is waiting and stdout is quiet.
+ */
+export function probeProcessProgress(processId, reader = readFileSync) {
+  const pending = [Number(processId)];
+  const seen = new Set();
+  const records = [];
+  while (pending.length) {
+    const pid = pending.shift();
+    if (!Number.isInteger(pid) || pid < 1 || seen.has(pid)) continue;
+    seen.add(pid);
+    records.push(processProgressRecord(pid, reader));
+    try {
+      const children = String(reader(`/proc/${pid}/task/${pid}/children`, 'utf8')).trim();
+      if (children) pending.push(...children.split(/\s+/).map(Number));
+    } catch { /* a child may exit between proc reads */ }
+  }
+  if (records.length === 0) return null;
+  return records.sort().join('|');
+}
+
+export function deriveTerminalOutcome({ effectiveExitCode, childPayload, childReason }) {
+  if (childPayload?.awaitingPlanApproval) return 'plan_only_awaiting_approval';
+  if (effectiveExitCode === 0) return 'completed';
+  return normalizeTerminalOutcome(childReason);
+}
+
+/**
+ * The single production-authoritative ownership check for every currently
+ * `active` recovery attempt (#698 round 5, finding 1). Supersedes treating
+ * "process confirmed live" alone as proof of ownership — a live process
+ * with a superseded manager authority, a conflicting lease, or stalled
+ * progress no longer counted as orphaned before this round, so it kept the
+ * global execution slot reserved indefinitely. Every active row now goes
+ * through the same evidence-based classifier
+ * (`computeAttemptLivenessEvidence()`/`classifyAttemptLivenessState()`)
+ * fault-injection already exercises as an oracle; here its result directly
+ * controls persisted state and slot disposition, not merely a test
+ * assertion. Only `actively_owned` leaves the row untouched; every other
+ * classification demotes it identically to the historical dead-process
+ * path — durable attention, the global slot released (`finished_at`/
+ * `resolution_state: 'unresolved'` persisted), and the scheduler continues
+ * scanning unrelated work. A GitHub read failure while checking current
+ * authority fails closed (`authorityCurrent = false`) rather than trusting
+ * a stale claim revision or crashing the whole reconciliation pass.
+ */
+export async function reconcileSchedulerAttempts({ state, args, processProbe = probeProcessIdentity, ghRunner = gh, now = () => new Date().toISOString(), stalledPassLimit = args.stalledPassLimit || DEFAULT_STALLED_PASS_LIMIT, excludeAttemptId = null }) {
+  const active = state.invoke('activeRecoveryAttempts', args.repo) || [];
+  const attention = [];
+  let demoted = 0;
+  for (const row of active) {
+    // The attempt the calling watchdog is directly supervising (its own
+    // in-flight child) skips the *authority* re-derivation below: authority
+    // was already proven once at dispatch/claim time, and re-deriving it
+    // from a live GitHub comment read on every watchdog tick would fail
+    // closed -- demoting and releasing the slot of a healthy, still-running
+    // job -- on any transient GitHub read error, or on an operator posting
+    // an unrelated later comment while the run is still legitimately in
+    // flight (#698 round 5 watchdog false-positive). Liveness,
+    // lease-exclusivity, and progress-stall evidence still apply in full,
+    // so a genuinely stalled or dead self-supervised attempt is still
+    // demoted exactly as before.
+    const isSelfSupervised = excludeAttemptId != null && String(row.attempt_id) === String(excludeAttemptId);
+    const detectedAt = now();
+    const progressRow = state.invoke('markStalledPass', row.attempt_id, stalledPassLimit, detectedAt) || row;
+    const otherLease = active.some((other) => other.attempt_id !== row.attempt_id && other.issue_number === row.issue_number);
+    let comments = [];
+    let authorityReadOk = true;
+    if (!isSelfSupervised) {
+      try {
+        comments = readIssueComments(args.repo, row.issue_number, ghRunner);
+      } catch (error) {
+        authorityReadOk = false;
+        state.recordTaskError('reconcile-authority-read', error);
+      }
+    }
+    const evidence = await computeAttemptLivenessEvidence(progressRow, {
+      processProbe, comments, otherLease, now, stallPassLimit: stalledPassLimit,
+    });
+    if (isSelfSupervised) evidence.authorityCurrent = true;
+    else if (!authorityReadOk) evidence.authorityCurrent = false;
+    const bucket = classifyAttemptLivenessState({ resolution_state: 'active', recovery_eligible: row.recovery_eligible }, evidence);
+    if (bucket === 'actively_owned') continue;
+
+    // Not actively owned for any reason (dead process, superseded
+    // authority, conflicting lease, or stalled progress) — release the
+    // global slot the same way a confirmed-dead process always has.
+    // `liveProcessRaw` preserves confirmed-dead (`false`) vs. ambiguous
+    // (`null`, e.g. a probe error) — both fail closed identically for
+    // classification, but only a confirmed-dead process is labeled an
+    // orphaned claim; ambiguous evidence (including any OTHER demotion
+    // reason — stale authority, conflicting lease, stalled progress — with
+    // a still-live process) is `unknown_failure`.
+    const outcome = evidence.liveProcessRaw === false ? 'orphaned_active_claim' : 'unknown_failure';
+    const decision = decideRecovery({ outcome, evidence: { processOwner: false, conflictingLease: false, ownershipAmbiguous: false } });
+    const event = buildAttentionEvent({
+      repository: args.repo, project: args.project?.id, issueNumber: row.issue_number, attemptId: row.attempt_id,
+      reason: outcome, recoveryStatus: decision.status, nextAction: decision.nextAction, startedAt: row.started_at, finishedAt: detectedAt,
+    });
+    const attemptPersisted = state.record('recordRecoveryAttempt', {
+      attemptId: row.attempt_id, repo: args.repo, project: args.project?.id, issueNumber: row.issue_number,
+      claimId: row.claim_id, preflightRevision: row.preflight_revision, agent: row.agent, model: row.model, harness: row.harness,
+      startedAt: row.started_at, finishedAt: detectedAt, outcome,
+      recoveryEligible: decision.eligible, recoveryAction: decision.action, recoveryAttemptCount: row.recovery_attempt_count,
+      retryAt: decision.retryAt || null,
+      nextRetryAt: decision.eligible ? (decision.retryAt || null) : null,
+      retryAttempt: decision.recoveryAttemptCount || row.recovery_attempt_count || 0,
+      retryCap: recoveryAttemptCapForOutcome(outcome),
+      retryReason: decision.eligible ? outcome : null,
+      attentionStatus: 'attention_required', attentionDedupeKey: event.dedupeKey, resolutionState: 'unresolved',
+      processId: row.process_id, processBootId: row.process_boot_id, processStartTicks: row.process_start_ticks, systemdInvocationId: row.systemd_invocation_id,
+      restrictedEvidence: { processId: row.process_id, livenessEvidence: evidence },
+    });
+    if (attemptPersisted) {
+      const persisted = state.invoke('upsertAttentionEvent', event);
+      if (persisted?.materiallyChanged) {
+        try { upsertGitHubAttentionComment(args, { number: row.issue_number }, event, ghRunner); } catch (error) { state.recordTaskError('watchdog-attention-comment', error); }
+      }
+    }
+    attention.push(event);
+    demoted += 1;
+  }
+  return { checked: active.length, orphaned: demoted, attention };
+}
+
+export async function runChildWithWatchdog({ command, commandArgs, options, state, args, attemptId = null, ghRunner = gh, spawnRunner = spawn, processProbe = probeProcessIdentity, progressProbe = probeProcessProgress, now = () => new Date().toISOString(), watchdogIntervalMs = args.watchdogIntervalMs, stalledPassLimit = args.stalledPassLimit }) {
+  const child = spawnRunner(command, commandArgs, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  let spawnError = null;
+  const maxBuffer = Number.isFinite(options?.maxBuffer) ? options.maxBuffer : 20 * 1024 * 1024;
+  const appendOutput = (current, chunk) => {
+    const next = current + chunk;
+    if (Buffer.byteLength(stdout) + Buffer.byteLength(stderr) + Buffer.byteLength(chunk) > maxBuffer) {
+      const error = new Error(`runner child output exceeded maxBuffer (${maxBuffer} bytes)`);
+      error.code = 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+      spawnError ||= error;
+      child.kill('SIGKILL');
+      return current;
+    }
+    return next;
+  };
+  let reconciling = null;
+  let outputRevision = 0;
+  const persistProgress = (token) => {
+    if (!attemptId || !token) return;
+    state.invoke('recordRecoveryProgress', attemptId, token, now());
+  };
+  try {
+    const initialProgress = progressProbe(child.pid);
+    persistProgress(initialProgress ? `process:${initialProgress}` : null);
+  } catch { /* missing proc evidence is fail-closed by unchanged revisions */ }
+  const reconcile = async () => {
+    if (reconciling) return reconciling;
+    reconciling = Promise.resolve().then(() => {
+      let token = null;
+      try { token = progressProbe(child.pid); } catch { token = null; }
+      persistProgress(token ? `process:${token}` : null);
+      return reconcileSchedulerAttempts({ state, args, processProbe, ghRunner, now, stalledPassLimit, excludeAttemptId: attemptId });
+    })
+      .catch((error) => {
+        // Not on the enumerated systemic-fault list (corrupt/unavailable
+        // shared state, broken locking, ambiguous checkout ownership, unsafe
+        // config, repo corruption, credential compromise, operator pause) —
+        // an unexpected exception in one watchdog pass must not idle
+        // unrelated dispatch; it is retried on the next tick (#698 finding 5).
+        state.recordTaskError('in-lock-watchdog', error);
+        return { checked: 0, orphaned: 0, attention: [] };
+      })
+      .finally(() => { reconciling = null; });
+    return reconciling;
+  };
+  child.stdout?.setEncoding('utf8');
+  child.stderr?.setEncoding('utf8');
+  child.stdout?.on('data', (chunk) => { stdout = appendOutput(stdout, chunk); persistProgress(`output:${++outputRevision}`); });
+  child.stderr?.on('data', (chunk) => { stderr = appendOutput(stderr, chunk); persistProgress(`output:${++outputRevision}`); });
+  const timer = setInterval(() => { void reconcile(); }, watchdogIntervalMs);
+  const result = await new Promise((resolveResult) => {
+    child.once('error', (error) => { spawnError = error; });
+    child.once('close', (status, signal) => resolveResult({ status, signal }));
+  });
+  clearInterval(timer);
+  if (reconciling) await reconciling;
+  return { ...result, stdout, stderr, error: spawnError };
+}
+
+export function runQuotaPreflight(args, env = process.env, runner = spawnSync) {
+  if (!args.execute || !args.quotaPreflight) return { blocked: false, skipped: true, reason: 'not-required' };
+
+  const nodeArgs = quotaPreflightArgs(args);
+  const result = runner(process.execPath, nodeArgs, { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, env });
+  let payload = null;
+  try {
+    payload = JSON.parse(result.stdout || '{}');
+  } catch {
+    payload = null;
+  }
+
+  const status = payload?.status || null;
+  const blocked = result.status !== 0 || !payload || status !== 'available';
+  return {
+    blocked,
+    skipped: false,
+    nodeArgs,
+    exitCode: result.status,
+    signal: result.signal,
+    status,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    payload,
+    reason: blocked ? 'quota-preflight-blocked' : null,
+  };
+}
+
+/**
+ * Give a status:ready candidate with no proceed command and no manager
+ * preflight a chance at local preflight generation (Agent Runner v2.2)
+ * before selection runs. Mutates GitHub (posts a comment) only when
+ * `args.execute` is set, matching the no-mutation-in-dry-run convention used
+ * elsewhere in this file (see claimIssueForExecution). Returns the (possibly
+ * updated) comment list plus an optional skip entry for blocked/pending
+ * cases so the caller can push it onto `skipped` and move on.
+ */
+function maybeGeneratePreflight(args, issue, comments, openPrs, ghRunner) {
+  if (args.autoPreflightMode === false || issue.statusLabel !== STATUS_READY) {
+    return { comments, generated: null, skip: null };
+  }
+
+  const linkedOpenPrs = findLinkedOpenPullRequests({ issueNumber: issue.number, pullRequests: openPrs });
+  const action = resolvePreflightAction({
+    issue,
+    comments,
+    linkedOpenPrs,
+    autoPreflightEnabled: true,
+    requireManagerPreflight: args.requireManagerPreflight !== false,
+  });
+
+  if (action.action === 'blocked') {
+    return { comments, generated: null, skip: { issue: issue.number, statusLabel: issue.statusLabel, reason: action.reason, detail: action.detail } };
+  }
+
+  if (action.action !== 'generate') {
+    return { comments, generated: null, skip: null };
+  }
+
+  if (!args.execute) {
+    return { comments, generated: null, skip: { issue: issue.number, statusLabel: issue.statusLabel, reason: 'preflight-generation-pending-dry-run' } };
+  }
+
+  const posted = postGeneratedPreflightComment(args, issue, action.packet, ghRunner);
+  return {
+    comments: [...comments, posted],
+    generated: {
+      issue: issue.number,
+      fingerprint: action.fingerprint,
+      stale: action.stale,
+      sourceCommentId: posted.id,
+      sourceCommentIdentity: posted.commentIdentity,
+    },
+    skip: null,
+  };
+}
+
+export async function selectIssue(args, ghRunner = gh, { state = null, processProbe = probeProcessIdentity } = {}) {
+  const skipped = [];
+  const generatedPreflights = [];
+  let openPrs;
+  let candidates;
+  try {
+    openPrs = args.autoPreflightMode === false ? [] : listOpenPullRequests(args.repo, ghRunner);
+    candidates = listCandidateIssues(args.repo, args.limit, args.agentLabels, args.includeInProgress, ghRunner);
+    // #698 round 5, finding 3: a successful repo-wide scan is exactly the
+    // condition that clears `queue_inspection_degraded` — resolve it here,
+    // not merely by letting newer queue events push a stale event out of a
+    // latest-N window.
+    state?.record?.('resolveHealthCondition', { repo: args.repo, conditionType: 'queue_inspection_degraded' });
+  } catch (error) {
+    // A transient GitHub failure fetching the repo-wide open-PR or
+    // candidate-issue lists must not crash the whole scheduler pass. No
+    // attempt is claimed and no global slot is held, so this is safe to
+    // treat as "no eligible candidate this pass" rather than an uncaught
+    // throw — the next cron tick retries with a fresh call (#698 finding 10).
+    //
+    // That local safety must not be conflated with an *operational* "no
+    // eligible work" report, though (#698 finding 3): the queue was never
+    // actually inspected this pass, so a dedicated, resolvable
+    // `queue_inspection_degraded` health condition is opened — distinct
+    // from an ordinary per-issue `skip` event — so `buildRunnerOperatorStatus()`
+    // can surface a visibly degraded operator status instead of `idle`,
+    // and stop showing it the moment a later pass genuinely recovers.
+    // This is deliberately *not* routed through `emitSystemicStatePause`:
+    // persisted recovery reconciliation for already-known attempts is
+    // healthy and must keep running; only *new*-candidate discovery is
+    // blind this pass.
+    state?.recordTaskError?.('candidate-scan-failed', error);
+    state?.record?.('recordQueueEvent', {
+      repo: args.repo,
+      eventType: 'queue-inspection-degraded',
+      reason: 'candidate-scan-failed',
+      payload: { error: String(error?.message || error) },
+    });
+    state?.record?.('openHealthCondition', {
+      repo: args.repo, conditionType: 'queue_inspection_degraded', reason: 'candidate-scan-failed',
+      safeNextAction: 'Verify GitHub API connectivity/auth for the runner; new-candidate discovery is blind until this clears. Already-known recovery attempts continue reconciling normally.',
+      payload: { error: String(error?.message || error) },
+    });
+    skipped.push({ issue: null, statusLabel: null, reason: 'candidate-scan-failed', error: String(error?.message || error) });
+    return { issue: null, selection: null, command: null, currentPreflight: null, skipped, generatedPreflights, blocked: null, queueInspectionDegraded: true };
+  }
+
+  for (const issue of candidates) {
+    const conflictSkip = metadataConflictSkip(issue);
+    if (conflictSkip) {
+      skipped.push(conflictSkip);
+      continue;
+    }
+
+    const agent = resolveAgentForLabels([...(issue.labels || []), issue.agentLabel]);
+    if (!agent?.implemented) {
+      skipped.push({
+        ...unsupportedAgentSkip(agent, { issueNumber: issue.number }),
+        statusLabel: issue.statusLabel,
+      });
+      continue;
+    }
+
+    // A transient GitHub read failure for one candidate must not crash the
+    // whole selection scan — it is task-local to this one issue, and every
+    // other ready candidate must still be reachable (#698's governing
+    // invariant: a single-issue failure never blocks unrelated eligible
+    // work, discovered via the fault-injection harness, finding 10).
+    let comments;
+    let selection;
+    try {
+      comments = readIssueComments(args.repo, issue.number, ghRunner);
+
+      const preflightResult = maybeGeneratePreflight(args, issue, comments, openPrs, ghRunner);
+      comments = preflightResult.comments;
+      if (preflightResult.generated) generatedPreflights.push(preflightResult.generated);
+      if (preflightResult.skip) {
+        skipped.push(preflightResult.skip);
+        continue;
+      }
+
+      selection = resolveIssueSelection(issue, comments, {
+        requireManagerPreflight: args.requireManagerPreflight !== false,
+        preflightDirectMode: args.preflightDirectMode !== false,
+      });
+    } catch (error) {
+      skipped.push({ issue: issue.number, statusLabel: issue.statusLabel, reason: 'candidate-read-failed', error: String(error?.message || error) });
+      continue;
+    }
+
+    if (!selection.mode) {
+      const activeBlock = await activeRunBlockForIssue(issue, comments, selection.reason, { state, repo: args.repo, processProbe });
+      if (activeBlock) {
+        // A claimed or paused task reserves only itself. The scheduler lock
+        // prevents concurrent cron workers; a historical GitHub marker must
+        // never idle unrelated ready work.
+        skipped.push(activeBlock);
+        continue;
+      }
+
+      const conflicts = issueMetadataConflicts(issue);
+      skipped.push({
+        issue: issue.number,
+        statusLabel: issue.statusLabel,
+        reason: selection.reason,
+        ...(conflicts.length ? { metadataConflicts: conflicts } : {}),
+      });
+      continue;
+    }
+    return {
+      issue,
+      selection,
+      command: selection.command,
+      // The actual latest authoritative manager preflight, independent of
+      // selection mode. `selection.preflight` is only populated in
+      // preflight-direct mode; a proceed-command attempt must never fall
+      // back to the command comment id as its preflight revision (#698
+      // finding 1), so callers persisting `preflight_revision` must use
+      // this field instead of `selection.preflight`.
+      currentPreflight: latestManagerPreflightComment(comments),
+      skipped,
+      generatedPreflights,
+      blocked: null,
+      metadataConflicts: issueMetadataConflicts(issue),
+    };
+  }
+  return { issue: null, selection: null, command: null, currentPreflight: null, skipped, generatedPreflights, blocked: null };
+}
+
+/**
+ * The only path allowed to durably apply a successful recovery's
+ * `status:blocked` -> `status:in-progress` transition. Mutates GitHub, then
+ * re-fetches and proves the exact expected label state before any local
+ * completion is recorded — a clean `gh` exit code alone is not proof the
+ * mutation applied (#698 finding 4). Returns `{ applied, failureReason }`;
+ * callers decide what to persist locally based on that result.
+ */
+function applySuccessfulRecoveryTransition(args, issue, ghRunner = gh) {
+  try {
+    restoreIssueAfterSuccessfulRecovery(args, issue, ghRunner);
+  } catch (error) {
+    return { applied: false, failureReason: 'github-mutation-failed', error };
+  }
+  let verifyIssue;
+  try {
+    verifyIssue = readRecoveryIssue(args.repo, issue.number, ghRunner);
+  } catch (error) {
+    return { applied: false, failureReason: 'post-mutation-verification-unavailable', error };
+  }
+  const verifyLabels = issueLabels(verifyIssue).filter((label) => label.startsWith('status:'));
+  const applied = String(verifyIssue.state || '').toUpperCase() === 'OPEN'
+    && verifyLabels.length === 1 && verifyLabels[0] === STATUS_IN_PROGRESS;
+  return applied ? { applied: true, failureReason: null } : { applied: false, failureReason: 'post-mutation-verification-failed' };
+}
+
+// Bounded transition-mutation cap (#698 finding 6): the live within-pass
+// attempt counts as mutation 1; reconciliation permits at most one further
+// retry (mutation 2). Beyond that, a row moves to
+// operator_attention_required instead of being mutated on every timer tick.
+export const MAX_TRANSITION_MUTATION_ATTEMPTS = 2;
+
+/**
+ * Reconstruct a `recordRecoveryAttempt()` payload from a persisted SQLite
+ * row, with overrides. Used by every follow-up write to an attempt already
+ * in flight so pass-through columns (claim id, agent, started_at, ...) stay
+ * consistent without re-deriving them at each call site.
+ */
+function attemptRecordPayload(attempt, overrides = {}) {
+  let restrictedEvidence = null;
+  try { restrictedEvidence = attempt.payload_json ? JSON.parse(attempt.payload_json) : null; } catch { restrictedEvidence = null; }
+  return {
+    attemptId: attempt.attempt_id, repo: attempt.repo, project: attempt.project,
+    issueNumber: attempt.issue_number, claimId: attempt.claim_id, preflightRevision: attempt.preflight_revision,
+    phase: attempt.phase, agent: attempt.agent, model: attempt.model, harness: attempt.harness,
+    startedAt: attempt.started_at, finishedAt: attempt.finished_at, outcome: attempt.outcome,
+    exitCode: attempt.exit_code, signal: attempt.signal, recoveryEligible: Boolean(attempt.recovery_eligible),
+    recoveryAction: attempt.recovery_action, recoveryAttemptCount: attempt.recovery_attempt_count, retryAt: attempt.retry_at,
+    checkpointAvailable: Boolean(attempt.checkpoint_available), sessionAvailable: Boolean(attempt.session_available),
+    worktreeAvailable: Boolean(attempt.worktree_available), branchAvailable: Boolean(attempt.branch_available), prAvailable: Boolean(attempt.pr_available),
+    attentionStatus: attempt.attention_status, attentionDedupeKey: attempt.attention_dedupe_key, lastNotificationAt: attempt.last_notification_at,
+    resolutionState: attempt.resolution_state, processId: attempt.process_id, processBootId: attempt.process_boot_id,
+    processStartTicks: attempt.process_start_ticks, systemdInvocationId: attempt.systemd_invocation_id,
+    stalledPasses: attempt.stalled_passes, attentionDetectedAt: attempt.attention_detected_at,
+    claimedRecoveryAction: attempt.claimed_recovery_action,
+    restrictedEvidence,
+    ...overrides,
+  };
+}
+
+/**
+ * The only path allowed to durably complete a successful recovery. A
+ * recovery is successful only once: (1) the attempt row durably records the
+ * label mutation as applied (`attention_resolution_pending`), (2) the
+ * sanitized resolved GitHub attention marker is durably delivered (created,
+ * updated, or proven already-equivalent via dedupe), and only then (3) one
+ * atomic transaction verifies the expected state, resolves local attention,
+ * marks the attempt `resolved`, and records exactly one `recovery-succeeded`
+ * queue event (`completeRecoveryTransitionAtomic`, #698 finding 4). The
+ * queue event is deliberately never recorded before delivery succeeds —
+ * unlike the prior design, which recorded it unconditionally up front and
+ * could duplicate it on every reconciliation retry. A delivery failure at
+ * step 2 leaves the attempt at `attention_resolution_pending` — never
+ * `resolved` — so a later pass retries only the comment, never the
+ * already-applied label mutation.
+ */
+function completeSuccessfulRecoveryTransition({ state, args, issue, attempt, finishedAt, ghRunner = gh, policyRevision = RECOVERY_POLICY_REVISION, convergedFromPending = false }) {
+  const attemptId = attempt.attempt_id;
+  if (attempt.resolution_state === 'resolved') return { completed: true };
+
+  if (!state.record('recordRecoveryAttempt', attemptRecordPayload(attempt, {
+    finishedAt, outcome: 'completed', resolutionState: 'attention_resolution_pending',
+  }))) return { completed: false };
+
+  // A GitHub delivery failure here is task-local, not a scheduler-health
+  // problem — it must not be pushed into `state.errors` (which gates
+  // systemic-pause checks and would otherwise idle the whole queue over one
+  // issue's comment failure). Durability comes from the
+  // `attention_resolution_pending` row just persisted above, not from
+  // `state.errors`.
+  let delivered = false;
+  let deliveryError = null;
+  try {
+    upsertGitHubAttentionComment(args, issue, {
+      reason: 'completed', finishedAt, recoveryStatus: 'not_needed',
+      nextAction: 'Human review may continue; the issue remains open and in progress.',
+      policyRevision,
+    }, ghRunner);
+    delivered = true;
+  } catch (error) {
+    deliveryError = String(error?.message || error);
+  }
+  if (!delivered) return { completed: false, deliveryError };
+
+  const completion = state.invoke('completeRecoveryTransitionAtomic', {
+    attemptId, repo: args.repo, issueNumber: issue.number, statusLabel: STATUS_IN_PROGRESS, reason: 'completed',
+    payload: { fromStatus: STATUS_BLOCKED, toStatus: STATUS_IN_PROGRESS, issueClosed: false, convergedFromPending, attemptId },
+  });
+  if (!state.healthy || !completion?.completed) return { completed: false };
+  return { completed: true };
+}
+
+/**
+ * Persist an unresolved attention event for a recovery whose successful
+ * child result could not be durably applied to GitHub, and publish/update
+ * the sanitized GitHub marker when materially changed. `resolutionState`
+ * defaults to the bounded-retry-eligible `transition_uncertain`; callers
+ * pass `operator_attention_required` once the bounded mutation cap is
+ * reached or the disagreement is ambiguous — that state is deliberately
+ * excluded from automatic reconciliation (#698 finding 6).
+ */
+function recordUnappliedRecoveryTransition({ state, args, issue, attempt, finishedAt, ghRunner = gh, failureReason, policyRevision = RECOVERY_POLICY_REVISION, resolutionState = 'transition_uncertain' }) {
+  const bounded = resolutionState === 'operator_attention_required';
+  const event = buildAttentionEvent({
+    repository: args.repo, project: args.project?.id, issueNumber: issue.number, attemptId: attempt.attempt_id,
+    reason: 'unknown_failure', agent: attempt.agent, startedAt: attempt.started_at, finishedAt,
+    recoveryStatus: bounded ? 'operator_attention_required' : 'transition_uncertain',
+    nextAction: bounded
+      ? `A successful recovery result could not be durably applied to GitHub after reaching the bounded mutation-attempt limit (${failureReason}). Automatic retry is exhausted; an operator must confirm current GitHub state and, if still needed, provide a fresh manager recovery authorization.`
+      : `A successful recovery result could not be durably applied to GitHub (${failureReason}). The next scheduler pass safely re-checks current GitHub state before retrying; provide a new manager recovery authorization if this persists.`,
+    dashboardReference: `issue-${issue.number}`, policyRevision,
+  });
+  // The resolution-state write must durably succeed before a GitHub
+  // attention comment describing that state is ever published — otherwise
+  // an operator could see a comment for a state (e.g.
+  // operator_attention_required) that was never actually persisted (#698
+  // finding 3).
+  if (!state.record('recordRecoveryAttempt', attemptRecordPayload(attempt, {
+    finishedAt, outcome: 'completed', recoveryEligible: false, recoveryAction: 'attention_required',
+    attentionStatus: 'attention_required', attentionDedupeKey: event.dedupeKey, resolutionState,
+    restrictedEvidence: { stage: 'transition', failureReason },
+  }))) return event;
+  const attentionPersisted = state.invoke('upsertAttentionEvent', event);
+  if (attentionPersisted?.materiallyChanged) {
+    try { upsertGitHubAttentionComment(args, issue, event, ghRunner); }
+    catch (error) { state.recordTaskError('transition-failure-attention-comment', error); }
+  }
+  return event;
+}
+
+/**
+ * Crash-safe, fully-revalidated convergence for recovery attempts whose
+ * successful child result was persisted but whose GitHub status transition
+ * never durably completed. For each pending row (`transition_pending`,
+ * `transition_uncertain`, or `attention_resolution_pending`):
+ *
+ *  1. Runs the same full authority revalidation the live recovery path
+ *     proves before ever mutating GitHub — current agent ownership, claim
+ *     and manager-preflight revision, authorization, handoff, linked PR,
+ *     and branch/worktree/process conflicts (#698 finding 5). Stale or
+ *     ambiguous authority stops here — even when GitHub already looks
+ *     correct — and persists `operator_attention_required` attention
+ *     instead of guessing.
+ *  2. Re-fetches the live issue. Already `status:in-progress` -> the prior
+ *     mutation landed; converge locally without repeating it.
+ *  3. `attention_resolution_pending` rows only retry the resolved-comment
+ *     delivery; the label mutation is already proven applied and must
+ *     never be repeated. GitHub disagreeing here is ambiguous, not a
+ *     license to re-mutate.
+ *  4. Still `status:blocked` -> retry the mutation, bounded by
+ *     `MAX_TRANSITION_MUTATION_ATTEMPTS`; beyond the bound, hand off to an
+ *     operator instead of mutating on every timer tick.
+ *  5. Anything else (closed, reassigned) -> ambiguous; attention, no
+ *     mutation.
+ */
+export async function reconcilePendingRecoveryTransitions({ state, args, ghRunner = gh, now = () => new Date().toISOString(), dependencies = {} }) {
+  const pending = state.invoke('pendingRecoveryTransitions', args.repo) || [];
+  if (!state.healthy) return { checked: 0, converged: 0 };
+  let converged = 0;
+  const skipped = [];
+  const revalidateRecovery = dependencies.revalidateRecovery || collectRecoveryRevalidation;
+  const processProbe = dependencies.processProbe || probeProcessIdentity;
+  for (const attempt of pending) {
+    // A transient GitHub read failure for one stuck row must not pause the
+    // whole scheduler pass (queue continuity for unrelated issues) — it is
+    // simply retried on the next pass, so it is not pushed into
+    // `state.errors`, which gates the systemic-pause checks that follow
+    // this reconciliation step.
+    let issue;
+    try {
+      issue = readRecoveryIssue(args.repo, attempt.issue_number, ghRunner);
+    } catch (error) {
+      skipped.push({ attemptId: attempt.attempt_id, issueNumber: attempt.issue_number, reason: String(error?.message || error) });
+      continue;
+    }
+    const finishedAt = attempt.finished_at || now();
+
+    // Uses the dedicated `transition_reconcile` stage (#698 finding 2), not
+    // `pre_claim`: `pre_claim`'s `authorizationFresh` key requires the
+    // manager authorization to have been created *after* `attempt.finished_at`
+    // — correct when claiming a *new* attempt to recover a *prior* failure,
+    // but backwards here, since the authorization that permitted *this*
+    // (now-completed) attempt necessarily predates its own finish time. That
+    // made `evaluateRecoveryRevalidation` fail closed on every real
+    // reconciliation pass, forcing every pending row to
+    // `operator_attention_required` regardless of actual authority state.
+    // `transition_reconcile` drops that key and relies on the already-correct
+    // `authorizationCurrent` (exact authorization-ID match) instead. It also
+    // does not reuse `pre_transition`'s TRANSITION_REVALIDATION_KEYS, whose
+    // lease-matching keys assume a live in-process handoff that cannot hold
+    // across a crash/restart. Every other authority fact (ownership,
+    // claim/preflight revision, handoff, PR, branch/worktree/process
+    // conflicts) is proven identically either way. `claimed_recovery_action`
+    // is set once at claim time and never overwritten by later terminal
+    // writes (unlike `recovery_action`, which becomes 'none'/
+    // 'attention_required' once the attempt finishes) — it is the durable
+    // record of which action the current manager authorization actually
+    // approved, so authorization-action matching stays correct.
+    const revalidation = await revalidateRecoverySafely(revalidateRecovery, {
+      stage: 'transition_reconcile', action: attempt.claimed_recovery_action || attempt.recovery_action, attempt,
+      args: { ...args, currentQuotaPreflight: dependencies.currentQuotaPreflight }, ghRunner, state,
+      processProbe, currentProcessIdentity: dependencies.processIdentity,
+      repositoryEvidence: dependencies.repositoryEvidence, checkedAt: now(),
+    });
+    // The append-only revalidation write must durably succeed before this
+    // pass is allowed to mutate GitHub or complete a transition for *any*
+    // row — a failed write means the store itself is now unhealthy, and
+    // continuing to process further rows against a broken store risks
+    // mutating GitHub without a durable evidentiary record (#698 finding 3).
+    // `state.healthy` (not just this call's own return value) gates the
+    // whole remaining pass, since a store failure is systemic, not specific
+    // to this one row.
+    if (!persistRecoveryRevalidation(state, attempt, revalidation) || !state.healthy) {
+      skipped.push({ attemptId: attempt.attempt_id, issueNumber: attempt.issue_number, reason: 'revalidation-persistence-failed' });
+      break;
+    }
+    if (revalidation.allowed !== true) {
+      recordUnappliedRecoveryTransition({
+        state, args, issue, attempt, finishedAt, ghRunner,
+        failureReason: `stale-recovery-authority: ${(revalidation.failedChecks || []).join(', ') || 'unknown'}`,
+        resolutionState: 'operator_attention_required',
+      });
+      continue;
+    }
+
+    const statusLabels = issueLabels(issue).filter((label) => label.startsWith('status:'));
+    const issueOpen = String(issue.state || '').toUpperCase() === 'OPEN';
+    const alreadyInProgress = issueOpen && statusLabels.length === 1 && statusLabels[0] === STATUS_IN_PROGRESS;
+    const stillBlocked = issueOpen && statusLabels.length === 1 && statusLabels[0] === STATUS_BLOCKED;
+
+    if (alreadyInProgress) {
+      const result = completeSuccessfulRecoveryTransition({ state, args, issue, attempt, finishedAt, ghRunner, convergedFromPending: true });
+      if (result.completed) converged += 1;
+      continue;
+    }
+
+    if (attempt.resolution_state === 'attention_resolution_pending') {
+      // The label mutation is already durably proven applied; GitHub not
+      // showing status:in-progress here is a disagreement that must not be
+      // resolved by mutating again — an operator must reconcile it.
+      recordUnappliedRecoveryTransition({
+        state, args, issue, attempt, finishedAt, ghRunner,
+        failureReason: 'github-label-state-disagrees-with-durable-local-record',
+        resolutionState: 'operator_attention_required',
+      });
+      continue;
+    }
+
+    if (stillBlocked) {
+      if ((attempt.transition_mutation_count || 0) >= MAX_TRANSITION_MUTATION_ATTEMPTS) {
+        recordUnappliedRecoveryTransition({
+          state, args, issue, attempt, finishedAt, ghRunner,
+          failureReason: 'bounded-mutation-attempts-exhausted', resolutionState: 'operator_attention_required',
+        });
+        continue;
+      }
+      // #698 round 5, finding 2: a real bounded retry schedule, not
+      // mutation-count headroom alone — once a prior mutation attempt has
+      // persisted a backoff deadline (`retry_reason` set), respect it
+      // before attempting another mutation instead of retrying on every
+      // single reconciliation pass with no cooldown.
+      const scheduledDeadlineMs = Date.parse(attempt.next_retry_at || '');
+      if (attempt.retry_reason && Number.isFinite(scheduledDeadlineMs) && Date.parse(now()) < scheduledDeadlineMs) {
+        skipped.push({ attemptId: attempt.attempt_id, issueNumber: attempt.issue_number, reason: 'transition-retry-deadline-not-yet-reached' });
+        continue;
+      }
+      // The mutation-count increment must durably succeed before GitHub is
+      // ever mutated — otherwise a crash immediately after this GitHub call
+      // could repeat the mutation on the next pass without the bounded cap
+      // ever advancing (#698 finding 3).
+      const nextMutationAttempt = (attempt.transition_mutation_count || 0) + 1;
+      const mutationCount = state.invoke('incrementTransitionMutationCount', attempt.attempt_id, {
+        nextRetryAt: backoffDeadline(nextMutationAttempt, Date.parse(now())),
+        retryAttempt: nextMutationAttempt,
+        retryCap: MAX_TRANSITION_MUTATION_ATTEMPTS,
+        retryReason: 'transition-mutation-retry',
+      });
+      if (mutationCount === null || !state.healthy) {
+        skipped.push({ attemptId: attempt.attempt_id, issueNumber: attempt.issue_number, reason: 'transition-mutation-count-persistence-failed' });
+        break;
+      }
+      const retry = applySuccessfulRecoveryTransition(args, issue, ghRunner);
+      if (retry.applied) {
+        const result = completeSuccessfulRecoveryTransition({ state, args, issue, attempt, finishedAt, ghRunner, convergedFromPending: true });
+        if (result.completed) converged += 1;
+      } else {
+        recordUnappliedRecoveryTransition({ state, args, issue, attempt, finishedAt, ghRunner, failureReason: retry.failureReason });
+      }
+      continue;
+    }
+
+    // Ambiguous local/remote disagreement (closed, reassigned) — an
+    // operator must resolve; no mutation.
+    recordUnappliedRecoveryTransition({
+      state, args, issue, attempt, finishedAt, ghRunner,
+      failureReason: 'ambiguous-issue-state-during-reconciliation', resolutionState: 'operator_attention_required',
+    });
+  }
+  return { checked: pending.length, converged, skipped };
+}
+
+export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
+  const now = dependencies.now || (() => new Date().toISOString());
+  const ghRunner = dependencies.ghRunner || gh;
+  const args = parseArgs(argv, env);
+  if (args.help) {
+    printHelp();
+    return 0;
+  }
+  if (rootBlocked(process.getuid?.(), args.allowRoot)) throw new Error('Refusing to run as root. Use the modelspend user crontab.');
+  const authEnv = resolveGithubAuthEnv(env, dependencies.tokenResolver || githubTokenFromGh);
+  if (!authEnv) throw new Error('Missing GITHUB_TOKEN or GH_TOKEN environment variable, and gh auth token was unavailable');
+  if (env === process.env && !process.env.GITHUB_TOKEN && !process.env.GH_TOKEN && authEnv.GH_TOKEN) {
+    process.env.GH_TOKEN = authEnv.GH_TOKEN;
+  }
+
+  const schedulerStartedAt = args.execute ? null : now();
+  const unlock = (dependencies.acquireLock || acquireLock)(args.lockPath);
+  const state = createStateRecorder(args, dependencies.openStore || openRunnerStateStore);
+  try {
+    if (!state.ensureWritable('startup-write-probe')) return emitSystemicStatePause(args, state, 'startup', { now, logger: dependencies.logger }).exitCode;
+    // #698 round 5, finding 3: a pass that proves the store writable again
+    // is exactly the condition that cleared `systemic_pause` — resolve it
+    // here rather than leaving an operator to infer resolution from a
+    // latest-N queue-event window. A resolve on an already-resolved (or
+    // never-opened) condition is a documented no-op.
+    state.record('resolveHealthCondition', { repo: args.repo, conditionType: 'systemic_pause' });
+    let processIdentity;
+    try {
+      processIdentity = dependencies.processIdentity || captureProcessIdentity(process.pid, env);
+    } catch (error) {
+      state.errors.push({ stage: 'process-identity', message: String(error?.message || error) });
+      return emitSystemicStatePause(args, state, 'process-identity', { now, logger: dependencies.logger }).exitCode;
+    }
+    const quotaPreflight = runQuotaPreflight(args, authEnv, dependencies.quotaRunner || spawnSync);
+    if (!state.record('recordQuotaHistory', { repo: args.repo, quotaPreflight })) {
+      return emitSystemicStatePause(args, state, 'quota-history', { now, logger: dependencies.logger }).exitCode;
+    }
+    if (quotaPreflight.blocked) {
+      const payload = {
+        dryRun: !args.execute,
+        quotaBlocked: true,
+        quotaPreflight,
+        selectedIssue: null,
+        skipped: [],
+        stateDbPath: args.stateDbPath,
+        statePersistenceErrors: state.errors,
+        taskLocalErrors: state.taskErrors,
+      };
+      const logPath = writeLog(args.outputDir, payload);
+      if (!state.record('recordRunResult', { repo: args.repo, mode: 'quota-blocked', exitCode: 0, logPath, payload })) {
+        return emitSystemicStatePause(args, state, 'quota-blocked-result', { now, logger: dependencies.logger }).exitCode;
+      }
+      console.log(JSON.stringify({ ...payload, quotaPreflight: { ...quotaPreflight, stdout: '<see log>', stderr: '<see log>' }, logPath }, null, 2));
+      return 0;
+    }
+
+    if (args.execute) {
+      // Crash-safe convergence for a prior pass's incomplete GitHub status
+      // transition. A GitHub read/write hiccup for one stuck row is
+      // task-local (recorded, not fatal to this pass); only genuine SQLite
+      // unavailability inside the reconciler itself short-circuits it.
+      const reconcileTransitions = dependencies.reconcilePendingRecoveryTransitions || reconcilePendingRecoveryTransitions;
+      await reconcileTransitions({
+        state, args, ghRunner, now,
+        dependencies: {
+          revalidateRecovery: dependencies.revalidateRecovery,
+          processProbe: dependencies.processProbe,
+          repositoryEvidence: dependencies.repositoryEvidence,
+          processIdentity,
+          currentQuotaPreflight: quotaPreflight,
+        },
+      });
+    }
+
+    let recoveryClaim = null;
+    let recoveryInvocation = null;
+    let recoveryLeaseId = null;
+    let recoveryPreLaunch = null;
+    const dueRecovery = args.execute ? (state.invoke('dueRecoveryAttempts', args.repo, now()) || [])[0] : null;
+    if (!state.healthy) return emitSystemicStatePause(args, state, 'recovery-read', { now, logger: dependencies.logger }).exitCode;
+    if (dueRecovery) {
+      const revalidateRecovery = dependencies.revalidateRecovery || collectRecoveryRevalidation;
+      const revalidationArgs = { ...args, currentQuotaPreflight: quotaPreflight };
+      const preClaimInput = {
+        stage: 'pre_claim', action: dueRecovery.recovery_action, attempt: dueRecovery, args: revalidationArgs,
+        ghRunner, state, processProbe: dependencies.processProbe || probeProcessIdentity,
+        currentProcessIdentity: processIdentity, repositoryEvidence: dependencies.repositoryEvidence, checkedAt: now(),
+      };
+      const preClaim = await revalidateRecoverySafely(revalidateRecovery, preClaimInput);
+      if (!persistRecoveryRevalidation(state, dueRecovery, preClaim)) {
+        return emitSystemicStatePause(args, state, 'pre-claim-revalidation-persistence', { now, logger: dependencies.logger }).exitCode;
+      }
+      if (preClaim.allowed !== true) {
+        const blocked = blockRecoveryBeforeLaunch(state, args, dueRecovery, preClaim, now, ghRunner);
+        if (!blocked.persisted) return emitSystemicStatePause(args, state, 'pre-claim-recovery-attention', { now, logger: dependencies.logger }).exitCode;
+        const payload = { recoveryBlocked: true, stage: 'pre_claim', issue: dueRecovery.issue_number, failedChecks: preClaim.failedChecks, childLaunched: false };
+        const logPath = writeLog(args.outputDir, payload);
+        if (!state.record('recordRunResult', { repo: args.repo, issueNumber: dueRecovery.issue_number, mode: 'recovery-blocked', exitCode: 1, logPath, payload })) {
+          return emitSystemicStatePause(args, state, 'pre-claim-recovery-result', { now, logger: dependencies.logger }).exitCode;
+        }
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return 1;
+      }
+      recoveryLeaseId = dependencies.recoveryLeaseId || randomUUID();
+      const recoveryClaimed = state.invoke('claimRecovery', dueRecovery.attempt_id, dueRecovery.recovery_attempt_count, now(), processIdentity, {
+        expectedAction: dueRecovery.recovery_action,
+        expectedClaimId: dueRecovery.claim_id,
+        expectedClaimIdentity: deserializeCommentIdentity(dueRecovery.claim_identity_json || dueRecovery.claim_id, 'due-recovery-claim'),
+        expectedPreflightRevision: dueRecovery.preflight_revision,
+        expectedPreflightIdentity: deserializeCommentIdentity(dueRecovery.preflight_identity_json || dueRecovery.preflight_revision, 'due-recovery-preflight'),
+        authorizationId: preClaim.authorizationId,
+        authorizationIdentity: preClaim.authorizationIdentity,
+        recoveryLeaseId,
+      });
+      if (!state.healthy || recoveryClaimed !== true) {
+        state.errors.push({ stage: 'recovery-claim', message: 'due recovery could not be claimed atomically' });
+        return emitSystemicStatePause(args, state, 'recovery-claim', { now, logger: dependencies.logger }).exitCode;
+      }
+      recoveryClaim = state.invoke('recoveryAttempt', dueRecovery.attempt_id);
+      if (!state.healthy || !recoveryClaim) return emitSystemicStatePause(args, state, 'recovery-claim-readback', { now, logger: dependencies.logger }).exitCode;
+      const currentRecoveryIdentity = { ...processIdentity, recoveryLeaseId };
+      const preLaunchInput = {
+        stage: 'post_claim', action: dueRecovery.recovery_action, attempt: recoveryClaim, args: revalidationArgs,
+        ghRunner, state, processProbe: dependencies.processProbe || probeProcessIdentity,
+        currentProcessIdentity: currentRecoveryIdentity, repositoryEvidence: dependencies.repositoryEvidence, checkedAt: now(),
+      };
+      recoveryPreLaunch = await revalidateRecoverySafely(revalidateRecovery, preLaunchInput);
+      if (!persistRecoveryRevalidation(state, recoveryClaim, recoveryPreLaunch, recoveryLeaseId)) {
+        return emitSystemicStatePause(args, state, 'pre-launch-revalidation-persistence', { now, logger: dependencies.logger }).exitCode;
+      }
+      const ordinaryInvocation = { command: process.execPath, args: runnerArgs(recoveryClaim.issue_number, args, { attemptId: recoveryClaim.attempt_id }), env: authEnv };
+      const restrictedDispatch = buildRestrictedRecoveryDispatch({
+        recoveryPreLaunch, issueNumber: recoveryClaim.issue_number, attemptId: recoveryClaim.attempt_id, args, authEnv, dependencies,
+      });
+      const dispatchRecovery = dependencies.dispatchRecovery || dispatchRecoveryAction;
+      const dispatch = dispatchRecovery({
+        action: dueRecovery.recovery_action,
+        revalidation: recoveryPreLaunch,
+        ordinaryInvocation,
+        quota: {
+          knownResetReached: Boolean(recoveryClaim.retry_at) && Date.parse(now()) >= Date.parse(recoveryClaim.retry_at),
+          freshPreflightPassed: quotaPreflight.blocked === false && quotaPreflight.skipped === false,
+          managerAuthorizationCurrent: recoveryPreLaunch.evidence?.authorizationCurrent === true,
+        },
+        nativeResume: restrictedDispatch.nativeResume,
+        continuation: restrictedDispatch.continuation,
+      });
+      if (recoveryPreLaunch.allowed !== true || dispatch.allowed !== true) {
+        const denied = recoveryPreLaunch.allowed === true
+          ? { stage: 'dispatch', failedChecks: [dispatch.reason], reason: dispatch.reason }
+          : recoveryPreLaunch;
+        const blocked = blockRecoveryBeforeLaunch(state, args, recoveryClaim, denied, now, ghRunner);
+        if (!blocked.persisted) return emitSystemicStatePause(args, state, 'pre-launch-recovery-attention', { now, logger: dependencies.logger }).exitCode;
+        const payload = { recoveryBlocked: true, stage: denied.stage, issue: recoveryClaim.issue_number, failedChecks: denied.failedChecks, childLaunched: false };
+        const logPath = writeLog(args.outputDir, payload);
+        if (!state.record('recordRunResult', { repo: args.repo, issueNumber: recoveryClaim.issue_number, mode: 'recovery-blocked', exitCode: 1, logPath, payload })) {
+          return emitSystemicStatePause(args, state, 'pre-launch-recovery-result', { now, logger: dependencies.logger }).exitCode;
+        }
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return 1;
+      }
+      recoveryInvocation = dispatch.invocation;
+    }
+    const selected = recoveryClaim ? {
+      issue: recoveryPreLaunch.issue,
+      selection: { mode: 'recovery', command: null, preflight: null }, command: null, currentPreflight: null,
+      skipped: [], generatedPreflights: [], blocked: null,
+    } : await selectIssue(args, ghRunner, { state, processProbe: dependencies.processProbe || probeProcessIdentity });
+    const selectedSourceCommentIdentity = selected.command?.sourceCommentIdentity || null;
+    const selectedPreflightCommentIdentity = selected.currentPreflight
+      ? normalizeCommentIdentity(selected.currentPreflight, { context: 'scheduler-manager-preflight', required: true })
+      : null;
+    const plan = {
+      dryRun: !args.execute,
+      agentLabels: args.agentLabels,
+      includeInProgress: args.includeInProgress,
+      claimOnExecute: args.claimOnExecute,
+      preflightDirectMode: args.preflightDirectMode,
+      quotaPreflight,
+      requireManagerPreflight: args.requireManagerPreflight,
+      selectedIssue: selected.issue?.number || null,
+      selectedStatusLabel: selected.issue?.statusLabel || null,
+      selectedMetadataConflicts: selected.metadataConflicts || issueMetadataConflicts(selected.issue),
+      agent: recoveryClaim
+        ? { agentId: recoveryClaim.agent, agentType: recoveryClaim.harness, implemented: true, model: recoveryClaim.model, effort: null }
+        : agentRunMetadata(resolveAgentForLabels([...(selected.issue?.labels || []), selected.issue?.agentLabel]), {}),
+      selectionMode: selected.selection?.mode || null,
+      selectedCommandKind: selected.command?.kind || null,
+      sourceCommentId: selected.command?.sourceCommentId || null,
+      sourceCommentIdentity: selectedSourceCommentIdentity,
+      sourcePreflightCommentIdentity: selectedPreflightCommentIdentity,
+      sourcePreflightRevision: commentRevision(selectedPreflightCommentIdentity),
+      sourcePreflightCommentId: commentRevision(selectedPreflightCommentIdentity),
+      autoPreflightMode: args.autoPreflightMode,
+      generatedPreflights: selected.generatedPreflights,
+      activeRunBlock: selected.blocked || null,
+      skipped: selected.skipped,
+      stateDbPath: args.stateDbPath,
+      statePersistenceErrors: state.errors,
+    };
+    if (!recordSelectionState(state, args, plan)) {
+      return emitSystemicStatePause(args, state, 'selection-persistence', { now, logger: dependencies.logger }).exitCode;
+    }
+    if (!selected.issue) {
+      const logPath = writeLog(args.outputDir, plan);
+      if (!state.record('recordRunResult', { repo: args.repo, mode: 'no-selection', exitCode: 0, logPath, payload: plan })) {
+        return emitSystemicStatePause(args, state, 'no-selection-result', { now, logger: dependencies.logger }).exitCode;
+      }
+      console.log(JSON.stringify({ ...plan, logPath }, null, 2));
+      return 0;
+    }
+
+    // A selected dry-run is a scheduler inspection, not an implementation
+    // attempt. Complete it before constructing an attempt identity, invoking
+    // the child, claiming the issue, or entering terminal/recovery policy.
+    // Selection and its durable audit record intentionally remain, while all
+    // execution-only state machines stay unreachable (#725).
+    if (!args.execute) {
+      const finishedAt = now();
+      const payload = {
+        ...plan,
+        claim: null,
+        executionStatus: 'not_executed',
+        startedAt: schedulerStartedAt,
+        finishedAt,
+        exitCode: 0,
+      };
+      const logPath = writeLog(args.outputDir, payload);
+      if (!state.record('recordRunResult', {
+        repo: args.repo,
+        issueNumber: selected.issue.number,
+        mode: 'scheduler-dry-run',
+        exitCode: 0,
+        logPath,
+        payload,
+        startedAt: schedulerStartedAt,
+        finishedAt,
+      })) return emitSystemicStatePause(args, state, 'dry-run-result-persistence', { now, logger: dependencies.logger }).exitCode;
+      console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+      return 0;
+    }
+
+    const startedAt = now();
+    const attemptId = recoveryClaim?.attempt_id || `${args.repo}#${selected.issue.number}:${startedAt}`;
+    // Every invocation — the first attempt and every recovery re-invocation
+    // of the same attempt row — passes the same attemptId so the child can
+    // write its restricted recovery handle (session id, worktree/branch
+    // identity) keyed consistently for a later native_resume/
+    // same_agent_continuation to read back (#698 finding 2).
+    let nodeArgs = recoveryInvocation?.args || runnerArgs(selected.issue.number, args, { attemptId });
+    // claimId identifies the comment that drove *selection* (a proceed/continue
+    // command in compatibility mode, or the preflight comment itself in
+    // preflight-direct mode). preflightRevision is a separate, independent
+    // fact: the actual latest authoritative manager-preflight comment id,
+    // sourced from selectIssue()'s unconditional currentPreflight lookup.
+    // A proceed-command claimId must never be reused as the preflight
+    // revision (#698 finding 1) — a normal proceed-command + separate
+    // preflight pair would otherwise be permanently unrecoverable because
+    // later revalidation compares this value against the live preflight
+    // comment id.
+    const schedulerClaimIdentity = selected.selection?.command?.sourceCommentIdentity
+      || normalizeCommentIdentity(selected.selection?.preflight);
+    const schedulerPreflightIdentity = selectedPreflightCommentIdentity;
+    const claimId = recoveryClaim?.claim_id || commentRevision(schedulerClaimIdentity);
+    const schedulerPreflightRevision = commentRevision(schedulerPreflightIdentity);
+    if (!recoveryClaim) {
+      if (!state.record('recordRecoveryAttempt', {
+        attemptId, repo: args.repo, project: args.project?.id, issueNumber: selected.issue.number, claimId,
+        claimIdentity: schedulerClaimIdentity,
+        preflightRevision: schedulerPreflightRevision,
+        preflightIdentity: schedulerPreflightIdentity,
+        phase: 'starting', agent: plan.agent?.agentId, model: plan.agent?.model, harness: plan.agent?.agentType,
+        startedAt, ...processIdentity, resolutionState: 'active',
+      })) return emitSystemicStatePause(args, state, 'attempt-start', { now, logger: dependencies.logger }).exitCode;
+    }
+    let claim = null;
+    if (args.execute && args.claimOnExecute && !recoveryClaim) {
+      if (!state.ensureWritable('pre-issue-mutation-write-probe')) return emitSystemicStatePause(args, state, 'pre-issue-mutation', { now, logger: dependencies.logger }).exitCode;
+      claim = claimIssueForExecution(args, selected.issue, selected.selection, ghRunner);
+      if (!state.record('recordClaim', { repo: args.repo, issueNumber: selected.issue.number, claim })) {
+        return emitSystemicStatePause(args, state, 'claim-persistence', { now, logger: dependencies.logger }).exitCode;
+      }
+    }
+    if (recoveryClaim) {
+      const currentAttempt = state.invoke('recoveryAttempt', recoveryClaim.attempt_id);
+      if (!state.healthy || !currentAttempt) return emitSystemicStatePause(args, state, 'immediate-pre-launch-attempt-read', { now, logger: dependencies.logger }).exitCode;
+      const revalidateRecovery = dependencies.revalidateRecovery || collectRecoveryRevalidation;
+      const immediateInput = {
+        stage: 'pre_launch', action: recoveryClaim.claimed_recovery_action, attempt: currentAttempt,
+        args: { ...args, currentQuotaPreflight: quotaPreflight }, ghRunner, state,
+        processProbe: dependencies.processProbe || probeProcessIdentity,
+        currentProcessIdentity: { ...processIdentity, recoveryLeaseId },
+        repositoryEvidence: dependencies.repositoryEvidence,
+        checkedAt: now(),
+      };
+      const immediate = await revalidateRecoverySafely(revalidateRecovery, immediateInput);
+      if (!persistRecoveryRevalidation(state, currentAttempt, immediate, recoveryLeaseId)) {
+        return emitSystemicStatePause(args, state, 'immediate-pre-launch-revalidation-persistence', { now, logger: dependencies.logger }).exitCode;
+      }
+      const immediateRestrictedDispatch = buildRestrictedRecoveryDispatch({
+        recoveryPreLaunch: immediate, issueNumber: selected.issue.number, attemptId: recoveryClaim.attempt_id, args, authEnv, dependencies,
+      });
+      const redispatch = (dependencies.dispatchRecovery || dispatchRecoveryAction)({
+        action: recoveryClaim.claimed_recovery_action,
+        revalidation: immediate,
+        ordinaryInvocation: { command: process.execPath, args: runnerArgs(selected.issue.number, args, { attemptId: recoveryClaim.attempt_id }), env: authEnv },
+        quota: {
+          knownResetReached: Boolean(currentAttempt.retry_at) && Date.parse(now()) >= Date.parse(currentAttempt.retry_at),
+          freshPreflightPassed: quotaPreflight.blocked === false && quotaPreflight.skipped === false,
+          managerAuthorizationCurrent: immediate.evidence?.authorizationCurrent === true,
+        },
+        nativeResume: immediateRestrictedDispatch.nativeResume,
+        continuation: immediateRestrictedDispatch.continuation,
+      });
+      if (immediate.allowed !== true || redispatch.allowed !== true) {
+        const denied = immediate.allowed === true
+          ? { stage: 'dispatch', failedChecks: [redispatch.reason], reason: redispatch.reason }
+          : immediate;
+        const blocked = blockRecoveryBeforeLaunch(state, args, currentAttempt, denied, now, ghRunner);
+        if (!blocked.persisted) return emitSystemicStatePause(args, state, 'immediate-pre-launch-recovery-attention', { now, logger: dependencies.logger }).exitCode;
+        return 1;
+      }
+      recoveryInvocation = redispatch.invocation;
+      nodeArgs = recoveryInvocation.args;
+    }
+    if (!state.ensureWritable('pre-child-launch-write-probe')) return emitSystemicStatePause(args, state, 'pre-child-launch', { now, logger: dependencies.logger }).exitCode;
+    const runChild = dependencies.runChild || runChildWithWatchdog;
+    const result = await runChild({
+      command: recoveryInvocation?.command || process.execPath,
+      commandArgs: nodeArgs,
+      options: { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, env: recoveryInvocation?.env || authEnv },
+      state,
+      args,
+      attemptId,
+      ghRunner,
+      spawnRunner: dependencies.spawnRunner || spawn,
+      processProbe: dependencies.processProbe || probeProcessIdentity,
+      progressProbe: dependencies.progressProbe || probeProcessProgress,
+      now,
+      watchdogIntervalMs: dependencies.watchdogIntervalMs || args.watchdogIntervalMs,
+      stalledPassLimit: dependencies.stalledPassLimit || args.stalledPassLimit,
+    });
+    const finishedAt = now();
+    const childPayload = parseChildRunnerOutput(result.stdout);
+    const childCheck = evaluateChildRunResult({ execute: args.execute, exitCode: result.status, childPayload });
+    let effectiveExitCode = childCheck.failed ? 1 : result.status;
+    let outcome = deriveTerminalOutcome({ effectiveExitCode, childPayload, childReason: childCheck.reason });
+    // The child independently re-derives its own manager-preflight comment
+    // id from live GitHub state. Cross-check it against the scheduler's own
+    // authoritative revision (captured before the child started) so a
+    // preflight edited/replaced mid-run cannot be silently trusted from
+    // either side alone (#698 finding 1).
+    const expectedPreflightIdentity = recoveryClaim
+      ? deserializeCommentIdentity(recoveryClaim.preflight_identity_json || recoveryClaim.preflight_revision, 'expected-manager-preflight')
+      : schedulerPreflightIdentity;
+    const expectedPreflightRevision = commentRevision(expectedPreflightIdentity);
+    const childPreflightIdentity = normalizeCommentIdentity(
+      childPayload?.sourcePreflightCommentIdentity || childPayload?.sourcePreflightCommentId,
+      { context: 'child-manager-preflight' },
+    );
+    // When an authoritative expected preflight revision exists, a
+    // successful child result must supply a matching, well-formed
+    // sourcePreflightCommentId — missing, empty, or unparseable evidence
+    // fails closed exactly like a value that disagrees. A completed
+    // implementation must never be accepted on absent revision evidence
+    // (#698 finding 7 re-review).
+    const preflightRevisionDisagreement = Boolean(expectedPreflightIdentity)
+      && !sameCommentIdentity(childPreflightIdentity, expectedPreflightIdentity);
+    if (preflightRevisionDisagreement && outcome === 'completed') {
+      outcome = 'unknown_failure';
+      if (effectiveExitCode === 0) effectiveExitCode = 1;
+    }
+    let recoveryTransition = null;
+    if (recoveryClaim && outcome === 'completed') {
+      const currentAttempt = state.invoke('recoveryAttempt', recoveryClaim.attempt_id);
+      if (!state.healthy || !currentAttempt) return emitSystemicStatePause(args, state, 'pre-transition-attempt-read', { now, logger: dependencies.logger }).exitCode;
+      const revalidateRecovery = dependencies.revalidateRecovery || collectRecoveryRevalidation;
+      const transitionInput = {
+        stage: 'pre_transition', action: recoveryClaim.claimed_recovery_action, attempt: currentAttempt,
+        args: { ...args, currentQuotaPreflight: quotaPreflight }, ghRunner, state,
+        processProbe: dependencies.processProbe || probeProcessIdentity,
+        currentProcessIdentity: { ...processIdentity, recoveryLeaseId },
+        repositoryEvidence: dependencies.repositoryEvidence,
+        checkedAt: now(),
+      };
+      recoveryTransition = await revalidateRecoverySafely(revalidateRecovery, transitionInput);
+      if (!persistRecoveryRevalidation(state, currentAttempt, recoveryTransition, recoveryLeaseId)) {
+        return emitSystemicStatePause(args, state, 'pre-transition-revalidation-persistence', { now, logger: dependencies.logger }).exitCode;
+      }
+    }
+    const activeLeaseRows = state.invoke('activeRecoveryAttempts', args.repo) || [];
+    if (!state.healthy) return emitSystemicStatePause(args, state, 'terminal-lease-read', { now, logger: dependencies.logger }).exitCode;
+    const childEnded = result.status !== null || Boolean(result.signal) || Boolean(result.error);
+    const conflictingLease = activeLeaseRows.some((row) => row.attempt_id !== attemptId && row.issue_number === selected.issue.number);
+    const actualAgent = childPayload?.agent?.agentId || childPayload?.agentId || plan.agent?.agentId || null;
+    const actualModel = childPayload?.agent?.model || childPayload?.model || plan.agent?.model || null;
+    const actualHarness = childPayload?.agent?.agentType || childPayload?.agentType || plan.agent?.agentType || null;
+    const decision = decideRecovery({
+      outcome,
+      recoveryAttemptCount: recoveryClaim ? recoveryClaim.recovery_attempt_count + 1 : 0,
+      retryAt: childPayload?.quotaPauseState?.pausedUntil || childPayload?.quotaPauseState?.resetAt || null,
+      evidence: {
+        processOwner: childEnded ? false : null,
+        conflictingLease,
+        ownershipAmbiguous: !childEnded,
+        repositoryMutated: childPayload?.implementationEvidence?.repositoryMutated === false,
+        checkpointAvailable: Boolean(childPayload?.checkpointAvailable), sessionAvailable: Boolean(childPayload?.sessionAvailable),
+        profileCompatible: Boolean(actualAgent && actualModel && actualHarness && sameAgent(actualAgent, plan.agent?.agentId)
+          && actualModel === plan.agent?.model && actualHarness === plan.agent?.agentType),
+        sameProfileAvailable: childPayload?.recoveryEvidence?.sameProfileAvailable === true,
+        quotaHeadroom: quotaPreflight.blocked === false && quotaPreflight.skipped === false,
+        budgetHeadroom: childPayload?.costAdmission?.allowed === true,
+        turnHeadroom: childPayload?.recoveryEvidence?.turnHeadroom === true,
+        conflictingWorktree: Boolean(childPayload?.worktreeIdentity?.rootPath), conflictingBranch: Boolean(childPayload?.implementationPublication?.branch), conflictingPr: Boolean(childPayload?.implementationPublication?.pullRequest),
+        worktreeAvailable: Boolean(childPayload?.worktreeIdentity),
+        explicitDeterministicValidationFailure: childPayload?.recoveryEvidence?.deterministicValidationFailure === true,
+        policyApproved: childPayload?.recoveryEvidence?.policyApproved === true,
+      },
+    });
+    const transitionBlocked = recoveryClaim && outcome === 'completed' && recoveryTransition?.allowed !== true;
+    const attentionEvent = outcome === 'completed' && !transitionBlocked ? null : buildAttentionEvent({
+      repository: args.repo, project: args.project?.id, issueNumber: selected.issue.number, attemptId,
+      reason: transitionBlocked ? 'unknown_failure' : outcome, agent: actualAgent, startedAt, finishedAt,
+      recoveryStatus: transitionBlocked ? 'forbidden' : decision.status,
+      nextAction: preflightRevisionDisagreement
+        ? (!childPreflightIdentity
+          ? 'The child result did not provide a matching manager preflight comment id even though one is required. Confirm the current preflight and provide a new manager decision before retrying.'
+          : 'The child-observed manager preflight comment disagreed with the scheduler\'s authoritative revision. Confirm the current preflight and provide a new manager decision before retrying.')
+        : transitionBlocked
+          ? `Successful child result was not applied because recovery authority changed: ${(recoveryTransition.failedChecks || []).join(', ')}.`
+          : decision.nextAction,
+      dashboardReference: `issue-${selected.issue.number}`, policyRevision: decision.policyRevision,
+    });
+    if (!state.record('recordRecoveryAttempt', {
+      attemptId, repo: args.repo, project: args.project?.id, issueNumber: selected.issue.number, claimId,
+      claimIdentity: recoveryClaim
+        ? deserializeCommentIdentity(recoveryClaim.claim_identity_json || recoveryClaim.claim_id, 'terminal-recovery-claim')
+        : schedulerClaimIdentity,
+      preflightRevision: expectedPreflightRevision,
+      preflightIdentity: expectedPreflightIdentity,
+      phase: childPayload?.executionPhase || null, agent: actualAgent, model: actualModel, harness: actualHarness,
+      startedAt, finishedAt, outcome, exitCode: result.status, signal: result.signal,
+      recoveryEligible: transitionBlocked ? false : decision.eligible,
+      recoveryAction: transitionBlocked ? 'attention_required' : decision.action,
+      recoveryAttemptCount: recoveryClaim ? recoveryClaim.recovery_attempt_count : Math.max(0, (decision.recoveryAttemptCount || 0) - (decision.eligible ? 1 : 0)),
+      retryAt: decision.retryAt || null,
+      // #698 round 5, finding 2: the authoritative retry schedule, gated
+      // identically to recoveryEligible/recoveryAction above -- a
+      // transition-blocked or ineligible outcome must never carry a
+      // schedule that would let the evidence-based classifier treat it as
+      // bounded-retry.
+      nextRetryAt: (!transitionBlocked && decision.eligible) ? (decision.retryAt || null) : null,
+      retryAttempt: decision.recoveryAttemptCount || 0,
+      retryCap: recoveryAttemptCapForOutcome(outcome),
+      retryReason: (!transitionBlocked && decision.eligible) ? outcome : null,
+      checkpointAvailable: Boolean(childPayload?.checkpointAvailable), sessionAvailable: Boolean(childPayload?.sessionAvailable),
+      worktreeAvailable: Boolean(childPayload?.worktreeIdentity), branchAvailable: Boolean(childPayload?.implementationPublication?.branch), prAvailable: Boolean(childPayload?.implementationPublication?.pullRequest),
+      attentionStatus: attentionEvent ? 'attention_required' : 'none', attentionDedupeKey: attentionEvent?.dedupeKey,
+      resolutionState: attentionEvent ? 'unresolved' : recoveryClaim ? 'transition_pending' : 'resolved', ...processIdentity,
+      // Persisted to the dedicated write-once restricted_handle_digest
+      // column (#698 finding 8) — never overwritten once set, unlike the
+      // generic restrictedEvidence/payload_json blob below, which is
+      // wholesale replaced on every write.
+      restrictedHandleDigest: childPayload?.restrictedHandleBindingDigest || null,
+      restrictedEvidence: { exitCode: result.status, signal: result.signal, logPath: childPayload?.logPath || null, restrictedRecoveryHandleDigest: childPayload?.restrictedRecoveryHandleDigest || null },
+    })) return emitSystemicStatePause(args, state, 'terminal-outcome-persistence', { now, logger: dependencies.logger }).exitCode;
+    let attentionPersistence = null;
+    let transitionMutationFailed = false;
+    if (attentionEvent) {
+      attentionPersistence = state.invoke('upsertAttentionEvent', attentionEvent);
+      if (!state.healthy || !attentionPersistence) return emitSystemicStatePause(args, state, 'attention-persistence', { now, logger: dependencies.logger }).exitCode;
+    }
+    else {
+      if (recoveryClaim) {
+        if (!state.ensureWritable('pre-successful-recovery-status-write-probe')) {
+          return emitSystemicStatePause(args, state, 'pre-successful-recovery-status', { now, logger: dependencies.logger }).exitCode;
+        }
+        // The attempt row above already persisted resolution_state =
+        // 'transition_pending' before this mutation is attempted. A failed
+        // mutation, a failed post-mutation verification, or a failed local
+        // completion write must never fall through to a successful exit
+        // code — the attempt stays transition_pending/transition_uncertain/
+        // attention_resolution_pending and this pass returns nonzero (#698
+        // finding 4). Re-fetch the row so downstream writes see the exact
+        // persisted state, and count this as mutation attempt 1 of the
+        // bounded cap (#698 finding 6). Also persists the authoritative
+        // backoff deadline for a possible mutation 2 (#698 round 5, finding
+        // 2) — this live, within-pass first mutation is never itself
+        // deadline-gated, but a future reconciliation-driven retry must be.
+        const mutationCount = state.invoke('incrementTransitionMutationCount', attemptId, {
+          nextRetryAt: backoffDeadline(1, Date.parse(now())),
+          retryAttempt: 1,
+          retryCap: MAX_TRANSITION_MUTATION_ATTEMPTS,
+          retryReason: 'transition-mutation-retry',
+        });
+        if (mutationCount === null || !state.healthy) {
+          return emitSystemicStatePause(args, state, 'transition-mutation-count-persistence', { now, logger: dependencies.logger }).exitCode;
+        }
+        const currentAttempt = state.invoke('recoveryAttempt', attemptId) || { ...recoveryClaim, attempt_id: attemptId, finished_at: finishedAt, outcome: 'completed' };
+        const transition = applySuccessfulRecoveryTransition(args, selected.issue, ghRunner);
+        if (transition.applied) {
+          const completion = completeSuccessfulRecoveryTransition({ state, args, issue: selected.issue, attempt: currentAttempt, finishedAt, ghRunner, policyRevision: decision.policyRevision });
+          if (!completion.completed) {
+            if (!state.healthy) return emitSystemicStatePause(args, state, 'successful-recovery-resolution', { now, logger: dependencies.logger }).exitCode;
+            transitionMutationFailed = true;
+          }
+        } else {
+          if (transition.error) state.recordTaskError('successful-recovery-status', transition.error);
+          recordUnappliedRecoveryTransition({ state, args, issue: selected.issue, attempt: currentAttempt, finishedAt, ghRunner, failureReason: transition.failureReason, policyRevision: decision.policyRevision });
+          transitionMutationFailed = true;
+        }
+      } else {
+        const resolvedAttention = state.invoke('resolveAttentionForAttempt', attemptId, finishedAt);
+        if (!state.healthy) return emitSystemicStatePause(args, state, 'attention-resolution-persistence', { now, logger: dependencies.logger }).exitCode;
+        if (resolvedAttention > 0) {
+          try { upsertGitHubAttentionComment(args, selected.issue, { reason: 'completed', finishedAt, recoveryStatus: 'not_needed', nextAction: 'Human review may continue; the issue remains open.', policyRevision: decision.policyRevision }, ghRunner); }
+          catch (error) { state.recordTaskError('attention-resolution-comment', error); }
+        }
+      }
+    }
+    let failureRecovery = null;
+    if (args.execute && args.claimOnExecute && (claim || recoveryClaim) && effectiveExitCode !== 0) {
+      if (outcome === 'quota_paused') {
+        let attentionResult = null;
+        try { attentionResult = attentionPersistence?.materiallyChanged ? upsertGitHubAttentionComment(args, selected.issue, attentionEvent, ghRunner) : { deduplicated: true }; } catch (error) { attentionResult = { error: String(error?.message || error) }; }
+        failureRecovery = { issue: selected.issue.number, reason: outcome, taskPaused: true, statusUpdated: false, attentionResult, queueReleased: true, errors: [] };
+      } else if (outcome === 'plan_only_awaiting_approval') {
+        failureRecovery = waitForExplicitPlanApproval(args, selected.issue, attentionEvent || { reason: outcome, finishedAt }, ghRunner);
+      } else {
+        failureRecovery = quarantineIssueAfterFailedRun(args, selected.issue, attentionEvent || { reason: outcome, finishedAt }, ghRunner);
+      }
+      const eventType = outcome === 'quota_paused' ? 'pause' : outcome === 'plan_only_awaiting_approval' ? 'approval-wait' : 'quarantine';
+      if (!state.record('recordQueueEvent', {
+        repo: args.repo,
+        eventType,
+        issueNumber: selected.issue.number,
+        statusLabel: outcome === 'quota_paused' ? STATUS_IN_PROGRESS : STATUS_BLOCKED,
+        reason: failureRecovery.reason,
+        payload: failureRecovery,
+      })) return emitSystemicStatePause(args, state, 'terminal-queue-state', { now, logger: dependencies.logger }).exitCode;
+    }
+    const payload = {
+      ...plan,
+      claim,
+      // Never the raw exec argv: nodeArgs can carry --resume-session
+      // <realSessionId> for a native_resume invocation. Only a positionally
+      // redacted preview is safe for this ordinary JSON payload (#698
+      // finding 1 re-review).
+      runnerArgs: redactExecutableArgs(nodeArgs),
+      startedAt,
+      finishedAt,
+      exitCode: result.status,
+      signal: result.signal,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      childRunFailure: childCheck.failed ? childCheck.reason : null,
+      terminalOutcome: outcome,
+      recoveryDecision: decision,
+      recoveryTransition: recoveryTransition ? { allowed: recoveryTransition.allowed, failedChecks: recoveryTransition.failedChecks, checkedAt: recoveryTransition.checkedAt } : null,
+      attentionDedupeKey: attentionEvent?.dedupeKey || null,
+      failureRecovery,
+      executionPhase: childPayload?.executionPhase || null,
+      worktreeIdentity: childPayload?.worktreeIdentity || null,
+      implementationEvidence: childPayload?.implementationEvidence || null,
+      implementationPublication: childPayload?.implementationPublication || null,
+      usageAccounting: childPayload?.usageAccounting || null,
+      awaitingPlanApproval: Boolean(childPayload?.awaitingPlanApproval),
+      planPath: childPayload?.planPath || null,
+    };
+    const logPath = writeLog(args.outputDir, payload);
+    if (!state.record('recordRunResult', {
+      repo: args.repo,
+      issueNumber: selected.issue.number,
+      mode: 'issue-run',
+      exitCode: transitionBlocked || transitionMutationFailed ? 1 : effectiveExitCode,
+      signal: result.signal,
+      logPath,
+      payload,
+      startedAt,
+      finishedAt,
+    })) return emitSystemicStatePause(args, state, 'run-result-persistence', { now, logger: dependencies.logger }).exitCode;
+    console.log(JSON.stringify({ ...payload, stdout: '<see log>', stderr: '<see log>', logPath }, null, 2));
+    if (transitionBlocked || transitionMutationFailed) return 1;
+    return effectiveExitCode === null ? 1 : effectiveExitCode;
+  } finally {
+    if (args.execute && state.healthy) await reconcileSchedulerAttempts({ state, args, ghRunner, now, processProbe: dependencies.processProbe || probeProcessIdentity });
+    state.close();
+    unlock();
+  }
+}
+
+const invokedAsScript = process.argv[1]
+  ? import.meta.url === new URL(process.argv[1], `file://${process.cwd()}/`).href
+  : false;
+
+if (invokedAsScript) {
+  try {
+    process.exitCode = await main();
+  } catch (error) {
+    console.error(error?.stack || error?.message || String(error));
+    process.exitCode = 1;
+  }
+}

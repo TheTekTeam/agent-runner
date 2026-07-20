@@ -1,0 +1,34 @@
+{
+  "projectId": "modelspend",
+  "displayName": "ModelSpend",
+  "githubRepo": "TheTekTeam/modelspend",
+  "localRepoPath": "/home/gp/projects/modelspend-runner-live",
+  "legacyStateRoot": "/home/gp/projects/modelspend/.var/claude-runner",
+  "outputDir": "/home/gp/.local/state/agent-runner/modelspend",
+  "stateDbPath": "/home/gp/.local/state/agent-runner/modelspend/runner-state.sqlite",
+  "acceptedAgentLabels": [
+    "agent:claude",
+    "agent:claude-code-cli"
+  ],
+  "statusLabels": {
+    "ready": "status:ready",
+    "inProgress": "status:in-progress",
+    "blocked": "status:blocked"
+  },
+  "priorityLabelRanking": [
+    "priority:P0",
+    "priority:P1",
+    "priority:P2",
+    "priority:P3"
+  ],
+  "safeDefaultValidationCommands": [
+    "npm run validate:quick:plan -- --files <changed-files>",
+    "npm run validate:thorough"
+  ],
+  "systemd": {
+    "serviceName": "agent-runner-modelspend.service",
+    "timerName": "agent-runner-modelspend.timer",
+    "dashboardServiceName": "agent-runner-dashboard.service",
+    "dashboardTimerName": "agent-runner-dashboard.timer"
+  }
+}

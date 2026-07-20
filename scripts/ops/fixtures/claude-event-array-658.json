@@ -1,0 +1,36 @@
+[
+  {
+    "type": "system",
+    "subtype": "init",
+    "session_id": "<redacted>",
+    "permissionMode": "plan"
+  },
+  {
+    "type": "rate_limit_event",
+    "rate_limit_info": {
+      "status": "allowed",
+      "utilization": 0.44
+    }
+  },
+  {
+    "type": "assistant",
+    "message": {
+      "content": [
+        {
+          "type": "text",
+          "text": "Inspecting the portable runner seam."
+        }
+      ]
+    }
+  },
+  {
+    "type": "result",
+    "subtype": "error_max_turns",
+    "is_error": true,
+    "duration_ms": 446912,
+    "num_turns": 10,
+    "result": "Error: Reached max turns (10)",
+    "session_id": "<redacted>",
+    "total_cost_usd": 7.91
+  }
+]
