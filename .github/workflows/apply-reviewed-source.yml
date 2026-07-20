@@ -1,9 +1,9 @@
 name: Apply reviewed Agent Runner source
 
 on:
-  push:
+  pull_request:
     branches:
-      - claude/standalone-runner-686
+      - main
     paths:
       - .github/workflows/apply-reviewed-source.yml
 
@@ -12,16 +12,18 @@ permissions:
 
 jobs:
   apply:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       # Ephemeral, already-expiring transfer URL; this workflow deletes itself after use.
-      SOURCE_URL: "https://sdmntprnortheu.oaiusercontent.com/files/00000000-1a6c-81f4-9f1a-3e9b25b32680/raw?se=2026-07-20T20:06:34Z&sp=r&sv=2026-02-06&sr=b&scid=d25c6335-4bca-5d0d-9bc1-e54278cb375a&skoid=56822d8b-6cfd-42ed-a00d-1452dca42036&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-07-20T05:51:50Z&ske=2026-07-22T05:51:50Z&sks=b&skv=2026-02-06&sig=pCs1gwPNF9KyXFgztjDNVJifqSC/hioERkzkuuU2wSI%3D"
+      SOURCE_URL: "https://sdmntprnortheu.oaiusercontent.com/files/00000000-c9f8-81f4-8db6-1de40e259dfc/raw?se=2026-07-20T20:09:02Z&sp=r&sv=2026-02-06&sr=b&scid=dd753517-9450-58f3-bbd9-c8c0dad46b83&skoid=56822d8b-6cfd-42ed-a00d-1452dca42036&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-07-20T19:13:51Z&ske=2026-07-22T19:13:51Z&sks=b&skv=2026-02-06&sig=zzcSMfrjhTvcFw37rbjwYQm6qmOvweX/0mI75MQAy5M%3D"
       EXPECTED_SOURCE_COMMIT: 4d19c27af1d7ed8626848d3ac6ed1f0c94867fbf
+      TARGET_BRANCH: claude/standalone-runner-686
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: claude/standalone-runner-686
+          ref: ${{ env.TARGET_BRANCH }}
           fetch-depth: 0
       - name: Download and verify reviewed source
         shell: bash
@@ -80,4 +82,4 @@ jobs:
           git add -A
           git diff --cached --check
           git commit -m 'Import canonical runner implementation from ModelSpend'
-          git push origin HEAD:claude/standalone-runner-686
+          git push origin HEAD:"$TARGET_BRANCH"
