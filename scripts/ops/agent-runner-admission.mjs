@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { pathToFileURL } from 'node:url';
 
 export const FAILURE_SCOPES = Object.freeze({
   SYSTEMIC: 'systemic',
@@ -121,4 +122,15 @@ export function machineProfilePausePayload(admission) {
     issueMutation: false,
     systemdOutcome: 'handled',
   };
+}
+
+export function main(argv = process.argv.slice(2), env = process.env, logger = console) {
+  const admission = admitMachineProfile({ argv, env });
+  if (admission.allowed) return 0;
+  logger.log(JSON.stringify(machineProfilePausePayload(admission), null, 2));
+  return 3;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  process.exitCode = main();
 }
