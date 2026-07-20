@@ -37,6 +37,22 @@ export function candidateSnapshot(selected = {}) {
   };
 }
 
+export function commandRevisionChanged(initial, current) {
+  if (current.selectionMode === 'preflight-direct') {
+    return initial.commandKind !== null
+      || current.commandKind !== null
+      || initial.commandIdentity !== null
+      || current.commandIdentity !== null;
+  }
+  if (current.selectionMode === 'proceed-command') {
+    return initial.commandKind !== current.commandKind
+      || !initial.commandIdentity
+      || !current.commandIdentity
+      || !sameCommentIdentity(initial.commandIdentity, current.commandIdentity);
+  }
+  return true;
+}
+
 export function evaluateCandidateAdmission({ initial, current, approvers = [] } = {}) {
   if (!initial?.issueNumber || !current?.issueNumber) {
     return { allowed: false, reason: 'candidate-no-longer-runnable' };
@@ -53,7 +69,7 @@ export function evaluateCandidateAdmission({ initial, current, approvers = [] } 
   if (initial.selectionMode !== current.selectionMode || !['proceed-command', 'preflight-direct'].includes(current.selectionMode)) {
     return { allowed: false, reason: 'candidate-dispatch-mode-changed' };
   }
-  if (initial.commandKind !== current.commandKind || !sameCommentIdentity(initial.commandIdentity, current.commandIdentity)) {
+  if (commandRevisionChanged(initial, current)) {
     return { allowed: false, reason: 'candidate-command-revision-changed' };
   }
   if (!current.preflightIdentity || !sameCommentIdentity(initial.preflightIdentity, current.preflightIdentity)) {
