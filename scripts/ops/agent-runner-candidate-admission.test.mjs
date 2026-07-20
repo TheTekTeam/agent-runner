@@ -31,13 +31,38 @@ function selection({
   };
 }
 
-test('stable approved candidate is admitted', () => {
+function command(id = 200, kind = 'proceed') {
+  return {
+    kind,
+    sourceCommentIdentity: { databaseId: id },
+    sourceCommentId: `github-comment:database-id:${id}`,
+  };
+}
+
+test('stable approved preflight-direct candidate is admitted without a command identity', () => {
   const initial = candidateSnapshot(selection());
   const current = candidateSnapshot(selection());
+  assert.equal(initial.commandIdentity, null);
+  assert.equal(current.commandIdentity, null);
   assert.deepEqual(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }), {
     allowed: true,
     reason: 'candidate-admitted',
   });
+});
+
+test('stable approved proceed-command candidate is admitted', () => {
+  const initial = candidateSnapshot(selection({ mode: 'proceed-command', command: command(200) }));
+  const current = candidateSnapshot(selection({ mode: 'proceed-command', command: command(200) }));
+  assert.deepEqual(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }), {
+    allowed: true,
+    reason: 'candidate-admitted',
+  });
+});
+
+test('proceed-command revision change fails closed', () => {
+  const initial = candidateSnapshot(selection({ mode: 'proceed-command', command: command(200) }));
+  const current = candidateSnapshot(selection({ mode: 'proceed-command', command: command(201) }));
+  assert.equal(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }).reason, 'candidate-command-revision-changed');
 });
 
 test('preflight revision change fails closed', () => {
