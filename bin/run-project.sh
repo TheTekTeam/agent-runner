@@ -87,9 +87,23 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   PROBE_STATUS=$?
   set -e
   case "$PROBE_STATUS" in
-    0) exec node "$ROOT/scripts/ops/claude-runner-cron.mjs" "${ARGS[@]}" ;;
+    0) ;;
     3) echo "[agent-runner] no runnable candidate; no-selection recorded"; exit 0 ;;
     *) echo "[agent-runner] ERROR: candidate probe failed with exit $PROBE_STATUS" >&2; exit "$PROBE_STATUS" ;;
+  esac
+
+  # Re-read the selected candidate twice and require stable issue, status,
+  # agent, dispatch mode, command revision, manager-preflight revision and an
+  # approved manager author. A handled refusal occurs before the canonical
+  # scheduler can create an attempt row or mutate GitHub.
+  set +e
+  node "$ROOT/scripts/ops/agent-runner-candidate-admission.mjs" "${ARGS[@]}"
+  CANDIDATE_STATUS=$?
+  set -e
+  case "$CANDIDATE_STATUS" in
+    0) exec node "$ROOT/scripts/ops/claude-runner-cron.mjs" "${ARGS[@]}" ;;
+    3) echo "[agent-runner] candidate authority changed or is not approved; no attempt created or issue mutated"; exit 0 ;;
+    *) echo "[agent-runner] ERROR: candidate admission failed with exit $CANDIDATE_STATUS" >&2; exit "$CANDIDATE_STATUS" ;;
   esac
 fi
 
