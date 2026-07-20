@@ -44,6 +44,12 @@ require_file() { [ -f "$1" ] || { echo "Required file missing: $1" >&2; exit 1; 
 json_value() {
   node -e 'const fs=require("node:fs"); const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const path=process.argv[2].split("."); let x=v; for (const key of path) x=x?.[key]; if (typeof x!=="string" || !x) process.exit(2); process.stdout.write(x);' "$CONFIG_FILE" "$1"
 }
+legacy_state_root() {
+  printf '%s/.var/claude-runner\n' "$(json_value localRepoPath)"
+}
+standalone_state_root() {
+  dirname "$(json_value stateDbPath)"
+}
 
 render_units() {
   install -d -m 0755 "$USER_UNIT_DIR"
@@ -125,6 +131,16 @@ future_trigger_exists() {
   systemctl --user list-timers "$1" --all --no-pager --no-legend | grep -Fq "$1"
 }
 
+restore_legacy_timer() {
+  local enabled_state="$1" active_state="$2"
+  if [[ "$enabled_state" == enabled* ]]; then
+    systemctl --user enable "$OLD_TIMER" >/dev/null
+  fi
+  if [ "$active_state" = active ]; then
+    systemctl --user start "$OLD_TIMER"
+  fi
+}
+
 verify() {
   require_file "$CONFIG_FILE"
   require_file "$ROOT/MIGRATION-MANIFEST.json"
@@ -135,7 +151,10 @@ verify() {
   local project state_db
   project="$(json_value localRepoPath)"
   state_db="$(json_value stateDbPath)"
-  [ -d "$project/.git" ] || { echo "Configured project checkout is invalid: $project" >&2; exit 1; }
+  git -C "$project" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    echo "Configured project checkout is invalid: $project" >&2
+    exit 1
+  }
   [ -f "$state_db" ] || { echo "Migrated state DB is missing: $state_db" >&2; exit 1; }
   node --input-type=module - "$state_db" <<'NODE'
 import { DatabaseSync } from 'node:sqlite';
@@ -151,6 +170,9 @@ NODE
 
 status() {
   printf 'Repository: %s\nConfig: %s\nEnvironment: %s\n' "$ROOT" "$CONFIG_FILE" "$ENV_FILE"
+  if [ -f "$CONFIG_FILE" ]; then
+    printf 'Legacy state: %s\nStandalone state: %s\n' "$(legacy_state_root)" "$(standalone_state_root)"
+  fi
   for unit in "$RUN_SERVICE" "$RUN_TIMER" "$DASH_SERVICE" "$DASH_TIMER" "$OLD_SERVICE" "$OLD_TIMER"; do
     printf '%-42s enabled=%-12s active=%s\n' "$unit" \
       "$(systemctl --user is-enabled "$unit" 2>/dev/null || true)" \
@@ -170,19 +192,44 @@ case "$COMMAND" in
     verify
     if [ "$CUTOVER" = true ]; then
       [ "$ASSUME_YES" = true ] || { echo "Refusing cutover without --yes" >&2; exit 1; }
-      "$ROOT/scripts/migrate-state.sh" verify
-      "$ROOT/scripts/migrate-state.sh" link --yes
-      install -d -m 0700 "$STATE_ROOT"
+      LEGACY_STATE_ROOT="$(legacy_state_root)"
+      XDG_STATE_ROOT="$(standalone_state_root)"
       OLD_TIMER_ENABLED="$(systemctl --user is-enabled "$OLD_TIMER" 2>/dev/null || true)"
+      OLD_TIMER_ACTIVE="$(systemctl --user is-active "$OLD_TIMER" 2>/dev/null || true)"
+
       systemctl --user disable --now "$OLD_TIMER" 2>/dev/null || true
       systemctl --user stop "$OLD_SERVICE" 2>/dev/null || true
       systemctl --user reset-failed "$OLD_SERVICE" 2>/dev/null || true
-      systemctl --user enable "$RUN_TIMER" "$DASH_TIMER"
-      systemctl --user restart "$RUN_TIMER" "$DASH_TIMER"
-      future_trigger_exists "$RUN_TIMER" || { echo "No future runner timer trigger" >&2; exit 1; }
-      future_trigger_exists "$DASH_TIMER" || { echo "No future dashboard timer trigger" >&2; exit 1; }
+
+      if ! "$ROOT/scripts/migrate-state.sh" verify \
+        --source "$LEGACY_STATE_ROOT" --destination "$XDG_STATE_ROOT"; then
+        restore_legacy_timer "$OLD_TIMER_ENABLED" "$OLD_TIMER_ACTIVE"
+        echo "Cutover aborted: state verification failed; legacy schedule restored" >&2
+        exit 1
+      fi
+      if ! "$ROOT/scripts/migrate-state.sh" link --yes \
+        --source "$LEGACY_STATE_ROOT" --destination "$XDG_STATE_ROOT"; then
+        restore_legacy_timer "$OLD_TIMER_ENABLED" "$OLD_TIMER_ACTIVE"
+        echo "Cutover aborted: shared-state link failed; legacy schedule restored" >&2
+        exit 1
+      fi
+
+      if ! systemctl --user enable "$RUN_TIMER" "$DASH_TIMER" \
+        || ! systemctl --user restart "$RUN_TIMER" "$DASH_TIMER" \
+        || ! future_trigger_exists "$RUN_TIMER" \
+        || ! future_trigger_exists "$DASH_TIMER"; then
+        systemctl --user disable --now "$RUN_TIMER" "$DASH_TIMER" 2>/dev/null || true
+        systemctl --user stop "$RUN_SERVICE" "$DASH_SERVICE" 2>/dev/null || true
+        "$ROOT/scripts/migrate-state.sh" rollback-link --yes \
+          --source "$LEGACY_STATE_ROOT" --destination "$XDG_STATE_ROOT" || true
+        restore_legacy_timer "$OLD_TIMER_ENABLED" "$OLD_TIMER_ACTIVE"
+        echo "Cutover aborted: standalone timer verification failed; state and legacy schedule restored" >&2
+        exit 1
+      fi
+
+      install -d -m 0700 "$STATE_ROOT"
       cat > "$CUTOVER_FILE" <<JSON
-{"schemaVersion":1,"cutoverAt":"$(date -u +%FT%TZ)","oldTimerEnabled":"$OLD_TIMER_ENABLED","runnerRoot":"$ROOT","config":"$CONFIG_FILE"}
+{"schemaVersion":1,"cutoverAt":"$(date -u +%FT%TZ)","oldTimerEnabled":"$OLD_TIMER_ENABLED","oldTimerActive":"$OLD_TIMER_ACTIVE","runnerRoot":"$ROOT","config":"$CONFIG_FILE","legacyStateRoot":"$LEGACY_STATE_ROOT","standaloneStateRoot":"$XDG_STATE_ROOT"}
 JSON
       chmod 0600 "$CUTOVER_FILE"
       echo "PASS: standalone runner cut over; old service disabled and rollback record written"
@@ -204,12 +251,20 @@ JSON
     ;;
   rollback)
     [ "$ASSUME_YES" = true ] || { echo "Refusing rollback without --yes" >&2; exit 1; }
+    LEGACY_STATE_ROOT="$(legacy_state_root)"
+    XDG_STATE_ROOT="$(standalone_state_root)"
     systemctl --user disable --now "$RUN_TIMER" "$DASH_TIMER" 2>/dev/null || true
     systemctl --user stop "$RUN_SERVICE" "$DASH_SERVICE" 2>/dev/null || true
-    "$ROOT/scripts/migrate-state.sh" rollback-link --yes
-    if [ -f "$CUTOVER_FILE" ] && grep -q '"oldTimerEnabled":"enabled"' "$CUTOVER_FILE"; then
-      systemctl --user enable "$OLD_TIMER"
-      systemctl --user restart "$OLD_TIMER"
+    "$ROOT/scripts/migrate-state.sh" rollback-link --yes \
+      --source "$LEGACY_STATE_ROOT" --destination "$XDG_STATE_ROOT"
+    OLD_TIMER_ENABLED="disabled"
+    OLD_TIMER_ACTIVE="inactive"
+    if [ -f "$CUTOVER_FILE" ]; then
+      OLD_TIMER_ENABLED="$(node -e 'const fs=require("node:fs");const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(v.oldTimerEnabled||"disabled")' "$CUTOVER_FILE")"
+      OLD_TIMER_ACTIVE="$(node -e 'const fs=require("node:fs");const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));process.stdout.write(v.oldTimerActive||"inactive")' "$CUTOVER_FILE")"
+    fi
+    restore_legacy_timer "$OLD_TIMER_ENABLED" "$OLD_TIMER_ACTIVE"
+    if [ "$OLD_TIMER_ACTIVE" = active ]; then
       future_trigger_exists "$OLD_TIMER" || { echo "No future legacy timer trigger after rollback" >&2; exit 1; }
     fi
     mv "$CUTOVER_FILE" "$CUTOVER_FILE.rolled-back-$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
