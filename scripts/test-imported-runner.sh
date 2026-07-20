@@ -22,12 +22,30 @@ if [ "${#tests[@]}" -eq 0 ]; then
 fi
 
 node --test "${tests[@]}"
-node "$ROOT/.agent-runner/scripts/runner.mjs" --help >/dev/null
-node "$ROOT/.agent-runner/scripts/runner-cron.mjs" --help >/dev/null
+
+echo "Checking portable runner help..."
+node "$ROOT/.agent-runner/scripts/runner.mjs" --help >/tmp/agent-runner-help.out 2>/tmp/agent-runner-help.err || {
+  status=$?
+  cat /tmp/agent-runner-help.err >&2
+  echo "ERROR: portable runner --help exited $status" >&2
+  exit "$status"
+}
+
+echo "Checking portable cron help..."
+node "$ROOT/.agent-runner/scripts/runner-cron.mjs" --help >/tmp/agent-runner-cron-help.out 2>/tmp/agent-runner-cron-help.err || {
+  status=$?
+  cat /tmp/agent-runner-cron-help.err >&2
+  echo "ERROR: portable runner-cron --help exited $status" >&2
+  exit "$status"
+}
+
+echo "Checking safe missing-state dashboard response..."
 node "$ROOT/scripts/ops/claude-runner-dashboard-api.mjs" \
   --db "$ROOT/.tmp-missing-runner-state.sqlite" >/tmp/agent-runner-dashboard-missing.json
 node -e 'const fs=require("node:fs"); const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if(v.ok!==false || !v.diagnostics?.some(x=>x.code==="state-db-missing")) process.exit(1)' \
   /tmp/agent-runner-dashboard-missing.json
-rm -f /tmp/agent-runner-dashboard-missing.json
+rm -f /tmp/agent-runner-help.out /tmp/agent-runner-help.err \
+  /tmp/agent-runner-cron-help.out /tmp/agent-runner-cron-help.err \
+  /tmp/agent-runner-dashboard-missing.json
 
 echo "PASS: imported runner syntax, focused tests and safe missing-state smoke checks"
