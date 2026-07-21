@@ -8,6 +8,7 @@ import {
   revalidationFailureEvidence,
   runAtomicCandidateRevalidation,
 } from './agent-runner-atomic-candidate-store.mjs';
+import { acquireRecoverableCronLock } from './agent-runner-cron-lock.mjs';
 import {
   createLivenessFilteredStore,
   inspectDueRecoveryLiveness,
@@ -82,6 +83,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
   try {
     exitCode = await schedulerMain(argv, env, {
       ...dependencies,
+      acquireLock: dependencies.acquireLock || acquireRecoverableCronLock,
       openStore: atomicOpenStore,
       logger,
     });
