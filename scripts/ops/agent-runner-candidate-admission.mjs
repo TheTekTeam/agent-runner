@@ -11,6 +11,7 @@ import {
 } from './claude-runner-comment-identity.mjs';
 
 export const CANDIDATE_PAUSED_EXIT_CODE = 3;
+export const NEW_CLAIM_AUTHORIZATION_MODE = 'preflight-direct';
 
 function preflightAuthor(preflight) {
   return String(
@@ -73,19 +74,10 @@ export function normalizeCandidateSnapshot(snapshot = {}) {
 }
 
 export function commandRevisionChanged(initial, current) {
-  if (current.selectionMode === 'preflight-direct') {
-    return initial.commandKind !== null
-      || current.commandKind !== null
-      || initial.commandIdentity !== null
-      || current.commandIdentity !== null;
-  }
-  if (current.selectionMode === 'proceed-command') {
-    return initial.commandKind !== current.commandKind
-      || !initial.commandIdentity
-      || !current.commandIdentity
-      || !sameCommentIdentity(initial.commandIdentity, current.commandIdentity);
-  }
-  return true;
+  return initial.commandKind !== null
+    || current.commandKind !== null
+    || initial.commandIdentity !== null
+    || current.commandIdentity !== null;
 }
 
 export function evaluateCandidateAdmission({ initial, current, approvers = [] } = {}) {
@@ -113,11 +105,14 @@ export function evaluateCandidateAdmission({ initial, current, approvers = [] } 
   if (initial.agentLabel !== current.agentLabel) {
     return { allowed: false, reason: 'candidate-agent-changed' };
   }
-  if (initial.selectionMode !== current.selectionMode || !['proceed-command', 'preflight-direct'].includes(current.selectionMode)) {
+  if (initial.selectionMode !== current.selectionMode) {
     return { allowed: false, reason: 'candidate-dispatch-mode-changed' };
   }
+  if (current.selectionMode !== NEW_CLAIM_AUTHORIZATION_MODE) {
+    return { allowed: false, reason: 'candidate-manager-preflight-required' };
+  }
   if (commandRevisionChanged(initial, current)) {
-    return { allowed: false, reason: 'candidate-command-revision-changed' };
+    return { allowed: false, reason: 'candidate-proceed-command-not-authoritative' };
   }
   if (!current.preflightIdentity || !sameCommentIdentity(initial.preflightIdentity, current.preflightIdentity)) {
     return { allowed: false, reason: 'candidate-preflight-revision-changed' };
@@ -133,7 +128,7 @@ export function candidatePausePayload(admission, snapshot) {
     candidatePaused: true,
     failureScope: 'issue_not_runnable',
     reason: admission.reason,
-    safeNextAction: 'Repair execution-critical status/agent labels or provide a current manager preflight from an approved ChatGPT manager identity.',
+    safeNextAction: 'Repair execution-critical status/agent labels or provide a current immutable manager preflight from an approved ChatGPT manager identity. Proceed or continue comments cannot authorize a new claim.',
     selectedIssue: snapshot?.issueNumber || null,
     candidateRevision: snapshot?.preflightRevision || null,
     childLaunched: false,
