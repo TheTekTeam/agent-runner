@@ -94,10 +94,11 @@ export function findLinkedOpenPullRequests({ issueNumber, pullRequests = [] } = 
   });
 }
 
-export function buildReviewFollowUpPrompt({ pr, issueNumber = null, branch, unresolved }) {
+export function buildReviewFollowUpPrompt({ pr, issueNumber = null, branch, unresolved, repo = null }) {
   const commentList = (unresolved.unresolvedComments || [])
     .map((comment, index) => `${index + 1}. [${comment.source}] ${comment.author} (${comment.createdAt || 'unknown time'}):\n   ${String(comment.body || '').trim().replace(/\n/g, '\n   ')}`)
     .join('\n\n') || '(no comment bodies captured — check the PR review tab directly)';
+  const identityLine = repo ? `You are Claude Code CLI working on ${repo}.` : 'You are Claude Code CLI working on this repository.';
 
-  return `You are Claude Code CLI working on ModelSpend.\n\nThis is a PR review follow-up run, not a new task.\n\nPR: #${pr.number} — ${pr.title}\nURL: ${pr.url || ''}\nLinked issue: ${issueNumber ? `#${issueNumber}` : 'unknown — check the PR body'}\nBranch: ${branch}\n\nUnresolved review/manager feedback triggering this run:\n${unresolved.reasons.join(', ') || 'unresolved review state detected'}\n\nUnresolved comments:\n\n${commentList}\n\nRunner rules for this follow-up run:\n- Stay on branch \`${branch}\`. Do not create a new branch.\n- Address only the unresolved review/manager feedback listed above.\n- Do not start unrelated work, refactors, or scope expansion.\n- Rerun the validation the PR requires (see docs/claude/VALIDATION-GATES.md) after making changes.\n- Do not merge, approve, or close anything yourself. A human merge gate remains mandatory.\n- Report exactly which unresolved comments were addressed and which (if any) still need human input.\n`;
+  return `${identityLine}\n\nThis is a PR review follow-up run, not a new task.\n\nPR: #${pr.number} — ${pr.title}\nURL: ${pr.url || ''}\nLinked issue: ${issueNumber ? `#${issueNumber}` : 'unknown — check the PR body'}\nBranch: ${branch}\n\nUnresolved review/manager feedback triggering this run:\n${unresolved.reasons.join(', ') || 'unresolved review state detected'}\n\nUnresolved comments:\n\n${commentList}\n\nRunner rules for this follow-up run:\n- Stay on branch \`${branch}\`. Do not create a new branch.\n- Address only the unresolved review/manager feedback listed above.\n- Do not start unrelated work, refactors, or scope expansion.\n- Rerun the validation the PR requires (see docs/claude/VALIDATION-GATES.md) after making changes.\n- Do not merge, approve, or close anything yourself. A human merge gate remains mandatory.\n- Report exactly which unresolved comments were addressed and which (if any) still need human input.\n`;
 }

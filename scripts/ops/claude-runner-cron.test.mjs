@@ -12,6 +12,7 @@ import {
   claimIssueForExecution,
   claimRevisionIsCurrent,
   classifyAttemptLivenessState,
+  CLAUDE_RUNNER_ENTRYPOINT,
   computeAttemptLivenessEvidence,
   collectRecoveryRevalidation,
   captureProcessIdentity,
@@ -292,7 +293,13 @@ test('runnerArgs adds execute only when requested', () => {
 
 test('quotaPreflightArgs runs the forced usage preflight through claude-runner', () => {
   const args = quotaPreflightArgs({ outputDir: '.var/out' });
-  assert.deepEqual(args, ['scripts/ops/claude-runner.mjs', '--check-quota', '--force-quota-check', '--output-dir', '.var/out']);
+  assert.deepEqual(args, [CLAUDE_RUNNER_ENTRYPOINT, '--check-quota', '--force-quota-check', '--output-dir', '.var/out']);
+});
+
+test('runnerArgs and quotaPreflightArgs invoke the canonical claude-runner.mjs by absolute path, not a bare relative path resolved against process cwd', () => {
+  assert.ok(CLAUDE_RUNNER_ENTRYPOINT.startsWith('/'));
+  assert.ok(CLAUDE_RUNNER_ENTRYPOINT.endsWith('/scripts/ops/claude-runner.mjs'));
+  assert.equal(runnerArgs(381, { outputDir: '.var/out', execute: false })[0], CLAUDE_RUNNER_ENTRYPOINT);
 });
 
 test('runQuotaPreflight is skipped for dry-runs', () => {
