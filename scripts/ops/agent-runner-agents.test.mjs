@@ -11,21 +11,20 @@ import {
   agentRunMetadata,
 } from './agent-runner-agents.mjs';
 
-test('Claude adapter builds an uncapped CLI invocation', () => {
+test('Claude implementation adapter builds an uncapped CLI invocation', () => {
   const args = buildAgentCommandArgs({
     agent: resolveAgentById('claude-code-cli'),
     prompt: 'hello',
-    profile: { model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.50', permissionMode: 'plan' },
+    profile: { model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.50', permissionMode: 'dontAsk' },
   });
-  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.50', '--permission-mode', 'plan', '--output-format', 'json']);
+  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.50', '--permission-mode', 'dontAsk', '--output-format', 'json']);
   assert.equal(args.includes('--max-turns'), false);
   assert.equal(args.at(-1), 'hello');
 });
 
-test('legacy maxTurns values are accepted but ignored', () => {
+test('legacy maxTurns values are accepted but ignored for implementation', () => {
   const agent = resolveAgentById('claude-code-cli');
   assert.equal(agent.controls.maxTurns.deprecated, true);
-  assert.equal(agent.controls.maxTurns.ignored, true);
 
   const args = buildAgentCommandArgs({
     agent,
@@ -74,6 +73,15 @@ test('Claude adapter builds a constrained native-worktree implementation invocat
   ]);
   assert.equal(args.includes('--max-turns'), false);
   assert.equal(args.at(-1), 'implement the approved preflight');
+});
+
+test('read-only plan mode retains its bounded compatibility invocation', () => {
+  const args = buildAgentCommandArgs({
+    agent: resolveAgentById('claude-code-cli'),
+    prompt: 'plan only',
+    profile: { model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.00', permissionMode: 'plan' },
+  });
+  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-turns', '4', '--max-budget-usd', '1.00', '--permission-mode', 'plan', '--output-format', 'json']);
 });
 
 test('future agent labels resolve to unsupported skip diagnostics', () => {
