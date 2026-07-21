@@ -1,48 +1,71 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { main } from './agent-runner-atomic-cron.mjs';
+import { createStableOutputCapture } from './agent-runner-atomic-cron.mjs';
 
-test('captures scheduler logger and direct console output without recursion', async () => {
+test('default capture sinks remain stable after globals are patched', () => {
+  const directLogged = [];
+  const directErrored = [];
+  const originalLog = (...values) => directLogged.push(values);
+  const originalError = (...values) => directErrored.push(values);
+  const observed = [];
+  const capture = createStableOutputCapture({
+    originalConsoleLog: originalLog,
+    originalConsoleError: originalError,
+    onValues: (values) => observed.push(values),
+  });
+
+  const savedLog = console.log;
+  const savedError = console.error;
+  try {
+    console.log = capture.directLog;
+    console.error = capture.directError;
+    capture.loggerLog('{"selectedIssue":686}');
+    capture.loggerError('bounded scheduler error');
+    console.log('{"directConsole":true}');
+    console.error('direct console error');
+  } finally {
+    console.log = savedLog;
+    console.error = savedError;
+  }
+
+  assert.deepEqual(directLogged, [
+    ['{"selectedIssue":686}'],
+    ['{"directConsole":true}'],
+  ]);
+  assert.deepEqual(directErrored, [
+    ['bounded scheduler error'],
+    ['direct console error'],
+  ]);
+  assert.deepEqual(observed, [
+    ['{"selectedIssue":686}'],
+    ['bounded scheduler error'],
+    ['{"directConsole":true}'],
+    ['direct console error'],
+  ]);
+});
+
+test('custom logger capture stays separate from direct console capture', () => {
   const logged = [];
   const errored = [];
-  const originalLog = console.log;
-  const originalError = console.error;
-
-  const exitCode = await main([], {}, {
-    parseArgs: () => ({ execute: false }),
+  const directLogged = [];
+  const directErrored = [];
+  const capture = createStableOutputCapture({
     logger: {
       log: (...values) => logged.push(values),
       error: (...values) => errored.push(values),
     },
-    schedulerMain: async (_argv, _env, dependencies) => {
-      dependencies.logger.log('{"selectedIssue":686}');
-      dependencies.logger.error('bounded scheduler error');
-      console.log('{"directConsole":true}');
-      console.error('direct console error');
-      return 1;
-    },
+    originalConsoleLog: (...values) => directLogged.push(values),
+    originalConsoleError: (...values) => directErrored.push(values),
   });
 
-  assert.equal(exitCode, 1);
-  assert.deepEqual(logged, [['{"selectedIssue":686}']]);
-  assert.deepEqual(errored, [['bounded scheduler error']]);
-  assert.equal(console.log, originalLog);
-  assert.equal(console.error, originalError);
-});
+  capture.loggerLog('logger output');
+  capture.loggerError('logger error');
+  capture.directLog('direct output');
+  capture.directError('direct error');
 
-test('restores console methods when scheduler throws', async () => {
-  const originalLog = console.log;
-  const originalError = console.error;
-
-  await assert.rejects(() => main([], {}, {
-    parseArgs: () => ({ execute: false }),
-    logger: { log() {}, error() {} },
-    schedulerMain: async () => {
-      throw new Error('scheduler exploded');
-    },
-  }), /scheduler exploded/);
-
-  assert.equal(console.log, originalLog);
-  assert.equal(console.error, originalError);
+  assert.deepEqual(logged, [['logger output']]);
+  assert.deepEqual(errored, [['logger error']]);
+  assert.deepEqual(directLogged, [['direct output']]);
+  assert.deepEqual(directErrored, [['direct error']]);
 });
