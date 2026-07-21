@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -70,4 +70,14 @@ test('circuit pause proves no candidate consumption or mutation', () => {
   assert.equal(payload.childLaunched, false);
   assert.equal(payload.issueMutation, false);
   assert.equal(payload.systemdOutcome, 'handled');
+});
+
+test('standalone launcher checks the circuit before candidate discovery and records profile refusal', () => {
+  const source = readFileSync(new URL('../../bin/run-project.sh', import.meta.url), 'utf8');
+  const check = source.indexOf('agent-runner-circuit-breaker.mjs" check');
+  const admission = source.indexOf('agent-runner-admission.mjs');
+  const candidate = source.indexOf('claude-runner-candidate-probe.mjs');
+  assert.ok(check >= 0 && check < admission && admission < candidate);
+  assert.match(source, /AGENT_RUNNER_ADMISSION_RESULT=.*agent-runner-circuit-breaker\.mjs" record/s);
+  assert.match(source, /CIRCUIT_STATUS[\s\S]*3\).*exit 0/);
 });
