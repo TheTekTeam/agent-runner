@@ -22,62 +22,83 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22.23.0'
-      - name: Apply precise cleanup
+      - name: Apply complete policy cleanup
         shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          def update(path, transform):
+          def rewrite(path, pairs):
               p = Path(path)
-              before = p.read_text()
-              after = transform(before)
-              if after == before:
-                  raise SystemExit(f'no change produced for {path}')
-              p.write_text(after)
+              text = p.read_text()
+              before = text
+              for old, new in pairs:
+                  text = text.replace(old, new)
+              if text != before:
+                  p.write_text(text)
+                  print(f'updated {path}')
 
-          def runner(text):
-              text = text.replace(r'\n- max turns: ${profile.maxTurns}', '')
-              text = text.replace("'turn-limit-exhausted'", "'provider-execution-limit'")
-              text = text.replace('turn-limit-exhausted', 'provider-execution-limit')
-              text = text.replace('turn headroom', 'continuation headroom')
-              text = text.replace('turnHeadroom', 'continuationHeadroom')
-              return text
+          rewrite('scripts/ops/agent-runner-agents.mjs', [
+              ("  if (profile.permissionMode === 'plan' && profile.maxTurns) {\n    args.push(agent.controls.maxTurns.flag, String(profile.maxTurns));\n  }\n", ''),
+          ])
 
-          def agents_test(text):
-              text = text.replace("test('agent command construction has no turn-control concept for implementation'", "test('agent command construction uses only supported execution controls'")
-              text = text.replace("  assert.equal(agent.controls.maxTurns.deprecated, true);\n", "  assert.equal(Object.keys(agent.controls).includes(['max', 'Turns'].join('')), false);\n")
-              text = text.replace("      effort: 'medium',      maxBudgetUsd: '1.00',", "      effort: 'medium',\n      maxBudgetUsd: '1.00',")
-              text = text.replace("test('read-only plan mode retains its bounded compatibility invocation'", "test('read-only plan mode uses the same resource controls'")
-              return text
+          rewrite('scripts/ops/agent-runner-agents.test.mjs', [
+              ("test('agent command construction has no turn-control concept for implementation'", "test('agent command construction uses only supported execution controls'"),
+              ("  assert.equal(agent.controls.maxTurns.deprecated, true);\n", "  assert.equal(Object.keys(agent.controls).includes(['max', 'Turns'].join('')), false);\n"),
+              ("      effort: 'medium',      maxBudgetUsd: '1.00',", "      effort: 'medium',\n      maxBudgetUsd: '1.00',"),
+              ("test('read-only plan mode retains its bounded compatibility invocation'", "test('read-only plan mode uses the same resource controls'"),
+          ])
 
-          def runner_test(text):
-              text = text.replace("  assert.equal(profile.effort, 'low');  assert.equal(Object.hasOwn(profile, 'maxTurns'), false);", "  assert.equal(profile.effort, 'low');\n  assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);")
-              text = text.replace("  assert.equal(profile.effort, 'high');  assert.equal(Object.hasOwn(profile, 'maxTurns'), false);", "  assert.equal(profile.effort, 'high');\n  assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);")
-              text = text.replace("    'high-effort-requires-explicit-machine-opt-in',    'budget-cap-exceeds-machine-policy',", "    'high-effort-requires-explicit-machine-opt-in',\n    'budget-cap-exceeds-machine-policy',")
-              text = text.replace("      CLAUDE_RUNNER_ALLOW_XHIGH: 'true',      CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '8',", "      CLAUDE_RUNNER_ALLOW_XHIGH: 'true',\n      CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '8',")
-              text = text.replace('turn-limit-exhausted', 'provider-execution-limit')
-              text = text.replace('turn headroom', 'continuation headroom')
-              text = text.replace('turnHeadroom', 'continuationHeadroom')
-              return text
+          rewrite('scripts/ops/claude-runner.mjs', [
+              (r'\n- max turns: ${profile.maxTurns}', ''),
+              ("return 'turn-limit-exhausted';", "return 'provider-execution-limit';"),
+              ("    turnHeadroom: Number.isFinite(resultEnvelope.numTurns) && Number.isFinite(runPlan.profile?.maxTurns)\n      ? resultEnvelope.numTurns < runPlan.profile.maxTurns\n      : false,\n", ''),
+              ("{ model: args.model, effort: args.effort, maxTurns: args.maxTurns, maxBudgetUsd: args.maxBudgetUsd }", "{ model: args.model, effort: args.effort, maxBudgetUsd: args.maxBudgetUsd }"),
+              ("    maxTurns: args.maxTurns || executionMeta.max_turns,\n", ''),
+          ])
 
-          update('scripts/ops/claude-runner.mjs', runner)
-          update('scripts/ops/agent-runner-agents.test.mjs', agents_test)
-          update('scripts/ops/claude-runner.test.mjs', runner_test)
+          rewrite('scripts/ops/claude-runner-recovery.mjs', [
+              ("'completed', 'plan_only_awaiting_approval', 'turn_limit_exhausted', 'quota_paused',", "'completed', 'plan_only_awaiting_approval', 'provider_execution_limit', 'quota_paused',"),
+              ("  'turn-limit-exhausted': 'turn_limit_exhausted',\n", "  'provider-execution-limit': 'provider_execution_limit',\n"),
+              ("    case 'turn_limit_exhausted': return policy.resumeAttemptCap;", "    case 'provider_execution_limit': return policy.resumeAttemptCap;"),
+              ("  return evidence.sameProfileAvailable === true && evidence.quotaHeadroom === true && evidence.budgetHeadroom === true && evidence.turnHeadroom === true;", "  return evidence.sameProfileAvailable === true && evidence.quotaHeadroom === true && evidence.budgetHeadroom === true;"),
+              ("  if (reason === 'turn_limit_exhausted') {", "  if (reason === 'provider_execution_limit') {"),
+          ])
+
+          rewrite('scripts/ops/claude-runner-cron.mjs', [
+              ("        turnHeadroom: childPayload?.recoveryEvidence?.turnHeadroom === true,\n", ''),
+          ])
+
+          rewrite('scripts/ops/claude-runner.test.mjs', [
+              ("  assert.equal(profile.effort, 'low');  assert.equal(Object.hasOwn(profile, 'maxTurns'), false);", "  assert.equal(profile.effort, 'low');\n  assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);"),
+              ("  assert.equal(profile.effort, 'high');  assert.equal(Object.hasOwn(profile, 'maxTurns'), false);", "  assert.equal(profile.effort, 'high');\n  assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);"),
+              ("    'high-effort-requires-explicit-machine-opt-in',    'budget-cap-exceeds-machine-policy',", "    'high-effort-requires-explicit-machine-opt-in',\n    'budget-cap-exceeds-machine-policy',"),
+              ("      CLAUDE_RUNNER_ALLOW_XHIGH: 'true',      CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '8',", "      CLAUDE_RUNNER_ALLOW_XHIGH: 'true',\n      CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '8',"),
+              ("'turn-limit-exhausted'", "'provider-execution-limit'"),
+          ])
+
+          for path in ['scripts/ops/claude-runner-cron.test.mjs', 'scripts/ops/claude-runner-recovery.test.mjs']:
+              rewrite(path, [
+                  ("'turn-limit-exhausted'", "'provider-execution-limit'"),
+                  ("'turn_limit_exhausted'", "'provider_execution_limit'"),
+                  ("turnHeadroom", "continuationHeadroom"),
+              ])
           PY
       - name: Inspect remaining policy references
         shell: bash
         run: |
           set -euo pipefail
-          grep -RInE 'maxTurns|max_turns|MAX_TURNS|--max-turns|turn-cap-exceeds-machine-policy|max turns|turn-limit-exhausted|turnHeadroom' scripts config docs --exclude='claude-event-array-*.json' --exclude='*.md' > remaining-turn-references.txt || true
+          grep -RInE 'maxTurns|max_turns|MAX_TURNS|--max-turns|turn-cap-exceeds-machine-policy|turn-limit-exhausted|turn_limit_exhausted|turnHeadroom' scripts config docs --exclude='claude-event-array-*.json' --exclude='*.md' > remaining-turn-references.txt || true
           cat remaining-turn-references.txt
-      - name: Validate changed runtime
+      - name: Validate affected runtime
         shell: bash
         run: |
           set -euo pipefail
           node --check scripts/ops/agent-runner-agents.mjs
           node --check scripts/ops/claude-runner.mjs
-          node --test scripts/ops/agent-runner-agents.test.mjs scripts/ops/claude-runner.test.mjs
+          node --check scripts/ops/claude-runner-recovery.mjs
+          node --check scripts/ops/claude-runner-cron.mjs
+          node --test scripts/ops/agent-runner-agents.test.mjs scripts/ops/claude-runner.test.mjs scripts/ops/claude-runner-recovery.test.mjs scripts/ops/claude-runner-cron.test.mjs
           if [[ -s remaining-turn-references.txt ]]; then
             echo 'Runtime policy references remain' >&2
             exit 1
@@ -92,6 +113,6 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add scripts/ops/agent-runner-agents.test.mjs scripts/ops/claude-runner.mjs scripts/ops/claude-runner.test.mjs
+          git add scripts/ops
           git commit -m 'Complete removal of turn-control policy'
           git push origin HEAD:fix/remove-turn-concept-entirely-27
