@@ -58,13 +58,28 @@ test('stable approved preflight-direct candidate is admitted without a command i
   });
 });
 
-test('stable approved proceed-command candidate is admitted', () => {
+test('historical proceed-command selection cannot authorize a new claim', () => {
   const initial = candidateSnapshot(selection({ mode: 'proceed-command', command: command(200) }));
   const current = candidateSnapshot(selection({ mode: 'proceed-command', command: command(200) }));
   assert.deepEqual(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }), {
-    allowed: true,
-    reason: 'candidate-admitted',
+    allowed: false,
+    reason: 'candidate-manager-preflight-required',
   });
+});
+
+test('a proceed comment attached to preflight-direct selection is non-authoritative', () => {
+  const initial = candidateSnapshot(selection({ command: command(200) }));
+  const current = candidateSnapshot(selection({ command: command(200) }));
+  assert.deepEqual(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }), {
+    allowed: false,
+    reason: 'candidate-proceed-command-not-authoritative',
+  });
+});
+
+test('mode change from proceed compatibility selection to preflight-direct fails closed', () => {
+  const initial = candidateSnapshot(selection({ mode: 'proceed-command', command: command(200) }));
+  const current = candidateSnapshot(selection());
+  assert.equal(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }).reason, 'candidate-dispatch-mode-changed');
 });
 
 test('duplicate status labels fail closed before attempt creation', () => {
@@ -88,12 +103,6 @@ test('project-derived selected agent cannot override the sole agent label', () =
   const current = candidateSnapshot(selection({ selectedAgent: 'agent:codex' }));
   assert.equal(current.agentLabel, 'agent:claude');
   assert.equal(evaluateCandidateAdmission({ initial: current, current, approvers: ['gpcola'] }).reason, 'candidate-agent-field-label-conflict');
-});
-
-test('proceed-command revision change fails closed', () => {
-  const initial = candidateSnapshot(selection({ mode: 'proceed-command', command: command(200) }));
-  const current = candidateSnapshot(selection({ mode: 'proceed-command', command: command(201) }));
-  assert.equal(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }).reason, 'candidate-command-revision-changed');
 });
 
 test('preflight revision change fails closed', () => {
