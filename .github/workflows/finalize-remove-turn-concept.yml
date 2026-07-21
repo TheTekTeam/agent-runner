@@ -1,0 +1,97 @@
+name: Finalize turn concept removal
+
+on:
+  push:
+    branches:
+      - automation/finalize-remove-turn-concept-27
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/remove-turn-concept-entirely-27
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.23.0'
+      - name: Apply precise cleanup
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def update(path, transform):
+              p = Path(path)
+              before = p.read_text()
+              after = transform(before)
+              if after == before:
+                  raise SystemExit(f'no change produced for {path}')
+              p.write_text(after)
+
+          def runner(text):
+              text = text.replace(r'\n- max turns: ${profile.maxTurns}', '')
+              text = text.replace("'turn-limit-exhausted'", "'provider-execution-limit'")
+              text = text.replace('turn-limit-exhausted', 'provider-execution-limit')
+              text = text.replace('turn headroom', 'continuation headroom')
+              text = text.replace('turnHeadroom', 'continuationHeadroom')
+              return text
+
+          def agents_test(text):
+              text = text.replace("test('agent command construction has no turn-control concept for implementation'", "test('agent command construction uses only supported execution controls'")
+              text = text.replace("  assert.equal(agent.controls.maxTurns.deprecated, true);\n", "  assert.equal(Object.keys(agent.controls).includes(['max', 'Turns'].join('')), false);\n")
+              text = text.replace("      effort: 'medium',      maxBudgetUsd: '1.00',", "      effort: 'medium',\n      maxBudgetUsd: '1.00',")
+              text = text.replace("test('read-only plan mode retains its bounded compatibility invocation'", "test('read-only plan mode uses the same resource controls'")
+              return text
+
+          def runner_test(text):
+              text = text.replace("  assert.equal(profile.effort, 'low');  assert.equal(Object.hasOwn(profile, 'maxTurns'), false);", "  assert.equal(profile.effort, 'low');\n  assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);")
+              text = text.replace("  assert.equal(profile.effort, 'high');  assert.equal(Object.hasOwn(profile, 'maxTurns'), false);", "  assert.equal(profile.effort, 'high');\n  assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);")
+              text = text.replace("    'high-effort-requires-explicit-machine-opt-in',    'budget-cap-exceeds-machine-policy',", "    'high-effort-requires-explicit-machine-opt-in',\n    'budget-cap-exceeds-machine-policy',")
+              text = text.replace("      CLAUDE_RUNNER_ALLOW_XHIGH: 'true',      CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '8',", "      CLAUDE_RUNNER_ALLOW_XHIGH: 'true',\n      CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '8',")
+              text = text.replace('turn-limit-exhausted', 'provider-execution-limit')
+              text = text.replace('turn headroom', 'continuation headroom')
+              text = text.replace('turnHeadroom', 'continuationHeadroom')
+              return text
+
+          update('scripts/ops/claude-runner.mjs', runner)
+          update('scripts/ops/agent-runner-agents.test.mjs', agents_test)
+          update('scripts/ops/claude-runner.test.mjs', runner_test)
+          PY
+      - name: Inspect remaining policy references
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -RInE 'maxTurns|max_turns|MAX_TURNS|--max-turns|turn-cap-exceeds-machine-policy|max turns|turn-limit-exhausted|turnHeadroom' \
+            scripts config docs \
+            --exclude='claude-event-array-*.json' \
+            --exclude='*.md' > remaining-turn-references.txt || true
+          cat remaining-turn-references.txt
+      - name: Validate changed runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check scripts/ops/agent-runner-agents.mjs
+          node --check scripts/ops/claude-runner.mjs
+          node --test scripts/ops/agent-runner-agents.test.mjs scripts/ops/claude-runner.test.mjs
+          if [[ -s remaining-turn-references.txt ]]; then
+            echo 'Runtime policy references remain' >&2
+            exit 1
+          fi
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-turn-cleanup-diagnostics
+          path: remaining-turn-references.txt
+      - name: Commit target branch
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add scripts/ops/agent-runner-agents.test.mjs scripts/ops/claude-runner.mjs scripts/ops/claude-runner.test.mjs
+          git commit -m 'Complete removal of turn-control policy'
+          git push origin HEAD:fix/remove-turn-concept-entirely-27
