@@ -17,6 +17,8 @@ When `/home/gp/projects/agent-runner` contains the imported standalone implement
 
 The historical `scripts/ops/claude-runner*.mjs` paths remain compatibility entrypoints during the proving window. They are not the long-term source of truth.
 
+Most of `scripts/ops/claude-runner*.mjs` still ships as a byte-locked verbatim import from ModelSpend (`MIGRATION-MANIFEST.json`, enforced by `scripts/verify-imported-tree.mjs`). A file only stops being locked when its manifest entry is explicitly marked `status: "transferred"` with a provenance/ownership record — see "Manifest provenance and ownership transfer" in `docs/MIGRATION.md`. As of PR #19, `claude-runner.mjs`, `claude-runner.test.mjs`, `claude-runner-cron.mjs`, `claude-runner-cron.test.mjs`, and `claude-runner-review-followup.mjs` are transferred; the rest of the imported closure remains locked.
+
 ## Repository and runtime paths
 
 ```text

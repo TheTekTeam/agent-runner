@@ -59,6 +59,38 @@ The importer:
 
 Commit the generated source and manifest to the extraction branch. The manifest is the provenance record for the documented initial import.
 
+### Manifest provenance and ownership transfer
+
+Every entry in `MIGRATION-MANIFEST.json.files[]` carries a `status`:
+
+- **`locked`** (the default when `status` is absent, matching the manifest's original single-status shape): the file must stay byte-identical to the ModelSpend commit it was extracted from. `scripts/verify-imported-tree.mjs` enforces this with an exact sha256 match and fails the build on any drift.
+- **`transferred`**: canonical ownership of this file has explicitly moved to `TheTekTeam/agent-runner` and it is free to evolve independently — its content is *not* hash-checked. A transferred entry must still carry a well-formed provenance/ownership record instead of a top-level `sha256`:
+
+  ```json
+  {
+    "path": "scripts/ops/claude-runner.mjs",
+    "mode": "100644",
+    "status": "transferred",
+    "provenance": {
+      "sourceRepository": "TheTekTeam/modelspend",
+      "sourceCommit": "c6e18c00f17b92f5ac27ba2dbe37c6ba768c4dc0",
+      "importedSha256": "2fdbab1fed718dede3ae221cfb85c1cb830bf28e83dd7eb5c1621f7e34e6a396"
+    },
+    "ownership": {
+      "canonicalRepository": "TheTekTeam/agent-runner",
+      "transferredAt": "2026-07-21T12:00:00.000Z",
+      "reason": "Repository-context boundary fix for #686 -- the bug lived inside this file and could not be corrected while it stayed byte-locked to the import.",
+      "reference": "https://github.com/TheTekTeam/agent-runner/pull/19"
+    }
+  }
+  ```
+
+  `provenance` preserves where the file originally came from (repository, commit, and its hash at import time); `ownership` records why/when/by which change it stopped being locked. Both are required and shape-checked by `scripts/ops/agent-runner-manifest-provenance.mjs` — a missing field, an unparseable `transferredAt`, or an unrecognized `status` value fails closed, the same as a real hash mismatch.
+
+Only mark a file `transferred` when a change genuinely cannot be made while it stays byte-locked to the ModelSpend import (as opposed to routine evolution that happens to touch a locked file — prefer a wrapper/adapter file for that, as `agent-runner-atomic-cron.mjs` and `agent-runner-atomic-candidate-store.mjs` already do around `claude-runner-cron.mjs`). The point at which the standalone repository becomes canonical for a given file is exactly the moment its manifest entry is declared `transferred`; per-project migration-completion status (Dell reboot survival, timer cutover, and so on — tracked on `TheTekTeam/modelspend#686`) governs when *operational* traffic moves, not when a given source file may diverge.
+
+`node scripts/import-modelspend-runner.mjs --verify-only` (checked against a live ModelSpend source checkout) skips both the destination- and source-hash comparison for `transferred` entries, but still requires the destination file to exist. Re-running `--write`/`--replace` against a fresh ModelSpend export does **not** currently re-derive `transferred` status automatically — restore it by hand (or extend the importer) before committing a fresh import over files that have already diverged.
+
 ## 2. Prepare machine-local configuration
 
 ```bash
