@@ -19,18 +19,50 @@ import { main as schedulerMain, parseArgs as schedulerParseArgs } from './claude
 
 export * from './claude-runner-cron.mjs';
 
+export function createStableOutputCapture({ logger, originalConsoleLog, originalConsoleError, onValues }) {
+  const baseLogger = logger || {
+    log: originalConsoleLog.bind(console),
+    error: originalConsoleError.bind(console),
+  };
+  const record = (values) => onValues?.(values);
+  return {
+    baseLogger,
+    directLog: (...values) => {
+      record(values);
+      originalConsoleLog(...values);
+    },
+    directError: (...values) => {
+      record(values);
+      originalConsoleError(...values);
+    },
+    loggerLog: (...values) => {
+      record(values);
+      baseLogger.log(...values);
+    },
+    loggerError: (...values) => {
+      record(values);
+      baseLogger.error(...values);
+    },
+  };
+}
+
 export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
   const pauseState = { result: null };
   const originalConsoleLog = console.log;
   const originalConsoleError = console.error;
-  const baseLogger = dependencies.logger || {
-    log: originalConsoleLog.bind(console),
-    error: originalConsoleError.bind(console),
-  };
+  let finalPayload = null;
+  const capture = createStableOutputCapture({
+    logger: dependencies.logger,
+    originalConsoleLog,
+    originalConsoleError,
+    onValues: (values) => {
+      const parsed = parseStructuredOutput(values);
+      if (parsed) finalPayload = parsed;
+    },
+  });
+  const baseLogger = capture.baseLogger;
   const openStore = dependencies.openStore || openRunnerStateStore;
   const revalidate = dependencies.revalidateCandidate || runAtomicCandidateRevalidation;
-  const runScheduler = dependencies.schedulerMain || schedulerMain;
-  let finalPayload = null;
   let livenessDecisions = [];
 
   const parsedArgs = (dependencies.parseArgs || schedulerParseArgs)(argv, env);
@@ -61,26 +93,14 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     },
   );
 
-  const recordStructuredOutput = (values) => {
-    const parsed = parseStructuredOutput(values);
-    if (parsed) finalPayload = parsed;
-  };
-  const captureDirectConsole = (method, originalMethod) => (...values) => {
-    recordStructuredOutput(values);
-    originalMethod(...values);
-  };
-  const captureLogger = (method) => (...values) => {
-    recordStructuredOutput(values);
-    baseLogger[method](...values);
-  };
-
-  console.log = captureDirectConsole('log', originalConsoleLog);
-  console.error = captureDirectConsole('error', originalConsoleError);
+  console.log = capture.directLog;
+  console.error = capture.directError;
 
   const logger = {
-    log: captureLogger('log'),
+    log: capture.loggerLog,
     error: (...values) => {
-      recordStructuredOutput(values);
+      const parsed = parseStructuredOutput(values);
+      if (parsed) finalPayload = parsed;
       // The imported scheduler cannot distinguish a broken atomic
       // revalidation subprocess from a genuine state-store failure, so its
       // own `runner_state_unavailable` line here is never the operator's
@@ -92,7 +112,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
 
   let exitCode;
   try {
-    exitCode = await runScheduler(argv, env, {
+    exitCode = await schedulerMain(argv, env, {
       ...dependencies,
       acquireLock: dependencies.acquireLock || acquireRecoverableCronLock,
       openStore: atomicOpenStore,
