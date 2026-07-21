@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -13,6 +13,7 @@ import {
 function withTempLock(run) {
   const root = mkdtempSync(join(tmpdir(), 'agent-runner-lock-'));
   const lockPath = join(root, '.var/claude-runner/cron.lock');
+  mkdirSync(dirname(lockPath), { recursive: true });
   try { run(lockPath); } finally { rmSync(root, { recursive: true, force: true }); }
 }
 
