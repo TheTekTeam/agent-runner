@@ -7,6 +7,7 @@ import {
   createAtomicAdmissionStore,
   runAtomicCandidateRevalidation,
 } from './agent-runner-atomic-candidate-store.mjs';
+import { parseStructuredOutput, serviceExitCode } from './agent-runner-service-semantics.mjs';
 import { openRunnerStateStore } from './claude-runner-state.mjs';
 import { main as schedulerMain } from './claude-runner-cron.mjs';
 
@@ -17,6 +18,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
   const baseLogger = dependencies.logger || console;
   const openStore = dependencies.openStore || openRunnerStateStore;
   const revalidate = dependencies.revalidateCandidate || runAtomicCandidateRevalidation;
+  let finalPayload = null;
 
   const atomicOpenStore = (dbPath) => createAtomicAdmissionStore(openStore(dbPath), {
     argv,
@@ -25,28 +27,48 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     revalidate,
   });
 
+  const capture = (method) => (...values) => {
+    const parsed = parseStructuredOutput(values);
+    if (parsed) finalPayload = parsed;
+    baseLogger[method](...values);
+  };
+  const originalConsoleLog = console.log;
+  const originalConsoleError = console.error;
+  console.log = capture('log');
+  console.error = capture('error');
+
   const logger = {
-    log: (...values) => baseLogger.log(...values),
+    log: capture('log'),
     error: (...values) => {
+      const parsed = parseStructuredOutput(values);
+      if (parsed) finalPayload = parsed;
       if (!pauseState.result) baseLogger.error(...values);
     },
   };
 
-  const exitCode = await schedulerMain(argv, env, {
-    ...dependencies,
-    openStore: atomicOpenStore,
-    logger,
-  });
+  let exitCode;
+  try {
+    exitCode = await schedulerMain(argv, env, {
+      ...dependencies,
+      openStore: atomicOpenStore,
+      logger,
+    });
+  } finally {
+    console.log = originalConsoleLog;
+    console.error = originalConsoleError;
+  }
 
-  if (!pauseState.result) return exitCode;
+  if (pauseState.result) {
+    const payload = {
+      ...candidatePausePayload(pauseState.result.admission, pauseState.result.current),
+      admissionBoundary: 'recordRecoveryAttempt',
+      durableAudit: true,
+    };
+    baseLogger.log(JSON.stringify(payload, null, 2));
+    return 0;
+  }
 
-  const payload = {
-    ...candidatePausePayload(pauseState.result.admission, pauseState.result.current),
-    admissionBoundary: 'recordRecoveryAttempt',
-    durableAudit: true,
-  };
-  baseLogger.log(JSON.stringify(payload, null, 2));
-  return 0;
+  return serviceExitCode(exitCode, finalPayload);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
