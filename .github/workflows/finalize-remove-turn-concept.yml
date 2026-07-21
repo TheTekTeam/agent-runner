@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - automation/finalize-remove-turn-concept-27
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
@@ -66,10 +69,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          grep -RInE 'maxTurns|max_turns|MAX_TURNS|--max-turns|turn-cap-exceeds-machine-policy|max turns|turn-limit-exhausted|turnHeadroom' \
-            scripts config docs \
-            --exclude='claude-event-array-*.json' \
-            --exclude='*.md' > remaining-turn-references.txt || true
+          grep -RInE 'maxTurns|max_turns|MAX_TURNS|--max-turns|turn-cap-exceeds-machine-policy|max turns|turn-limit-exhausted|turnHeadroom' scripts config docs --exclude='claude-event-array-*.json' --exclude='*.md' > remaining-turn-references.txt || true
           cat remaining-turn-references.txt
       - name: Validate changed runtime
         shell: bash
