@@ -26,10 +26,7 @@ export const AGENT_ADAPTERS = Object.freeze({
     controls: Object.freeze({
       model: Object.freeze({ supported: true, flag: '--model' }),
       effort: Object.freeze({ supported: true, flag: '--effort' }),
-      // Retained only as a legacy configuration capability. Agent Runner no
-      // longer forwards --max-turns, so old profiles remain readable without
-      // imposing an internal interaction-count limit on issue completion.
-      maxTurns: Object.freeze({ supported: true, deprecated: true, ignored: true }),
+      maxTurns: Object.freeze({ supported: true, flag: '--max-turns', deprecated: true }),
       maxBudgetUsd: Object.freeze({ supported: true, flag: '--max-budget-usd' }),
       permissionMode: Object.freeze({ supported: true, flag: '--permission-mode' }),
       resumeSession: Object.freeze({ supported: true, flag: '--resume' }),
@@ -41,9 +38,6 @@ export const AGENT_ADAPTERS = Object.freeze({
       disableSlashCommands: Object.freeze({ supported: true, flag: '--disable-slash-commands' }),
       settings: Object.freeze({ supported: true, flag: '--settings' }),
       settingSources: Object.freeze({ supported: true, flag: '--setting-sources' }),
-      // JSON is the safe unattended default because the result envelope
-      // includes turns, token usage, model usage and the client-side cost
-      // estimate. Text output discarded that evidence during #658/#599.
       outputFormat: Object.freeze({ supported: true, flag: '--output-format', default: 'json' }),
     }),
   }),
@@ -135,8 +129,12 @@ export function buildAgentCommandArgs({ agent = resolveAgentById(), prompt, prof
   args.push('-p');
   args.push(agent.controls.model.flag, profile.model);
   args.push(agent.controls.effort.flag, profile.effort);
-  // Intentionally do not forward legacy profile.maxTurns. Completion is
-  // bounded by real quota, cost and safety policy rather than tool-call count.
+  // Implementation runs must be able to continue through discovery, edits,
+  // validation and commit. Retain the legacy cap only for read-only plan mode
+  // until the remaining profile/config cleanup in #27 is completed.
+  if (profile.permissionMode === 'plan' && profile.maxTurns) {
+    args.push(agent.controls.maxTurns.flag, String(profile.maxTurns));
+  }
   args.push(agent.controls.maxBudgetUsd.flag, String(profile.maxBudgetUsd));
   args.push(agent.controls.permissionMode.flag, profile.permissionMode);
   if (profile.tools) args.push(agent.controls.tools.flag, profile.tools);
