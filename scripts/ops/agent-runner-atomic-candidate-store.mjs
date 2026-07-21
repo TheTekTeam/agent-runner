@@ -27,9 +27,26 @@ export function snapshotFromSelectionRecord(record = {}) {
   };
 }
 
+const MISSING_MODULE_PATTERN = /ERR_MODULE_NOT_FOUND|Cannot find module|ERR_MODULE_NOT_A_DIRECTORY/;
+
+// The atomic revalidation subprocess must run against the plain scheduler
+// module, never the atomic wrapper (`agent-runner-atomic-cron.mjs`) — that
+// wrapper itself spawns this revalidation, so pointing at it would recurse.
+// This mirrors the fallback already used by `selectorFor()` in
+// `agent-runner-candidate-admission.mjs`.
+export class CandidateRevalidationUnavailableError extends Error {
+  constructor(message, { cause = null, missingModule = false } = {}) {
+    super(message);
+    this.name = 'CandidateRevalidationUnavailableError';
+    this.code = missingModule ? 'CANDIDATE_REVALIDATION_MODULE_NOT_FOUND' : 'CANDIDATE_REVALIDATION_UNAVAILABLE';
+    this.missingModule = missingModule;
+    if (cause) this.cause = cause;
+  }
+}
+
 export function runAtomicCandidateRevalidation({ argv = [], env = process.env, expected, spawn = spawnSync } = {}) {
   const script = new URL('./agent-runner-candidate-admission.mjs', import.meta.url);
-  const baseModule = new URL('./claude-runner-cron-base.mjs', import.meta.url).href;
+  const baseModule = new URL('./claude-runner-cron.mjs', import.meta.url).href;
   const result = spawn(process.execPath, [script.pathname], {
     encoding: 'utf8',
     env: {
@@ -39,13 +56,38 @@ export function runAtomicCandidateRevalidation({ argv = [], env = process.env, e
       AGENT_RUNNER_CANDIDATE_CRON_MODULE: baseModule,
     },
   });
-  if (result.error) throw result.error;
+  if (result.error) {
+    throw new CandidateRevalidationUnavailableError(
+      `atomic candidate revalidation process failed to start: ${result.error.message}`,
+      { cause: result.error, missingModule: result.error.code === 'ERR_MODULE_NOT_FOUND' },
+    );
+  }
   let parsed = null;
   try { parsed = JSON.parse(String(result.stdout || '').trim()); } catch { parsed = null; }
   if (![0, 3].includes(result.status) || !parsed?.admission) {
-    throw new Error(`atomic candidate revalidation failed with exit ${result.status}: ${String(result.stderr || '').trim()}`);
+    const stderr = String(result.stderr || '').trim();
+    throw new CandidateRevalidationUnavailableError(
+      `atomic candidate revalidation failed with exit ${result.status}: ${stderr}`,
+      { missingModule: MISSING_MODULE_PATTERN.test(stderr) },
+    );
   }
   return parsed;
+}
+
+// Single source of truth for how a broken atomic revalidation subprocess is
+// reported, so the durable `queue_events`/`runner_health_conditions` rows
+// written during the imported scheduler's own (mislabelled)
+// `emitSystemicStatePause` and the corrected stdout evidence in
+// `agent-runner-atomic-cron.mjs` always agree.
+export function revalidationFailureEvidence(failure) {
+  const missingModule = failure instanceof CandidateRevalidationUnavailableError && failure.missingModule === true;
+  return {
+    missingModule,
+    reason: missingModule ? 'runner_code_unavailable' : 'candidate_revalidation_unavailable',
+    safeNextAction: missingModule
+      ? 'Restore the missing standalone runner module before dispatching or mutating any issue. This is a missing-code failure, not a state-store failure.'
+      : 'Repair the atomic candidate-revalidation subprocess before dispatching or mutating any issue. This is not a state-store failure.',
+  };
 }
 
 function positiveInteger(value) {
@@ -96,7 +138,21 @@ export function createAtomicAdmissionStore(store, {
             pauseState.result = mismatch;
             throw new CandidateAdmissionPausedError(mismatch);
           }
-          const result = revalidate({ argv, env, expected: selectedSnapshot });
+          let result;
+          try {
+            result = revalidate({ argv, env, expected: selectedSnapshot });
+          } catch (error) {
+            // The imported scheduler's own state recorder cannot distinguish
+            // this from a genuine store failure (it catches every
+            // `store[method]()` throw uniformly) and will report
+            // `runner_state_unavailable` regardless of cause. Stash the real
+            // failure here — the one boundary that knows it's actually the
+            // atomic revalidation subprocess, not the state store — so the
+            // outer `agent-runner-atomic-cron.mjs` wrapper can correct the
+            // evidence after the (still fail-closed) throw propagates.
+            pauseState.revalidationFailure = error;
+            throw error;
+          }
           if (result.admission.allowed !== true) {
             pauseState.result = result;
             throw new CandidateAdmissionPausedError(result);
@@ -116,12 +172,31 @@ export function createAtomicAdmissionStore(store, {
               payload,
             });
           }
+          // The imported scheduler's `emitSystemicStatePause` already wrote
+          // `reason: 'runner_state_unavailable'` into this record before
+          // control returns to this trap — correct it here so the durable
+          // audit trail (not just stdout) never misreports a broken
+          // revalidation subprocess as a state-store failure. This stays a
+          // systemic-pause event (not `candidate-admission-paused`): a
+          // missing module is not a candidate denial.
+          if (pauseState.revalidationFailure && record?.eventType === 'systemic-pause') {
+            const evidence = revalidationFailureEvidence(pauseState.revalidationFailure);
+            return target.recordQueueEvent({
+              ...record,
+              reason: evidence.reason,
+              payload: { ...(record.payload || {}), reason: evidence.reason, safeNextAction: evidence.safeNextAction },
+            });
+          }
           return target.recordQueueEvent(record);
         };
       }
       if (property === 'openHealthCondition') {
         return (record) => {
           if (pauseState.result && record?.conditionType === 'systemic_pause') return undefined;
+          if (pauseState.revalidationFailure && record?.conditionType === 'systemic_pause') {
+            const evidence = revalidationFailureEvidence(pauseState.revalidationFailure);
+            return target.openHealthCondition({ ...record, reason: evidence.reason, safeNextAction: evidence.safeNextAction });
+          }
           return target.openHealthCondition(record);
         };
       }

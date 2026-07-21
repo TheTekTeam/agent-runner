@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { candidatePausePayload } from './agent-runner-candidate-admission.mjs';
 import {
   createAtomicAdmissionStore,
+  revalidationFailureEvidence,
   runAtomicCandidateRevalidation,
 } from './agent-runner-atomic-candidate-store.mjs';
 import {
@@ -68,7 +69,12 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     error: (...values) => {
       const parsed = parseStructuredOutput(values);
       if (parsed) finalPayload = parsed;
-      if (!pauseState.result) baseLogger.error(...values);
+      // The imported scheduler cannot distinguish a broken atomic
+      // revalidation subprocess from a genuine state-store failure, so its
+      // own `runner_state_unavailable` line here is never the operator's
+      // authoritative record when `pauseState.revalidationFailure` is set —
+      // the correction below replaces it.
+      if (!pauseState.result && !pauseState.revalidationFailure) baseLogger.error(...values);
     },
   };
 
@@ -92,6 +98,26 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     };
     baseLogger.log(JSON.stringify(payload, null, 2));
     return 0;
+  }
+
+  // A broken atomic revalidation subprocess (missing module, crashed spawn,
+  // unparsable output) is not a candidate denial and must stay fail-closed —
+  // unlike the branch above, this never returns 0. It also is not a state
+  // store failure: the imported scheduler's own evidence (`finalPayload`)
+  // mislabels it `runner_state_unavailable` because its state recorder
+  // catches every store-method throw uniformly. Correct the reason and
+  // safe-next-action here, where the real cause is known, while preserving
+  // `systemicPause`, `stage`, and the fail-closed exit code untouched.
+  if (pauseState.revalidationFailure) {
+    const evidence = revalidationFailureEvidence(pauseState.revalidationFailure);
+    const corrected = {
+      ...(finalPayload || { systemicPause: true }),
+      reason: evidence.reason,
+      safeNextAction: evidence.safeNextAction,
+      candidateRevalidationFailure: String(pauseState.revalidationFailure?.message || pauseState.revalidationFailure),
+    };
+    baseLogger.error(JSON.stringify(corrected, null, 2));
+    return serviceExitCode(exitCode || 1, corrected);
   }
 
   return serviceExitCode(exitCode, finalPayload);
