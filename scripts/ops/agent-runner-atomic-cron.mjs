@@ -21,9 +21,15 @@ export * from './claude-runner-cron.mjs';
 
 export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
   const pauseState = { result: null };
-  const baseLogger = dependencies.logger || console;
+  const originalConsoleLog = console.log;
+  const originalConsoleError = console.error;
+  const baseLogger = dependencies.logger || {
+    log: originalConsoleLog.bind(console),
+    error: originalConsoleError.bind(console),
+  };
   const openStore = dependencies.openStore || openRunnerStateStore;
   const revalidate = dependencies.revalidateCandidate || runAtomicCandidateRevalidation;
+  const runScheduler = dependencies.schedulerMain || schedulerMain;
   let finalPayload = null;
   let livenessDecisions = [];
 
@@ -55,21 +61,26 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     },
   );
 
-  const capture = (method) => (...values) => {
+  const recordStructuredOutput = (values) => {
     const parsed = parseStructuredOutput(values);
     if (parsed) finalPayload = parsed;
+  };
+  const captureDirectConsole = (method, originalMethod) => (...values) => {
+    recordStructuredOutput(values);
+    originalMethod(...values);
+  };
+  const captureLogger = (method) => (...values) => {
+    recordStructuredOutput(values);
     baseLogger[method](...values);
   };
-  const originalConsoleLog = console.log;
-  const originalConsoleError = console.error;
-  console.log = capture('log');
-  console.error = capture('error');
+
+  console.log = captureDirectConsole('log', originalConsoleLog);
+  console.error = captureDirectConsole('error', originalConsoleError);
 
   const logger = {
-    log: capture('log'),
+    log: captureLogger('log'),
     error: (...values) => {
-      const parsed = parseStructuredOutput(values);
-      if (parsed) finalPayload = parsed;
+      recordStructuredOutput(values);
       // The imported scheduler cannot distinguish a broken atomic
       // revalidation subprocess from a genuine state-store failure, so its
       // own `runner_state_unavailable` line here is never the operator's
@@ -81,7 +92,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
 
   let exitCode;
   try {
-    exitCode = await schedulerMain(argv, env, {
+    exitCode = await runScheduler(argv, env, {
       ...dependencies,
       acquireLock: dependencies.acquireLock || acquireRecoverableCronLock,
       openStore: atomicOpenStore,
