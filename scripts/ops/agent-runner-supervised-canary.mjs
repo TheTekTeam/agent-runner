@@ -47,7 +47,7 @@ function parseLastJsonLine(output) {
 function sanitizeDiagnosticText(value) {
   return String(value || '')
     .replace(/\u001b\[[0-9;]*m/g, '')
-    .replace(/\b(?:GH_TOKEN|GITHUB_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY)\s*=\s*[^\s]+/gi, '$&'.replace(/=.*/, '=<redacted>'))
+    .replace(/\b(GH_TOKEN|GITHUB_TOKEN|ANTHROPIC_API_KEY|OPENAI_API_KEY)\s*=\s*[^\s]+/gi, '$1=<redacted>')
     .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, 'Bearer <redacted>')
     .replace(/\b(?:sk|gh[opsu])-[-A-Za-z0-9_]{12,}\b/g, '<redacted-token>');
 }
