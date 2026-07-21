@@ -4,7 +4,9 @@ import test from 'node:test';
 
 import {
   CandidateAdmissionPausedError,
+  CandidateRevalidationUnavailableError,
   createAtomicAdmissionStore,
+  runAtomicCandidateRevalidation,
   snapshotFromSelectionRecord,
 } from './agent-runner-atomic-candidate-store.mjs';
 
@@ -92,6 +94,25 @@ test('stale candidate refuses attempt persistence before claim or child launch',
   assert.equal(pauseState.result.admission.reason, 'candidate-preflight-revision-changed');
 });
 
+test('a broken revalidation subprocess stashes the real failure on pauseState and still fails closed (does not become a handled candidate denial)', () => {
+  const raw = fakeStore();
+  const pauseState = { result: null };
+  const failure = new CandidateRevalidationUnavailableError(
+    "atomic candidate revalidation failed with exit 1: Error [ERR_MODULE_NOT_FOUND]: Cannot find module 'claude-runner-cron-base.mjs'",
+    { missingModule: true },
+  );
+  const store = createAtomicAdmissionStore(raw, {
+    pauseState,
+    revalidate: () => { throw failure; },
+  });
+  store.recordIssueSelection(selectionRecord);
+  assert.throws(() => store.recordRecoveryAttempt(initialAttempt), CandidateRevalidationUnavailableError);
+  assert.equal(raw.calls.filter(([kind]) => kind === 'attempt').length, 0, 'the attempt must never be persisted');
+  assert.equal(pauseState.result, null, 'this is not a candidate-admission denial');
+  assert.equal(pauseState.revalidationFailure, failure);
+  assert.equal(pauseState.revalidationFailure.missingModule, true);
+});
+
 test('candidate pause is audited without opening systemic health', () => {
   const raw = fakeStore();
   const pauseState = {
@@ -116,4 +137,71 @@ test('standalone atomic scheduler adapter wraps the immutable imported scheduler
   assert.match(source, /admissionBoundary: 'recordRecoveryAttempt'/);
   assert.match(source, /schedulerMain\(argv, env/);
   assert.match(source, /from '\.\/claude-runner-cron\.mjs'/);
+});
+
+test('atomic revalidation source no longer references the removed claude-runner-cron-base.mjs module', () => {
+  const source = readFileSync(new URL('./agent-runner-atomic-candidate-store.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(source, /claude-runner-cron-base/);
+  assert.match(source, /new URL\('\.\/claude-runner-cron\.mjs', import\.meta\.url\)/);
+});
+
+test('the module the atomic revalidation subprocess is pointed at actually resolves and exports the scheduler surface', async () => {
+  const baseModule = new URL('./claude-runner-cron.mjs', import.meta.url);
+  const cron = await import(baseModule.href);
+  assert.equal(typeof cron.parseArgs, 'function');
+  assert.equal(typeof cron.selectIssue, 'function');
+});
+
+test('runAtomicCandidateRevalidation classifies a missing-module subprocess crash without misreporting it as a state-store failure', () => {
+  assert.throws(
+    () => runAtomicCandidateRevalidation({
+      expected: { issueNumber: 686 },
+      spawn: () => ({
+        status: 1,
+        signal: null,
+        error: null,
+        stdout: '',
+        stderr: "Error [ERR_MODULE_NOT_FOUND]: Cannot find module "
+          + "'/home/gp/projects/agent-runner/scripts/ops/claude-runner-cron-base.mjs' imported from "
+          + "'/home/gp/projects/agent-runner/scripts/ops/agent-runner-candidate-admission.mjs'",
+      }),
+    }),
+    (error) => {
+      assert.ok(error instanceof CandidateRevalidationUnavailableError);
+      assert.equal(error.code, 'CANDIDATE_REVALIDATION_MODULE_NOT_FOUND');
+      assert.equal(error.missingModule, true);
+      return true;
+    },
+  );
+});
+
+test('runAtomicCandidateRevalidation classifies a non-module subprocess crash as candidate-revalidation-unavailable, not missing-module', () => {
+  assert.throws(
+    () => runAtomicCandidateRevalidation({
+      expected: { issueNumber: 686 },
+      spawn: () => ({ status: 1, signal: null, error: null, stdout: '', stderr: 'TypeError: boom' }),
+    }),
+    (error) => {
+      assert.ok(error instanceof CandidateRevalidationUnavailableError);
+      assert.equal(error.code, 'CANDIDATE_REVALIDATION_UNAVAILABLE');
+      assert.equal(error.missingModule, false);
+      return true;
+    },
+  );
+});
+
+test('runAtomicCandidateRevalidation classifies a spawn-start failure by the underlying module error code', () => {
+  const spawnError = new Error("Cannot find module 'agent-runner-candidate-admission.mjs'");
+  spawnError.code = 'ERR_MODULE_NOT_FOUND';
+  assert.throws(
+    () => runAtomicCandidateRevalidation({
+      expected: { issueNumber: 686 },
+      spawn: () => ({ status: null, signal: null, error: spawnError, stdout: '', stderr: '' }),
+    }),
+    (error) => {
+      assert.ok(error instanceof CandidateRevalidationUnavailableError);
+      assert.equal(error.missingModule, true);
+      return true;
+    },
+  );
 });
