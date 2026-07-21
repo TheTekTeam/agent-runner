@@ -18,15 +18,6 @@
         "reason": "Issue #27 adds canonical standalone-runner regression coverage proving implementation maxTurns values are ignored and --max-turns is not forwarded.",
         "reference": "https://github.com/TheTekTeam/agent-runner/pull/28"
       }
-    },
-    {
-      "path": "scripts/ops/agent-runner-manifest-provenance.test.mjs",
-      "ownership": {
-        "canonicalRepository": "TheTekTeam/agent-runner",
-        "transferredAt": "2026-07-21T19:20:00.000Z",
-        "reason": "Issue #27 extends canonical ownership validation so transferred standalone files remain auditable without weakening historical import hashes.",
-        "reference": "https://github.com/TheTekTeam/agent-runner/pull/28"
-      }
     }
   ]
 }
