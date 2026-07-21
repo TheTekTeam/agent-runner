@@ -11,8 +11,8 @@ CONFIG_FILE="${AGENT_RUNNER_CONFIG:-$HOME/.config/agent-runner/modelspend.json}"
 ENV_FILE="${AGENT_RUNNER_ENV_FILE:-$HOME/.config/agent-runner/runner.env}"
 
 [ -f "$CONFIG_FILE" ] || { echo "[agent-runner] ERROR: config missing: $CONFIG_FILE" >&2; exit 1; }
-[ -f "$ROOT/scripts/ops/claude-runner-cron.mjs" ] || {
-  echo "[agent-runner] ERROR: canonical runner source has not been imported" >&2
+[ -f "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" ] || {
+  echo "[agent-runner] ERROR: atomic runner entrypoint is missing" >&2
   exit 1
 }
 
@@ -101,10 +101,10 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   CANDIDATE_STATUS=$?
   set -e
   case "$CANDIDATE_STATUS" in
-    0) exec node "$ROOT/scripts/ops/claude-runner-cron.mjs" "${ARGS[@]}" ;;
+    0) exec node "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}" ;;
     3) echo "[agent-runner] candidate authority changed or is not approved; no attempt created or issue mutated"; exit 0 ;;
     *) echo "[agent-runner] ERROR: candidate admission failed with exit $CANDIDATE_STATUS" >&2; exit "$CANDIDATE_STATUS" ;;
   esac
 fi
 
-exec node "$ROOT/scripts/ops/claude-runner-cron.mjs" "${ARGS[@]}"
+exec node "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}"
