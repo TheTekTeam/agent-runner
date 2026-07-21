@@ -7,6 +7,7 @@ import {
   CandidateAdmissionPausedError,
 } from './agent-runner-atomic-candidate-store.mjs';
 import {
+  boundedDiagnostic,
   parseSupervisedCanaryArgs,
   runSupervisedCanary,
 } from './agent-runner-supervised-canary.mjs';
@@ -63,8 +64,38 @@ test('launches one standalone run with a pinned canary issue', () => {
   assert.equal(result.exitCode, 0);
   assert.equal(result.payload.launched, true);
   assert.equal(result.payload.timerRemainedDisabled, true);
+  assert.equal(result.payload.runnerDiagnostics, undefined);
   assert.equal(calls[2].options.env.AGENT_RUNNER_CANARY_ISSUE, '5');
   assert.equal(calls[2].options.env.CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT, 'true');
+});
+
+test('nonzero launcher exit exposes bounded sanitized diagnostics', () => {
+  const { spawn } = spawnSequence([
+    { status: 3, stdout: '', stderr: '' },
+    { status: 0, stdout: '{"selectedIssue":5}\n', stderr: '' },
+    {
+      status: 1,
+      stdout: `before\nGH_TOKEN=ghp_abcdefghijklmnop\n${'x'.repeat(5000)}`,
+      stderr: 'Bearer abc.def.ghi\nstartup failed',
+    },
+  ]);
+  const result = runSupervisedCanary({ issueNumber: 5, execute: true, timerUnit: 'timer.service' }, {}, { spawn });
+  assert.equal(result.exitCode, 1);
+  assert.equal(result.payload.runnerDiagnostics.restricted, true);
+  assert.equal(result.payload.runnerDiagnostics.maxCharsPerStream, 4096);
+  assert.equal(result.payload.runnerDiagnostics.stdout.truncated, true);
+  assert.equal(result.payload.runnerDiagnostics.stdout.text.length, 4096);
+  assert.doesNotMatch(result.payload.runnerDiagnostics.stdout.text, /ghp_/);
+  assert.equal(result.payload.runnerDiagnostics.stderr.text, 'Bearer <redacted>\nstartup failed');
+  assert.match(result.payload.safeNextAction, /runnerDiagnostics/);
+});
+
+test('boundedDiagnostic reports deterministic truncation metadata', () => {
+  assert.deepEqual(boundedDiagnostic('abcdef', 4), {
+    text: 'cdef',
+    truncated: true,
+    originalChars: 6,
+  });
 });
 
 test('atomic claim boundary rejects a different selected issue before attempt persistence', () => {
