@@ -26,7 +26,10 @@ export const AGENT_ADAPTERS = Object.freeze({
     controls: Object.freeze({
       model: Object.freeze({ supported: true, flag: '--model' }),
       effort: Object.freeze({ supported: true, flag: '--effort' }),
-      maxTurns: Object.freeze({ supported: true, flag: '--max-turns' }),
+      // Retained only as a legacy configuration capability. Agent Runner no
+      // longer forwards --max-turns, so old profiles remain readable without
+      // imposing an internal interaction-count limit on issue completion.
+      maxTurns: Object.freeze({ supported: true, deprecated: true, ignored: true }),
       maxBudgetUsd: Object.freeze({ supported: true, flag: '--max-budget-usd' }),
       permissionMode: Object.freeze({ supported: true, flag: '--permission-mode' }),
       resumeSession: Object.freeze({ supported: true, flag: '--resume' }),
@@ -132,7 +135,8 @@ export function buildAgentCommandArgs({ agent = resolveAgentById(), prompt, prof
   args.push('-p');
   args.push(agent.controls.model.flag, profile.model);
   args.push(agent.controls.effort.flag, profile.effort);
-  args.push(agent.controls.maxTurns.flag, String(profile.maxTurns));
+  // Intentionally do not forward legacy profile.maxTurns. Completion is
+  // bounded by real quota, cost and safety policy rather than tool-call count.
   args.push(agent.controls.maxBudgetUsd.flag, String(profile.maxBudgetUsd));
   args.push(agent.controls.permissionMode.flag, profile.permissionMode);
   if (profile.tools) args.push(agent.controls.tools.flag, profile.tools);
