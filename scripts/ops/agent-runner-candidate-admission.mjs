@@ -3,6 +3,7 @@
 import { pathToFileURL } from 'node:url';
 
 import { normalizeImplementationApprovers } from './agent-runner-admission.mjs';
+import { executionLabelAuthority } from './agent-runner-label-authority.mjs';
 import {
   commentRevision,
   normalizeCommentIdentity,
@@ -23,10 +24,22 @@ function preflightAuthor(preflight) {
 export function candidateSnapshot(selected = {}) {
   const commandIdentity = normalizeCommentIdentity(selected.command?.sourceCommentIdentity || selected.command?.sourceCommentId);
   const preflightIdentity = normalizeCommentIdentity(selected.currentPreflight);
+  const labelAuthority = selected.issue ? executionLabelAuthority(selected.issue) : {
+    allowed: false,
+    reason: 'candidate-no-longer-runnable',
+    statusLabel: null,
+    agentLabel: null,
+    evidence: { statusLabels: [], agentLabels: [] },
+  };
   return {
     issueNumber: selected.issue?.number || null,
-    statusLabel: selected.issue?.statusLabel || null,
-    agentLabel: selected.issue?.agentLabel || null,
+    statusLabel: labelAuthority.statusLabel,
+    agentLabel: labelAuthority.agentLabel,
+    labelAuthorityAllowed: labelAuthority.allowed,
+    labelAuthorityReason: labelAuthority.reason,
+    labelAuthorityEvidence: labelAuthority.evidence,
+    selectedStatusLabel: selected.issue?.statusLabel || null,
+    selectedAgentLabel: selected.issue?.agentLabel || null,
     selectionMode: selected.selection?.mode || null,
     commandKind: selected.command?.kind || null,
     commandIdentity,
@@ -44,6 +57,11 @@ export function normalizeCandidateSnapshot(snapshot = {}) {
     issueNumber: snapshot.issueNumber || null,
     statusLabel: snapshot.statusLabel || null,
     agentLabel: snapshot.agentLabel || null,
+    labelAuthorityAllowed: snapshot.labelAuthorityAllowed !== false,
+    labelAuthorityReason: snapshot.labelAuthorityReason || null,
+    labelAuthorityEvidence: snapshot.labelAuthorityEvidence || null,
+    selectedStatusLabel: snapshot.selectedStatusLabel || null,
+    selectedAgentLabel: snapshot.selectedAgentLabel || null,
     selectionMode: snapshot.selectionMode || null,
     commandKind: snapshot.commandKind || null,
     commandIdentity,
@@ -77,6 +95,18 @@ export function evaluateCandidateAdmission({ initial, current, approvers = [] } 
   if (initial.issueNumber !== current.issueNumber) {
     return { allowed: false, reason: 'candidate-selection-changed' };
   }
+  if (initial.labelAuthorityAllowed !== true) {
+    return { allowed: false, reason: initial.labelAuthorityReason || 'candidate-label-authority-invalid' };
+  }
+  if (current.labelAuthorityAllowed !== true) {
+    return { allowed: false, reason: current.labelAuthorityReason || 'candidate-label-authority-invalid' };
+  }
+  if (current.selectedStatusLabel && current.selectedStatusLabel !== current.statusLabel) {
+    return { allowed: false, reason: 'candidate-status-field-label-conflict' };
+  }
+  if (current.selectedAgentLabel && current.selectedAgentLabel !== current.agentLabel) {
+    return { allowed: false, reason: 'candidate-agent-field-label-conflict' };
+  }
   if (initial.statusLabel !== current.statusLabel || !['status:ready', 'status:in-progress'].includes(current.statusLabel)) {
     return { allowed: false, reason: 'candidate-status-changed' };
   }
@@ -103,7 +133,7 @@ export function candidatePausePayload(admission, snapshot) {
     candidatePaused: true,
     failureScope: 'issue_not_runnable',
     reason: admission.reason,
-    safeNextAction: 'Refresh the candidate and obtain a current manager preflight from an approved ChatGPT manager identity.',
+    safeNextAction: 'Repair execution-critical status/agent labels or provide a current manager preflight from an approved ChatGPT manager identity.',
     selectedIssue: snapshot?.issueNumber || null,
     candidateRevision: snapshot?.preflightRevision || null,
     childLaunched: false,
