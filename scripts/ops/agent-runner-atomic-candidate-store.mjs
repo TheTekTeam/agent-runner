@@ -48,11 +48,33 @@ export function runAtomicCandidateRevalidation({ argv = [], env = process.env, e
   return parsed;
 }
 
+function positiveInteger(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+export function canaryIssueMismatchResult(expectedIssueNumber, selectedSnapshot, record = {}) {
+  const selectedIssueNumber = positiveInteger(selectedSnapshot?.issueNumber ?? record?.issueNumber);
+  if (!expectedIssueNumber || selectedIssueNumber === expectedIssueNumber) return null;
+  return {
+    admission: {
+      allowed: false,
+      scope: 'issue_not_runnable',
+      reason: 'canary-issue-mismatch',
+      safeNextAction: `Keep the timer disabled and rerun the supervised canary only when issue #${expectedIssueNumber} is the exact selected candidate.`,
+      expectedIssueNumber,
+      selectedIssueNumber,
+    },
+    current: selectedSnapshot || { issueNumber: selectedIssueNumber },
+  };
+}
+
 export function createAtomicAdmissionStore(store, {
   argv = [],
   env = process.env,
   pauseState = { result: null },
   revalidate = runAtomicCandidateRevalidation,
+  expectedIssueNumber = positiveInteger(env.AGENT_RUNNER_CANARY_ISSUE),
 } = {}) {
   let selectedSnapshot = null;
   return new Proxy(store, {
@@ -69,6 +91,11 @@ export function createAtomicAdmissionStore(store, {
             && record?.resolutionState === 'active'
             && record?.finishedAt == null;
           if (!initialAttempt) return target.recordRecoveryAttempt(record);
+          const mismatch = canaryIssueMismatchResult(expectedIssueNumber, selectedSnapshot, record);
+          if (mismatch) {
+            pauseState.result = mismatch;
+            throw new CandidateAdmissionPausedError(mismatch);
+          }
           const result = revalidate({ argv, env, expected: selectedSnapshot });
           if (result.admission.allowed !== true) {
             pauseState.result = result;
