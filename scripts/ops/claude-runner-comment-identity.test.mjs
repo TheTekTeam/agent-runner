@@ -81,7 +81,7 @@ test('captured #300 attention update uses only the numeric REST database id', ()
   const result = upsertGitHubAttentionComment(
     { repo: 'TheTekTeam/modelspend' },
     { number: 300 },
-    { reason: 'turn_limit_exhausted', detectedAt: '2026-07-19T19:02:00Z' },
+    { reason: 'provider_execution_limit', detectedAt: '2026-07-19T19:02:00Z' },
     ghRunner,
   );
 
@@ -110,7 +110,7 @@ test('attention update without a numeric REST identity fails closed and never cl
     () => upsertGitHubAttentionComment(
       { repo: 'TheTekTeam/modelspend' },
       { number: 300 },
-      { reason: 'turn_limit_exhausted', detectedAt: '2026-07-19T19:02:00Z' },
+      { reason: 'provider_execution_limit', detectedAt: '2026-07-19T19:02:00Z' },
       ghRunner,
     ),
     /numeric REST database id/i,
@@ -120,7 +120,7 @@ test('attention update without a numeric REST identity fails closed and never cl
 
 test('repeated identical attention remains deduplicated without requiring a mutation identity', () => {
   const issue = { number: 300 };
-  const failure = { reason: 'turn_limit_exhausted', detectedAt: '2026-07-19T19:02:00Z' };
+  const failure = { reason: 'provider_execution_limit', detectedAt: '2026-07-19T19:02:00Z' };
   const body = runnerAttentionCommentBody(issue, failure);
   const calls = [];
   const ghRunner = (args) => {
@@ -160,7 +160,7 @@ test('restart persistence retains both typed identifiers for selection, claim, r
       attemptId: 'TheTekTeam/modelspend#300:captured', repo: 'TheTekTeam/modelspend', issueNumber: 300,
       claimId: commentRevision(identity), claimIdentity: identity,
       preflightRevision: commentRevision(identity), preflightIdentity: identity,
-      startedAt: '2026-07-19T19:02:00Z', outcome: 'turn_limit_exhausted', resolutionState: 'unresolved',
+      startedAt: '2026-07-19T19:02:00Z', outcome: 'provider_execution_limit', resolutionState: 'unresolved',
     });
     store.close();
 

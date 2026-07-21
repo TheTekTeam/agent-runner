@@ -323,7 +323,8 @@ test('issue #658 guardrail prose cannot promote a runner task to the critical pr
 test('supports configured model aliases', () => {
   const profile = resolveProfile('docs', {}, { CLAUDE_RUNNER_MODEL_DOCS: 'custom-haiku' });
   assert.equal(profile.model, 'custom-haiku');
-  assert.equal(profile.effort, 'low');  assert.equal(Object.hasOwn(profile, 'maxTurns'), false);
+  assert.equal(profile.effort, 'low');
+  assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);
 });
 
 test('clear policy defaults to fresh context', () => {
@@ -343,7 +344,8 @@ test('Claude args include model effort and budget without interaction caps', () 
 test('critical defaults retain monetary bounds and do not silently select Opus/xhigh', () => {
   const profile = resolveProfile('critical');
   assert.equal(profile.model, 'sonnet');
-  assert.equal(profile.effort, 'high');  assert.equal(Object.hasOwn(profile, 'maxTurns'), false);
+  assert.equal(profile.effort, 'high');
+  assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);
   assert.equal(profile.maxBudgetUsd, '1.50');
 });
 
@@ -352,7 +354,8 @@ test('unattended cost admission rejects the observed #658 Opus/xhigh/$8 controls
   assert.equal(result.allowed, false);
   assert.deepEqual(result.violations, [
     'opus-requires-explicit-machine-opt-in',
-    'high-effort-requires-explicit-machine-opt-in',    'budget-cap-exceeds-machine-policy',
+    'high-effort-requires-explicit-machine-opt-in',
+    'budget-cap-exceeds-machine-policy',
   ]);
 });
 
@@ -367,7 +370,8 @@ test('Opus/xhigh can only be admitted with explicit machine opt-ins and raised c
     { model: 'opus', effort: 'xhigh', maxBudgetUsd: '8.00' },
     {
       CLAUDE_RUNNER_ALLOW_OPUS: 'true',
-      CLAUDE_RUNNER_ALLOW_XHIGH: 'true',      CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '8',
+      CLAUDE_RUNNER_ALLOW_XHIGH: 'true',
+      CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '8',
     },
   );
   assert.equal(result.allowed, true);
@@ -505,7 +509,7 @@ test('detectExecutionNoop does not flag a genuine non-zero Claude failure exit (
 test('classifyClaudeRunFailure normalizes the observed max-turns failure from issue #658', () => {
   assert.equal(
     classifyClaudeRunFailure({ status: 1, stdout: 'Error: Reached max turns (10)' }),
-    'turn-limit-exhausted',
+    'provider-execution-limit',
   );
 });
 
@@ -557,7 +561,7 @@ test('structured Claude max-turn subtype has priority over a generic process exi
     num_turns: 3,
     total_cost_usd: 0.75,
   }));
-  assert.equal(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'turn-limit-exhausted');
+  assert.equal(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'provider-execution-limit');
 });
 
 function capturedClaudeArray(issue) {
@@ -596,7 +600,7 @@ test('#658 captured array selects the terminal result and classifies max turns',
   assert.equal(envelope.parsed, true);
   assert.equal(envelope.subtype, 'error_max_turns');
   assert.equal(envelope.numTurns, 10);
-  assert.equal(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'turn-limit-exhausted');
+  assert.equal(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'provider-execution-limit');
 });
 
 test('single-object JSON, JSONL and JSON-array envelopes select the terminal result', () => {

@@ -10,11 +10,11 @@ import {
 } from './claude-runner-recovery.mjs';
 
 const exclusive = { processOwner: false, conflictingLease: false, ownershipAmbiguous: false };
-const headroom = { sameProfileAvailable: true, quotaHeadroom: true, budgetHeadroom: true, turnHeadroom: true };
+const headroom = { sameProfileAvailable: true, quotaHeadroom: true, budgetHeadroom: true, continuationHeadroom: true };
 
 test('normalizes legacy max-turn outcome and refuses resume without checkpoint', () => {
-  assert.equal(normalizeTerminalOutcome('turn-limit-exhausted'), 'turn_limit_exhausted');
-  assert.equal(decideRecovery({ outcome: 'turn-limit-exhausted', evidence: exclusive }).eligible, false);
+  assert.equal(normalizeTerminalOutcome('provider-execution-limit'), 'provider_execution_limit');
+  assert.equal(decideRecovery({ outcome: 'provider-execution-limit', evidence: exclusive }).eligible, false);
 });
 
 test('normalizes both Claude plan approval spellings to the canonical approval wait', () => {
@@ -28,9 +28,9 @@ test('normalizes both Claude plan approval spellings to the canonical approval w
 
 test('native turn-limit resume is capped at one and fails closed on ownership ambiguity', () => {
   const evidence = { ...exclusive, ...headroom, checkpointAvailable: true, sessionAvailable: true, profileCompatible: true, conflictingWorktree: false, conflictingBranch: false, conflictingPr: false };
-  assert.equal(decideRecovery({ outcome: 'turn_limit_exhausted', recoveryAttemptCount: 0, now: '2026-01-01T00:00:00Z', evidence }).action, 'native_resume');
-  assert.equal(decideRecovery({ outcome: 'turn_limit_exhausted', recoveryAttemptCount: 1, evidence }).status, 'exhausted');
-  assert.equal(decideRecovery({ outcome: 'turn_limit_exhausted', evidence: { ...evidence, ownershipAmbiguous: true } }).eligible, false);
+  assert.equal(decideRecovery({ outcome: 'provider_execution_limit', recoveryAttemptCount: 0, now: '2026-01-01T00:00:00Z', evidence }).action, 'native_resume');
+  assert.equal(decideRecovery({ outcome: 'provider_execution_limit', recoveryAttemptCount: 1, evidence }).status, 'exhausted');
+  assert.equal(decideRecovery({ outcome: 'provider_execution_limit', evidence: { ...evidence, ownershipAmbiguous: true } }).eligible, false);
 });
 
 test('transient recovery is bounded and forbidden after mutation', () => {
@@ -55,7 +55,7 @@ test('decideRecovery never returns eligible:true without a truthy retryAt, acros
     { outcome: 'quota_paused', retryAt: '2026-01-01T00:05:00Z', evidence: exclusive },
     { outcome: 'rate_limited', evidence: exclusive },
     { outcome: 'transient_provider_or_network_failure', evidence: { ...exclusive, repositoryMutated: false } },
-    { outcome: 'turn_limit_exhausted', evidence: { ...exclusive, ...headroom, checkpointAvailable: true, sessionAvailable: true, profileCompatible: true, conflictingWorktree: false, conflictingBranch: false, conflictingPr: false } },
+    { outcome: 'provider_execution_limit', evidence: { ...exclusive, ...headroom, checkpointAvailable: true, sessionAvailable: true, profileCompatible: true, conflictingWorktree: false, conflictingBranch: false, conflictingPr: false } },
     { outcome: 'validation_failed', evidence: { ...exclusive, explicitDeterministicValidationFailure: true, policyApproved: true, checkpointAvailable: true, profileCompatible: true, worktreeAvailable: true, ...headroom } },
   ];
   let eligibleCasesSeen = 0;

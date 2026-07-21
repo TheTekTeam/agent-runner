@@ -268,7 +268,7 @@ test('summarizeRunnerState reports corrupt DBs without throwing', () => {
 test('recovery counters, deadlines, attention state and dedupe survive reopening', () => {
   const dir = mkdtempSync(join(tmpdir(), 'modelspend-runner-recovery-state-'));
   const dbPath = join(dir, 'state.sqlite');
-  const event = buildAttentionEvent({ repository: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 698, attemptId: 'attempt-1', reason: 'turn_limit_exhausted', agent: 'claude', recoveryStatus: 'forbidden', nextAction: 'Manager review.' });
+  const event = buildAttentionEvent({ repository: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 698, attemptId: 'attempt-1', reason: 'provider_execution_limit', agent: 'claude', recoveryStatus: 'forbidden', nextAction: 'Manager review.' });
   try {
     let store = openRunnerStateStore(dbPath, { now: () => '2026-07-17T10:00:00.000Z' });
     store.recordRecoveryAttempt({ attemptId: 'attempt-1', repo: event.repository, project: event.project, issueNumber: 698, startedAt: '2026-07-17T09:00:00.000Z', outcome: event.reason, recoveryEligible: true, recoveryAttemptCount: 1, retryAt: '2026-07-17T11:00:00.000Z', attentionStatus: 'attention_required', attentionDedupeKey: event.dedupeKey, processId: 321, processBootId: 'boot-a', processStartTicks: '456', systemdInvocationId: 'invocation-a' });

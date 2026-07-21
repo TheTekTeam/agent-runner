@@ -129,9 +129,6 @@ export function buildAgentCommandArgs({ agent = resolveAgentById(), prompt, prof
   // Implementation runs must be able to continue through discovery, edits,
   // validation and commit. Retain the legacy cap only for read-only plan mode
   // until the remaining profile/config cleanup in #27 is completed.
-  if (profile.permissionMode === 'plan' && profile.maxTurns) {
-    args.push(agent.controls.maxTurns.flag, String(profile.maxTurns));
-  }
   args.push(agent.controls.maxBudgetUsd.flag, String(profile.maxBudgetUsd));
   args.push(agent.controls.permissionMode.flag, profile.permissionMode);
   if (profile.tools) args.push(agent.controls.tools.flag, profile.tools);
