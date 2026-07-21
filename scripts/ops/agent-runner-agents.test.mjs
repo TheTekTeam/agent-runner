@@ -11,17 +11,32 @@ import {
   agentRunMetadata,
 } from './agent-runner-agents.mjs';
 
-test('Claude adapter builds existing CLI argument order', () => {
+test('Claude adapter builds an uncapped CLI invocation', () => {
   const args = buildAgentCommandArgs({
     agent: resolveAgentById('claude-code-cli'),
     prompt: 'hello',
     profile: { model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.50', permissionMode: 'plan' },
   });
-  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-turns', '4', '--max-budget-usd', '1.50', '--permission-mode', 'plan', '--output-format', 'json']);
+  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.50', '--permission-mode', 'plan', '--output-format', 'json']);
+  assert.equal(args.includes('--max-turns'), false);
   assert.equal(args.at(-1), 'hello');
 });
 
-test('Claude adapter builds a constrained native-worktree implementation invocation', () => {
+test('legacy maxTurns values are accepted but ignored', () => {
+  const agent = resolveAgentById('claude-code-cli');
+  assert.equal(agent.controls.maxTurns.deprecated, true);
+  assert.equal(agent.controls.maxTurns.ignored, true);
+
+  const args = buildAgentCommandArgs({
+    agent,
+    prompt: 'complete the issue',
+    profile: { model: 'sonnet', effort: 'medium', maxTurns: 1, maxBudgetUsd: '1.00', permissionMode: 'dontAsk' },
+  });
+  assert.equal(args.includes('--max-turns'), false);
+  assert.equal(args.includes('1'), false);
+});
+
+test('Claude adapter builds a constrained native-worktree implementation invocation without a turn cap', () => {
   const args = buildAgentCommandArgs({
     agent: resolveAgentById('claude-code-cli'),
     prompt: 'implement the approved preflight',
@@ -46,7 +61,6 @@ test('Claude adapter builds a constrained native-worktree implementation invocat
     '-p',
     '--model', 'sonnet',
     '--effort', 'medium',
-    '--max-turns', '3',
     '--max-budget-usd', '1.00',
     '--permission-mode', 'dontAsk',
     '--tools', 'Read,Edit,Bash',
@@ -58,6 +72,7 @@ test('Claude adapter builds a constrained native-worktree implementation invocat
     '--setting-sources', '',
     '--output-format', 'json',
   ]);
+  assert.equal(args.includes('--max-turns'), false);
   assert.equal(args.at(-1), 'implement the approved preflight');
 });
 
