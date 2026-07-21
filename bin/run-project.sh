@@ -66,20 +66,39 @@ if [ -n "${AGENT_RUNNER_ARGS:-${CLAUDE_RUNNER_ARGS:-}}" ]; then
 fi
 
 if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
-  # Machine/profile policy is admitted before candidate discovery. A handled
-  # refusal must not query, claim, relabel, comment on, or consume any issue.
-  # Automatic/generated preflight implementation remains prohibited by owner
-  # decision; only an existing normal-ChatGPT manager packet may be consumed.
+  # Automatic/generated preflight remains prohibited. These values also form
+  # part of the effective configuration fingerprint used by the local circuit.
   export CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT=true
   export CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=false
+
+  # A tripped profile/systemic circuit is checked before candidate discovery,
+  # attempt creation or any GitHub mutation. Handled pauses remain systemd 0.
   set +e
-  node "$ROOT/scripts/ops/agent-runner-admission.mjs" "${ARGS[@]}"
+  node "$ROOT/scripts/ops/agent-runner-circuit-breaker.mjs" check
+  CIRCUIT_STATUS=$?
+  set -e
+  case "$CIRCUIT_STATUS" in
+    0) ;;
+    3) echo "[agent-runner] admission circuit paused; no candidate selected or mutated"; exit 0 ;;
+    *) echo "[agent-runner] ERROR: circuit breaker check failed with exit $CIRCUIT_STATUS" >&2; exit "$CIRCUIT_STATUS" ;;
+  esac
+
+  # Machine/profile policy is admitted before candidate discovery. A handled
+  # refusal is durably recorded into the circuit before returning success.
+  set +e
+  ADMISSION_OUTPUT="$(node "$ROOT/scripts/ops/agent-runner-admission.mjs" "${ARGS[@]}" 2>&1)"
   ADMISSION_STATUS=$?
   set -e
   case "$ADMISSION_STATUS" in
     0) ;;
-    3) echo "[agent-runner] machine profile paused; no candidate selected or mutated"; exit 0 ;;
-    *) echo "[agent-runner] ERROR: admission check failed with exit $ADMISSION_STATUS" >&2; exit "$ADMISSION_STATUS" ;;
+    3)
+      AGENT_RUNNER_ADMISSION_RESULT="$ADMISSION_OUTPUT" \
+        node "$ROOT/scripts/ops/agent-runner-circuit-breaker.mjs" record >/dev/null
+      printf '%s\n' "$ADMISSION_OUTPUT"
+      echo "[agent-runner] machine profile paused and circuit recorded; no candidate selected or mutated"
+      exit 0
+      ;;
+    *) printf '%s\n' "$ADMISSION_OUTPUT" >&2; echo "[agent-runner] ERROR: admission check failed with exit $ADMISSION_STATUS" >&2; exit "$ADMISSION_STATUS" ;;
   esac
 
   set +e
