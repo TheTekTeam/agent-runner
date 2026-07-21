@@ -203,16 +203,26 @@ function verifyManifest(sourceRoot) {
   if (!existsSync(MANIFEST_PATH)) fail('MIGRATION-MANIFEST.json does not exist');
   const manifest = JSON.parse(readFileSync(MANIFEST_PATH, 'utf8'));
   const problems = [];
+  let lockedCount = 0;
   for (const item of manifest.files || []) {
     const destination = join(REPO_ROOT, item.path);
-    const source = join(sourceRoot, item.path);
     if (!existsSync(destination)) problems.push(`missing destination: ${item.path}`);
-    else if (sha256(destination) !== item.sha256) problems.push(`destination drift: ${item.path}`);
+
+    // A "transferred" entry (see scripts/ops/agent-runner-manifest-provenance.mjs)
+    // has had its canonical ownership moved to this repository and is
+    // expected to diverge from the ModelSpend source it was originally
+    // imported from -- only its existence is required here, never a hash
+    // match against either checkout.
+    if (item.status === 'transferred') continue;
+
+    if (existsSync(destination) && sha256(destination) !== item.sha256) problems.push(`destination drift: ${item.path}`);
+    const source = join(sourceRoot, item.path);
     if (!existsSync(source)) problems.push(`missing source: ${item.path}`);
     else if (sha256(source) !== item.sha256) problems.push(`source drift since ${manifest.sourceCommit}: ${item.path}`);
+    lockedCount += 1;
   }
   if (problems.length) fail(problems.join('\n'));
-  console.log(`PASS: ${manifest.files.length} imported files match ${manifest.sourceCommit}`);
+  console.log(`PASS: ${lockedCount} locked imported files match ${manifest.sourceCommit} (${manifest.files.length - lockedCount} transferred file(s) skipped)`);
 }
 
 function copySelection(sourceRoot, files, { replace }) {

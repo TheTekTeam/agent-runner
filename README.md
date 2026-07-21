@@ -23,4 +23,4 @@ ModelSpend is a configured project consumed by this runner. It is not the canoni
 bash scripts/validate.sh
 ```
 
-With the migration manifest present, validation checks every imported file hash, JavaScript syntax, the focused runner test suite, safe missing-state behaviour, installer/state-migration contracts and repository secret boundaries.
+With the migration manifest present, validation checks each imported file's declared status — an exact hash match for files still `locked` to the ModelSpend import, or a well-formed provenance/ownership record for files explicitly `transferred` to canonical ownership here (see "Manifest provenance and ownership transfer" in `docs/MIGRATION.md`) — plus JavaScript syntax, the focused runner test suite, safe missing-state behaviour, installer/state-migration contracts and repository secret boundaries.

@@ -4,6 +4,7 @@ import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, openSync, closeSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join as joinPath } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { loadAgentRunnerConfig, stripConfigArgs } from './agent-runner-config.mjs';
 import {
@@ -63,6 +64,12 @@ import { redactExecutableArgs } from './lib/redact.mjs';
 const DEFAULT_REPO = 'TheTekTeam/modelspend';
 const DEFAULT_LOCK = '.var/claude-runner/cron.lock';
 const DEFAULT_OUTPUT = '.var/claude-runner';
+// Resolved from this module's own location rather than passed as a bare
+// relative path to spawn(): a bare 'scripts/ops/claude-runner.mjs' resolves
+// against the spawning process's cwd, which run-project.sh has already
+// changed to the configured project's checkout -- silently running that
+// checkout's own vendored copy instead of this canonical implementation.
+export const CLAUDE_RUNNER_ENTRYPOINT = fileURLToPath(new URL('./claude-runner.mjs', import.meta.url));
 const DEFAULT_AGENT_LABELS = allAgentLabels({ includeFuture: false });
 const DEFAULT_LIMIT = 100;
 const DEFAULT_WATCHDOG_INTERVAL_MS = 10 * 60_000;
@@ -289,7 +296,7 @@ export function evaluateChildRunResult({ execute, exitCode, childPayload }) {
 }
 
 export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeSessionId } = {}) {
-  const out = ['scripts/ops/claude-runner.mjs', '--issue', String(issueNumber), '--output-dir', args.outputDir];
+  const out = [CLAUDE_RUNNER_ENTRYPOINT, '--issue', String(issueNumber), '--output-dir', args.outputDir];
   if (args.execute) out.push('--execute');
   // attemptId lets the child write its restricted recovery handle (session
   // id, worktree/branch identity) under the same attempt row the scheduler
@@ -304,7 +311,7 @@ export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeS
 }
 
 export function quotaPreflightArgs(args) {
-  return ['scripts/ops/claude-runner.mjs', '--check-quota', '--force-quota-check', '--output-dir', args.outputDir];
+  return [CLAUDE_RUNNER_ENTRYPOINT, '--check-quota', '--force-quota-check', '--output-dir', args.outputDir];
 }
 
 function gh(jsonArgs) {

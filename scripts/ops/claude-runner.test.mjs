@@ -42,6 +42,10 @@ import {
   DEFAULT_MAX_SESSION_USAGE_BEFORE_START_PERCENT,
   parseQuotaCheckOutput,
 } from './claude-runner-quota.mjs';
+import {
+  RUNNER_OWN_REPOSITORY,
+  resolveRepositoryContext,
+} from './agent-runner-repository-context.mjs';
 
 test('finds latest proceed command', () => {
   const comments = [
@@ -137,6 +141,147 @@ test('implementation prompt consumes the manager preflight as the plan and requi
   assert.match(prompt, /do not spend this attempt writing another plan/i);
   assert.match(prompt, /worktree-agent-runner-658-77/);
   assert.match(prompt, /Current manager preflight packet \(source comment github-comment:database:77\)/);
+});
+
+// #686 regression: the standalone-runner acceptance canary for
+// TheTekTeam/modelspend#686 generated an implementation prompt that told
+// Claude "You are Claude Code CLI working on ModelSpend", injected
+// ModelSpend's own repository instructions, and rooted the worktree/draft-PR
+// in the ModelSpend checkout -- even though the preflight's own prose named
+// the standalone runner checkout (/home/gp/projects/agent-runner) as the
+// place the acceptance change belonged. Claude concluded it was working
+// inside modelspend-runner-live and stopped with
+// implementation-no-repository-change; no commit, PR or evidence was ever
+// produced. This is the exact preflight-packet body the failing run
+// consumed (comment github-comment:database:5029607103, cited by the
+// runner-started marker posted immediately afterward).
+const ISSUE_686_MANAGER_PREFLIGHT_BODY = [
+  '## Manager preflight packet',
+  '',
+  '**Manager:** ChatGPT',
+  '**Acceptance slice:** `RELIABILITY.RESET.1`',
+  '**Phase:** implementation',
+  '**Scope:** one bounded supervised acceptance run only.',
+  '',
+  '### Current state verified',
+  '',
+  '- The standalone runner checkout is `/home/gp/projects/agent-runner`.',
+  '- Project config is `/home/gp/.config/agent-runner/modelspend.json`.',
+  '- Runtime state is `/home/gp/.local/state/agent-runner/modelspend/runner-state.sqlite`.',
+  '- The standalone dashboard publishes to `/var/www/agent-runner/dashboard`.',
+  '- The previous attempted canary did not claim or execute this issue because it was `status:in-progress` without a current manager preflight.',
+  '- Issue #686 has now been reset to `status:ready` specifically for this acceptance run.',
+  '',
+  '### Required work',
+  '',
+  'Run the smallest complete implementation/acceptance slice needed to prove the standalone runner’s normal execution path end to end for #686:',
+  '',
+  '1. work only in the runner-owned isolated worktree and branch;',
+  '2. make one minimal, legitimate repository change that records or strengthens the standalone acceptance evidence for `RELIABILITY.RESET.1` without widening the architecture;',
+  '3. run the directly mapped focused validation;',
+  '4. commit the change on the exact runner-owned branch;',
+  '5. allow the runner to push that branch and create exactly one draft PR;',
+  '6. persist claim, implementation, publication, terminal-result and notification evidence;',
+  '7. leave issue closure and merge to a human.',
+  '',
+  '### Boundaries',
+  '',
+  '- Do not redesign the runner or reopen completed migration work.',
+  '- Do not change systemd units, timers, deployment, secrets, firewall, DNS, Grafana or Netdata configuration.',
+  '- Do not enable either execution timer.',
+  '- Do not modify the legacy runner checkout.',
+  '- Do not merge, approve, close #686, or create more than one PR.',
+  '- Stop and report a blocker if a minimal legitimate repository change cannot be identified within the existing acceptance/runner documentation or tests.',
+].join('\n');
+
+const ISSUE_686_PROJECT = {
+  issueRepository: 'TheTekTeam/modelspend',
+  projectRepository: 'TheTekTeam/modelspend',
+  projectCheckout: '/home/gp/projects/modelspend-runner-live',
+  runnerCheckout: '/home/gp/projects/agent-runner',
+};
+
+test('#686 regression: the actual fetched preflight text (no structured field) still defaults implementation to the configured project, not a guess', () => {
+  const meta = parseKeyValueBlock(ISSUE_686_MANAGER_PREFLIGHT_BODY);
+  // The real preflight only ever named the runner checkout in prose/bullets;
+  // parseKeyValueBlock (the same parser used for Profile/Model/Effort today)
+  // finds no machine-readable field there, so resolution must fall back to
+  // the configured project rather than guessing from prose.
+  assert.equal(meta.implementation_repository, undefined);
+
+  const result = resolveRepositoryContext({ ...ISSUE_686_PROJECT, requestedImplementationRepository: meta.implementation_repository });
+  assert.equal(result.allowed, true);
+  assert.equal(result.context.implementationRepository, 'TheTekTeam/modelspend');
+
+  const prompt = buildPreflightDirectPrompt({
+    issue: { number: 686, title: 'OPS.AGENT.RUNNER.STANDALONE.REPO.1', body: 'Extract Agent Runner.' },
+    preflight: { id: 5029607103, sourceCommentId: 5029607103, body: ISSUE_686_MANAGER_PREFLIGHT_BODY },
+    profile: { profile: 'complex', model: 'sonnet', effort: 'medium', maxTurns: 3, maxBudgetUsd: '1.00' },
+    clearContext: true,
+    executionPhase: EXECUTION_PHASE_IMPLEMENTATION,
+    worktreeIdentity: { name: 'agent-runner-686-5029607103', expectedBranch: 'worktree-agent-runner-686-5029607103' },
+    repositoryContext: result.context,
+  });
+  assert.match(prompt, /You are Claude Code CLI working on TheTekTeam\/modelspend\./);
+});
+
+test('#686 regression: once the preflight names the runner repository explicitly, the prompt/worktree/instructions all resolve to Agent Runner and never claim ModelSpend', () => {
+  const updatedBody = `${ISSUE_686_MANAGER_PREFLIGHT_BODY}\n\nImplementation repository: ${RUNNER_OWN_REPOSITORY}\n`;
+  const meta = parseKeyValueBlock(updatedBody);
+  assert.equal(meta.implementation_repository, RUNNER_OWN_REPOSITORY);
+
+  const result = resolveRepositoryContext({ ...ISSUE_686_PROJECT, requestedImplementationRepository: meta.implementation_repository });
+  assert.equal(result.allowed, true);
+  assert.equal(result.context.implementationRepository, RUNNER_OWN_REPOSITORY);
+  assert.equal(result.context.implementationCheckout, '/home/gp/projects/agent-runner');
+  assert.deepEqual(result.context.implementationInstructionPaths, ['AGENTS.md']);
+  // ModelSpend remains visible as the issue/project source, never overwritten
+  assert.equal(result.context.issueRepository, 'TheTekTeam/modelspend');
+  assert.equal(result.context.projectRepository, 'TheTekTeam/modelspend');
+
+  const prompt = buildPreflightDirectPrompt({
+    issue: { number: 686, title: 'OPS.AGENT.RUNNER.STANDALONE.REPO.1', body: 'Extract Agent Runner.' },
+    preflight: { id: 5029607103, sourceCommentId: 5029607103, body: updatedBody },
+    profile: { profile: 'complex', model: 'sonnet', effort: 'medium', maxTurns: 3, maxBudgetUsd: '1.00' },
+    clearContext: true,
+    executionPhase: EXECUTION_PHASE_IMPLEMENTATION,
+    worktreeIdentity: { name: 'agent-runner-686-5029607103', expectedBranch: 'worktree-agent-runner-686-5029607103' },
+    repositoryContext: result.context,
+  });
+  assert.match(prompt, /You are Claude Code CLI working on TheTekTeam\/agent-runner\./);
+  assert.match(prompt, /Follow AGENTS\.md\./);
+  assert.doesNotMatch(prompt, /working on ModelSpend/);
+  assert.doesNotMatch(prompt, /docs\/claude\/README\.md/);
+  // The issue itself is still ModelSpend's #686 -- only the implementation
+  // repository identity changes, not the issue source.
+  assert.match(prompt, /Issue: #686/);
+});
+
+test('buildClaudePrompt and buildPreflightDirectPrompt never say "working on ModelSpend" when the resolved implementation repository is Agent Runner', () => {
+  const repositoryContext = {
+    implementationRepository: RUNNER_OWN_REPOSITORY,
+    implementationInstructionPaths: ['AGENTS.md'],
+  };
+  const issue = { number: 5, title: 'Simplify queue admission' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium', maxTurns: 3, maxBudgetUsd: '1.00' };
+
+  const claudePrompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext: false, repositoryContext });
+  const preflightPrompt = buildPreflightDirectPrompt({ issue, preflight: { id: 1, body: 'x' }, profile, clearContext: false, repositoryContext });
+  for (const prompt of [claudePrompt, preflightPrompt]) {
+    assert.doesNotMatch(prompt, /ModelSpend/);
+    assert.match(prompt, /working on TheTekTeam\/agent-runner\./);
+    assert.match(prompt, /Follow AGENTS\.md\./);
+  }
+});
+
+test('prompts default to the historical ModelSpend instruction set when no repository context is supplied, preserving ordinary same-repository behaviour', () => {
+  const issue = { number: 99, title: 'Legacy command issue' };
+  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.50' };
+  const prompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext: false });
+  assert.match(prompt, /Follow CLAUDE\.md\./);
+  assert.match(prompt, /Follow docs\/claude\/README\.md\./);
+  assert.match(prompt, /Follow docs\/ai\/AGENT-ORCHESTRATION-WORKFLOW\.md\./);
+  assert.match(prompt, /Follow docs\/claude\/VALIDATION-GATES\.md\./);
 });
 
 test('generated issue-mode prompts never start with a literal /clear slash command, with or without clearContext', () => {
@@ -547,6 +692,68 @@ test('runner publishes only its exact committed worktree branch as a draft PR', 
   assert.ok(create.includes('--draft'));
   assert.ok(create.includes('TheTekTeam/modelspend'));
   assert.ok(create.includes('worktree-agent-runner-658-77'));
+});
+
+test('draft publication targets the resolved implementation repository, not just whatever "repo" happens to be passed', () => {
+  const calls = [];
+  let listCount = 0;
+  const runner = (command, args) => {
+    calls.push([command, ...args]);
+    if (command === 'git') return { status: 0, stdout: '' };
+    if (args[0] === 'pr' && args[1] === 'list') {
+      listCount += 1;
+      return {
+        status: 0,
+        stdout: listCount === 1 ? '[]' : JSON.stringify([{ number: 42, url: 'https://github.com/TheTekTeam/agent-runner/pull/42', isDraft: true }]),
+      };
+    }
+    if (args[0] === 'pr' && args[1] === 'create') return { status: 0, stdout: 'https://github.com/TheTekTeam/agent-runner/pull/42\n' };
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  const result = publishImplementationDraft({
+    workspace: { worktreePath: '/home/gp/projects/agent-runner/.claude/worktrees/agent-runner-686-x', baseRef: 'origin/main' },
+    worktreeIdentity: { expectedBranch: 'worktree-agent-runner-686-x' },
+    repo: RUNNER_OWN_REPOSITORY,
+    issueNumber: 686,
+    issueTitle: 'OPS.AGENT.RUNNER.STANDALONE.REPO.1',
+    runner,
+    env: {},
+  });
+  assert.equal(result.published, true);
+  const create = calls.find((call) => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create');
+  assert.ok(create.includes(RUNNER_OWN_REPOSITORY));
+  assert.ok(!create.includes('TheTekTeam/modelspend'));
+});
+
+test('implementation workspace preparation roots the worktree at an explicit implementationCheckout, not the runner process\'s ambient cwd', () => {
+  const seenCwds = [];
+  const runner = (_command, args, options = {}) => {
+    const joined = args.join(' ');
+    seenCwds.push({ joined, cwd: options.cwd });
+    if (joined === 'rev-parse --show-toplevel') return { status: 0, stdout: '/home/gp/projects/agent-runner\n' };
+    if (joined === 'fetch --quiet origin main') return { status: 0, stdout: '' };
+    if (joined === 'rev-parse origin/main') return { status: 0, stdout: 'base-sha\n' };
+    if (joined === 'symbolic-ref refs/remotes/origin/HEAD') return { status: 0, stdout: 'refs/remotes/origin/main\n' };
+    if (joined.startsWith('show-ref --verify --quiet')) return { status: 1, stdout: '' };
+    if (joined === 'worktree list --porcelain') return { status: 0, stdout: 'worktree /home/gp/projects/agent-runner\nHEAD base-sha\nbranch refs/heads/main\n' };
+    if (joined === 'rev-parse HEAD') return { status: 0, stdout: 'base-sha\n' };
+    if (joined === 'branch --show-current') return { status: 0, stdout: 'main\n' };
+    if (joined === 'status --porcelain=v1 --untracked-files=no') return { status: 0, stdout: '' };
+    return { status: 1, stdout: '', stderr: `unexpected: ${joined}` };
+  };
+  const result = prepareImplementationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-686-x', expectedBranch: 'worktree-agent-runner-686-x' },
+    implementationCheckout: '/home/gp/projects/agent-runner',
+    env: {},
+    runner,
+  });
+  assert.equal(result.allowed, true);
+  assert.equal(result.rootPath, '/home/gp/projects/agent-runner');
+  assert.equal(result.worktreePath, '/home/gp/projects/agent-runner/.claude/worktrees/agent-runner-686-x');
+  // The very first git call (the one that discovers the repository root)
+  // must search from the explicit implementationCheckout, not resolve('.').
+  assert.equal(seenCwds[0].joined, 'rev-parse --show-toplevel');
+  assert.equal(seenCwds[0].cwd, '/home/gp/projects/agent-runner');
 });
 
 test('implementation workspace preparation proves fresh origin/main and exclusive branch ownership', () => {

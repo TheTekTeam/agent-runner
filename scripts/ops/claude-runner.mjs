@@ -4,6 +4,12 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
+import { loadAgentRunnerConfig, stripConfigArgs } from './agent-runner-config.mjs';
+import {
+  DEFAULT_PROJECT_REPOSITORY_INSTRUCTIONS,
+  resolveRepositoryContext,
+  runnerOwnCheckoutRoot,
+} from './agent-runner-repository-context.mjs';
 import { redactExecutableArgs, redactSensitiveText } from './lib/redact.mjs';
 import {
   buildQuotaCheckArgs,
@@ -51,6 +57,10 @@ import {
 const DEFAULT_REPO = 'TheTekTeam/modelspend';
 const DEFAULT_OUTPUT_DIR = '.var/claude-runner';
 const PROFILE_NAMES = ['docs', 'narrow', 'complex', 'critical'];
+// This script's own checkout root -- the runner's implementation checkout
+// when a repository context explicitly names the runner's own repository
+// (see resolveRepositoryContext), independent of process.cwd().
+const RUNNER_OWN_CHECKOUT = runnerOwnCheckoutRoot(import.meta.url);
 export {
   CLAUDE_COMMAND_HEADINGS,
   findLastMarkdownHeadingIndex,
@@ -383,7 +393,19 @@ function executionPhasePrompt({ executionPhase, worktreeIdentity } = {}) {
   return 'Execution phase: plan. Read and reason only; do not edit repository files, create commits, push branches, or claim implementation success.\n';
 }
 
-export function buildClaudePrompt({ issue, commandText, currentPreflight = null, profile, clearContext, executionPhase = profile?.permissionMode === 'plan' ? EXECUTION_PHASE_PLAN : EXECUTION_PHASE_IMPLEMENTATION, worktreeIdentity = null }) {
+function repositoryIdentityLine(repositoryContext) {
+  const repo = repositoryContext?.implementationRepository;
+  return repo ? `You are Claude Code CLI working on ${repo}.` : 'You are Claude Code CLI working on this repository.';
+}
+
+function repositoryInstructionRules(repositoryContext) {
+  const paths = repositoryContext?.implementationInstructionPaths?.length
+    ? repositoryContext.implementationInstructionPaths
+    : DEFAULT_PROJECT_REPOSITORY_INSTRUCTIONS;
+  return paths.map((path) => `Follow ${path}.`).join('\n- ');
+}
+
+export function buildClaudePrompt({ issue, commandText, currentPreflight = null, profile, clearContext, executionPhase = profile?.permissionMode === 'plan' ? EXECUTION_PHASE_PLAN : EXECUTION_PHASE_IMPLEMENTATION, worktreeIdentity = null, repositoryContext = null }) {
   const clearPrefix = clearContext
     ? 'Start a fresh task context. Do not carry assumptions or files from any previous Claude task.\n\n'
     : '';
@@ -391,7 +413,7 @@ export function buildClaudePrompt({ issue, commandText, currentPreflight = null,
     ? `\n\nCurrent manager preflight packet (source comment ${commentRevision(currentPreflight) || 'unknown'}):\n\n${currentPreflight.body || ''}`
     : '';
 
-  return `${clearPrefix}You are Claude Code CLI working on ModelSpend.\n\nIssue: #${issue.number} — ${issue.title}\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max turns: ${profile.maxTurns}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- Follow CLAUDE.md first.\n- Follow docs/claude/README.md.\n- Follow docs/ai/AGENT-ORCHESTRATION-WORKFLOW.md.\n- Follow docs/claude/VALIDATION-GATES.md.\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. If the task cannot fit the stated turn/budget caps, stop and report the blocker before broad exploration.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nLatest Claude command:\n\n${commandText}${preflightText}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
+  return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max turns: ${profile.maxTurns}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. If the task cannot fit the stated turn/budget caps, stop and report the blocker before broad exploration.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nLatest Claude command:\n\n${commandText}${preflightText}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
 }
 
 /**
@@ -400,12 +422,12 @@ export function buildClaudePrompt({ issue, commandText, currentPreflight = null,
  * owns prompt construction here instead of relaying operator-authored
  * comment text.
  */
-export function buildPreflightDirectPrompt({ issue, preflight, profile, clearContext, executionPhase = profile?.permissionMode === 'plan' ? EXECUTION_PHASE_PLAN : EXECUTION_PHASE_IMPLEMENTATION, worktreeIdentity = null }) {
+export function buildPreflightDirectPrompt({ issue, preflight, profile, clearContext, executionPhase = profile?.permissionMode === 'plan' ? EXECUTION_PHASE_PLAN : EXECUTION_PHASE_IMPLEMENTATION, worktreeIdentity = null, repositoryContext = null }) {
   const clearPrefix = clearContext
     ? 'Start a fresh task context. Do not carry assumptions or files from any previous Claude task.\n\n'
     : '';
 
-  return `${clearPrefix}You are Claude Code CLI working on ModelSpend.\n\nIssue: #${issue.number} — ${issue.title}\n\nSelection mode: preflight-direct — this issue had no Claude proceed command. The runner built this prompt directly from the issue and its latest manager preflight packet.\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max turns: ${profile.maxTurns}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- Follow CLAUDE.md first.\n- Follow docs/claude/README.md.\n- Follow docs/ai/AGENT-ORCHESTRATION-WORKFLOW.md.\n- Follow docs/claude/VALIDATION-GATES.md.\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. If the task cannot fit the stated turn/budget caps, stop and report the blocker before broad exploration.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- Use the manager preflight packet below as the durable implementation scope. Do not redo broad repo discovery/preflight.\n- Implement only the issue as scoped by its body and the preflight packet.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nIssue body:\n\n${issue.body || '(no issue body)'}\n\nLatest manager preflight packet (source comment ${commentRevision(preflight) || 'unknown'}):\n\n${preflight.body}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
+  return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nSelection mode: preflight-direct — this issue had no Claude proceed command. The runner built this prompt directly from the issue and its latest manager preflight packet.\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max turns: ${profile.maxTurns}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. If the task cannot fit the stated turn/budget caps, stop and report the blocker before broad exploration.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- Use the manager preflight packet below as the durable implementation scope. Do not redo broad repo discovery/preflight.\n- Implement only the issue as scoped by its body and the preflight packet.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nIssue body:\n\n${issue.body || '(no issue body)'}\n\nLatest manager preflight packet (source comment ${commentRevision(preflight) || 'unknown'}):\n\n${preflight.body}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
 }
 
 export function buildClaudeArgs({ prompt, profile, resumeSession }) {
@@ -482,13 +504,14 @@ export function captureGitRepositoryEvidence({ cwd = resolve('.'), includeUntrac
   };
 }
 
-export function prepareImplementationWorkspace({ worktreeIdentity, env = process.env, runner = spawnSync } = {}) {
+export function prepareImplementationWorkspace({ worktreeIdentity, implementationCheckout, env = process.env, runner = spawnSync } = {}) {
   const baseRef = String(env.CLAUDE_RUNNER_BASE_REF || 'origin/main').trim();
   if (!/^origin\/[A-Za-z0-9._/-]+$/.test(baseRef)) {
     return { allowed: false, failureReason: 'implementation-base-ref-invalid', baseRef };
   }
 
-  const rootResult = runGit(['rev-parse', '--show-toplevel'], { runner });
+  const searchCwd = implementationCheckout ? resolve(implementationCheckout) : resolve('.');
+  const rootResult = runGit(['rev-parse', '--show-toplevel'], { cwd: searchCwd, runner });
   const rootPath = rootResult?.status === 0 ? String(rootResult.stdout || '').trim() : '';
   if (!rootPath) return { allowed: false, failureReason: 'implementation-repository-root-unavailable', baseRef };
 
@@ -540,13 +563,14 @@ export function prepareImplementationWorkspace({ worktreeIdentity, env = process
  * matching the deterministic identity derived from the same issue/comment
  * (#698 finding 2). Never creates a new worktree or branch.
  */
-export function prepareContinuationWorkspace({ worktreeIdentity, env = process.env, runner = spawnSync } = {}) {
+export function prepareContinuationWorkspace({ worktreeIdentity, implementationCheckout, env = process.env, runner = spawnSync } = {}) {
   const baseRef = String(env.CLAUDE_RUNNER_BASE_REF || 'origin/main').trim();
   if (!/^origin\/[A-Za-z0-9._/-]+$/.test(baseRef)) {
     return { allowed: false, failureReason: 'continuation-base-ref-invalid', baseRef };
   }
 
-  const rootResult = runGit(['rev-parse', '--show-toplevel'], { runner });
+  const searchCwd = implementationCheckout ? resolve(implementationCheckout) : resolve('.');
+  const rootResult = runGit(['rev-parse', '--show-toplevel'], { cwd: searchCwd, runner });
   const rootPath = rootResult?.status === 0 ? String(rootResult.stdout || '').trim() : '';
   if (!rootPath) return { allowed: false, failureReason: 'continuation-repository-root-unavailable', baseRef };
 
@@ -1148,9 +1172,10 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
     // worktree/branch the original attempt owned — the opposite of the
     // fresh-attempt requirement above, which refuses to reuse one (#698
     // finding 2).
+    const implementationCheckout = runPlan.repositoryContext?.implementationCheckout;
     implementationWorkspace = args.recoveryMode
-      ? prepareContinuationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, env })
-      : prepareImplementationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, env });
+      ? prepareContinuationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env })
+      : prepareImplementationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env });
     planWithPrompt = {
       ...planWithPrompt,
       workspacePreparation: {
@@ -1246,7 +1271,7 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
     implementationPublication = publishImplementationDraft({
       workspace: implementationWorkspace,
       worktreeIdentity: runPlan.worktreeIdentity,
-      repo: runPlan.repo,
+      repo: runPlan.repositoryContext?.implementationRepository || runPlan.repo,
       issueNumber: runPlan.issue,
       issueTitle: runPlan.issueTitle,
       env,
@@ -1382,6 +1407,7 @@ async function runPrFollowUp(args, env, token) {
     issueNumber: linkedIssue,
     branch,
     unresolved,
+    repo: args.repo,
   });
   const profileName = inferProfile({ explicitProfile: args.profile, issue: { title: pullRequest.title, body: pullRequest.body } });
   const profile = resolveProfile(profileName, { model: args.model, effort: args.effort, maxTurns: args.maxTurns, maxBudgetUsd: args.maxBudgetUsd }, env);
@@ -1410,7 +1436,8 @@ async function runPrFollowUp(args, env, token) {
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
-  const args = parseArgs(argv);
+  const config = loadAgentRunnerConfig({ argv, env });
+  const args = parseArgs(stripConfigArgs(argv));
   if (args.help) {
     printHelp();
     return 0;
@@ -1473,6 +1500,32 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const preflightMeta = parseKeyValueBlock(currentPreflight?.body || '');
   const commandMeta = command ? parseKeyValueBlock(command.body) : {};
   const executionMeta = { ...preflightMeta, ...commandMeta };
+
+  // Typed repository-context boundary (#686): implementationRepository
+  // defaults to the configured project and only diverges when the current
+  // preflight/command explicitly names a known repository via a plain
+  // `Implementation repository: <owner>/<repo>` metadata line. This keeps
+  // prompt identity, worktree root and draft-PR target in lockstep and
+  // fails closed instead of silently collapsing onto the issue's repo.
+  const repositoryContextResult = resolveRepositoryContext({
+    issueRepository: args.repo,
+    projectRepository: config.githubRepo,
+    projectCheckout: config.localRepoPath,
+    runnerCheckout: RUNNER_OWN_CHECKOUT,
+    requestedImplementationRepository: executionMeta.implementation_repository,
+  });
+  if (!repositoryContextResult.allowed) {
+    const payload = {
+      blocked: true,
+      reason: repositoryContextResult.failureReason,
+      issue: args.issue,
+      message: `The repository context for issue #${args.issue} could not be resolved unambiguously (${repositoryContextResult.failureReason}). No Claude process was started.`,
+    };
+    console.log(JSON.stringify(payload, null, 2));
+    return EXECUTION_POLICY_EXIT_CODE;
+  }
+  const repositoryContext = repositoryContextResult.context;
+
   const profileName = inferProfile({
     explicitProfile: args.profile || executionMeta.profile,
     commandText: referenceText,
@@ -1523,6 +1576,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       clearContext,
       executionPhase: executionAuthorization.phase,
       worktreeIdentity,
+      repositoryContext,
     })
     : buildPreflightDirectPrompt({
       issue: { number: args.issue, title: issue.title, body: issue.body },
@@ -1531,6 +1585,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       clearContext,
       executionPhase: executionAuthorization.phase,
       worktreeIdentity,
+      repositoryContext,
     });
   const claudeArgs = buildClaudeArgs({ prompt, profile, resumeSession: args.resumeSession });
 
@@ -1539,6 +1594,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     issue: args.issue,
     issueTitle: issue.title,
     repo: args.repo,
+    repositoryContext,
     selectionMode,
     commandKind: command?.kind || null,
     commandHeading: command?.heading || null,
