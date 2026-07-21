@@ -12,6 +12,9 @@ function selection({
   issue = 5,
   status = 'status:ready',
   agent = 'agent:claude',
+  labels = [status, agent],
+  selectedStatus = status,
+  selectedAgent = agent,
   mode = 'preflight-direct',
   command = null,
   preflightId = 100,
@@ -24,7 +27,12 @@ function selection({
     user: { login: author },
   };
   return {
-    issue: issue == null ? null : { number: issue, statusLabel: status, agentLabel: agent },
+    issue: issue == null ? null : {
+      number: issue,
+      labels,
+      statusLabel: selectedStatus,
+      agentLabel: selectedAgent,
+    },
     selection: issue == null ? null : { mode, command, preflight: mode === 'preflight-direct' ? preflight : null },
     command,
     currentPreflight: preflight,
@@ -57,6 +65,29 @@ test('stable approved proceed-command candidate is admitted', () => {
     allowed: true,
     reason: 'candidate-admitted',
   });
+});
+
+test('duplicate status labels fail closed before attempt creation', () => {
+  const current = candidateSnapshot(selection({ labels: ['status:ready', 'status:blocked', 'agent:claude'] }));
+  assert.equal(current.labelAuthorityAllowed, false);
+  assert.equal(evaluateCandidateAdmission({ initial: current, current, approvers: ['gpcola'] }).reason, 'candidate-status-label-ambiguous');
+});
+
+test('missing agent label fails closed before attempt creation', () => {
+  const current = candidateSnapshot(selection({ labels: ['status:ready'] }));
+  assert.equal(evaluateCandidateAdmission({ initial: current, current, approvers: ['gpcola'] }).reason, 'candidate-agent-label-missing');
+});
+
+test('project-derived selected status cannot override the sole status label', () => {
+  const current = candidateSnapshot(selection({ selectedStatus: 'status:blocked' }));
+  assert.equal(current.statusLabel, 'status:ready');
+  assert.equal(evaluateCandidateAdmission({ initial: current, current, approvers: ['gpcola'] }).reason, 'candidate-status-field-label-conflict');
+});
+
+test('project-derived selected agent cannot override the sole agent label', () => {
+  const current = candidateSnapshot(selection({ selectedAgent: 'agent:codex' }));
+  assert.equal(current.agentLabel, 'agent:claude');
+  assert.equal(evaluateCandidateAdmission({ initial: current, current, approvers: ['gpcola'] }).reason, 'candidate-agent-field-label-conflict');
 });
 
 test('proceed-command revision change fails closed', () => {
