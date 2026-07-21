@@ -19,12 +19,50 @@ import { main as schedulerMain, parseArgs as schedulerParseArgs } from './claude
 
 export * from './claude-runner-cron.mjs';
 
+export function createStableOutputCapture({ logger, originalConsoleLog, originalConsoleError, onValues }) {
+  const baseLogger = logger || {
+    log: originalConsoleLog.bind(console),
+    error: originalConsoleError.bind(console),
+  };
+  const record = (values) => onValues?.(values);
+  return {
+    baseLogger,
+    directLog: (...values) => {
+      record(values);
+      originalConsoleLog(...values);
+    },
+    directError: (...values) => {
+      record(values);
+      originalConsoleError(...values);
+    },
+    loggerLog: (...values) => {
+      record(values);
+      baseLogger.log(...values);
+    },
+    loggerError: (...values) => {
+      record(values);
+      baseLogger.error(...values);
+    },
+  };
+}
+
 export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
   const pauseState = { result: null };
-  const baseLogger = dependencies.logger || console;
+  const originalConsoleLog = console.log;
+  const originalConsoleError = console.error;
+  let finalPayload = null;
+  const capture = createStableOutputCapture({
+    logger: dependencies.logger,
+    originalConsoleLog,
+    originalConsoleError,
+    onValues: (values) => {
+      const parsed = parseStructuredOutput(values);
+      if (parsed) finalPayload = parsed;
+    },
+  });
+  const baseLogger = capture.baseLogger;
   const openStore = dependencies.openStore || openRunnerStateStore;
   const revalidate = dependencies.revalidateCandidate || runAtomicCandidateRevalidation;
-  let finalPayload = null;
   let livenessDecisions = [];
 
   const parsedArgs = (dependencies.parseArgs || schedulerParseArgs)(argv, env);
@@ -55,18 +93,11 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     },
   );
 
-  const capture = (method) => (...values) => {
-    const parsed = parseStructuredOutput(values);
-    if (parsed) finalPayload = parsed;
-    baseLogger[method](...values);
-  };
-  const originalConsoleLog = console.log;
-  const originalConsoleError = console.error;
-  console.log = capture('log');
-  console.error = capture('error');
+  console.log = capture.directLog;
+  console.error = capture.directError;
 
   const logger = {
-    log: capture('log'),
+    log: capture.loggerLog,
     error: (...values) => {
       const parsed = parseStructuredOutput(values);
       if (parsed) finalPayload = parsed;
