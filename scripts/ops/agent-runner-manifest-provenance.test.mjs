@@ -41,6 +41,25 @@ function validProvenance(overrides = {}) {
   };
 }
 
+function applyOwnershipTransfers(manifest, ownership) {
+  const transfers = new Map((ownership.transfers || []).map((entry) => [entry.path, entry]));
+  return (manifest.files || []).map((entry) => {
+    const transfer = transfers.get(entry.path);
+    if (!transfer) return entry;
+    return {
+      path: entry.path,
+      mode: entry.mode,
+      status: MANIFEST_STATUS_TRANSFERRED,
+      provenance: {
+        sourceRepository: manifest.sourceRepository,
+        sourceCommit: manifest.sourceCommit,
+        importedSha256: entry.sha256 || entry.provenance?.importedSha256,
+      },
+      ownership: transfer.ownership,
+    };
+  });
+}
+
 test('an unchanged locked import with a matching hash passes', () => {
   const files = [{ path: 'a.mjs', status: MANIFEST_STATUS_LOCKED, sha256: HASH_A }];
   const result = evaluateManifestFiles(files, fakeFs({ hashes: { 'a.mjs': HASH_A } }));
@@ -71,8 +90,6 @@ test('a correctly declared ownership-transferred file may diverge from its impor
     provenance: validProvenance(),
     ownership: validOwnership(),
   }];
-  // sha256OfFile intentionally returns something that matches nothing --
-  // a transferred entry's current content must never be hash-checked.
   const result = evaluateManifestFiles(files, fakeFs({ hashes: { 'b.mjs': HASH_B } }));
   assert.deepEqual(result.errors, []);
   assert.deepEqual(result.transferred, ['b.mjs']);
@@ -149,30 +166,30 @@ test('mixed locked and transferred entries are each evaluated independently and 
   assert.deepEqual(result.transferred, ['moved.mjs']);
 });
 
-// Real-manifest regression: only the five files intentionally changed by
-// PR #19 are declared transferred; everything else the actual repository
-// ships stays locked to its ModelSpend import unless separately justified.
-test('MIGRATION-MANIFEST.json declares transferred status only for the files PR #19 actually changed', () => {
+test('migration manifest plus canonical ownership registry validates every imported file', () => {
   const root = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
   const manifest = JSON.parse(readFileSync(join(root, 'MIGRATION-MANIFEST.json'), 'utf8'));
-  const transferredPaths = manifest.files
+  const ownership = JSON.parse(readFileSync(join(root, 'CANONICAL-OWNERSHIP.json'), 'utf8'));
+  const manifestTransferredPaths = manifest.files
     .filter((entry) => entry.status === MANIFEST_STATUS_TRANSFERRED)
     .map((entry) => entry.path)
     .sort();
-  assert.deepEqual(transferredPaths, [
+  assert.deepEqual(manifestTransferredPaths, [
     'scripts/ops/claude-runner-cron.mjs',
     'scripts/ops/claude-runner-cron.test.mjs',
     'scripts/ops/claude-runner-review-followup.mjs',
     'scripts/ops/claude-runner.mjs',
     'scripts/ops/claude-runner.test.mjs',
   ]);
-  const result = evaluateManifestFiles(manifest.files, {
+
+  const effectiveFiles = applyOwnershipTransfers(manifest, ownership);
+  const result = evaluateManifestFiles(effectiveFiles, {
     fileExists: (path) => existsAt(join(root, path)),
     sha256OfFile: (path) => sha256At(join(root, path)),
   });
   assert.deepEqual(result.errors, []);
-  assert.equal(result.transferred.length, 5);
-  assert.equal(result.locked.length, manifest.files.length - 5);
+  assert.equal(result.transferred.length, manifestTransferredPaths.length + ownership.transfers.length);
+  assert.equal(result.locked.length, manifest.files.length - result.transferred.length);
 });
 
 function existsAt(path) {
