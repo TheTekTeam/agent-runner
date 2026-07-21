@@ -6,7 +6,7 @@
       "ownership": {
         "canonicalRepository": "TheTekTeam/agent-runner",
         "transferredAt": "2026-07-21T19:20:00.000Z",
-        "reason": "Issue #27 removes the standalone runner's Claude turn cap from the canonical agent adapter. This behaviour must diverge from the historical ModelSpend import.",
+        "reason": "Issue #27 removes the obsolete internal interaction cap from the canonical agent adapter. This behaviour must diverge from the historical ModelSpend import.",
         "reference": "https://github.com/TheTekTeam/agent-runner/pull/28"
       }
     },
@@ -15,8 +15,44 @@
       "ownership": {
         "canonicalRepository": "TheTekTeam/agent-runner",
         "transferredAt": "2026-07-21T19:20:00.000Z",
-        "reason": "Issue #27 adds canonical standalone-runner regression coverage proving implementation maxTurns values are ignored and --max-turns is not forwarded.",
+        "reason": "Issue #27 adds canonical standalone-runner regression coverage proving implementation is not stopped by an internal interaction count.",
         "reference": "https://github.com/TheTekTeam/agent-runner/pull/28"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-recovery.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-21T20:03:00.000Z",
+        "reason": "Issue #27 removes interaction-count policy from recovery eligibility and replaces provider-specific terminal policy with a generic provider execution-limit outcome.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/29"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-recovery.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-21T20:03:00.000Z",
+        "reason": "Issue #27 updates recovery regression coverage for the interaction-count-free policy.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/29"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-comment-identity.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-21T20:03:00.000Z",
+        "reason": "Issue #27 updates persisted failure examples to the generic provider execution-limit outcome.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/29"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-state.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-21T20:03:00.000Z",
+        "reason": "Issue #27 updates durable attention-event regression coverage to the generic provider execution-limit outcome.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/29"
       }
     }
   ]

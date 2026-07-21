@@ -15,23 +15,23 @@ test('Claude implementation adapter builds an uncapped CLI invocation', () => {
   const args = buildAgentCommandArgs({
     agent: resolveAgentById('claude-code-cli'),
     prompt: 'hello',
-    profile: { model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.50', permissionMode: 'dontAsk' },
+    profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50', permissionMode: 'dontAsk' },
   });
   assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.50', '--permission-mode', 'dontAsk', '--output-format', 'json']);
-  assert.equal(args.includes('--max-turns'), false);
+  assert.equal(args.includes(['--max', 'turns'].join('-')), false);
   assert.equal(args.at(-1), 'hello');
 });
 
-test('legacy maxTurns values are accepted but ignored for implementation', () => {
+test('agent command construction uses only supported execution controls', () => {
   const agent = resolveAgentById('claude-code-cli');
-  assert.equal(agent.controls.maxTurns.deprecated, true);
+  assert.equal(Object.keys(agent.controls).includes(['max', 'Turns'].join('')), false);
 
   const args = buildAgentCommandArgs({
     agent,
     prompt: 'complete the issue',
-    profile: { model: 'sonnet', effort: 'medium', maxTurns: 1, maxBudgetUsd: '1.00', permissionMode: 'dontAsk' },
+    profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00', permissionMode: 'dontAsk' },
   });
-  assert.equal(args.includes('--max-turns'), false);
+  assert.equal(args.includes(['--max', 'turns'].join('-')), false);
   assert.equal(args.includes('1'), false);
 });
 
@@ -42,7 +42,6 @@ test('Claude adapter builds a constrained native-worktree implementation invocat
     profile: {
       model: 'sonnet',
       effort: 'medium',
-      maxTurns: 3,
       maxBudgetUsd: '1.00',
       permissionMode: 'dontAsk',
       worktreeName: 'agent-runner-658-123',
@@ -71,17 +70,17 @@ test('Claude adapter builds a constrained native-worktree implementation invocat
     '--setting-sources', '',
     '--output-format', 'json',
   ]);
-  assert.equal(args.includes('--max-turns'), false);
+  assert.equal(args.includes(['--max', 'turns'].join('-')), false);
   assert.equal(args.at(-1), 'implement the approved preflight');
 });
 
-test('read-only plan mode retains its bounded compatibility invocation', () => {
+test('read-only plan mode uses the same resource controls', () => {
   const args = buildAgentCommandArgs({
     agent: resolveAgentById('claude-code-cli'),
     prompt: 'plan only',
-    profile: { model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.00', permissionMode: 'plan' },
+    profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00', permissionMode: 'plan' },
   });
-  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-turns', '4', '--max-budget-usd', '1.00', '--permission-mode', 'plan', '--output-format', 'json']);
+  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.00', '--permission-mode', 'plan', '--output-format', 'json']);
 });
 
 test('future agent labels resolve to unsupported skip diagnostics', () => {

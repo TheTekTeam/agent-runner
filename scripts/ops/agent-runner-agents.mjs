@@ -1,7 +1,6 @@
 const FUTURE_CONTROLS = {
   model: { supported: false },
   effort: { supported: false },
-  maxTurns: { supported: false },
   maxBudgetUsd: { supported: false },
   permissionMode: { supported: false },
   resumeSession: { supported: false },
@@ -26,7 +25,6 @@ export const AGENT_ADAPTERS = Object.freeze({
     controls: Object.freeze({
       model: Object.freeze({ supported: true, flag: '--model' }),
       effort: Object.freeze({ supported: true, flag: '--effort' }),
-      maxTurns: Object.freeze({ supported: true, flag: '--max-turns', deprecated: true }),
       maxBudgetUsd: Object.freeze({ supported: true, flag: '--max-budget-usd' }),
       permissionMode: Object.freeze({ supported: true, flag: '--permission-mode' }),
       resumeSession: Object.freeze({ supported: true, flag: '--resume' }),
@@ -109,7 +107,6 @@ export function buildAgentCommandArgs({ agent = resolveAgentById(), prompt, prof
   validateAgentControls(agent, {
     model: profile.model,
     effort: profile.effort,
-    maxTurns: profile.maxTurns,
     maxBudgetUsd: profile.maxBudgetUsd,
     permissionMode: profile.permissionMode,
     resumeSession,
@@ -132,9 +129,6 @@ export function buildAgentCommandArgs({ agent = resolveAgentById(), prompt, prof
   // Implementation runs must be able to continue through discovery, edits,
   // validation and commit. Retain the legacy cap only for read-only plan mode
   // until the remaining profile/config cleanup in #27 is completed.
-  if (profile.permissionMode === 'plan' && profile.maxTurns) {
-    args.push(agent.controls.maxTurns.flag, String(profile.maxTurns));
-  }
   args.push(agent.controls.maxBudgetUsd.flag, String(profile.maxBudgetUsd));
   args.push(agent.controls.permissionMode.flag, profile.permissionMode);
   if (profile.tools) args.push(agent.controls.tools.flag, profile.tools);

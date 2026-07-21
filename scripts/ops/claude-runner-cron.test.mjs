@@ -188,8 +188,8 @@ test('evaluateChildRunResult classifies a non-zero child exit as a terminal runn
 
 test('evaluateChildRunResult preserves a normalized child failure reason when available', () => {
   assert.deepEqual(
-    evaluateChildRunResult({ execute: true, exitCode: 1, childPayload: { failureReason: 'turn-limit-exhausted' } }),
-    { failed: true, reason: 'turn-limit-exhausted' },
+    evaluateChildRunResult({ execute: true, exitCode: 1, childPayload: { failureReason: 'provider-execution-limit' } }),
+    { failed: true, reason: 'provider-execution-limit' },
   );
 });
 
@@ -218,9 +218,9 @@ test('evaluateChildRunResult fails closed on a normalized failure reason even if
   const result = evaluateChildRunResult({
     execute: true,
     exitCode: 0,
-    childPayload: { logPath: 'x.json', failureReason: 'turn-limit-exhausted' },
+    childPayload: { logPath: 'x.json', failureReason: 'provider-execution-limit' },
   });
-  assert.deepEqual(result, { failed: true, reason: 'turn-limit-exhausted' });
+  assert.deepEqual(result, { failed: true, reason: 'provider-execution-limit' });
 });
 
 test('evaluateChildRunResult fails a clean exit when the child flagged its own execution as a no-op', () => {
@@ -459,7 +459,7 @@ test('quarantineIssueAfterFailedRun releases the task and posts a machine-readab
   const result = quarantineIssueAfterFailedRun(
     { repo: 'TheTekTeam/modelspend' },
     { number: 658 },
-    { reason: 'turn-limit-exhausted', exitCode: 1, finishedAt: '2026-07-15T20:32:37Z' },
+    { reason: 'provider-execution-limit', exitCode: 1, finishedAt: '2026-07-15T20:32:37Z' },
     (ghArgs) => { calls.push(ghArgs); return ''; },
   );
 
@@ -468,7 +468,7 @@ test('quarantineIssueAfterFailedRun releases the task and posts a machine-readab
   assert.equal(calls[2][1], 'comment');
   const body = calls[2][calls[2].indexOf('--body') + 1];
   assert.match(body, /<!-- agent-runner:attention:v1 -->/);
-  assert.match(body, /turn_limit_exhausted/);
+  assert.match(body, /provider_execution_limit/);
   assert.match(body, /continue with other eligible work/);
   assert.equal(result.statusUpdated, true);
   assert.equal(result.attentionPosted, true);
@@ -716,7 +716,7 @@ test('restart recovery revalidation keeps a GraphQL preflight current when GitHu
       preflightRevision: `github-comment:database:${databaseId}`, preflightIdentity: identity,
       agent: 'claude-code-cli', model: 'claude-sonnet-4-5', harness: 'claude',
       startedAt: '2026-07-19T18:00:00Z', finishedAt: '2026-07-19T18:30:00Z',
-      outcome: 'turn_limit_exhausted', recoveryEligible: true, recoveryAction: 'fresh_retry', resolutionState: 'unresolved',
+      outcome: 'provider_execution_limit', recoveryEligible: true, recoveryAction: 'fresh_retry', resolutionState: 'unresolved',
       processId: 321, processBootId: 'boot-a', processStartTicks: '10',
     });
     store.close();
@@ -1013,7 +1013,7 @@ async function runRecoveryRevalidationScenario({ action = 'fresh_retry', decideS
     attemptId, repo: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 698, claimId: '41', preflightRevision: '41',
     agent: 'claude-code-cli', model: 'claude-sonnet-4-5', harness: 'claude',
     startedAt: '2026-07-17T18:00:00Z', finishedAt: '2026-07-17T18:01:00Z',
-    outcome: action === 'native_resume' ? 'turn_limit_exhausted' : 'transient_provider_or_network_failure',
+    outcome: action === 'native_resume' ? 'provider_execution_limit' : 'transient_provider_or_network_failure',
     recoveryEligible: true, recoveryAction: action, recoveryAttemptCount: 0, retryAt: '2026-07-17T18:02:00Z',
     attentionStatus: 'attention_required', resolutionState: 'unresolved',
     processId: 321, processBootId: 'old-boot', processStartTicks: '100', systemdInvocationId: 'old-invocation',

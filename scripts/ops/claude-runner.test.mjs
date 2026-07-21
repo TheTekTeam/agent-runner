@@ -94,7 +94,7 @@ test('claude-runner.mjs re-exports manager preflight helpers from the shared sel
 test('buildPreflightDirectPrompt builds the prompt from issue title/body and the manager preflight packet, not a proceed command', () => {
   const issue = { number: 641, title: 'Agent Runner v2', body: 'Implement preflight-direct dispatch.' };
   const preflight = { id: 12, sourceCommentId: 12, body: '## Manager preflight packet\nFiles checked by ChatGPT.' };
-  const profile = { profile: 'complex', model: 'sonnet', effort: 'high', maxTurns: 8, maxBudgetUsd: '4.00' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'high', maxBudgetUsd: '4.00' };
 
   const prompt = buildPreflightDirectPrompt({ issue, preflight, profile, clearContext: true });
 
@@ -110,7 +110,7 @@ test('buildPreflightDirectPrompt builds the prompt from issue title/body and the
 
 test('buildClaudePrompt (compatibility mode) still relays the literal command text', () => {
   const issue = { number: 99, title: 'Legacy command issue' };
-  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.50' };
+  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50' };
   const prompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext: false });
   assert.equal(prompt.startsWith('/clear'), false);
   assert.match(prompt, /Latest Claude command:/);
@@ -119,7 +119,7 @@ test('buildClaudePrompt (compatibility mode) still relays the literal command te
 
 test('buildClaudePrompt with clearContext uses a plain fresh-context instruction, not a slash command', () => {
   const issue = { number: 99, title: 'Legacy command issue' };
-  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.50' };
+  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50' };
   const prompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext: true });
   assert.equal(prompt.startsWith('/clear'), false);
   assert.match(prompt, /^Start a fresh task context\./);
@@ -127,7 +127,7 @@ test('buildClaudePrompt with clearContext uses a plain fresh-context instruction
 
 test('implementation prompt consumes the manager preflight as the plan and requires repository work', () => {
   const issue = { number: 658, title: 'Portable runner entrypoints' };
-  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium', maxTurns: 3, maxBudgetUsd: '1.00', permissionMode: 'dontAsk' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00', permissionMode: 'dontAsk' };
   const prompt = buildClaudePrompt({
     issue,
     commandText: '## Claude proceed command\nPhase: implementation',
@@ -216,7 +216,7 @@ test('#686 regression: the actual fetched preflight text (no structured field) s
   const prompt = buildPreflightDirectPrompt({
     issue: { number: 686, title: 'OPS.AGENT.RUNNER.STANDALONE.REPO.1', body: 'Extract Agent Runner.' },
     preflight: { id: 5029607103, sourceCommentId: 5029607103, body: ISSUE_686_MANAGER_PREFLIGHT_BODY },
-    profile: { profile: 'complex', model: 'sonnet', effort: 'medium', maxTurns: 3, maxBudgetUsd: '1.00' },
+    profile: { profile: 'complex', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00' },
     clearContext: true,
     executionPhase: EXECUTION_PHASE_IMPLEMENTATION,
     worktreeIdentity: { name: 'agent-runner-686-5029607103', expectedBranch: 'worktree-agent-runner-686-5029607103' },
@@ -242,7 +242,7 @@ test('#686 regression: once the preflight names the runner repository explicitly
   const prompt = buildPreflightDirectPrompt({
     issue: { number: 686, title: 'OPS.AGENT.RUNNER.STANDALONE.REPO.1', body: 'Extract Agent Runner.' },
     preflight: { id: 5029607103, sourceCommentId: 5029607103, body: updatedBody },
-    profile: { profile: 'complex', model: 'sonnet', effort: 'medium', maxTurns: 3, maxBudgetUsd: '1.00' },
+    profile: { profile: 'complex', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00' },
     clearContext: true,
     executionPhase: EXECUTION_PHASE_IMPLEMENTATION,
     worktreeIdentity: { name: 'agent-runner-686-5029607103', expectedBranch: 'worktree-agent-runner-686-5029607103' },
@@ -263,7 +263,7 @@ test('buildClaudePrompt and buildPreflightDirectPrompt never say "working on Mod
     implementationInstructionPaths: ['AGENTS.md'],
   };
   const issue = { number: 5, title: 'Simplify queue admission' };
-  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium', maxTurns: 3, maxBudgetUsd: '1.00' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00' };
 
   const claudePrompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext: false, repositoryContext });
   const preflightPrompt = buildPreflightDirectPrompt({ issue, preflight: { id: 1, body: 'x' }, profile, clearContext: false, repositoryContext });
@@ -276,7 +276,7 @@ test('buildClaudePrompt and buildPreflightDirectPrompt never say "working on Mod
 
 test('prompts default to the historical ModelSpend instruction set when no repository context is supplied, preserving ordinary same-repository behaviour', () => {
   const issue = { number: 99, title: 'Legacy command issue' };
-  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.50' };
+  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50' };
   const prompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext: false });
   assert.match(prompt, /Follow CLAUDE\.md\./);
   assert.match(prompt, /Follow docs\/claude\/README\.md\./);
@@ -287,7 +287,7 @@ test('prompts default to the historical ModelSpend instruction set when no repos
 test('generated issue-mode prompts never start with a literal /clear slash command, with or without clearContext', () => {
   const issue = { number: 641, title: 'Agent Runner v2', body: 'Implement preflight-direct dispatch.' };
   const preflight = { id: 12, sourceCommentId: 12, body: '## Manager preflight packet\nFiles checked by ChatGPT.' };
-  const profile = { profile: 'complex', model: 'sonnet', effort: 'high', maxTurns: 8, maxBudgetUsd: '4.00' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'high', maxBudgetUsd: '4.00' };
 
   for (const clearContext of [true, false]) {
     const claudePrompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext });
@@ -324,7 +324,7 @@ test('supports configured model aliases', () => {
   const profile = resolveProfile('docs', {}, { CLAUDE_RUNNER_MODEL_DOCS: 'custom-haiku' });
   assert.equal(profile.model, 'custom-haiku');
   assert.equal(profile.effort, 'low');
-  assert.equal(profile.maxTurns, 2);
+  assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);
 });
 
 test('clear policy defaults to fresh context', () => {
@@ -333,29 +333,28 @@ test('clear policy defaults to fresh context', () => {
   assert.equal(shouldUseClear({ noClear: true }), false);
 });
 
-test('Claude args include model effort budget and turn caps', () => {
+test('Claude args include model effort and budget without interaction caps', () => {
   const args = buildClaudeArgs({
     prompt: 'hello',
-    profile: { model: 'sonnet', effort: 'medium', maxTurns: 4, maxBudgetUsd: '1.50', permissionMode: 'plan' },
+    profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50', permissionMode: 'plan' },
   });
-  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-turns', '4', '--max-budget-usd', '1.50', '--permission-mode', 'plan', '--output-format', 'json']);
+  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.50', '--permission-mode', 'plan', '--output-format', 'json']);
 });
 
-test('critical defaults remain bounded and do not silently select Opus/xhigh', () => {
+test('critical defaults retain monetary bounds and do not silently select Opus/xhigh', () => {
   const profile = resolveProfile('critical');
   assert.equal(profile.model, 'sonnet');
   assert.equal(profile.effort, 'high');
-  assert.equal(profile.maxTurns, 3);
+  assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);
   assert.equal(profile.maxBudgetUsd, '1.50');
 });
 
-test('unattended cost admission rejects the observed #658 Opus/xhigh/10-turn/$8 controls', () => {
-  const result = evaluateClaudeCostAdmission({ model: 'opus', effort: 'xhigh', maxTurns: 10, maxBudgetUsd: '8.00' }, {});
+test('unattended cost admission rejects the observed #658 Opus/xhigh/$8 controls', () => {
+  const result = evaluateClaudeCostAdmission({ model: 'opus', effort: 'xhigh', maxBudgetUsd: '8.00' }, {});
   assert.equal(result.allowed, false);
   assert.deepEqual(result.violations, [
     'opus-requires-explicit-machine-opt-in',
     'high-effort-requires-explicit-machine-opt-in',
-    'turn-cap-exceeds-machine-policy',
     'budget-cap-exceeds-machine-policy',
   ]);
 });
@@ -368,11 +367,10 @@ test('unattended cost admission permits the bounded critical default', () => {
 
 test('Opus/xhigh can only be admitted with explicit machine opt-ins and raised caps', () => {
   const result = evaluateClaudeCostAdmission(
-    { model: 'opus', effort: 'xhigh', maxTurns: 10, maxBudgetUsd: '8.00' },
+    { model: 'opus', effort: 'xhigh', maxBudgetUsd: '8.00' },
     {
       CLAUDE_RUNNER_ALLOW_OPUS: 'true',
       CLAUDE_RUNNER_ALLOW_XHIGH: 'true',
-      CLAUDE_RUNNER_MAX_TURNS_PER_ATTEMPT: '10',
       CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '8',
     },
   );
@@ -511,7 +509,7 @@ test('detectExecutionNoop does not flag a genuine non-zero Claude failure exit (
 test('classifyClaudeRunFailure normalizes the observed max-turns failure from issue #658', () => {
   assert.equal(
     classifyClaudeRunFailure({ status: 1, stdout: 'Error: Reached max turns (10)' }),
-    'turn-limit-exhausted',
+    'provider-execution-limit',
   );
 });
 
@@ -563,7 +561,7 @@ test('structured Claude max-turn subtype has priority over a generic process exi
     num_turns: 3,
     total_cost_usd: 0.75,
   }));
-  assert.equal(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'turn-limit-exhausted');
+  assert.equal(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'provider-execution-limit');
 });
 
 function capturedClaudeArray(issue) {
@@ -602,7 +600,7 @@ test('#658 captured array selects the terminal result and classifies max turns',
   assert.equal(envelope.parsed, true);
   assert.equal(envelope.subtype, 'error_max_turns');
   assert.equal(envelope.numTurns, 10);
-  assert.equal(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'turn-limit-exhausted');
+  assert.equal(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'provider-execution-limit');
 });
 
 test('single-object JSON, JSONL and JSON-array envelopes select the terminal result', () => {

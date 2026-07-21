@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 
 export const RECOVERY_POLICY_REVISION = 'runner-recovery-v1';
 export const TERMINAL_OUTCOMES = Object.freeze([
-  'completed', 'plan_only_awaiting_approval', 'turn_limit_exhausted', 'quota_paused',
+  'completed', 'plan_only_awaiting_approval', 'provider_execution_limit', 'quota_paused',
   'rate_limited', 'transient_provider_or_network_failure', 'validation_failed',
   'permission_or_auth_failure', 'process_crash_or_signal', 'checkpoint_incompatible',
   'unknown_failure', 'orphaned_active_claim',
@@ -19,7 +19,7 @@ export const DEFAULT_RECOVERY_POLICY = Object.freeze({
 });
 
 const LEGACY_REASONS = Object.freeze({
-  'turn-limit-exhausted': 'turn_limit_exhausted',
+  'provider-execution-limit': 'provider_execution_limit',
   'plan-only-awaiting-approval': 'plan_only_awaiting_approval',
   'awaiting-plan-approval': 'plan_only_awaiting_approval',
   awaiting_plan_approval: 'plan_only_awaiting_approval',
@@ -53,7 +53,7 @@ export function recoveryAttemptCapForOutcome(outcome, policy = DEFAULT_RECOVERY_
   switch (outcome) {
     case 'rate_limited': return policy.rateLimitAttemptCap;
     case 'transient_provider_or_network_failure': return policy.transientAttemptCap;
-    case 'turn_limit_exhausted': return policy.resumeAttemptCap;
+    case 'provider_execution_limit': return policy.resumeAttemptCap;
     case 'validation_failed': return policy.validationAttemptCap;
     default: return null;
   }
@@ -68,7 +68,7 @@ function ownershipProven(evidence) {
 }
 
 function headroomProven(evidence) {
-  return evidence.sameProfileAvailable === true && evidence.quotaHeadroom === true && evidence.budgetHeadroom === true && evidence.turnHeadroom === true;
+  return evidence.sameProfileAvailable === true && evidence.quotaHeadroom === true && evidence.budgetHeadroom === true;
 }
 
 /**
@@ -106,7 +106,7 @@ export function decideRecovery(input, policyOverrides = {}) {
     if (evidence.repositoryMutated !== false) return forbidden(reason, 'Inspect preserved repository state; do not blind-retry after possible mutation.');
     return retry(reason, 'fresh_retry', attempts, policy.transientAttemptCap, nowMs, policy, 'Retry after bounded backoff only if ownership and headroom remain proven.');
   }
-  if (reason === 'turn_limit_exhausted') {
+  if (reason === 'provider_execution_limit') {
     if (!(evidence.checkpointAvailable === true && evidence.sessionAvailable === true && evidence.profileCompatible === true && headroomProven(evidence)
       && evidence.conflictingWorktree === false && evidence.conflictingBranch === false && evidence.conflictingPr === false)) {
       return forbidden(reason, 'Review the attempt; a proven compatible native checkpoint and exclusive ownership are required to resume.');

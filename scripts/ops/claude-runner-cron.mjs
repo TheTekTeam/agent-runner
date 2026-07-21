@@ -2664,7 +2664,6 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         sameProfileAvailable: childPayload?.recoveryEvidence?.sameProfileAvailable === true,
         quotaHeadroom: quotaPreflight.blocked === false && quotaPreflight.skipped === false,
         budgetHeadroom: childPayload?.costAdmission?.allowed === true,
-        turnHeadroom: childPayload?.recoveryEvidence?.turnHeadroom === true,
         conflictingWorktree: Boolean(childPayload?.worktreeIdentity?.rootPath), conflictingBranch: Boolean(childPayload?.implementationPublication?.branch), conflictingPr: Boolean(childPayload?.implementationPublication?.pullRequest),
         worktreeAvailable: Boolean(childPayload?.worktreeIdentity),
         explicitDeterministicValidationFailure: childPayload?.recoveryEvidence?.deterministicValidationFailure === true,

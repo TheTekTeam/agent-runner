@@ -104,7 +104,6 @@ export const DEFAULT_PROFILES = {
     modelEnv: 'CLAUDE_RUNNER_MODEL_DOCS',
     defaultModel: 'haiku',
     effort: 'low',
-    maxTurns: 2,
     maxBudgetUsd: '0.25',
     permissionMode: 'plan',
   },
@@ -112,7 +111,6 @@ export const DEFAULT_PROFILES = {
     modelEnv: 'CLAUDE_RUNNER_MODEL_NARROW',
     defaultModel: 'sonnet',
     effort: 'low',
-    maxTurns: 2,
     maxBudgetUsd: '0.50',
     permissionMode: 'plan',
   },
@@ -120,7 +118,6 @@ export const DEFAULT_PROFILES = {
     modelEnv: 'CLAUDE_RUNNER_MODEL_COMPLEX',
     defaultModel: 'sonnet',
     effort: 'medium',
-    maxTurns: 3,
     maxBudgetUsd: '1.00',
     permissionMode: 'plan',
   },
@@ -130,7 +127,6 @@ export const DEFAULT_PROFILES = {
     // can still approve those controls explicitly through the cost policy.
     defaultModel: 'sonnet',
     effort: 'high',
-    maxTurns: 3,
     maxBudgetUsd: '1.50',
     permissionMode: 'plan',
   }
@@ -140,10 +136,6 @@ function truthy(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
 }
 
-function positiveInteger(value, fallback) {
-  const parsed = Number.parseInt(value, 10);
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
-}
 
 function positiveNumber(value, fallback) {
   const parsed = Number.parseFloat(value);
@@ -152,15 +144,13 @@ function positiveNumber(value, fallback) {
 
 /**
  * Fail-closed admission for an unattended paid Claude run. Explicit CLI or
- * issue metadata cannot silently raise the machine's spend/turn ceiling.
+ * issue metadata cannot silently raise the machine's spend ceiling.
  * Opus and xhigh/max each require their own machine-local opt-in.
  */
 export function evaluateClaudeCostAdmission(profile = {}, env = process.env) {
-  const maxTurns = positiveInteger(env.CLAUDE_RUNNER_MAX_TURNS_PER_ATTEMPT, 4);
   const maxBudgetUsd = positiveNumber(env.CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT, 2);
   const model = String(profile.model || '').trim().toLowerCase();
   const effort = String(profile.effort || '').trim().toLowerCase();
-  const requestedTurns = Number.parseInt(profile.maxTurns, 10);
   const requestedBudgetUsd = Number.parseFloat(profile.maxBudgetUsd);
   const violations = [];
 
@@ -169,9 +159,6 @@ export function evaluateClaudeCostAdmission(profile = {}, env = process.env) {
   }
   if (['xhigh', 'max'].includes(effort) && !truthy(env.CLAUDE_RUNNER_ALLOW_XHIGH)) {
     violations.push('high-effort-requires-explicit-machine-opt-in');
-  }
-  if (!Number.isInteger(requestedTurns) || requestedTurns < 1 || requestedTurns > maxTurns) {
-    violations.push('turn-cap-exceeds-machine-policy');
   }
   if (!Number.isFinite(requestedBudgetUsd) || requestedBudgetUsd <= 0 || requestedBudgetUsd > maxBudgetUsd) {
     violations.push('budget-cap-exceeds-machine-policy');
@@ -183,11 +170,9 @@ export function evaluateClaudeCostAdmission(profile = {}, env = process.env) {
     requested: {
       model: profile.model || null,
       effort: profile.effort || null,
-      maxTurns: Number.isInteger(requestedTurns) ? requestedTurns : null,
       maxBudgetUsd: Number.isFinite(requestedBudgetUsd) ? requestedBudgetUsd : null,
     },
     policy: {
-      maxTurns,
       maxBudgetUsd,
       opusAllowed: truthy(env.CLAUDE_RUNNER_ALLOW_OPUS),
       highEffortAllowed: truthy(env.CLAUDE_RUNNER_ALLOW_XHIGH),
@@ -208,7 +193,6 @@ export function parseArgs(argv = process.argv.slice(2)) {
     pr: undefined,
     model: undefined,
     effort: undefined,
-    maxTurns: undefined,
     maxBudgetUsd: undefined,
     resumeSession: undefined,
     attemptId: undefined,
@@ -241,7 +225,6 @@ export function parseArgs(argv = process.argv.slice(2)) {
     else if (arg === '--profile') args.profile = next();
     else if (arg === '--model') args.model = next();
     else if (arg === '--effort') args.effort = next();
-    else if (arg === '--max-turns') args.maxTurns = Number.parseInt(next(), 10);
     else if (arg === '--max-budget-usd') args.maxBudgetUsd = next();
     else if (arg === '--resume-session') args.resumeSession = next();
     else if (arg === '--attempt-id') args.attemptId = next();
@@ -295,7 +278,6 @@ Options:
   --profile <name>          docs | narrow | complex | critical
   --model <model>           Override profile model. Prefer env vars for durable config.
   --effort <level>          low | medium | high | xhigh | max
-  --max-turns <number>      Claude print-mode turn cap
   --max-budget-usd <value>  Claude print-mode budget cap
   --resume-session <name>   Resume a matching Claude session; skips clear by default
   --no-clear                Skip clear-context instruction for new task. Not recommended.
@@ -368,7 +350,6 @@ export function resolveProfile(profileName, overrides = {}, env = process.env) {
     profile: profileName,
     model: overrides.model || env[base.modelEnv] || base.defaultModel,
     effort: overrides.effort || base.effort,
-    maxTurns: overrides.maxTurns || base.maxTurns,
     maxBudgetUsd: overrides.maxBudgetUsd || base.maxBudgetUsd,
     permissionMode: overrides.permissionMode || base.permissionMode,
     tools: overrides.tools,
@@ -413,7 +394,7 @@ export function buildClaudePrompt({ issue, commandText, currentPreflight = null,
     ? `\n\nCurrent manager preflight packet (source comment ${commentRevision(currentPreflight) || 'unknown'}):\n\n${currentPreflight.body || ''}`
     : '';
 
-  return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max turns: ${profile.maxTurns}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. If the task cannot fit the stated turn/budget caps, stop and report the blocker before broad exploration.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nLatest Claude command:\n\n${commandText}${preflightText}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
+  return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. Continue until the issue is complete or a genuine blocker is reached; remain within the configured monetary and safety policies.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nLatest Claude command:\n\n${commandText}${preflightText}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
 }
 
 /**
@@ -427,7 +408,7 @@ export function buildPreflightDirectPrompt({ issue, preflight, profile, clearCon
     ? 'Start a fresh task context. Do not carry assumptions or files from any previous Claude task.\n\n'
     : '';
 
-  return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nSelection mode: preflight-direct — this issue had no Claude proceed command. The runner built this prompt directly from the issue and its latest manager preflight packet.\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max turns: ${profile.maxTurns}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. If the task cannot fit the stated turn/budget caps, stop and report the blocker before broad exploration.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- Use the manager preflight packet below as the durable implementation scope. Do not redo broad repo discovery/preflight.\n- Implement only the issue as scoped by its body and the preflight packet.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nIssue body:\n\n${issue.body || '(no issue body)'}\n\nLatest manager preflight packet (source comment ${commentRevision(preflight) || 'unknown'}):\n\n${preflight.body}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
+  return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nSelection mode: preflight-direct — this issue had no Claude proceed command. The runner built this prompt directly from the issue and its latest manager preflight packet.\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. Continue until the issue is complete or a genuine blocker is reached; remain within the configured monetary and safety policies.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- Use the manager preflight packet below as the durable implementation scope. Do not redo broad repo discovery/preflight.\n- Implement only the issue as scoped by its body and the preflight packet.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nIssue body:\n\n${issue.body || '(no issue body)'}\n\nLatest manager preflight packet (source comment ${commentRevision(preflight) || 'unknown'}):\n\n${preflight.body}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
 }
 
 export function buildClaudeArgs({ prompt, profile, resumeSession }) {
@@ -1083,7 +1064,7 @@ export function classifyClaudeRunFailure({
       : 'awaiting-plan-approval';
   }
 
-  if (resultEnvelope?.subtype === 'error_max_turns') return 'turn-limit-exhausted';
+  if (resultEnvelope?.subtype === 'error_max_turns') return 'provider-execution-limit';
   if (resultEnvelope?.subtype === 'error_max_budget_usd') return 'budget-limit-exhausted';
   if (['quota_exhausted', 'billing_quota_exceeded'].includes(resultEnvelope?.structuredFailure)) return 'quota_paused';
   if (resultEnvelope?.structuredFailure === 'rate_limited') return 'rate_limited';
@@ -1092,7 +1073,7 @@ export function classifyClaudeRunFailure({
   }
 
   const combined = `${stdout}\n${stderr}`;
-  if (/reached max turns\s*\(\s*\d+\s*\)/i.test(combined)) return 'turn-limit-exhausted';
+  if (/reached max turns\s*\(\s*\d+\s*\)/i.test(combined)) return 'provider-execution-limit';
   if (/(?:reached|exceeded|exhausted)\s+(?:the\s+)?max(?:imum)? budget|max(?:imum)? budget(?: usd)?\s+(?:reached|exceeded|exhausted)/i.test(combined)) return 'budget-limit-exhausted';
   if (executionNoopReason) return executionNoopReason;
   if (status !== 0) return `claude-exit-${status ?? 'unknown'}`;
@@ -1343,9 +1324,6 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
   const sessionAvailable = resultEnvelope.hasSessionId;
   const recoveryEvidence = {
     sameProfileAvailable: Boolean(runPlan.profile?.model && runPlan.profile?.effort),
-    turnHeadroom: Number.isFinite(resultEnvelope.numTurns) && Number.isFinite(runPlan.profile?.maxTurns)
-      ? resultEnvelope.numTurns < runPlan.profile.maxTurns
-      : false,
   };
 
   const payload = {
@@ -1410,7 +1388,7 @@ async function runPrFollowUp(args, env, token) {
     repo: args.repo,
   });
   const profileName = inferProfile({ explicitProfile: args.profile, issue: { title: pullRequest.title, body: pullRequest.body } });
-  const profile = resolveProfile(profileName, { model: args.model, effort: args.effort, maxTurns: args.maxTurns, maxBudgetUsd: args.maxBudgetUsd }, env);
+  const profile = resolveProfile(profileName, { model: args.model, effort: args.effort, maxBudgetUsd: args.maxBudgetUsd }, env);
   const clearContext = shouldUseClear({ noClear: args.noClear, resumeSession: args.resumeSession });
   const claudeArgs = buildClaudeArgs({ prompt, profile, resumeSession: args.resumeSession });
 
@@ -1553,7 +1531,6 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const profile = resolveProfile(profileName, {
     model: args.model || executionMeta.model,
     effort: args.effort || executionMeta.effort,
-    maxTurns: args.maxTurns || executionMeta.max_turns,
     maxBudgetUsd: args.maxBudgetUsd || executionMeta.max_budget_usd,
     permissionMode: executionAuthorization.permissionMode,
     tools: implementationToolPolicy?.tools,
