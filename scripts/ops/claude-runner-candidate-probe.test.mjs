@@ -8,23 +8,20 @@ test('candidate probe reports no candidate for an empty queue', () => {
     candidate: false,
     selectedIssue: null,
     selectionMode: null,
-    sourcePreflightCommentId: null,
     pendingAutoPreflight: false,
     skipCount: 0,
   });
 });
 
-test('candidate probe reports the exact selected manager-preflight identity', () => {
+test('candidate probe recognises an already-runnable selected issue', () => {
   assert.deepEqual(candidateFromSelection({
     issue: { number: 711 },
-    currentPreflight: { id: 5057357402 },
-    selection: { mode: 'preflight-direct', preflight: { id: 5057357402 } },
+    selection: { mode: 'preflight-direct' },
     skipped: [],
   }), {
     candidate: true,
     selectedIssue: 711,
     selectionMode: 'preflight-direct',
-    sourcePreflightCommentId: 'github-comment:database:5057357402',
     pendingAutoPreflight: false,
     skipCount: 0,
   });
