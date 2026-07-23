@@ -1,0 +1,15 @@
+{
+  "agents": {
+    "ollama-agent": {
+      "enabled": false,
+      "paused": false,
+      "draining": false,
+      "disabled": true,
+      "executablePath": null,
+      "endpoint": "http://127.0.0.1:11434",
+      "endpointAllowlistHosts": [],
+      "installedModelAllowlist": [],
+      "minFreeMemoryBytes": 2147483648
+    }
+  }
+}
