@@ -114,6 +114,48 @@ test('parseArgs can load reusable project defaults from explicit config', () => 
   }
 });
 
+test('parseArgs keeps explicit state DB independent of output-dir argument order', () => {
+  const explicitStateDb = join('state', 'explicit.sqlite');
+  const outputDir = join('state', 'derived-output');
+
+  assert.equal(
+    parseArgs([
+      '--state-db',
+      explicitStateDb,
+      '--output-dir',
+      outputDir,
+    ], {}).stateDbPath,
+    explicitStateDb,
+  );
+
+  assert.equal(
+    parseArgs([
+      '--output-dir',
+      outputDir,
+      '--state-db',
+      explicitStateDb,
+    ], {}).stateDbPath,
+    explicitStateDb,
+  );
+});
+
+test('parseArgs derives state DB only without explicit or environment state', () => {
+  const outputDir = join('state', 'derived-output');
+
+  assert.equal(
+    parseArgs(['--output-dir', outputDir], {}).stateDbPath,
+    join(outputDir, 'runner-state.sqlite'),
+  );
+
+  assert.equal(
+    parseArgs(
+      ['--output-dir', outputDir],
+      { CLAUDE_RUNNER_STATE_DB: 'environment-state.sqlite' },
+    ).stateDbPath,
+    'environment-state.sqlite',
+  );
+});
+
 test('parseArgs enables quota preflight by default and supports explicit skip', () => {
   assert.equal(parseArgs([], {}).quotaPreflight, true);
   assert.equal(parseArgs([], { CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT: 'true' }).quotaPreflight, false);
