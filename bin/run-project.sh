@@ -9,11 +9,38 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_FILE="${AGENT_RUNNER_CONFIG:-$HOME/.config/agent-runner/modelspend.json}"
 ENV_FILE="${AGENT_RUNNER_ENV_FILE:-$HOME/.config/agent-runner/runner.env}"
+RESULT_FILE="${AGENT_RUNNER_RUN_RESULT_FILE:-}"
 
 [ -f "$CONFIG_FILE" ] || { echo "[agent-runner] ERROR: config missing: $CONFIG_FILE" >&2; exit 1; }
 [ -f "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" ] || {
   echo "[agent-runner] ERROR: atomic runner entrypoint is missing" >&2
   exit 1
+}
+
+write_run_result() {
+  local state="$1" reason="$2" exit_code="$3"
+  [ -n "$RESULT_FILE" ] || return 0
+  AGENT_RUNNER_RESULT_FILE="$RESULT_FILE" \
+  AGENT_RUNNER_RESULT_STATE="$state" \
+  AGENT_RUNNER_RESULT_REASON="$reason" \
+  AGENT_RUNNER_RESULT_EXIT_CODE="$exit_code" \
+  node <<'NODE'
+const fs = require('node:fs');
+const path = require('node:path');
+const target = process.env.AGENT_RUNNER_RESULT_FILE;
+if (!target) process.exit(0);
+const payload = {
+  schemaVersion: 'agent-runner-project-run-result/v1',
+  state: process.env.AGENT_RUNNER_RESULT_STATE || 'unknown',
+  reason: process.env.AGENT_RUNNER_RESULT_REASON || null,
+  exitCode: Number(process.env.AGENT_RUNNER_RESULT_EXIT_CODE || 0),
+  recordedAt: new Date().toISOString(),
+};
+fs.mkdirSync(path.dirname(target), { recursive: true });
+const temporary = `${target}.${process.pid}.tmp`;
+fs.writeFileSync(temporary, `${JSON.stringify(payload)}\n`, { mode: 0o600 });
+fs.renameSync(temporary, target);
+NODE
 }
 
 load_env_file() {
@@ -79,8 +106,16 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   set -e
   case "$CIRCUIT_STATUS" in
     0) ;;
-    3) echo "[agent-runner] admission circuit paused; no candidate selected or mutated"; exit 0 ;;
-    *) echo "[agent-runner] ERROR: circuit breaker check failed with exit $CIRCUIT_STATUS" >&2; exit "$CIRCUIT_STATUS" ;;
+    3)
+      write_run_result handled_noop circuit-paused 0
+      echo "[agent-runner] admission circuit paused; no candidate selected or mutated"
+      exit 0
+      ;;
+    *)
+      write_run_result wrapper_failure circuit-check-failed "$CIRCUIT_STATUS"
+      echo "[agent-runner] ERROR: circuit breaker check failed with exit $CIRCUIT_STATUS" >&2
+      exit "$CIRCUIT_STATUS"
+      ;;
   esac
 
   # Machine/profile policy is admitted before candidate discovery. A handled
@@ -95,10 +130,16 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
       AGENT_RUNNER_ADMISSION_RESULT="$ADMISSION_OUTPUT" \
         node "$ROOT/scripts/ops/agent-runner-circuit-breaker.mjs" record >/dev/null
       printf '%s\n' "$ADMISSION_OUTPUT"
+      write_run_result handled_noop machine-admission-paused 0
       echo "[agent-runner] machine profile paused and circuit recorded; no candidate selected or mutated"
       exit 0
       ;;
-    *) printf '%s\n' "$ADMISSION_OUTPUT" >&2; echo "[agent-runner] ERROR: admission check failed with exit $ADMISSION_STATUS" >&2; exit "$ADMISSION_STATUS" ;;
+    *)
+      printf '%s\n' "$ADMISSION_OUTPUT" >&2
+      write_run_result wrapper_failure admission-check-failed "$ADMISSION_STATUS"
+      echo "[agent-runner] ERROR: admission check failed with exit $ADMISSION_STATUS" >&2
+      exit "$ADMISSION_STATUS"
+      ;;
   esac
 
   set +e
@@ -107,8 +148,16 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   set -e
   case "$PROBE_STATUS" in
     0) ;;
-    3) echo "[agent-runner] no runnable candidate; no-selection recorded"; exit 0 ;;
-    *) echo "[agent-runner] ERROR: candidate probe failed with exit $PROBE_STATUS" >&2; exit "$PROBE_STATUS" ;;
+    3)
+      write_run_result handled_noop no-runnable-candidate 0
+      echo "[agent-runner] no runnable candidate; no-selection recorded"
+      exit 0
+      ;;
+    *)
+      write_run_result wrapper_failure candidate-probe-failed "$PROBE_STATUS"
+      echo "[agent-runner] ERROR: candidate probe failed with exit $PROBE_STATUS" >&2
+      exit "$PROBE_STATUS"
+      ;;
   esac
 
   # Re-read the selected candidate twice and require stable issue, status,
@@ -120,10 +169,22 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   CANDIDATE_STATUS=$?
   set -e
   case "$CANDIDATE_STATUS" in
-    0) exec node "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}" ;;
-    3) echo "[agent-runner] candidate authority changed or is not approved; no attempt created or issue mutated"; exit 0 ;;
-    *) echo "[agent-runner] ERROR: candidate admission failed with exit $CANDIDATE_STATUS" >&2; exit "$CANDIDATE_STATUS" ;;
+    0)
+      write_run_result canonical_runner_invoked canonical-runner-executed 0
+      exec node "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}"
+      ;;
+    3)
+      write_run_result handled_noop candidate-authority-refused 0
+      echo "[agent-runner] candidate authority changed or is not approved; no attempt created or issue mutated"
+      exit 0
+      ;;
+    *)
+      write_run_result wrapper_failure candidate-admission-failed "$CANDIDATE_STATUS"
+      echo "[agent-runner] ERROR: candidate admission failed with exit $CANDIDATE_STATUS" >&2
+      exit "$CANDIDATE_STATUS"
+      ;;
   esac
 fi
 
+write_run_result canonical_runner_invoked dry-run-runner-invoked 0
 exec node "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}"
