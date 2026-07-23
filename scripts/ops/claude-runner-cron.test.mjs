@@ -42,6 +42,7 @@ import {
   restoreIssueAfterSuccessfulRecovery,
   runChildWithWatchdog,
   quarantineIssueAfterFailedRun,
+  quarantineIssueBeforeClaim,
   reconcilePendingRecoveryTransitions,
   rootBlocked,
   runQuotaPreflight,
@@ -554,6 +555,39 @@ test('scheduler watchdog persists an orphan in one pass and demotes+releases a s
     const stalledRow = state.invoke('recoveryAttempt', 'stalled');
     assert.notEqual(stalledRow.finished_at, null, 'a demoted attempt must release the global slot (finished_at set), never stay active indefinitely');
     assert.equal(stalledRow.resolution_state, 'unresolved');
+    state.close();
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('watchdog demotes a dead-process attempt with no current lease and no current authority to stale_unresolved_claim, not orphaned_active_claim (#686 orphan-classifier granularity)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-stale-claim-'));
+  const args = { repo: 'TheTekTeam/modelspend', stateDbPath: join(dir, 'state.sqlite'), outputDir: dir, project: { id: 'modelspend' } };
+  const ghRunner = (values) => {
+    if (values[1] === 'view') return JSON.stringify({ comments: [{ id: 1, createdAt: '2026-07-16T00:00:00Z', body: '## Claude proceed command\nGo.' }] });
+    return '';
+  };
+  try {
+    const state = createStateRecorder(args);
+    // Two active rows for the same issue: row 'dead-no-claim' has no claim
+    // identity at all (authorityCurrent can never be current) and a second
+    // row for the same issue makes its lease non-exclusive (leaseCurrent
+    // false). Its process is confirmed dead. All three facts together are
+    // deterministic, not ambiguous -- this must not read as an "active
+    // claim" description.
+    state.record('recordRecoveryAttempt', { attemptId: 'dead-no-claim', repo: args.repo, issueNumber: 700, startedAt: '2026-07-17T00:00:00Z', processId: 111, resolutionState: 'active' });
+    // A second active row for the same issue is itself a genuine mutual
+    // lease conflict in this model (both rows see each other and neither's
+    // lease reads exclusive) — it demotes too, but for a *different* reason:
+    // its process is confirmed live, so it is `unknown_failure` (a live
+    // process demoted for a non-liveness reason), never `stale_unresolved_claim`.
+    // That contrast is exactly the granularity this classifier must draw.
+    state.record('recordRecoveryAttempt', { attemptId: 'other-live', repo: args.repo, issueNumber: 700, startedAt: '2026-07-17T00:00:00Z', processId: 222, claimId: '1', recoveryLeaseId: 'lease-x', resolutionState: 'active' });
+    const processProbe = async (identity) => identity.processId === 222;
+    const result = await reconcileSchedulerAttempts({ state, args, processProbe, ghRunner, now: () => '2026-07-17T00:15:00Z' });
+    assert.equal(result.orphaned, 2);
+    const rows = state.invoke('allRows', 'recovery_attempts');
+    assert.equal(rows.find((row) => row.attempt_id === 'dead-no-claim').outcome, 'stale_unresolved_claim');
+    assert.equal(rows.find((row) => row.attempt_id === 'other-live').outcome, 'unknown_failure');
     state.close();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -2228,6 +2262,251 @@ test('captured #300 mixed GraphQL/REST preflight identity completes through the 
     console.log = originalLog;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('#686 regression: a conflicting workspace is detected before claim consumption, no marker/child/packet-consumption occurs, and the exact reason is reported (not unknown_failure, not a missing-Phase diagnosis)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-686-workspace-conflict-'));
+  const lockPath = join(dir, 'cron.lock');
+  const stateDbPath = join(dir, 'state.sqlite');
+  const preflightComment = {
+    id: 41,
+    createdAt: '2026-07-23T09:00:00Z',
+    user: { login: 'chatgpt-manager' },
+    body: '## Manager preflight packet\nPhase: implementation\nFix the workspace ownership bug.',
+  };
+  const ghCalls = [];
+  const ghRunner = (args) => {
+    ghCalls.push(args);
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'list') {
+      const labels = args.flatMap((value, index) => (value === '--label' ? [args[index + 1]] : []));
+      if (labels.includes('status:ready') && labels.includes('agent:claude-code-cli')) {
+        return JSON.stringify([{
+          number: 686,
+          title: 'Repair supervised canary workspace ownership',
+          body: 'Fix the workspace ownership bug.',
+          updatedAt: '2026-07-23T09:00:00Z',
+          labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }],
+        }]);
+      }
+      return JSON.stringify([]);
+    }
+    if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ comments: [preflightComment] });
+    if (args[0] === 'issue' && ['edit', 'comment'].includes(args[1])) return '';
+    throw new Error(`unexpected GitHub call: ${args.join(' ')}`);
+  };
+  let runChildCalled = false;
+  const ownershipEvidence = Object.freeze({ expectedBranch: 'worktree-agent-runner-686-abc', matchingAttempt: null });
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
+    ], {
+      GH_TOKEN: 'test-token',
+      CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true',
+      CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'chatgpt-manager',
+    }, {
+      ghRunner,
+      now: () => '2026-07-23T09:05:00.000Z',
+      inspectWorkspaceOwnership: async () => ({
+        allowed: false,
+        reason: 'implementation-worktree-branch-already-exists',
+        safeActions: ['inspect-existing-worktree'],
+        evidence: ownershipEvidence,
+      }),
+      runChild: async () => { runChildCalled = true; return { status: 0, signal: null, stdout: '{}', stderr: '', error: null }; },
+    });
+
+    // 1 & 4: no Claude process was started, and the run is reported as a
+    // task-local (non-zero) failure rather than a systemic pause.
+    assert.equal(runChildCalled, false, 'no worker/Claude process is ever spawned when workspace ownership fails pre-claim');
+    assert.equal(exitCode, 1);
+
+    // 2 & 3: no runner-start marker was posted (so the manager preflight was
+    // never marked claimed), and the issue never transitioned to
+    // status:in-progress -- it went straight from status:ready to
+    // status:blocked.
+    const commentCalls = ghCalls.filter((call) => call[0] === 'issue' && call[1] === 'comment');
+    assert.equal(commentCalls.some((call) => call.join(' ').includes('Claude runner started')), false, 'no runner-start marker posted');
+    const labelCall = ghCalls.find((call) => call[0] === 'issue' && call[1] === 'edit');
+    assert.deepEqual(labelCall, ['issue', 'edit', '686', '--repo', 'TheTekTeam/modelspend', '--remove-label', 'status:ready', '--add-label', 'status:blocked']);
+
+    // 5: the queue was released -- no active/unresolved recovery_attempts
+    // row was ever committed for this attempt.
+    const state = openRunnerStateStore(stateDbPath);
+    const attempts = state.allRows('recovery_attempts');
+    assert.equal(attempts.length, 0, 'no claim row was ever committed for the conflicted attempt');
+    const claims = state.allRows('claims');
+    assert.equal(claims.length, 0, 'claimIssueForExecution never ran');
+
+    // 6: the exact structured workspace reason was persisted (never
+    // collapsed to unknown_failure).
+    const runResult = state.allRows('run_results')[0];
+    assert.equal(runResult.mode, 'workspace-ownership-blocked');
+    const payload = JSON.parse(runResult.payload_json);
+    assert.equal(payload.terminalOutcome, 'implementation-worktree-branch-already-exists');
+    assert.equal(payload.workspaceOwnership.reason, 'implementation-worktree-branch-already-exists');
+    state.close();
+
+    // 7 & 8: recovery reports that exact reason -- never unknown_failure,
+    // never an invented "missing Phase: implementation" diagnosis. The
+    // typed execution-authorization facts (phase/allowed) are stated
+    // explicitly instead.
+    const attentionComment = commentCalls.find((call) => call.join(' ').includes('agent-runner:attention'));
+    assert.ok(attentionComment, 'an attention comment was posted');
+    const body = attentionComment[attentionComment.indexOf('--body') + 1];
+    assert.match(body, /implementation_worktree_branch_already_exists/);
+    assert.equal(/unknown_failure/.test(body), false);
+    assert.equal(/lacked\s+`?Phase:\s*implementation`?/i.test(body), false);
+    assert.equal(/missing\s+Phase:\s*implementation/i.test(body), false);
+    assert.match(body, /Execution phase: `implementation`/);
+    assert.match(body, /Execution authorization allowed: `true`/);
+    assert.match(body, /No worker process was started/);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#686 regression: quarantining one issue for a workspace-ownership conflict does not stop the next pass from selecting a different runnable issue', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-686-queue-continues-'));
+  const lockPath = join(dir, 'cron.lock');
+  const stateDbPath = join(dir, 'state.sqlite');
+  const preflightBody = '## Manager preflight packet\nPhase: implementation\nScoped work.';
+  let issue686Status = 'status:ready';
+  const issues = () => [
+    { number: 686, title: 'Conflicted issue', body: 'x', updatedAt: '2026-07-23T09:00:00Z', statusName: issue686Status },
+    { number: 690, title: 'Unrelated runnable issue', body: 'x', updatedAt: '2026-07-23T09:00:00Z', statusName: 'status:ready' },
+  ];
+  const ghRunner = (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'edit' && args.includes('--add-label')) {
+      const target = Number(args[2]);
+      if (target === 686) issue686Status = args[args.indexOf('--add-label') + 1];
+      return '';
+    }
+    if (args[0] === 'issue' && args[1] === 'list') {
+      const labels = args.flatMap((value, index) => (value === '--label' ? [args[index + 1]] : []));
+      if (labels.includes('status:ready') && labels.includes('agent:claude-code-cli')) {
+        return JSON.stringify(issues()
+          .filter((issue) => issue.statusName === 'status:ready')
+          .map((issue) => ({ number: issue.number, title: issue.title, body: issue.body, updatedAt: issue.updatedAt, labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }] })));
+      }
+      return JSON.stringify([]);
+    }
+    if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ comments: [{ id: 41, createdAt: '2026-07-23T09:00:00Z', user: { login: 'chatgpt-manager' }, body: preflightBody }] });
+    if (args[0] === 'issue' && args[1] === 'comment') return '';
+    throw new Error(`unexpected GitHub call: ${args.join(' ')}`);
+  };
+  const env = { GH_TOKEN: 'test-token', CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true', CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'chatgpt-manager' };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const commonArgs = ['--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli'];
+
+    // First pass: issue 686 sorts first (lower number, same recency) and
+    // hits the workspace-ownership conflict; it gets quarantined.
+    const firstExit = await main(commonArgs, env, {
+      ghRunner, now: () => '2026-07-23T09:05:00.000Z',
+      inspectWorkspaceOwnership: async () => ({ allowed: false, reason: 'implementation-worktree-branch-already-exists', safeActions: [], evidence: {} }),
+      runChild: async () => { throw new Error('must not spawn a worker for the conflicted issue'); },
+    });
+    assert.equal(firstExit, 1);
+    assert.equal(issue686Status, 'status:blocked');
+
+    // Second pass: 686 is now status:blocked and drops out of candidate
+    // scanning; the scheduler reaches issue 690 normally, proving the
+    // failure stayed task-local to 686 and never blocked the queue.
+    let selectedIssue = null;
+    const secondExit = await main(commonArgs, env, {
+      ghRunner, now: () => '2026-07-23T09:06:00.000Z',
+      // Issue 690 has no workspace conflict -- the same boundary runs for
+      // it too (it is not 686-specific), but reports allowed:true.
+      inspectWorkspaceOwnership: async () => ({ allowed: true, action: 'create', ownership: 'new', worktreePath: '/tmp/wt-690', branchName: 'worktree-agent-runner-690-x' }),
+      runChild: async (input) => {
+        selectedIssue = Number(input.commandArgs[input.commandArgs.indexOf('--issue') + 1]);
+        return { status: 0, signal: null, stdout: JSON.stringify({ logPath: 'child.json', executionPhase: 'implementation', costAdmission: { allowed: true }, sourcePreflightCommentId: 41 }), stderr: '', error: null };
+      },
+    });
+    assert.equal(selectedIssue, 690, 'the scheduler moved on to the next eligible issue instead of getting stuck retrying 686');
+    assert.equal(secondExit, 0);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#686 regression: the workspace-ownership pre-claim boundary applies identically to legacy proceed-command dispatch', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-686-proceed-command-'));
+  const lockPath = join(dir, 'cron.lock');
+  const stateDbPath = join(dir, 'state.sqlite');
+  const comments = [
+    { id: 41, createdAt: '2026-07-23T09:00:00Z', user: { login: 'chatgpt-manager' }, body: '## Manager preflight packet\nPhase: implementation\nOriginal scope.' },
+    { id: 42, createdAt: '2026-07-23T09:01:00Z', user: { login: 'chatgpt-manager' }, body: '## Claude proceed command\nGo.' },
+  ];
+  const ghRunner = (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'list') {
+      const labels = args.flatMap((value, index) => (value === '--label' ? [args[index + 1]] : []));
+      if (labels.includes('status:ready') && labels.includes('agent:claude-code-cli')) {
+        return JSON.stringify([{
+          number: 687, title: 'Proceed-command dispatch', body: 'x', updatedAt: '2026-07-23T09:01:00Z',
+          labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }],
+        }]);
+      }
+      return JSON.stringify([]);
+    }
+    if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ comments });
+    if (args[0] === 'issue' && ['edit', 'comment'].includes(args[1])) return '';
+    throw new Error(`unexpected GitHub call: ${args.join(' ')}`);
+  };
+  let runChildCalled = false;
+  let ownershipCallCount = 0;
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
+    ], {
+      GH_TOKEN: 'test-token',
+      CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true',
+      CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'chatgpt-manager',
+    }, {
+      ghRunner,
+      now: () => '2026-07-23T09:05:00.000Z',
+      inspectWorkspaceOwnership: async () => {
+        ownershipCallCount += 1;
+        return { allowed: false, reason: 'workspace-owned-by-unresolved-attempt', safeActions: [], evidence: {} };
+      },
+      runChild: async () => { runChildCalled = true; return { status: 0, signal: null, stdout: '{}', stderr: '', error: null }; },
+    });
+    assert.equal(ownershipCallCount, 1, 'the same workspace-ownership boundary runs for proceed-command dispatch too');
+    assert.equal(runChildCalled, false);
+    assert.equal(exitCode, 1);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('quarantineIssueBeforeClaim moves a status:ready issue straight to status:blocked without ever claiming it, and preserves errors instead of throwing', () => {
+  const ghCalls = [];
+  const ghRunner = (args) => { ghCalls.push(args); return ''; };
+  const result = quarantineIssueBeforeClaim(
+    { repo: 'TheTekTeam/modelspend' },
+    { number: 686, statusLabel: 'status:ready' },
+    { reason: 'implementation-worktree-branch-already-exists', workerStarted: false, executionPhase: 'implementation', executionAuthorizationAllowed: true },
+    ghRunner,
+  );
+  assert.equal(result.statusUpdated, true);
+  assert.equal(result.markerPosted, false);
+  assert.equal(result.packetConsumed, false);
+  assert.equal(result.claimCommitted, false);
+  assert.equal(result.queueReleased, true);
+  assert.deepEqual(ghCalls[0], ['issue', 'edit', '686', '--repo', 'TheTekTeam/modelspend', '--remove-label', 'status:ready', '--add-label', 'status:blocked']);
 });
 
 test('a fresh (initial) attempt with an authoritative preflight fails closed when the child omits sourcePreflightCommentId', async () => {
