@@ -2604,6 +2604,48 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     const freshImplementationDispatch = Boolean(dispatchIdentity?.ok)
       && dispatchIdentity.executionAuthorization.phase === EXECUTION_PHASE_IMPLEMENTATION
       && dispatchIdentity.executionAuthorization.allowed === true;
+
+    // Dispatch authority -- the resolved repository, checkout, branch, base
+    // commit, manager revision and fingerprint (#56) -- is verified before
+    // any claim, attempt, GitHub mutation, workspace mutation, or worker/
+    // model launch. Falling through here (as the pre-#56 code did) let a
+    // packet whose canonical repository/branch authority failed to resolve
+    // still reach `recordRecoveryAttempt`/`claimIssueForExecution` below,
+    // exactly the #5-F1 "claim before admission" defect. A rejection here
+    // makes zero model calls, creates zero attempts and claims, and mutates
+    // neither GitHub nor the workspace -- it only records a local queue
+    // event for operator visibility.
+    if (!recoveryClaim && dispatchIdentity && dispatchIdentity.ok !== true) {
+      const finishedAt = now();
+      if (!state.record('recordQueueEvent', {
+        repo: args.repo, eventType: 'dispatch-authority-rejected', issueNumber: selected.issue.number,
+        statusLabel: selected.issue.statusLabel, reason: dispatchIdentity.failureReason,
+        payload: { failureScope: dispatchIdentity.failureScope, failureReason: dispatchIdentity.failureReason },
+      })) return emitSystemicStatePause(args, state, 'dispatch-authority-queue-event', { now, logger: dependencies.logger }).exitCode;
+      const payload = {
+        ...plan,
+        claim: null,
+        startedAt,
+        finishedAt,
+        exitCode: 1,
+        childLaunched: false,
+        markerPosted: false,
+        packetConsumed: false,
+        attemptCreated: false,
+        issueMutation: false,
+        workspaceMutation: false,
+        failureScope: dispatchIdentity.failureScope,
+        terminalOutcome: dispatchIdentity.failureReason,
+      };
+      const logPath = writeLog(args.outputDir, payload);
+      if (!state.record('recordRunResult', {
+        repo: args.repo, issueNumber: selected.issue.number, mode: 'dispatch-authority-rejected',
+        exitCode: 1, logPath, payload, startedAt, finishedAt,
+      })) return emitSystemicStatePause(args, state, 'dispatch-authority-result-persistence', { now, logger: dependencies.logger }).exitCode;
+      console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+      return 1;
+    }
+
     if (!recoveryClaim && args.execute && args.claimOnExecute) {
       if (freshImplementationDispatch) {
         if (!state.healthy) return emitSystemicStatePause(args, state, 'pre-claim-workspace-read', { now, logger: dependencies.logger }).exitCode;

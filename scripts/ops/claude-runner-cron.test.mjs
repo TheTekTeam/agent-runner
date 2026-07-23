@@ -58,12 +58,26 @@ import { RUNNER_STATE_TABLES, openRunnerStateStore } from './claude-runner-state
 import { readRestrictedRecoveryHandle, restrictedHandleBindingDigest, restrictedRecoveryDir, writeRestrictedRecoveryHandle } from './claude-runner-recovery-adapter.mjs';
 
 const TEST_MANAGER_FINGERPRINT = `sha256:${'a'.repeat(64)}`;
-function canonicalPreflightBody(revision = 'TEST.1', extra = '') {
-  return `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: ${revision}\nfingerprint: ${TEST_MANAGER_FINGERPRINT}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`\n${extra}`;
+const TEST_BASE_COMMIT = '0'.repeat(40);
+function sanitizedTestBranch(revision) {
+  return `test/${String(revision).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`;
 }
 
-function canonicalPreflightComment(id, revision = `TEST.${id}`, extra = '', user = 'chatgpt-manager') {
-  return { id, databaseId: id, createdAt: '2026-07-23T09:00:00Z', user: { login: user }, body: canonicalPreflightBody(revision, extra) };
+// #56: dispatch-resolution authority is now required for every implementation
+// packet, so every fixture packet carries a valid `approved_repository_scope`/
+// `approved_branch`/`base_commit`. The default branch is derived from the
+// revision only for fixture uniqueness -- no test in this file depends on its
+// exact value, only on it being valid and self-consistent.
+function canonicalPreflightBody(revision = 'TEST.1', extra = '', {
+  repo = 'TheTekTeam/modelspend',
+  branch = sanitizedTestBranch(revision),
+  baseCommit = TEST_BASE_COMMIT,
+} = {}) {
+  return `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: ${revision}\nfingerprint: ${TEST_MANAGER_FINGERPRINT}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\napproved_repository_scope:\n  - ${repo}\napproved_branch: ${branch}\nbase_commit: ${baseCommit}\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`\n${extra}`;
+}
+
+function canonicalPreflightComment(id, revision = `TEST.${id}`, extra = '', user = 'chatgpt-manager', dispatchOptions = {}) {
+  return { id, databaseId: id, createdAt: '2026-07-23T09:00:00Z', user: { login: user }, body: canonicalPreflightBody(revision, extra, dispatchOptions) };
 }
 
 function withEmptyOpenPrInventory(ghRunner) {
@@ -2403,6 +2417,85 @@ test('#686 regression: a conflicting workspace is detected before claim consumpt
     assert.match(body, /Execution phase: `implementation`/);
     assert.match(body, /Execution authorization allowed: `true`/);
     assert.match(body, /No worker process was started/);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#56: a manager packet missing dispatch-resolution authority (approved_repository_scope) is rejected before any claim, attempt, worker launch, or GitHub/workspace mutation', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-56-dispatch-authority-rejected-'));
+  const lockPath = join(dir, 'cron.lock');
+  const stateDbPath = join(dir, 'state.sqlite');
+  // Deliberately omits `approved_repository_scope`/`approved_branch` --
+  // otherwise a canonical, valid manager packet. Selection (manager-preflight
+  // authority) still passes; only the new repository/branch dispatch
+  // authority boundary rejects it.
+  const preflightComment = {
+    id: 901,
+    createdAt: '2026-07-23T09:00:00Z',
+    user: { login: 'chatgpt-manager' },
+    body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: TEST.900\nfingerprint: ${TEST_MANAGER_FINGERPRINT}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`\nMissing dispatch authority.`,
+  };
+  const ghCalls = [];
+  let runChildCalled = false;
+  const ghRunner = (args) => {
+    ghCalls.push(args);
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'list') {
+      const labels = args.flatMap((value, index) => (value === '--label' ? [args[index + 1]] : []));
+      if (labels.includes('status:ready') && labels.includes('agent:claude-code-cli')) {
+        return JSON.stringify([{
+          number: 900,
+          title: 'A packet missing dispatch authority',
+          body: 'Bounded task.',
+          updatedAt: '2026-07-23T09:00:00Z',
+          labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }],
+        }]);
+      }
+      return JSON.stringify([]);
+    }
+    if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ comments: [preflightComment] });
+    throw new Error(`unexpected GitHub call (must never mutate): ${args.join(' ')}`);
+  };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
+      '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
+    ], {
+      GH_TOKEN: 'test-token',
+      CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true',
+      CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'chatgpt-manager',
+    }, {
+      ghRunner,
+      now: () => '2026-07-23T09:05:00.000Z',
+      runChild: async () => { runChildCalled = true; return { status: 0, signal: null, stdout: '{}', stderr: '', error: null }; },
+    });
+
+    assert.equal(exitCode, 1);
+    assert.equal(runChildCalled, false, 'zero model/worker calls: dispatch authority rejection never launches a worker');
+    // Zero GitHub mutations: only read calls (`issue list`, `issue view`,
+    // `pr list`) ever reached ghRunner -- no `issue edit` (label flip), no
+    // `issue comment` (runner-start marker or attention comment).
+    assert.equal(ghCalls.every((call) => call[1] === 'list' || call[1] === 'view'), true, 'zero GitHub mutations');
+
+    const state = openRunnerStateStore(stateDbPath);
+    assert.equal(state.allRows('recovery_attempts').length, 0, 'zero attempts: no recovery_attempts row was ever committed');
+    assert.equal(state.allRows('claims').length, 0, 'zero claims: claimIssueForExecution never ran');
+    const runResult = state.allRows('run_results')[0];
+    assert.equal(runResult.mode, 'dispatch-authority-rejected');
+    const payload = JSON.parse(runResult.payload_json);
+    assert.equal(payload.attemptCreated, false);
+    assert.equal(payload.issueMutation, false);
+    assert.equal(payload.workspaceMutation, false);
+    assert.equal(payload.childLaunched, false);
+    assert.equal(payload.failureScope, 'issue_not_runnable');
+    assert.equal(payload.terminalOutcome, 'repository-scope-missing');
+    const queueEvents = state.allRows('queue_events').filter((row) => row.event_type === 'dispatch-authority-rejected');
+    assert.equal(queueEvents.length, 1, 'a local (non-GitHub) queue event records the rejection for operator visibility');
+    state.close();
   } finally {
     console.log = originalLog;
     rmSync(dir, { recursive: true, force: true });
