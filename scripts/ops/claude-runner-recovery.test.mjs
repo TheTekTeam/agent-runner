@@ -7,10 +7,38 @@ import {
   evaluateRecoveryRevalidation,
   normalizeTerminalOutcome,
   reconcileActiveAttempts,
+  WORKSPACE_OWNERSHIP_POLICY,
 } from './claude-runner-recovery.mjs';
 
 const exclusive = { processOwner: false, conflictingLease: false, ownershipAmbiguous: false };
 const headroom = { sameProfileAvailable: true, quotaHeadroom: true, budgetHeadroom: true, continuationHeadroom: true };
+
+test('#686 root cause: normalizeTerminalOutcome preserves the child-reported workspace-conflict reason instead of collapsing it to unknown_failure', () => {
+  // This is the literal proven #686 defect: the child's structured
+  // workspacePreparation.failureReason ('implementation-worktree-branch-
+  // already-exists') was not a member of TERMINAL_OUTCOMES, so
+  // normalizeTerminalOutcome() silently discarded it.
+  assert.equal(normalizeTerminalOutcome('implementation-worktree-branch-already-exists'), 'implementation_worktree_branch_already_exists');
+  assert.notEqual(normalizeTerminalOutcome('implementation-worktree-branch-already-exists'), 'unknown_failure');
+  for (const reason of [
+    'implementation-worktree-already-exists',
+    'workspace-owned-by-live-attempt',
+    'workspace-owned-by-unresolved-attempt',
+    'workspace-dirty',
+    'workspace-head-mismatch',
+    'workspace-ownership-unknown',
+    'claim-without-worker-start',
+    'stale-unresolved-claim',
+  ]) {
+    const normalized = normalizeTerminalOutcome(reason);
+    assert.notEqual(normalized, 'unknown_failure', `${reason} must not collapse to unknown_failure`);
+    assert.ok(WORKSPACE_OWNERSHIP_POLICY[normalized], `${reason} must have a specific recovery policy entry`);
+    const decision = decideRecovery({ outcome: reason, evidence: exclusive });
+    assert.equal(decision.eligible, false);
+    assert.equal(decision.action, 'attention_required');
+    assert.equal(decision.nextAction, WORKSPACE_OWNERSHIP_POLICY[normalized].nextAction);
+  }
+});
 
 test('normalizes legacy max-turn outcome and refuses resume without checkpoint', () => {
   assert.equal(normalizeTerminalOutcome('provider-execution-limit'), 'provider_execution_limit');

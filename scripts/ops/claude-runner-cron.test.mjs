@@ -2509,6 +2509,91 @@ test('quarantineIssueBeforeClaim moves a status:ready issue straight to status:b
   assert.deepEqual(ghCalls[0], ['issue', 'edit', '686', '--repo', 'TheTekTeam/modelspend', '--remove-label', 'status:ready', '--add-label', 'status:blocked']);
 });
 
+test('#686 regression fixture: when the pre-claim gate passes but the child itself hits the exact proven workspacePreparation failure, the terminal outcome and comment stay accurate (backstop path)', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-686-backstop-'));
+  const lockPath = join(dir, 'cron.lock');
+  const stateDbPath = join(dir, 'state.sqlite');
+  const preflightComment = { id: 41, createdAt: '2026-07-23T09:00:00Z', user: { login: 'chatgpt-manager' }, body: '## Manager preflight packet\nPhase: implementation\nFix the workspace ownership bug.' };
+  const ghCalls = [];
+  const ghRunner = (args) => {
+    ghCalls.push(args);
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'list') {
+      const labels = args.flatMap((value, index) => (value === '--label' ? [args[index + 1]] : []));
+      if (labels.includes('status:ready') && labels.includes('agent:claude-code-cli')) {
+        return JSON.stringify([{
+          number: 686, title: 'Repair supervised canary workspace ownership', body: 'x', updatedAt: '2026-07-23T09:00:00Z',
+          labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }],
+        }]);
+      }
+      return JSON.stringify([]);
+    }
+    if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ comments: [preflightComment] });
+    if (args[0] === 'issue' && ['edit', 'comment'].includes(args[1])) return '';
+    throw new Error(`unexpected GitHub call: ${args.join(' ')}`);
+  };
+  // The exact #686 regression fixture (spec section 9): the child ran,
+  // authorized implementation, but workspace preparation failed before
+  // Claude started -- and reported the exact structured evidence, matching
+  // the real production child.
+  const childPayload = {
+    logPath: 'child.json',
+    blocked: true,
+    reason: 'implementation-worktree-branch-already-exists',
+    failureReason: 'implementation-worktree-branch-already-exists',
+    message: 'The runner could not prove exclusive, current worktree ownership. No Claude process was started.',
+    selectionMode: 'preflight-direct',
+    executionPhase: 'implementation',
+    executionAuthorization: { allowed: true, phase: 'implementation', violations: [] },
+    workspacePreparation: { allowed: false, failureReason: 'implementation-worktree-branch-already-exists', baseRef: 'origin/main', baseHead: 'deadbeef' },
+    workerStarted: false,
+    costAdmission: { allowed: true },
+    sourcePreflightCommentId: 41,
+  };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
+    ], {
+      GH_TOKEN: 'test-token', CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true', CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'chatgpt-manager',
+    }, {
+      ghRunner,
+      now: () => '2026-07-23T09:05:00.000Z',
+      // The scheduler's own pre-claim check passed (simulating the race the
+      // child backstop exists for) -- the claim WAS committed, the marker
+      // WAS posted, and the child actually ran.
+      inspectWorkspaceOwnership: async () => ({ allowed: true, action: 'create', ownership: 'new', worktreePath: '/tmp/wt-686', branchName: 'worktree-agent-runner-686-abc' }),
+      runChild: async () => ({ status: 4, signal: null, stdout: JSON.stringify(childPayload), stderr: '', error: null }),
+    });
+    assert.notEqual(exitCode, 0);
+
+    const state = openRunnerStateStore(stateDbPath);
+    const attempt = state.allRows('recovery_attempts')[0];
+    // The literal #686 root cause: this must never read 'unknown_failure'.
+    assert.equal(attempt.outcome, 'implementation_worktree_branch_already_exists');
+    state.close();
+
+    const commentCalls = ghCalls.filter((call) => call[0] === 'issue' && call[1] === 'comment');
+    const attentionComment = commentCalls.find((call) => call.join(' ').includes('agent-runner:attention'));
+    assert.ok(attentionComment, 'an attention comment was posted');
+    const body = attentionComment[attentionComment.indexOf('--body') + 1];
+    assert.match(body, /implementation_worktree_branch_already_exists/);
+    assert.equal(/unknown_failure/.test(body), false);
+    assert.equal(/lacked\s+`?Phase:\s*implementation`?/i.test(body), false);
+    assert.equal(/missing\s+Phase:\s*implementation/i.test(body), false);
+    // Threaded from the child's own structured executionPhase/
+    // executionAuthorization evidence (section 6/8), not reparsed from the
+    // raw preflight comment.
+    assert.match(body, /Execution phase: `implementation`/);
+    assert.match(body, /Execution authorization allowed: `true`/);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a fresh (initial) attempt with an authoritative preflight fails closed when the child omits sourcePreflightCommentId', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'runner-preflight-evidence-initial-'));
   const lockPath = join(dir, 'cron.lock');

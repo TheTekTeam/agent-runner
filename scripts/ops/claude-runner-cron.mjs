@@ -2972,6 +2972,20 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         }
       }
     }
+    // Section 6/8: recovery reporting for a workspace-ownership outcome
+    // discovered *inside the child* (the backstop path -- workspace
+    // preparation failed after this scheduler's own pre-claim check already
+    // passed, e.g. a race between the two) must be built from the same
+    // structured, persisted child evidence the pre-claim path uses, never
+    // reparsed from the raw preflight comment. Threaded onto the
+    // already-built attentionEvent rather than recomputed independently.
+    const workspaceFailureDetails = attentionEvent && WORKSPACE_OWNERSHIP_OUTCOMES.includes(outcome) ? {
+      ...attentionEvent,
+      workerStarted: false,
+      executionPhase: childPayload?.executionPhase ?? null,
+      executionAuthorizationAllowed: childPayload?.executionAuthorization?.allowed ?? null,
+      reconciliationSteps: WORKSPACE_OWNERSHIP_POLICY[outcome]?.reconciliationSteps || [],
+    } : attentionEvent;
     let failureRecovery = null;
     if (args.execute && args.claimOnExecute && (claim || recoveryClaim) && effectiveExitCode !== 0) {
       if (outcome === 'quota_paused') {
@@ -2981,7 +2995,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       } else if (outcome === 'plan_only_awaiting_approval') {
         failureRecovery = waitForExplicitPlanApproval(args, selected.issue, attentionEvent || { reason: outcome, finishedAt }, ghRunner);
       } else {
-        failureRecovery = quarantineIssueAfterFailedRun(args, selected.issue, attentionEvent || { reason: outcome, finishedAt }, ghRunner);
+        failureRecovery = quarantineIssueAfterFailedRun(args, selected.issue, workspaceFailureDetails || { reason: outcome, finishedAt }, ghRunner);
       }
       const eventType = outcome === 'quota_paused' ? 'pause' : outcome === 'plan_only_awaiting_approval' ? 'approval-wait' : 'quarantine';
       if (!state.record('recordQueueEvent', {
