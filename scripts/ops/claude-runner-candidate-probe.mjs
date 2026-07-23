@@ -7,21 +7,14 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 
-import { commentRevision, normalizeCommentIdentity } from './claude-runner-comment-identity.mjs';
-
 export const NO_RUNNABLE_CANDIDATE_EXIT_CODE = 3;
 
 export function candidateFromSelection(selected = {}) {
   const pendingAutoPreflight = (selected.skipped || []).some((item) => item?.reason === 'preflight-generation-pending-dry-run');
-  const preflightIdentity = normalizeCommentIdentity(
-    selected.currentPreflight || selected.selection?.preflight || null,
-    { context: 'candidate-probe-preflight' },
-  );
   return {
     candidate: Boolean(selected.issue) || pendingAutoPreflight,
     selectedIssue: selected.issue?.number || null,
     selectionMode: selected.selection?.mode || null,
-    sourcePreflightCommentId: commentRevision(preflightIdentity),
     pendingAutoPreflight,
     skipCount: (selected.skipped || []).length,
   };
