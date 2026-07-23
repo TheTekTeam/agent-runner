@@ -277,18 +277,6 @@
       "status": "locked"
     },
     {
-      "path": "scripts/ops/claude-runner-preflight.mjs",
-      "mode": "100644",
-      "sha256": "41e050bd88661b2d41920a0c064cdbd0981e13f193fffe307b9166ae1f5d6407",
-      "status": "locked"
-    },
-    {
-      "path": "scripts/ops/claude-runner-preflight.test.mjs",
-      "mode": "100644",
-      "sha256": "c97609d95bf46bee6c1b96ea6ae18a212956b321c3b80ad788015f8beff79a7b",
-      "status": "locked"
-    },
-    {
       "path": "scripts/ops/claude-runner-quota.mjs",
       "mode": "100644",
       "sha256": "3cdc75bd8a8430131656679b4d781c503cc419735a284beccd4a7ee305ae48c7",
