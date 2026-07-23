@@ -157,20 +157,30 @@ function sanitizeWorktreePart(value) {
     .slice(0, 48) || 'unknown';
 }
 
-export function buildWorktreeIdentity({ issueNumber, sourceCommentId } = {}) {
+/**
+ * `approvedBranch` (#56) is the exact, byte-for-byte manager-authorised Git
+ * branch resolved by `resolveDispatchAuthority`. When present it replaces
+ * the generated `worktree-<name>` scheme as the branch this dispatch
+ * checks out, commits, pushes, and publishes a PR from -- the deterministic
+ * `name` below still seeds the *worktree directory* only, so a filesystem
+ * naming choice can never substitute for or alter the authorised Git
+ * branch.
+ */
+export function buildWorktreeIdentity({ issueNumber, sourceCommentId, approvedBranch = null } = {}) {
   const issue = Number.parseInt(issueNumber, 10);
   if (!Number.isInteger(issue) || issue <= 0) throw new Error('A positive issue number is required for an implementation worktree');
   const source = sanitizeWorktreePart(sourceCommentId);
   const name = `agent-runner-${issue}-${source}`.slice(0, 80).replace(/-+$/g, '');
   return {
     name,
-    expectedBranch: `worktree-${name}`,
+    expectedBranch: approvedBranch || `worktree-${name}`,
   };
 }
 
-export function buildImplementationToolPolicy({ expectedBranch } = {}) {
+export function buildImplementationToolPolicy({ expectedBranch, approvedBranch = null } = {}) {
   const branch = String(expectedBranch || '').trim();
-  if (!/^worktree-agent-runner-[a-z0-9-]+$/.test(branch)) {
+  const isApprovedBranch = Boolean(approvedBranch) && branch === approvedBranch;
+  if (!isApprovedBranch && !/^worktree-agent-runner-[a-z0-9-]+$/.test(branch)) {
     throw new Error('A valid runner-owned worktree branch is required for implementation tooling');
   }
 

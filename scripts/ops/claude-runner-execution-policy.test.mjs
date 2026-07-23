@@ -110,6 +110,43 @@ test('worktree identity is deterministic and strips unsafe comment-id characters
   });
 });
 
+test('#56: an authorised approved_branch is preserved byte-for-byte instead of the generated worktree-<name> scheme', () => {
+  const identity = buildWorktreeIdentity({
+    issueNumber: 56,
+    sourceCommentId: 'IC_kwDO/unsafe value',
+    approvedBranch: 'chatgpt/dispatch-workspace-authority',
+  });
+  assert.equal(identity.expectedBranch, 'chatgpt/dispatch-workspace-authority');
+  // The worktree directory name is still deterministically derived and
+  // generated -- only the Git branch is replaced by manager authority, so a
+  // filesystem naming choice can never substitute for the authorised branch.
+  assert.equal(identity.name, 'agent-runner-56-ic-kwdo-unsafe-value');
+});
+
+test('#56: without an approved_branch, buildWorktreeIdentity is unchanged (byte-for-byte backward compatible)', () => {
+  assert.deepEqual(buildWorktreeIdentity({ issueNumber: 658, sourceCommentId: 'IC_kwDO/unsafe value' }), {
+    name: 'agent-runner-658-ic-kwdo-unsafe-value',
+    expectedBranch: 'worktree-agent-runner-658-ic-kwdo-unsafe-value',
+  });
+});
+
+test('#56: implementation tool policy accepts an authorised approved branch containing slashes', () => {
+  const policy = buildImplementationToolPolicy({
+    expectedBranch: 'chatgpt/dispatch-workspace-authority',
+    approvedBranch: 'chatgpt/dispatch-workspace-authority',
+  });
+  assert.ok(policy.allowedTools.includes('Read'));
+  assert.equal(JSON.parse(policy.settings).permissions.disableBypassPermissionsMode, 'disable');
+});
+
+test('#56: an unauthorised branch is still rejected even when it merely resembles an approved form', () => {
+  assert.throws(() => buildImplementationToolPolicy({ expectedBranch: 'main' }));
+  assert.throws(() => buildImplementationToolPolicy({
+    expectedBranch: 'some-other-branch',
+    approvedBranch: 'chatgpt/dispatch-workspace-authority',
+  }), /runner-owned worktree branch/);
+});
+
 test('implementation tool policy is explicit, branch-scoped, and never enables bypass', () => {
   const policy = buildImplementationToolPolicy({ expectedBranch: 'worktree-agent-runner-658-4985264598' });
   assert.deepEqual(policy.allowedTools.slice(0, 5), ['Read', 'Glob', 'Grep', 'Edit', 'Write']);

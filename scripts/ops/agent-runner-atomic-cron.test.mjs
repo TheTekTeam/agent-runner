@@ -9,8 +9,12 @@ import { main } from './agent-runner-atomic-cron.mjs';
 import { openRunnerStateStore } from './claude-runner-state.mjs';
 
 const TEST_FP = `sha256:${'a'.repeat(64)}`;
+// #56: dispatch-resolution authority is now required for every
+// implementation packet -- approved_repository_scope/approved_branch/
+// base_commit must be present or admission fails closed before this
+// fixture's assertions even run.
 function managerPacket(id) {
-  return { id, databaseId: id, createdAt: '2026-07-17T19:00:00Z', user: { login: 'gpcola' }, body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: ATOMIC.${id}\nfingerprint: ${TEST_FP}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`\nBounded task.` };
+  return { id, databaseId: id, createdAt: '2026-07-17T19:00:00Z', user: { login: 'gpcola' }, body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: ATOMIC.${id}\nfingerprint: ${TEST_FP}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\napproved_repository_scope:\n  - TheTekTeam/modelspend\napproved_branch: test/atomic-${id}\nbase_commit: ${'0'.repeat(40)}\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`\nBounded task.` };
 }
 
 function readyIssueGhRunner({ number, comments, mutatingCalls }) {

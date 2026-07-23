@@ -19,6 +19,10 @@ fingerprint: sha256:<64 lowercase hex characters>
 producer_type: normal_chatgpt_manager_session # or chatgpt_scheduled_task
 approved_agent: claude-code-cli
 execution_phase: implementation
+approved_repository_scope:
+  - <owner>/<repo>
+approved_branch: <exact Git branch>
+base_commit: <40-character commit SHA>
 scope:
   - <bounded work>
 required_validation:
@@ -28,6 +32,17 @@ stop_conditions:
 ```
 
 The durable authority key is `manager-preflight:<revision>:<fingerprint>`. The scheduler also records a SHA-256 digest of the complete packet comment body. The attempt row, recovery path, liveness classifier, and pinned child require both the authority key and the unchanged body digest. The GitHub comment identity is retained only as source evidence.
+
+## Repository and branch dispatch authority (#56)
+
+`approved_repository_scope` and `approved_branch` are required for every implementation dispatch and are resolved and verified by `scripts/ops/agent-runner-dispatch-authority.mjs::resolveDispatchAuthority()` -- the single pre-claim boundary `resolveImplementationDispatchIdentity()` (`claude-runner.mjs`) and the scheduler (`claude-runner-cron.mjs`) both call before any claim, attempt, GitHub mutation, workspace mutation, or worker/model launch:
+
+- `approved_repository_scope` must contain exactly one `owner/repo` entry. It is resolved through the same repository registry as the legacy `implementation_repository` field (`agent-runner-repository-context.mjs::resolveRepositoryContext()`), so the implementation repository can only ever be the configured project repository or the runner's own repository -- never the ModelSpend project by default, the queue repository, or the current checkout, and never an unrecognised repository.
+- `approved_branch` is preserved byte-for-byte as the Git branch used for checkout, implementation, commit, push, and PR publication. It replaces the previously generated `worktree-agent-runner-<issue>-<comment>` branch scheme; the deterministic worktree *directory* name is still generated, so a filesystem naming choice can never substitute for or alter the authorised branch.
+- `base_commit` must be a well-formed 40-character commit SHA; it is carried through as part of the resolved dispatch authority.
+- A legacy free-form `key: value` line (parsed the same way as `implementation_repository`) that disagrees with a canonical YAML field fails closed rather than silently preferring either source.
+- Missing, multiple, or malformed `approved_repository_scope`/`approved_branch`/`base_commit` fails closed with `failureScope: issue_not_runnable`. A canonical repository this machine has no checkout registered for fails closed with `failureScope: systemic`.
+- A rejection here produces zero model calls, zero attempts, zero claims, and zero GitHub/workspace mutations -- the scheduler only records a local (non-GitHub) queue event for operator visibility.
 
 ## Retired behaviour
 

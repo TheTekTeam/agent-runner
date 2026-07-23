@@ -29,6 +29,7 @@ import {
   resolveAgentById,
 } from './agent-runner-agents.mjs';
 import { resolveCurrentManagerAuthority } from './agent-runner-manager-authority.mjs';
+import { resolveDispatchAuthority } from './agent-runner-dispatch-authority.mjs';
 import {
   CLAUDE_COMMAND_HEADINGS,
   findLastMarkdownHeadingIndex,
@@ -433,25 +434,41 @@ export function resolveImplementationDispatchIdentity({
   argsMaxBudgetUsd,
 } = {}) {
   if (!currentPreflight) {
-    return { ok: false, failureReason: 'manager-preflight-missing' };
+    return { ok: false, failureReason: 'manager-preflight-missing', failureScope: 'issue_not_runnable' };
   }
   if (command) {
-    return { ok: false, failureReason: 'proceed-command-not-authoritative' };
+    return { ok: false, failureReason: 'proceed-command-not-authoritative', failureScope: 'issue_not_runnable' };
   }
   const preflight = currentPreflight;
   const selectionMode = 'preflight-direct';
   const referenceText = preflight.body;
   const executionMeta = parseKeyValueBlock(currentPreflight.body || '');
 
+  // Repository and branch authority (#56) are resolved and verified before
+  // anything else in this function -- profile inference, execution
+  // authorization, and worktree identity all depend on (or are superseded
+  // by) this result, and every caller of this function gates claim/attempt/
+  // mutation/worker-launch on `ok` before using any of them.
+  const dispatchAuthority = resolveDispatchAuthority({
+    preflight: currentPreflight,
+    legacyMetadata: executionMeta,
+    argsRepo,
+    config: { githubRepo: config.githubRepo, localRepoPath: config.localRepoPath },
+    runnerCheckout: RUNNER_OWN_CHECKOUT,
+  });
+  if (!dispatchAuthority.ok) {
+    return { ok: false, failureReason: dispatchAuthority.failureReason, failureScope: dispatchAuthority.failureScope };
+  }
+
   const repositoryContextResult = resolveRepositoryContext({
     issueRepository: argsRepo,
     projectRepository: config.githubRepo,
     projectCheckout: config.localRepoPath,
     runnerCheckout: RUNNER_OWN_CHECKOUT,
-    requestedImplementationRepository: executionMeta.implementation_repository,
+    requestedImplementationRepository: dispatchAuthority.repository,
   });
   if (!repositoryContextResult.allowed) {
-    return { ok: false, failureReason: repositoryContextResult.failureReason };
+    return { ok: false, failureReason: repositoryContextResult.failureReason, failureScope: 'systemic' };
   }
 
   const profileName = inferProfile({
@@ -469,7 +486,7 @@ export function resolveImplementationDispatchIdentity({
   });
   const sourceAttemptCommentId = commentRevision(sourceCommentIdentity || sourcePreflightCommentIdentity);
   const worktreeIdentity = executionAuthorization.phase === EXECUTION_PHASE_IMPLEMENTATION
-    ? buildWorktreeIdentity({ issueNumber: issue.number, sourceCommentId: sourceAttemptCommentId })
+    ? buildWorktreeIdentity({ issueNumber: issue.number, sourceCommentId: sourceAttemptCommentId, approvedBranch: dispatchAuthority.branch })
     : null;
 
   return {
@@ -477,6 +494,7 @@ export function resolveImplementationDispatchIdentity({
     preflight,
     selectionMode,
     executionMeta,
+    dispatchAuthority,
     repositoryContext: repositoryContextResult.context,
     profileName,
     executionAuthorization,
@@ -1563,17 +1581,17 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       blocked: true,
       reason: dispatchIdentity.failureReason,
       issue: args.issue,
-      message: `The repository context for issue #${args.issue} could not be resolved unambiguously (${dispatchIdentity.failureReason}). No Claude process was started.`,
+      message: `The dispatch authority (repository/branch) for issue #${args.issue} could not be resolved unambiguously (${dispatchIdentity.failureReason}). No Claude process was started.`,
     };
     console.log(JSON.stringify(payload, null, 2));
     return EXECUTION_POLICY_EXIT_CODE;
   }
   const {
-    preflight, selectionMode, executionMeta, repositoryContext, profileName,
+    preflight, selectionMode, executionMeta, dispatchAuthority, repositoryContext, profileName,
     executionAuthorization, sourceCommentIdentity, sourcePreflightCommentIdentity, worktreeIdentity,
   } = dispatchIdentity;
   const implementationToolPolicy = worktreeIdentity
-    ? buildImplementationToolPolicy({ expectedBranch: worktreeIdentity.expectedBranch })
+    ? buildImplementationToolPolicy({ expectedBranch: worktreeIdentity.expectedBranch, approvedBranch: dispatchAuthority?.branch })
     : null;
   const profile = resolveProfile(profileName, {
     model: args.model || executionMeta.model,
