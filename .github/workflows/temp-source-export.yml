@@ -1,0 +1,21 @@
+name: Temporary source export
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Package source
+        run: tar --exclude=.git -czf /tmp/agent-runner-source.tgz .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-runner-source
+          path: /tmp/agent-runner-source.tgz
+          retention-days: 1
