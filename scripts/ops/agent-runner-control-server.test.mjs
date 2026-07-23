@@ -1,0 +1,419 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, relative } from 'node:path';
+import test from 'node:test';
+
+import { getAgentSettings } from './agent-runner-agent-settings.mjs';
+import { setOperatorCredential } from './agent-runner-control-auth.mjs';
+import { createControlServer, listenControlServer, resolveBindHost } from './agent-runner-control-server.mjs';
+
+const OPERATOR = { username: 'operator', password: 'unit-test-operator-password-value' };
+
+function tempDir() {
+  return mkdtempSync(join(tmpdir(), 'agent-runner-control-server-'));
+}
+
+async function apiRequest(baseUrl, path, { method = 'GET', headers = {}, body, cookie, csrfToken } = {}) {
+  const finalHeaders = { 'Content-Type': 'application/json', Origin: baseUrl, ...headers };
+  if (cookie) finalHeaders.Cookie = cookie;
+  if (csrfToken) finalHeaders['x-csrf-token'] = csrfToken;
+  const response = await fetch(`${baseUrl}${path}`, {
+    method,
+    headers: finalHeaders,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const setCookie = response.headers.get('set-cookie');
+  let json = null;
+  try { json = await response.json(); } catch { /* no body */ }
+  return { status: response.status, json, setCookie };
+}
+
+function walkFiles(dir) {
+  const files = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...walkFiles(full));
+    else if (entry.isFile()) files.push(full);
+  }
+  return files;
+}
+
+async function login(baseUrl, credentials = OPERATOR) {
+  const result = await apiRequest(baseUrl, '/api/session/login', { method: 'POST', body: credentials });
+  assert.equal(result.status, 200, JSON.stringify(result.json));
+  return { cookie: result.setCookie.split(';')[0], csrfToken: result.json.csrfToken };
+}
+
+async function withServer(fn) {
+  const dir = tempDir();
+  const paths = {
+    settingsPath: join(dir, 'agent-settings.json'),
+    secretStoreDir: join(dir, 'secrets'),
+    auditPath: join(dir, 'audit.jsonl'),
+    operatorCredentialPath: join(dir, 'operator.json'),
+    dbPath: join(dir, 'runner-state.sqlite'),
+  };
+  setOperatorCredential({ ...OPERATOR, path: paths.operatorCredentialPath });
+  const server = createControlServer({ ...paths });
+  await listenControlServer(server, { port: 0 });
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+  try {
+    return await fn({ baseUrl, server, dir, ...paths });
+  } finally {
+    await new Promise((resolvePromise) => server.close(resolvePromise));
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// -- loopback-only binding --------------------------------------------
+
+test('resolveBindHost refuses any non-loopback host before a bind is ever attempted', () => {
+  assert.throws(() => resolveBindHost('0.0.0.0'), /non-loopback/);
+  assert.throws(() => resolveBindHost('192.168.1.10'), /non-loopback/);
+  assert.throws(() => resolveBindHost('example.com'), /non-loopback/);
+  assert.equal(resolveBindHost('127.0.0.1'), '127.0.0.1');
+  assert.equal(resolveBindHost('localhost'), 'localhost');
+});
+
+test('createControlServer throws for a non-loopback host and never constructs a listening server', () => {
+  assert.throws(() => createControlServer({ host: '0.0.0.0', settingsPath: '/tmp/does-not-matter.json' }));
+});
+
+test('a real listening server is actually bound to loopback', () => withServer(async ({ server }) => {
+  const address = server.address();
+  assert.ok(['127.0.0.1', '::1'].includes(address.address));
+}));
+
+// -- authentication, sessions, CSRF, origin -----------------------------
+
+test('a protected route without a session cookie is rejected', () => withServer(async ({ baseUrl }) => {
+  const result = await apiRequest(baseUrl, '/api/instances');
+  assert.equal(result.status, 401);
+}));
+
+test('login with a wrong password is rejected and never issues a session', () => withServer(async ({ baseUrl }) => {
+  const result = await apiRequest(baseUrl, '/api/session/login', { method: 'POST', body: { username: 'operator', password: 'totally-wrong-password' } });
+  assert.equal(result.status, 401);
+  assert.equal(result.setCookie, null);
+}));
+
+test('login with correct credentials issues an HttpOnly, SameSite=Strict session cookie and a csrfToken', () => withServer(async ({ baseUrl }) => {
+  const result = await apiRequest(baseUrl, '/api/session/login', { method: 'POST', body: OPERATOR });
+  assert.equal(result.status, 200);
+  assert.match(result.setCookie, /HttpOnly/);
+  assert.match(result.setCookie, /SameSite=Strict/);
+  assert.ok(result.json.csrfToken);
+}));
+
+test('a mutating request with a valid session but no CSRF header is rejected', () => withServer(async ({ baseUrl }) => {
+  const { cookie } = await login(baseUrl);
+  const result = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, body: { agentId: 'claude-code-cli' } });
+  assert.equal(result.status, 403);
+  assert.equal(result.json.reason, 'csrf-token-missing');
+}));
+
+test('a mutating request with a mismatched CSRF token is rejected', () => withServer(async ({ baseUrl }) => {
+  const { cookie } = await login(baseUrl);
+  const result = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken: 'not-the-real-token', body: { agentId: 'claude-code-cli' } });
+  assert.equal(result.status, 403);
+  assert.equal(result.json.reason, 'csrf-token-mismatch');
+}));
+
+test('a request with a foreign Origin is rejected even with a valid session and CSRF token', () => withServer(async ({ baseUrl }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const result = await apiRequest(baseUrl, '/api/instances', {
+    method: 'POST',
+    cookie,
+    csrfToken,
+    headers: { Origin: 'http://evil.example.com' },
+    body: { agentId: 'claude-code-cli' },
+  });
+  assert.equal(result.status, 403);
+  assert.equal(result.json.reason, 'origin-not-allowed');
+}));
+
+test('a request with no Origin/Referer at all is rejected, even for GET', () => withServer(async ({ baseUrl }) => {
+  const { cookie } = await login(baseUrl);
+  const response = await fetch(`${baseUrl}/api/instances`, { headers: { Cookie: cookie } });
+  assert.equal(response.status, 403);
+}));
+
+test('logout invalidates the session immediately', () => withServer(async ({ baseUrl }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const out = await apiRequest(baseUrl, '/api/session/logout', { method: 'POST', cookie, csrfToken });
+  assert.equal(out.status, 200);
+  const after = await apiRequest(baseUrl, '/api/instances', { cookie });
+  assert.equal(after.status, 401);
+}));
+
+// -- instance lifecycle, allowlisted updates, catalogue gate -----------
+
+test('GET /api/instances lists the whole approved catalogue with capacity-1 load, none created yet', () => withServer(async ({ baseUrl }) => {
+  const { cookie } = await login(baseUrl);
+  const result = await apiRequest(baseUrl, '/api/instances', { cookie });
+  assert.equal(result.status, 200);
+  const ids = result.json.instances.map((instance) => instance.agentId).sort();
+  assert.deepEqual(ids, ['claude-code-cli', 'codex-cli', 'gemini-cli', 'gpt-agent', 'ollama-agent']);
+  assert.ok(result.json.instances.every((instance) => instance.load.capacity === 1));
+  assert.ok(result.json.instances.every((instance) => instance.created === false));
+}));
+
+test('POST /api/instances refuses an adapter id outside the approved catalogue', () => withServer(async ({ baseUrl }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const result = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'made-up-agent' } });
+  assert.equal(result.status, 400);
+}));
+
+test('full instance lifecycle: create, update allowlisted settings, transition, and see it reflected without restart', () => withServer(async ({ baseUrl, settingsPath }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+
+  const created = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
+  assert.equal(created.status, 201);
+  assert.equal(created.json.instance.lifecycle.disabled, true);
+  const revisionAfterCreate = created.json.revision;
+
+  const updated = await apiRequest(baseUrl, `/api/instances/claude-code-cli/settings`, {
+    method: 'PATCH',
+    cookie,
+    csrfToken,
+    body: { updates: { model: 'claude-opus-4-8' }, expectedRevision: revisionAfterCreate },
+  });
+  assert.equal(updated.status, 200);
+  assert.equal(updated.json.instance.model, 'claude-opus-4-8');
+
+  const enabled = await apiRequest(baseUrl, `/api/instances/claude-code-cli/lifecycle`, {
+    method: 'POST',
+    cookie,
+    csrfToken,
+    body: { targetState: 'enabled', expectedRevision: updated.json.revision },
+  });
+  assert.equal(enabled.status, 200);
+  assert.equal(enabled.json.instance.state, 'enabled');
+
+  // Visible before the next claim, without a service restart: a direct
+  // getAgentSettings() read against the same settings path sees it.
+  assert.equal(getAgentSettings({ agentId: 'claude-code-cli', settingsPath }).routable, true);
+}));
+
+test('disabling and draining are both reflected as claim-ineligible before any claim or GitHub mutation', () => withServer(async ({ baseUrl, settingsPath }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const created = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
+  await apiRequest(baseUrl, '/api/instances/claude-code-cli/lifecycle', { method: 'POST', cookie, csrfToken, body: { targetState: 'enabled', expectedRevision: created.json.revision } });
+  const draining = await apiRequest(baseUrl, '/api/instances/claude-code-cli/lifecycle', { method: 'POST', cookie, csrfToken, body: { targetState: 'draining', expectedRevision: created.json.revision + 1 } });
+  assert.equal(draining.status, 200);
+  assert.equal(getAgentSettings({ agentId: 'claude-code-cli', settingsPath }).routable, false);
+
+  const disabled = await apiRequest(baseUrl, '/api/instances/claude-code-cli/lifecycle', { method: 'POST', cookie, csrfToken, body: { targetState: 'disabled', expectedRevision: draining.json.revision } });
+  assert.equal(disabled.status, 200);
+  assert.equal(getAgentSettings({ agentId: 'claude-code-cli', settingsPath }).routable, false);
+}));
+
+test('arbitrary input is rejected: executablePath, unsupported lifecycle targets, and bad policy fields all fail closed', () => withServer(async ({ baseUrl }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const created = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
+
+  const badField = await apiRequest(baseUrl, '/api/instances/claude-code-cli/settings', { method: 'PATCH', cookie, csrfToken, body: { updates: { executablePath: '/bin/sh' }, expectedRevision: created.json.revision } });
+  assert.equal(badField.status, 422);
+
+  const badLifecycle = await apiRequest(baseUrl, '/api/instances/claude-code-cli/lifecycle', { method: 'POST', cookie, csrfToken, body: { targetState: 'unavailable', expectedRevision: created.json.revision } });
+  assert.equal(badLifecycle.status, 422);
+
+  const badPolicy = await apiRequest(baseUrl, '/api/instances/claude-code-cli/settings', { method: 'PATCH', cookie, csrfToken, body: { updates: { policy: { paidFallbackEnabled: true } }, expectedRevision: created.json.revision } });
+  assert.equal(badPolicy.status, 422);
+}));
+
+test('paid-adapter fail-closed default: a freshly created instance always requires human approval, with no writable field to disable it', () => withServer(async ({ baseUrl }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const created = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
+  assert.equal(created.json.instance.policy.requireHumanApproval, true);
+}));
+
+// -- optimistic concurrency: stale/concurrent writes --------------------
+
+test('a stale expectedRevision is rejected with 409 and the last known good revision survives', () => withServer(async ({ baseUrl, settingsPath }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const created = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
+  await apiRequest(baseUrl, '/api/instances/claude-code-cli/settings', { method: 'PATCH', cookie, csrfToken, body: { updates: { model: 'first' }, expectedRevision: created.json.revision } });
+
+  const stale = await apiRequest(baseUrl, '/api/instances/claude-code-cli/settings', { method: 'PATCH', cookie, csrfToken, body: { updates: { model: 'second' }, expectedRevision: created.json.revision } });
+  assert.equal(stale.status, 409);
+
+  const onDisk = JSON.parse(readFileSync(settingsPath, 'utf8'));
+  assert.equal(onDisk.agents['claude-code-cli'].model, 'first');
+}));
+
+// -- atomic replace + rollback + restart persistence --------------------
+
+test('rollback restores a previous settings revision, and a fresh server instance sees the persisted state (restart persistence)', () => withServer(async ({ baseUrl, settingsPath, secretStoreDir, auditPath, operatorCredentialPath, dbPath, dir, server }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const created = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
+  const first = await apiRequest(baseUrl, '/api/instances/claude-code-cli/settings', { method: 'PATCH', cookie, csrfToken, body: { updates: { model: 'first' }, expectedRevision: created.json.revision } });
+  await apiRequest(baseUrl, '/api/instances/claude-code-cli/settings', { method: 'PATCH', cookie, csrfToken, body: { updates: { model: 'second' }, expectedRevision: first.json.revision } });
+
+  const rollback = await apiRequest(baseUrl, '/api/settings/rollback', { method: 'POST', cookie, csrfToken, body: { targetRevision: first.json.revision } });
+  assert.equal(rollback.status, 200);
+
+  const afterRollback = await apiRequest(baseUrl, '/api/instances/claude-code-cli', { cookie });
+  assert.equal(afterRollback.json.instance.model, 'first');
+
+  // Simulate a full service restart: close this server, start a brand new
+  // one against the same on-disk paths, log in again (sessions never
+  // persist by design), and confirm the state survived.
+  await new Promise((resolvePromise) => server.close(resolvePromise));
+  const restarted = createControlServer({ settingsPath, secretStoreDir, auditPath, operatorCredentialPath, dbPath });
+  await listenControlServer(restarted, { port: 0 });
+  try {
+    const restartedBaseUrl = `http://127.0.0.1:${restarted.address().port}`;
+    const restartedSession = await login(restartedBaseUrl);
+    const afterRestart = await apiRequest(restartedBaseUrl, '/api/instances/claude-code-cli', { cookie: restartedSession.cookie });
+    assert.equal(afterRestart.json.instance.model, 'first');
+  } finally {
+    await new Promise((resolvePromise) => restarted.close(resolvePromise));
+  }
+}));
+
+// -- secret value non-disclosure (the leak-proof proof) -----------------
+
+test('LEAK-PROOF: a created/rotated/removed secret value never appears in any API response, audit entry, or settings file', () => withServer(async ({ baseUrl, secretStoreDir, auditPath, settingsPath }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const createdValue = 'unit-test-secret-created-value-must-never-leak';
+  const rotatedValue = 'unit-test-secret-rotated-value-must-never-leak';
+
+  const created = await apiRequest(baseUrl, '/api/secrets/adapter-token', { method: 'POST', cookie, csrfToken, body: { value: createdValue } });
+  assert.equal(created.status, 201);
+  assert.equal(created.json.status, 'configured');
+  assert.ok(!('value' in created.json));
+
+  const status = await apiRequest(baseUrl, '/api/secrets/adapter-token', { cookie });
+  assert.equal(status.status, 200);
+  assert.ok(!JSON.stringify(status.json).includes(createdValue));
+
+  const rotated = await apiRequest(baseUrl, '/api/secrets/adapter-token/rotate', { method: 'POST', cookie, csrfToken, body: { value: rotatedValue } });
+  assert.equal(rotated.status, 200);
+  assert.ok(!JSON.stringify(rotated.json).includes(rotatedValue));
+
+  const removed = await apiRequest(baseUrl, '/api/secrets/adapter-token', { method: 'DELETE', cookie, csrfToken });
+  assert.equal(removed.status, 200);
+  assert.equal(removed.json.status, 'missing');
+
+  // Sink 1: no API response anywhere in this test contained the value
+  // (checked inline above). Sink 2: the audit log.
+  const auditRaw = readFileSync(auditPath, 'utf8');
+  assert.ok(!auditRaw.includes(createdValue));
+  assert.ok(!auditRaw.includes(rotatedValue));
+  const auditEntries = auditRaw.trim().split('\n').map((line) => JSON.parse(line));
+  assert.ok(auditEntries.some((entry) => entry.action === 'secret.create'));
+  assert.ok(auditEntries.every((entry) => !('value' in entry)));
+
+  // Sink 3: the control settings document (metadata/secretref only).
+  if (readdirSync(join(settingsPath, '..')).includes('agent-settings.json')) {
+    const settingsRaw = readFileSync(settingsPath, 'utf8');
+    assert.ok(!settingsRaw.includes(createdValue));
+    assert.ok(!settingsRaw.includes(rotatedValue));
+  }
+
+  // Sink 4 (positive control): the rotated value *did* actually reach the
+  // one place it is allowed to — the 0600 secret-store file — proving the
+  // absence everywhere else is containment, not simply "never written".
+  const secretFileNames = readdirSync(secretStoreDir).filter((name) => name.endsWith('.secret.json'));
+  assert.equal(secretFileNames.length, 0, 'secret was removed, so no file should remain');
+}));
+
+test('LEAK-PROOF: while a secret is configured, its raw value is present only in the 0600 store file, never in the audit log', () => withServer(async ({ baseUrl, secretStoreDir, auditPath }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const value = 'unit-test-secret-still-configured-value';
+  await apiRequest(baseUrl, '/api/secrets/live-token', { method: 'POST', cookie, csrfToken, body: { value } });
+
+  const storeFile = readFileSync(join(secretStoreDir, 'live-token.secret.json'), 'utf8');
+  assert.ok(storeFile.includes(value), 'the one authorized sink must actually contain the value');
+
+  const auditRaw = readFileSync(auditPath, 'utf8');
+  assert.ok(!auditRaw.includes(value));
+}));
+
+test('a validation error on a bad secret value never echoes the submitted value', () => withServer(async ({ baseUrl }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const result = await apiRequest(baseUrl, '/api/secrets/bad-token', { method: 'POST', cookie, csrfToken, body: { value: '' } });
+  assert.equal(result.status, 400);
+  assert.deepEqual(Object.keys(result.json).sort(), ['ok', 'reason']);
+}));
+
+// -- read-only, no coupling to a missing/uninitialized SQLite state DB --
+
+test('GET /api/instances never throws even when the runner SQLite state DB does not exist yet', () => withServer(async ({ baseUrl }) => {
+  const { cookie } = await login(baseUrl);
+  const result = await apiRequest(baseUrl, '/api/instances', { cookie });
+  assert.equal(result.status, 200);
+  const claude = result.json.instances.find((instance) => instance.agentId === 'claude-code-cli');
+  assert.equal(claude.load.capacity, 1);
+}));
+
+// -- audit trail read surface --------------------------------------------
+
+test('LEAK-PROOF (whole-tree + stdout/stderr): a secret value survives only under the secret store, never in settings, .history snapshots, audit, operator file, or anything written to the console', () => withServer(async ({ baseUrl, dir, secretStoreDir }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  const marker = 'unit-test-whole-tree-leak-marker-4f9c2a';
+
+  // Generate real .history/<rev>.json snapshots: create an instance, then
+  // two settings updates so the pre-update document is snapshotted twice.
+  const created = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
+  const firstUpdate = await apiRequest(baseUrl, '/api/instances/claude-code-cli/settings', {
+    method: 'PATCH', cookie, csrfToken, body: { updates: { model: 'unrelated-model-name' }, expectedRevision: created.json.revision },
+  });
+  await apiRequest(baseUrl, '/api/instances/claude-code-cli/settings', {
+    method: 'PATCH', cookie, csrfToken, body: { updates: { profile: 'unrelated-profile' }, expectedRevision: firstUpdate.json.revision },
+  });
+
+  // Capture every byte written to stdout/stderr while the secret is created
+  // and rotated with the marker value.
+  const written = [];
+  const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+  const originalStderrWrite = process.stderr.write.bind(process.stderr);
+  process.stdout.write = (chunk, ...rest) => { written.push(String(chunk)); return originalStdoutWrite(chunk, ...rest); };
+  process.stderr.write = (chunk, ...rest) => { written.push(String(chunk)); return originalStderrWrite(chunk, ...rest); };
+  let createResult;
+  let rotateResult;
+  try {
+    createResult = await apiRequest(baseUrl, '/api/secrets/whole-tree-token', { method: 'POST', cookie, csrfToken, body: { value: marker } });
+    rotateResult = await apiRequest(baseUrl, '/api/secrets/whole-tree-token/rotate', { method: 'POST', cookie, csrfToken, body: { value: `${marker}-rotated` } });
+  } finally {
+    process.stdout.write = originalStdoutWrite;
+    process.stderr.write = originalStderrWrite;
+  }
+  assert.equal(createResult.status, 201);
+  assert.equal(rotateResult.status, 200);
+  assert.ok(!written.some((chunk) => chunk.includes(marker)), 'the secret value must never be written to stdout/stderr');
+
+  // Whole-tree walk: every file under the service's entire state directory,
+  // classified by whether it lives under the secret store.
+  const allFiles = walkFiles(dir);
+  assert.ok(allFiles.some((path) => path.includes('.history')), 'test setup sanity: at least one .history snapshot must exist');
+  const outsideSecretStore = allFiles.filter((path) => relative(secretStoreDir, path).startsWith('..'));
+  const insideSecretStore = allFiles.filter((path) => !relative(secretStoreDir, path).startsWith('..'));
+  assert.ok(insideSecretStore.length > 0);
+
+  for (const path of outsideSecretStore) {
+    const contents = readFileSync(path, 'utf8');
+    assert.ok(!contents.includes(marker), `secret value leaked outside the secret store into ${relative(dir, path)}`);
+    assert.ok(!contents.includes(`${marker}-rotated`), `rotated secret value leaked outside the secret store into ${relative(dir, path)}`);
+  }
+
+  // Positive control: the rotated value is actually present in exactly the
+  // one sink that is allowed to hold it.
+  const secretHits = insideSecretStore.filter((path) => readFileSync(path, 'utf8').includes(`${marker}-rotated`));
+  assert.equal(secretHits.length, 1);
+  assert.equal(statSync(secretHits[0]).mode & 0o777, 0o600);
+}));
+
+test('GET /api/audit returns actor/source/time/revision/changed-field-names only', () => withServer(async ({ baseUrl }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
+  const result = await apiRequest(baseUrl, '/api/audit', { cookie });
+  assert.equal(result.status, 200);
+  assert.ok(result.json.entries.length >= 1);
+  for (const entry of result.json.entries) {
+    assert.deepEqual(Object.keys(entry).sort(), ['action', 'actor', 'at', 'changedFields', 'id', 'outcome', 'reason', 'revision', 'source']);
+  }
+}));
