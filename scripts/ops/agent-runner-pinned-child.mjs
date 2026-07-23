@@ -4,6 +4,10 @@ import { pathToFileURL } from 'node:url';
 
 import { main as childMain } from './claude-runner.mjs';
 import {
+  evaluateManagerAuthorizedNoChange,
+  parseNoChangeCompletionPolicy,
+} from './agent-runner-no-change-completion.mjs';
+import {
   hasManagerPreflight,
   latestManagerPreflightComment,
 } from './claude-runner-selection.mjs';
@@ -106,6 +110,7 @@ export function pinManagerAuthorityComments(comments = [], authority = {}) {
     allowed: true,
     reason: 'pinned-child-comments-authorized',
     comments: filtered,
+    noChangePolicy: parseNoChangeCompletionPolicy(pinnedPreflight.body || ''),
     evidence: {
       issueNumber: authority.issueNumber,
       selectionMode: authority.selectionMode,
@@ -124,7 +129,11 @@ function commentsRequestForIssue(input, issueNumber) {
   return new RegExp(`/issues/${issueNumber}/comments(?:\\?|$)`).test(raw);
 }
 
-export function createPinnedFetch({ authority, originalFetch = globalThis.fetch } = {}) {
+export function createPinnedFetch({
+  authority,
+  originalFetch = globalThis.fetch,
+  onPinned = null,
+} = {}) {
   if (typeof originalFetch !== 'function') throw new Error('pinned-child-fetch-unavailable');
   return async (input, init) => {
     const response = await originalFetch(input, init);
@@ -133,6 +142,7 @@ export function createPinnedFetch({ authority, originalFetch = globalThis.fetch 
     const comments = await response.clone().json();
     const pinned = pinManagerAuthorityComments(comments, authority);
     if (!pinned.allowed) throw new Error(pinned.reason);
+    onPinned?.(pinned);
 
     const headers = new Headers(response.headers);
     headers.delete('content-length');
@@ -165,6 +175,21 @@ function structuredFailure(authority, reason) {
   };
 }
 
+function withPinnedAuthorityEvidence(payload, authority) {
+  return {
+    ...payload,
+    pinnedExecutionAuthority: {
+      allowed: true,
+      reason: 'pinned-child-authority-applied',
+      issueNumber: authority.issueNumber,
+      selectionMode: authority.selectionMode,
+      preflightRevision: authority.preflightRevision,
+      claimRevision: authority.claimRevision || null,
+      attemptId: authority.attemptId || null,
+    },
+  };
+}
+
 export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
   const authority = pinnedAuthorityFromEnv(env);
   if (!authority.allowed) {
@@ -173,26 +198,32 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
   }
 
   const originalFetch = dependencies.originalFetch || globalThis.fetch;
+  const runChildMain = dependencies.childMain || childMain;
   const previousFetch = globalThis.fetch;
   const previousLog = console.log;
-  globalThis.fetch = createPinnedFetch({ authority, originalFetch });
+  let noChangePolicy = parseNoChangeCompletionPolicy('');
+  let noChangeAccepted = false;
+
+  globalThis.fetch = createPinnedFetch({
+    authority,
+    originalFetch,
+    onPinned: (pinned) => {
+      noChangePolicy = pinned.noChangePolicy;
+    },
+  });
   console.log = (...values) => {
     if (values.length === 1 && typeof values[0] === 'string') {
       try {
         const payload = JSON.parse(values[0]);
         if (payload && typeof payload === 'object' && !Array.isArray(payload)) {
-          previousLog(JSON.stringify({
-            ...payload,
-            pinnedExecutionAuthority: {
-              allowed: true,
-              reason: 'pinned-child-authority-applied',
-              issueNumber: authority.issueNumber,
-              selectionMode: authority.selectionMode,
-              preflightRevision: authority.preflightRevision,
-              claimRevision: authority.claimRevision || null,
-              attemptId: authority.attemptId || null,
-            },
-          }, null, 2));
+          const completion = evaluateManagerAuthorizedNoChange({
+            payload,
+            policy: noChangePolicy,
+            authority,
+          });
+          const effectivePayload = completion.accepted ? completion.payload : payload;
+          noChangeAccepted = completion.accepted;
+          previousLog(JSON.stringify(withPinnedAuthorityEvidence(effectivePayload, authority), null, 2));
           return;
         }
       } catch {
@@ -203,7 +234,8 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
   };
 
   try {
-    return await childMain(argv, env);
+    const exitCode = await runChildMain(argv, env);
+    return noChangeAccepted ? 0 : exitCode;
   } catch (error) {
     const reason = String(error?.message || error || 'pinned-child-authority-failed');
     previousLog(JSON.stringify(structuredFailure(authority, reason), null, 2));
