@@ -222,7 +222,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
             authority,
           });
           const effectivePayload = completion.accepted ? completion.payload : payload;
-          if (completion.accepted) noChangeAccepted = true;
+          noChangeAccepted = completion.accepted;
           previousLog(JSON.stringify(withPinnedAuthorityEvidence(effectivePayload, authority), null, 2));
           return;
         }
