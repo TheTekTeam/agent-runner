@@ -32,6 +32,7 @@ function noChangePayload(overrides = {}) {
     statusFingerprint: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
   };
   return {
+    sourcePreflightCommentId: preflightRevision,
     executionPhase: 'implementation',
     exitCode: 0,
     signal: null,
@@ -109,8 +110,10 @@ test('no-change completion is denied when the manager field is absent', () => {
   });
 });
 
-test('no-change completion requires one exact affirmative manager field', () => {
+test('no-change completion requires the one literal manager value allowed', () => {
   assert.equal(parseNoChangeCompletionPolicy('No-change completion: allowed').allowed, true);
+  assert.equal(parseNoChangeCompletionPolicy('No-change completion: approved').allowed, false);
+  assert.equal(parseNoChangeCompletionPolicy('No-change completion: true').allowed, false);
   assert.equal(parseNoChangeCompletionPolicy('No-change completion: denied').allowed, false);
   assert.equal(parseNoChangeCompletionPolicy('No-change completion: allowed\nNo-change completion: allowed').reason, 'no-change-completion-field-ambiguous');
 });
@@ -138,6 +141,16 @@ test('explicit manager authorization promotes exact clean no-change evidence', (
   assert.equal(result.payload.implementationEvidence.changedFiles, 0);
   assert.equal(result.payload.implementationEvidence.completionKind, 'no-change');
   assert.equal(result.payload.noChangeCompletion.sourcePreflightRevision, preflightRevision);
+});
+
+test('payload preflight disagreement cannot be promoted to no-change success', () => {
+  const result = evaluateManagerAuthorizedNoChange({
+    payload: noChangePayload({ sourcePreflightCommentId: 'github-comment:database:5058000000' }),
+    policy: parseNoChangeCompletionPolicy('No-change completion: allowed'),
+    authority: authority(),
+  });
+  assert.equal(result.accepted, false);
+  assert.ok(result.failedChecks.includes('payloadPreflightCorrelation'));
 });
 
 test('dirty worktree cannot be promoted to no-change success', () => {
@@ -210,5 +223,32 @@ test('pinned child preserves failure when current preflight does not authorize n
 
   const payload = JSON.parse(output.at(-1));
   assert.equal(payload.failureReason, 'implementation-no-repository-change');
+  assert.equal(payload.noChangeCompletion, undefined);
+});
+
+test('only the final structured child payload controls the exit override', async () => {
+  const output = [];
+  const originalLog = console.log;
+  console.log = (...values) => output.push(values.join(' '));
+  try {
+    const exitCode = await pinnedChildMain([], pinnedEnv(), {
+      originalFetch: async () => new Response(JSON.stringify([managerPreflight()])),
+      childMain: async () => {
+        await fetch('https://api.github.com/repos/TheTekTeam/modelspend/issues/686/comments');
+        console.log(JSON.stringify(noChangePayload()));
+        console.log(JSON.stringify(noChangePayload({
+          exitCode: 1,
+          failureReason: 'child-terminal-failure',
+        })));
+        return 1;
+      },
+    });
+    assert.equal(exitCode, 1);
+  } finally {
+    console.log = originalLog;
+  }
+
+  const payload = JSON.parse(output.at(-1));
+  assert.equal(payload.failureReason, 'child-terminal-failure');
   assert.equal(payload.noChangeCompletion, undefined);
 });
