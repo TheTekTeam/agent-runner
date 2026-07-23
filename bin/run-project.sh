@@ -10,6 +10,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_FILE="${AGENT_RUNNER_CONFIG:-$HOME/.config/agent-runner/modelspend.json}"
 ENV_FILE="${AGENT_RUNNER_ENV_FILE:-$HOME/.config/agent-runner/runner.env}"
 RESULT_FILE="${AGENT_RUNNER_RUN_RESULT_FILE:-}"
+NODE_BIN="${AGENT_RUNNER_NODE_BIN:-node}"
 
 [ -f "$CONFIG_FILE" ] || { echo "[agent-runner] ERROR: config missing: $CONFIG_FILE" >&2; exit 1; }
 [ -f "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" ] || {
@@ -24,7 +25,7 @@ write_run_result() {
   AGENT_RUNNER_RESULT_STATE="$state" \
   AGENT_RUNNER_RESULT_REASON="$reason" \
   AGENT_RUNNER_RESULT_EXIT_CODE="$exit_code" \
-  node <<'NODE'
+  "$NODE_BIN" <<'NODE'
 const fs = require('node:fs');
 const path = require('node:path');
 const target = process.env.AGENT_RUNNER_RESULT_FILE;
@@ -67,7 +68,7 @@ load_env_file() {
 }
 
 json_value() {
-  node -e 'const fs=require("node:fs"); const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const path=process.argv[2].split("."); let x=v; for (const key of path) x=x?.[key]; if (typeof x!=="string" || !x) process.exit(2); process.stdout.write(x);' "$CONFIG_FILE" "$1"
+  "$NODE_BIN" -e 'const fs=require("node:fs"); const v=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const path=process.argv[2].split("."); let x=v; for (const key of path) x=x?.[key]; if (typeof x!=="string" || !x) process.exit(2); process.stdout.write(x);' "$CONFIG_FILE" "$1"
 }
 
 load_env_file "$ENV_FILE"
@@ -101,7 +102,7 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   # A tripped profile/systemic circuit is checked before candidate discovery,
   # attempt creation or any GitHub mutation. Handled pauses remain systemd 0.
   set +e
-  node "$ROOT/scripts/ops/agent-runner-circuit-breaker.mjs" check
+  "$NODE_BIN" "$ROOT/scripts/ops/agent-runner-circuit-breaker.mjs" check
   CIRCUIT_STATUS=$?
   set -e
   case "$CIRCUIT_STATUS" in
@@ -121,14 +122,14 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   # Machine/profile policy is admitted before candidate discovery. A handled
   # refusal is durably recorded into the circuit before returning success.
   set +e
-  ADMISSION_OUTPUT="$(node "$ROOT/scripts/ops/agent-runner-admission.mjs" "${ARGS[@]}" 2>&1)"
+  ADMISSION_OUTPUT="$("$NODE_BIN" "$ROOT/scripts/ops/agent-runner-admission.mjs" "${ARGS[@]}" 2>&1)"
   ADMISSION_STATUS=$?
   set -e
   case "$ADMISSION_STATUS" in
     0) ;;
     3)
       AGENT_RUNNER_ADMISSION_RESULT="$ADMISSION_OUTPUT" \
-        node "$ROOT/scripts/ops/agent-runner-circuit-breaker.mjs" record >/dev/null
+        "$NODE_BIN" "$ROOT/scripts/ops/agent-runner-circuit-breaker.mjs" record >/dev/null
       printf '%s\n' "$ADMISSION_OUTPUT"
       write_run_result handled_noop machine-admission-paused 0
       echo "[agent-runner] machine profile paused and circuit recorded; no candidate selected or mutated"
@@ -143,7 +144,7 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   esac
 
   set +e
-  node "$ROOT/scripts/ops/claude-runner-candidate-probe.mjs" "${ARGS[@]}"
+  "$NODE_BIN" "$ROOT/scripts/ops/claude-runner-candidate-probe.mjs" "${ARGS[@]}"
   PROBE_STATUS=$?
   set -e
   case "$PROBE_STATUS" in
@@ -165,13 +166,13 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   # approved manager author. A handled refusal occurs before the canonical
   # scheduler can create an attempt row or mutate GitHub.
   set +e
-  node "$ROOT/scripts/ops/agent-runner-candidate-admission.mjs" "${ARGS[@]}"
+  "$NODE_BIN" "$ROOT/scripts/ops/agent-runner-candidate-admission.mjs" "${ARGS[@]}"
   CANDIDATE_STATUS=$?
   set -e
   case "$CANDIDATE_STATUS" in
     0)
       write_run_result canonical_runner_invoked canonical-runner-executed 0
-      exec node "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}"
+      exec "$NODE_BIN" "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}"
       ;;
     3)
       write_run_result handled_noop candidate-authority-refused 0
@@ -187,4 +188,4 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
 fi
 
 write_run_result canonical_runner_invoked dry-run-runner-invoked 0
-exec node "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}"
+exec "$NODE_BIN" "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}"
