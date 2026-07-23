@@ -42,12 +42,25 @@ const FULL_PASSING_EVIDENCE = Object.freeze({
   sameRecoveryClaim: true, sameRecoveryAgent: true, noNewerManagerAction: true,
 });
 
-function canonicalManagerPacket({ id = 1, revision = 'FAULT.1', createdAt = '2026-07-01T09:00:00Z' } = {}) {
+function canonicalPreflightComment(id, revision = `TEST.${id}`, scope = 'Task.') {
   return {
     id,
-    createdAt,
-    user: { login: 'gpcola' },
-    body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: ${revision}\nfingerprint: sha256:${'a'.repeat(64)}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\``,
+    body: `<!-- agent-runner:manager-preflight -->
+## Manager preflight packet
+\`\`\`yaml
+schema_version: agent-runner-manager-preflight/v1
+revision: ${revision}
+fingerprint: sha256:${String(id).padStart(64, 'a').slice(-64)}
+producer_type: normal_chatgpt_manager_session
+approved_agent: claude-code-cli
+execution_phase: implementation
+scope:
+  - ${scope}
+required_validation:
+  - Run focused tests.
+stop_conditions:
+  - Stop on scope expansion.
+\`\`\``,
   };
 }
 
@@ -141,7 +154,7 @@ test('fault-injection: SQLite store fails to open at startup -> systemic pause, 
 test('fault-injection: the initial claim-persistence write fails mid-pass -> systemic pause, not a silently half-claimed row', () => runScenario('claim-persistence-write-failure', (record) => withTempDir('fault-claim-write-', async (dir) => {
   const stateDbPath = join(dir, 'state.sqlite');
   const lockPath = join(dir, 'cron.lock');
-  const comments = [canonicalManagerPacket({ revision: 'FAULT-700.1' })];
+  const comments = [{ ...canonicalPreflightComment(1, 'TEST.1', 'Ready task.'), createdAt: '2026-07-01T09:00:00Z' }];
   const ghRunner = (args) => {
     if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify([{ number: 700, labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }] }]);
     if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ number: 700, comments });
@@ -171,8 +184,8 @@ test('fault-injection: the initial claim-persistence write fails mid-pass -> sys
 })));
 
 test('fault-injection: a GitHub read failure for one candidate issue during selection does not block scanning other ready work', () => runScenario('per-issue-github-read-failure', (record) => withTempDir('fault-gh-view-selection-', async (dir) => {
-  const comments700 = [canonicalManagerPacket({ revision: 'FAULT-700-BROKEN.1' })];
-  const comments701 = [canonicalManagerPacket({ id: 2, revision: 'FAULT-701.1' })];
+  const comments700 = [{ ...canonicalPreflightComment(1, 'TEST.700', 'Broken issue.'), createdAt: '2026-07-01T09:00:00Z' }];
+  const comments701 = [{ ...canonicalPreflightComment(2, 'TEST.701', 'Healthy issue.'), createdAt: '2026-07-01T09:00:00Z' }];
   const ghRunner = (args) => {
     if (args[0] === 'issue' && args[1] === 'list') {
       return JSON.stringify([
@@ -269,7 +282,7 @@ test('fault-injection: quota preflight check itself fails (nonzero exit) -> quot
 })));
 
 test('fault-injection: the child process crashes (nonzero exit + signal) -> attempt lands in a valid bounded state, never ambiguous', () => runScenario('child-crash-signal', (record) => withTempDir('fault-child-crash-', async (dir) => {
-  const comments = [canonicalManagerPacket()];
+  const comments = [{ ...canonicalPreflightComment(1), createdAt: '2026-07-01T09:00:00Z' }];
   const ghRunner = (args) => {
     if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify([{ number: 702, labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }] }]);
     if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ number: 702, comments });
@@ -296,7 +309,7 @@ test('fault-injection: the child process crashes (nonzero exit + signal) -> atte
 })));
 
 test('fault-injection: child spawn failure (no process ever started) -> attempt lands in a valid bounded state, never ambiguous', () => runScenario('child-spawn-failure', (record) => withTempDir('fault-child-spawn-', async (dir) => {
-  const comments = [canonicalManagerPacket()];
+  const comments = [{ ...canonicalPreflightComment(1), createdAt: '2026-07-01T09:00:00Z' }];
   const ghRunner = (args) => {
     if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify([{ number: 704, labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }] }]);
     if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ number: 704, comments });
@@ -327,7 +340,7 @@ test('fault-injection: child spawn failure (no process ever started) -> attempt 
 })));
 
 test('fault-injection: child exits zero with malformed/missing terminal output -> treated as a failure, never a false completion', () => runScenario('child-zero-exit-malformed-output', (record) => withTempDir('fault-child-malformed-', async (dir) => {
-  const comments = [canonicalManagerPacket()];
+  const comments = [{ ...canonicalPreflightComment(1), createdAt: '2026-07-01T09:00:00Z' }];
   const ghRunner = (args) => {
     if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify([{ number: 705, labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }] }]);
     if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ number: 705, comments });
@@ -364,7 +377,7 @@ test('fault-injection: a throwing progress probe during the watchdog tick degrad
   const lockPath = join(dir, 'cron.lock');
   const ghRunner = (args) => {
     if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify([{ number: 706, labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }] }]);
-    if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ number: 706, comments: [canonicalManagerPacket()] });
+    if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ number: 706, comments: [{ ...canonicalPreflightComment(1), createdAt: '2026-07-01T09:00:00Z' }] });
     if (args[0] === 'issue' && args[1] === 'comment') return '';
     if (args[0] === 'issue' && args[1] === 'edit') return '';
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
@@ -499,7 +512,7 @@ test('fault-injection: worktree/checkpoint inspection failure (git command failu
 test('fault-injection: worktree/checkpoint inspection failure fails a native_resume/same_agent_continuation claim closed through the real revalidation path', async () => {
   await runScenario('worktree-inspection-failure-through-revalidation', async (record) => {
     const comments = [
-      { id: 41, createdAt: '2026-07-17T18:00:00Z', body: '## Manager preflight packet\nOriginal revision.' },
+      { ...canonicalPreflightComment(41, 'TEST.41', 'Original revision.'), createdAt: '2026-07-17T18:00:00Z' },
       { id: 99, createdAt: '2026-07-17T18:31:00Z', body: '## Manager recovery authorization\n- Attempt: attempt-worktree-fault\n- Action: same_agent_continuation\n- Claim revision: 41\n- Preflight revision: 41\n- Agent: claude-code-cli\n- Model: claude-sonnet-4-5\n- Harness: claude\n- Policy approved: yes' },
     ];
     const ghRunner = (args) => {
