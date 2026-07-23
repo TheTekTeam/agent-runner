@@ -347,7 +347,9 @@ export function runSupervisedCanary(args, env = process.env, dependencies = {}) 
     reason = 'terminal-failure';
   } else if (handledNoop) {
     exitCode = 3;
-    reason = wrapperResult?.reason || 'handled-noop-without-attempt';
+    reason = wrapperResult?.state === 'handled_noop'
+      ? (wrapperResult.reason || 'handled-noop-without-attempt')
+      : 'handled-noop-without-attempt';
   } else if (state === 'worker_started') {
     reason = 'worker-started-without-terminal-result';
   } else if (state === 'claim_persisted') {
