@@ -107,11 +107,7 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   set -e
   case "$CIRCUIT_STATUS" in
     0) ;;
-    3)
-      write_run_result handled_noop circuit-paused 0
-      echo "[agent-runner] admission circuit paused; no candidate selected or mutated"
-      exit 0
-      ;;
+    3) write_run_result handled_noop circuit-paused 0; echo "[agent-runner] admission circuit paused; no candidate selected or mutated"; exit 0 ;;
     *)
       write_run_result wrapper_failure circuit-check-failed "$CIRCUIT_STATUS"
       echo "[agent-runner] ERROR: circuit breaker check failed with exit $CIRCUIT_STATUS" >&2
