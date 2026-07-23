@@ -191,24 +191,6 @@
       }
     },
     {
-      "path": "scripts/ops/claude-runner-preflight.mjs",
-      "ownership": {
-        "canonicalRepository": "TheTekTeam/agent-runner",
-        "transferredAt": "2026-07-23T19:55:00.000Z",
-        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
-        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
-      }
-    },
-    {
-      "path": "scripts/ops/claude-runner-preflight.test.mjs",
-      "ownership": {
-        "canonicalRepository": "TheTekTeam/agent-runner",
-        "transferredAt": "2026-07-23T19:55:00.000Z",
-        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
-        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
-      }
-    },
-    {
       "path": "scripts/ops/claude-runner-recovery.mjs",
       "ownership": {
         "canonicalRepository": "TheTekTeam/agent-runner",
