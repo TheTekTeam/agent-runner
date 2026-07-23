@@ -13,13 +13,7 @@ import {
   normalizeCommentIdentity,
   sameCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
-
 import {
-  MANAGER_PREFLIGHT_ALREADY_CLAIMED,
-  MANAGER_PREFLIGHT_INVALID,
-  MANAGER_PREFLIGHT_REQUIRED,
-  MANAGER_PREFLIGHT_REVOKED,
-  parseManagerPreflightPacket,
   resolveCurrentManagerAuthority,
 } from './agent-runner-manager-authority.mjs';
 
@@ -96,8 +90,7 @@ export function invalidatesManagerPreflight(commandText = '') {
 export function hasManagerPreflight(commandText = '') {
   const value = String(commandText || '');
   if (invalidatesManagerPreflight(value)) return false;
-  return /<!--\s*agent-runner:manager-preflight\s*-->/i.test(value)
-    || /^#{2,4}\s*Manager\s+preflight\s+packet\b/im.test(value)
+  return /^#{2,4}\s*Manager\s+preflight\s+packet\b/im.test(value)
     || /^#{2,4}\s*ChatGPT\s+preflight(?:\s+packet)?\b/im.test(value)
     || /preflight\s+(?:prepared|completed|run)\s+by\s+(?:ChatGPT|manager)/i.test(value);
 }
@@ -142,9 +135,10 @@ export function preflightAlreadyClaimed(comments = [], preflight) {
 }
 
 /**
- * Read-only historical command classifier retained for migration evidence,
- * recovery inspection, and old tests. New claim selection never calls this
- * helper as an authority source.
+ * Compatibility-mode command check: is there a runnable (unclaimed,
+ * manager-preflighted) proceed/continue command on this issue? Unchanged
+ * from the pre-v2 selector so proceed-command mode keeps working exactly as
+ * before.
  */
 export function runnableCommandForIssue(issue, comments = [], { requireManagerPreflight = true } = {}) {
   if (issue.statusLabel === STATUS_READY) {
@@ -177,17 +171,18 @@ export function runnableCommandForIssue(issue, comments = [], { requireManagerPr
 }
 
 /**
- * New-claim dispatch authority is one canonical, immutable ChatGPT manager
- * packet. Historical proceed/continue comments remain readable through the
- * helpers above for migration and recovery evidence, but they never authorise
- * or outrank a new claim.
+ * Agent Runner v2 dual-dispatch selection. Tries the compatibility
+ * proceed/continue command path first (unchanged behaviour); if a
+ * status:ready issue has no proceed command but does have an unclaimed
+ * manager preflight packet, selects it directly in `preflight-direct` mode
+ * instead of skipping with "missing proceed command".
  */
-export function resolveIssueSelection(issue, comments = [], { requireManagerPreflight = true } = {}) {
-  if (![STATUS_READY, STATUS_IN_PROGRESS].includes(issue?.statusLabel)) {
-    return { mode: null, command: null, preflight: null, managerAuthority: null, reason: `unsupported status label ${issue?.statusLabel || 'unknown'}` };
-  }
-  if (!requireManagerPreflight) {
-    return { mode: null, command: null, preflight: null, managerAuthority: null, reason: MANAGER_PREFLIGHT_REQUIRED };
+export function resolveIssueSelection(issue, comments = [], _options = {}) {
+  if (![STATUS_READY, STATUS_IN_PROGRESS].includes(issue.statusLabel)) {
+    return {
+      mode: null, command: null, preflight: null, managerAuthority: null,
+      reason: `unsupported status label ${issue.statusLabel || 'unknown'}`,
+    };
   }
 
   const resolved = resolveCurrentManagerAuthority(comments);
@@ -195,9 +190,9 @@ export function resolveIssueSelection(issue, comments = [], { requireManagerPref
     return {
       mode: null,
       command: null,
-      preflight: resolved.authority?.comment || null,
+      preflight: null,
       managerAuthority: resolved.authority || null,
-      reason: resolved.reason || MANAGER_PREFLIGHT_REQUIRED,
+      reason: resolved.reason,
       detail: resolved.detail || null,
     };
   }
@@ -210,12 +205,3 @@ export function resolveIssueSelection(issue, comments = [], { requireManagerPref
     reason: null,
   };
 }
-
-export {
-  MANAGER_PREFLIGHT_ALREADY_CLAIMED,
-  MANAGER_PREFLIGHT_INVALID,
-  MANAGER_PREFLIGHT_REQUIRED,
-  MANAGER_PREFLIGHT_REVOKED,
-  parseManagerPreflightPacket,
-  resolveCurrentManagerAuthority,
-};
