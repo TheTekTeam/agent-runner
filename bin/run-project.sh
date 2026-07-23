@@ -11,10 +11,11 @@ CONFIG_FILE="${AGENT_RUNNER_CONFIG:-$HOME/.config/agent-runner/modelspend.json}"
 ENV_FILE="${AGENT_RUNNER_ENV_FILE:-$HOME/.config/agent-runner/runner.env}"
 RESULT_FILE="${AGENT_RUNNER_RUN_RESULT_FILE:-}"
 NODE_BIN="${AGENT_RUNNER_NODE_BIN:-node}"
+PINNED_CRON="$ROOT/scripts/ops/agent-runner-pinned-atomic-cron.mjs"
 
 [ -f "$CONFIG_FILE" ] || { echo "[agent-runner] ERROR: config missing: $CONFIG_FILE" >&2; exit 1; }
-[ -f "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" ] || {
-  echo "[agent-runner] ERROR: atomic runner entrypoint is missing" >&2
+[ -f "$PINNED_CRON" ] || {
+  echo "[agent-runner] ERROR: pinned atomic runner entrypoint is missing" >&2
   exit 1
 }
 
@@ -168,7 +169,7 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   case "$CANDIDATE_STATUS" in
     0)
       write_run_result canonical_runner_invoked canonical-runner-executed 0
-      exec "$NODE_BIN" "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}"
+      exec "$NODE_BIN" "$PINNED_CRON" "${ARGS[@]}"
       ;;
     3)
       write_run_result handled_noop candidate-authority-refused 0
@@ -184,4 +185,4 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
 fi
 
 write_run_result canonical_runner_invoked dry-run-runner-invoked 0
-exec "$NODE_BIN" "$ROOT/scripts/ops/agent-runner-atomic-cron.mjs" "${ARGS[@]}"
+exec "$NODE_BIN" "$PINNED_CRON" "${ARGS[@]}"
