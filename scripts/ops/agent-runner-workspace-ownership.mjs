@@ -5,7 +5,7 @@ import { findLinkedOpenPullRequests } from './claude-runner-review-followup.mjs'
 
 /**
  * The typed workspace-ownership inspection boundary (#686). This is the
- * single place a fresh `preflight-direct`/`proceed-command` implementation
+ * single place a fresh canonical manager-packet implementation
  * dispatch must pass through *before* the scheduler commits anything
  * irreversible (the runner-start marker, the `recovery_attempts` claim row,
  * or the status:ready -> status:in-progress label flip). The proven #686

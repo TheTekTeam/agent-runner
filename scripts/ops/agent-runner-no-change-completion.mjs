@@ -42,12 +42,13 @@ function payloadPreflightRevision(payload = {}) {
 }
 
 export function evaluateManagerAuthorizedNoChange({ payload = {}, policy = {}, authority = {} } = {}) {
+  const authorityPreflightRevision = authority.preflightCommentRevision || authority.preflightRevision || null;
   const evidence = payload.implementationEvidence || null;
   const failedChecks = [];
 
-  if (authority.allowed !== true || !authority.preflightRevision) failedChecks.push('pinnedAuthority');
+  if (authority.allowed !== true || !authorityPreflightRevision) failedChecks.push('pinnedAuthority');
   if (policy.explicit !== true || policy.allowed !== true || policy.value !== 'allowed') failedChecks.push('managerAuthorization');
-  if (payloadPreflightRevision(payload) !== authority.preflightRevision) failedChecks.push('payloadPreflightCorrelation');
+  if (payloadPreflightRevision(payload) !== authorityPreflightRevision) failedChecks.push('payloadPreflightCorrelation');
   if (payload.executionPhase !== 'implementation') failedChecks.push('implementationPhase');
   if (Number(payload.exitCode) !== 0 || payload.signal) failedChecks.push('successfulProcessExit');
   if (payload.blocked === true || payload.spawnError) failedChecks.push('noProcessBlocker');
@@ -93,7 +94,7 @@ export function evaluateManagerAuthorizedNoChange({ payload = {}, policy = {}, a
         accepted: true,
         policyRevision: 'manager-authorized-no-change/v1',
         reason: 'validated-existing-state',
-        sourcePreflightRevision: authority.preflightRevision,
+        sourcePreflightRevision: authorityPreflightRevision,
         sourcePreflightCommentIdentity: authority.preflightIdentity || null,
         attemptId: authority.attemptId || null,
       },

@@ -95,11 +95,6 @@ if [ -n "${AGENT_RUNNER_ARGS:-${CLAUDE_RUNNER_ARGS:-}}" ]; then
 fi
 
 if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
-  # Automatic/generated preflight remains prohibited. These values also form
-  # part of the effective configuration fingerprint used by the local circuit.
-  export CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT=true
-  export CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=false
-
   # A tripped profile/systemic circuit is checked before candidate discovery,
   # attempt creation or any GitHub mutation. Handled pauses remain systemd 0.
   set +e

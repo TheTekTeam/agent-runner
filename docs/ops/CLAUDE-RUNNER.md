@@ -1,133 +1,40 @@
 # Claude Runner
 
-Purpose: run Claude Code CLI from a GitHub issue proceed command, or from a PR
-review follow-up, while preserving explicit operator control, model and
-effort selection, clear-context behaviour, quota-aware pausing, and
-validation evidence.
+Purpose: run Claude Code CLI from a GitHub issue with explicit, immutable ChatGPT manager authority, or perform a bounded PR review follow-up, while preserving operator control, quota admission, isolated execution, and validation evidence.
 
 ## Safety model
 
-The runner defaults to dry-run. It does not invoke Claude unless the operator
-explicitly enables execution for that run.
-
-- `--execute` is required for every real Claude invocation; everything else
-  is a dry-run plan.
-- `--issue <number>` is the primary v1 workflow. Autonomous issue selection
-  (`claude-runner-cron.mjs`) remains a report-only/at-most-one-issue selector
-  and still delegates to `claude-runner.mjs --issue` for the actual run.
-- In `claude-runner-cron.mjs --execute` mode, the scheduled wrapper first runs
-  a conservative Claude `/usage` preflight and refuses to start or resume work
-  when the current session is exhausted or already too close to exhaustion.
-- The scheduled wrapper requires the latest Claude proceed/continue command to
-  include a ChatGPT/manager preflight packet before it will select or claim the
-  issue. Claude should not spend tokens on repo-discovery/preflight work that
-  ChatGPT can perform from GitHub/repo context.
-- The runner never auto-merges, auto-approves, or auto-closes anything, and
-  never broadly mutates labels beyond the existing `status:ready` →
-  `status:in-progress` claim transition in the cron wrapper.
-- Agent availability, account limits, and subscription usage are otherwise
-  managed externally by the operator; the runner does not read arbitrary
-  in-repo availability state to make account-usage decisions.
-- Local runner logs and quota state are intentionally local (under `.var/`)
-  and must not be committed.
-- A human merge gate remains mandatory: nothing in this runner merges a PR or
-  closes an issue.
+- Real execution requires `--execute`; dry-run remains the default.
+- New issue claims require one current canonical manager packet. Proceed/continue comments are read-only historical evidence.
+- Missing, malformed, stale, revoked, unauthorised, or already-claimed authority launches no worker, creates no attempt, and mutates no GitHub state.
+- The runner cannot generate or refresh manager packets.
+- Quota, implementation opt-in, approver allowlist, workspace ownership, linked-PR review, and state-store gates remain fail-closed.
+- The runner never merges, approves, closes issues, or bypasses permissions.
 
 ## Requirements
 
-- GitHub access token in the environment (`GITHUB_TOKEN` or `GH_TOKEN`).
-- Claude Code CLI installed and authenticated on the machine running the
-  script (Dell-local or otherwise).
-- A GitHub issue comment containing `## Claude proceed command` or
-  `## Claude continue command` for issue mode.
+- `GITHUB_TOKEN` or `GH_TOKEN` with the required repository access.
+- Claude Code CLI installed and authenticated on the runner machine.
+- `CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=true` and a normalized `CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS` allowlist for implementation.
+- A canonical manager packet as specified in [`AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md`](./AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md).
 
-## Dell-local setup
-
-1. Install and authenticate the Claude Code CLI on the Dell machine as
-   normal (`claude` on `PATH`, or set `CLAUDE_BIN` to its path).
-2. Export `GITHUB_TOKEN` (or `GH_TOKEN`) with repo-scoped access. Do not put
-   it in a committed file.
-3. Run everything from the repo root so relative `--output-dir` paths land
-   under the repo's own `.var/` (already ignored by git).
-4. Optionally set `CLAUDE_RUNNER_MODEL_DOCS` / `_NARROW` / `_COMPLEX` /
-   `_CRITICAL` env vars to override the default model per profile.
-
-## Targeted `--issue` flow (primary v1 mode)
+## Targeted issue flow
 
 ```bash
-# Dry-run: prints/writes a safe run plan and the generated prompt, does not call Claude.
-node scripts/ops/claude-runner.mjs --issue 629
-
-# Execute: actually invokes Claude with the resolved profile/prompt.
-node scripts/ops/claude-runner.mjs --issue 629 --execute
+node scripts/ops/claude-runner.mjs --issue 629            # dry-run
+node scripts/ops/claude-runner.mjs --issue 629 --execute  # execute after gates pass
 ```
 
-Both modes:
-
-- Fetch the issue and its comments, find the latest `## Claude proceed
-  command` / `## Claude continue command`, and resolve a model/effort
-  profile (`docs` | `narrow` | `complex` | `critical`) from the command
-  metadata, the issue text, or an explicit `--profile`.
-- Build the Claude prompt (with `/clear` by default unless resuming or
-  `--no-clear`) and write it — redacted — into the run plan so a dry-run
-  gives the operator the full prompt to review before ever running
-  `--execute`.
-- Refuse to start if the local quota pause state says quota is still paused
-  (see below), and refuse to start if an open PR linked to the issue has
-  unresolved review follow-up (see below), unless explicitly overridden.
-
-Dry-run output includes: the resolved profile, whether `/clear` will be
-used, the redacted prompt, the Claude CLI argument preview (prompt itself
-omitted from the argument preview since it's included separately), which
-provider-auth env vars would be stripped, and the local log path.
+The runner fetches the issue and comments, validates the canonical packet, resolves the approved profile and execution phase, constructs a bounded prompt, and performs linked-PR/quota/workspace checks. The scheduled wrapper revalidates the same immutable revision and fingerprint before claim; the pinned child re-reads and verifies that exact authority after the runner-start marker is posted.
 
 ## Scheduled queue flow
 
 ```bash
-# Dry-run: selects at most one issue and prints/writes the plan.
 node scripts/ops/claude-runner-cron.mjs
-
-# Execute: runs a Claude /usage preflight first, then at most one issue.
 node scripts/ops/claude-runner-cron.mjs --execute
 ```
 
-In `--execute` mode the scheduled wrapper runs:
-
-```bash
-node scripts/ops/claude-runner.mjs --check-quota --force-quota-check
-```
-
-before selecting or claiming work. If `/usage` reports that the current session
-is exhausted, or that current-session usage is at or above the conservative
-start threshold (`85%` by default), the check writes `quota-state.json` with
-`pausedUntil` set to the parsed reset timestamp and the scheduled wrapper exits
-without selecting, claiming, resuming, or starting an issue. This prevents the
-runner from starting a new task when there is unlikely to be enough session
-quota left to complete it.
-
-The scheduled wrapper then selects only issues whose latest Claude proceed or
-continue command includes a manager preflight marker, for example:
-
-```markdown
-## Claude proceed command
-
-## Manager preflight packet
-- Live GitHub issue/PR state checked by ChatGPT.
-- Files to inspect/edit are identified.
-- Validation gates are specified.
-- Known risks/blockers are listed.
-
-## Claude task
-Implement only the scoped change below...
-```
-
-If the marker is missing, the issue is skipped with `missing manager preflight
-packet` and is not claimed. This keeps repo discovery, sequencing, and prompt
-preparation with ChatGPT/manager, not Claude. Use `--skip-manager-preflight`
-only for emergency/manual recovery.
-
-Use `--skip-quota-preflight` only for manual recovery/debugging. It is not
-recommended for normal scheduled operation.
+The queue scanner continues past issue-local `manager-preflight-required` results. It does not synthesize commands or packets. Historical command comments are ignored for new-claim authority. Use `--skip-quota-preflight` only for supervised diagnosis; there is no manager-authority bypass.
 
 ## Quota-aware pausing
 

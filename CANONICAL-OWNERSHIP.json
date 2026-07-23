@@ -2,6 +2,87 @@
   "schemaVersion": 1,
   "transfers": [
     {
+      "path": ".agent-runner/README.md",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": ".agent-runner/config.example.json",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": ".agent-runner/config.modelspend.example.json",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": ".agent-runner/dashboard/dashboard.js",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "docs/ops/AGENT-RUNNER-DASHBOARD.md",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "docs/ops/AGENT-RUNNER-KIT.md",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "docs/ops/CLAUDE-RUNNER-DELL.md",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "docs/ops/CLAUDE-RUNNER-IMPLEMENTATION-PHASE.md",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "docs/ops/CLAUDE-RUNNER.md",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
       "path": "scripts/ops/agent-runner-agents.mjs",
       "ownership": {
         "canonicalRepository": "TheTekTeam/agent-runner",
@@ -17,6 +98,114 @@
         "transferredAt": "2026-07-21T19:20:00.000Z",
         "reason": "Issue #27 adds canonical standalone-runner regression coverage proving implementation is not stopped by an internal interaction count.",
         "reference": "https://github.com/TheTekTeam/agent-runner/pull/28"
+      }
+    },
+    {
+      "path": "scripts/ops/agent-runner-config.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/agent-runner-config.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-candidate-probe.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-candidate-probe.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-comment-identity.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-21T20:03:00.000Z",
+        "reason": "Issue #27 updates persisted failure examples to the generic provider execution-limit outcome.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/29"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-cron-auth.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-cron-state.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-execution-policy.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-execution-policy.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-fault-injection.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-preflight.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-preflight.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
       }
     },
     {
@@ -38,12 +227,21 @@
       }
     },
     {
-      "path": "scripts/ops/claude-runner-comment-identity.test.mjs",
+      "path": "scripts/ops/claude-runner-selection.mjs",
       "ownership": {
         "canonicalRepository": "TheTekTeam/agent-runner",
-        "transferredAt": "2026-07-21T20:03:00.000Z",
-        "reason": "Issue #27 updates persisted failure examples to the generic provider execution-limit outcome.",
-        "reference": "https://github.com/TheTekTeam/agent-runner/pull/29"
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-state.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
       }
     },
     {
@@ -53,6 +251,24 @@
         "transferredAt": "2026-07-21T20:03:00.000Z",
         "reason": "Issue #27 updates durable attention-event regression coverage to the generic provider execution-limit outcome.",
         "reference": "https://github.com/TheTekTeam/agent-runner/pull/29"
+      }
+    },
+    {
+      "path": "scripts/ops/install-claude-runner-systemd.sh",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
+      }
+    },
+    {
+      "path": "scripts/ops/install-claude-runner-systemd.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-23T19:55:00.000Z",
+        "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
       }
     }
   ]

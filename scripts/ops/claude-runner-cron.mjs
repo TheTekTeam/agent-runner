@@ -35,7 +35,7 @@ import {
   sameCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 import { findLinkedOpenPullRequests } from './claude-runner-review-followup.mjs';
-import { resolvePreflightAction } from './claude-runner-preflight.mjs';
+import { managerAuthorityKeyIsCurrent } from './agent-runner-manager-authority.mjs';
 import { defaultRunnerStateDbPath, openRunnerStateStore } from './claude-runner-state.mjs';
 import {
   RECOVERY_POLICY_REVISION,
@@ -88,7 +88,6 @@ export {
   hasManagerPreflight,
   latestManagerPreflightComment,
   preflightAlreadyClaimed,
-  resolvePreflightAction,
   runnableCommandForIssue,
 };
 
@@ -181,17 +180,10 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
     includeInProgress: !truthy(env.CLAUDE_RUNNER_CRON_DISABLE_CONTINUE),
     claimOnExecute: !truthy(env.CLAUDE_RUNNER_CRON_DISABLE_CLAIM),
     quotaPreflight: !truthy(env.CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT),
-    requireManagerPreflight: config.runner?.requireManagerPreflight !== false && !truthy(env.CLAUDE_RUNNER_CRON_SKIP_MANAGER_PREFLIGHT),
-    // preflightDirectMode: dispatch directly from a manager preflight packet
-    // when a status:ready issue has no Claude proceed command (Agent Runner
-    // v2). `CLAUDE_RUNNER_CRON_DISABLE_AUTO_PROCEED`/`--no-auto-proceed` are
-    // kept as compatibility aliases for the pre-v2 flag name.
-    preflightDirectMode: config.runner?.autoProceedFromPreflight !== false && !truthy(env.CLAUDE_RUNNER_CRON_DISABLE_PREFLIGHT_DIRECT) && !truthy(env.CLAUDE_RUNNER_CRON_DISABLE_AUTO_PROCEED),
-    // autoPreflightMode: generate a local `## Manager preflight packet` for a
-    // status:ready issue that has no proceed command and no existing
-    // preflight (Agent Runner v2.2), instead of skipping it forever with
-    // `missing manager preflight packet`.
-    autoPreflightMode: !truthy(env.CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT),
+    // New claims always require one canonical immutable ChatGPT manager packet.
+    // There is intentionally no emergency skip, proceed-command mode, or local
+    // packet-generation toggle in the live scheduler contract.
+    requireManagerPreflight: true,
     // #698 round 5, finding 4: native_resume/same_agent_continuation fail
     // closed for this release regardless of installed CLI capability. This
     // is deliberately an env-only, machine-local opt-in (never a repo-
@@ -226,9 +218,6 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
     else if (arg === '--no-continue') args.includeInProgress = false;
     else if (arg === '--no-claim') args.claimOnExecute = false;
     else if (arg === '--skip-quota-preflight') args.quotaPreflight = false;
-    else if (arg === '--skip-manager-preflight') args.requireManagerPreflight = false;
-    else if (arg === '--no-preflight-direct' || arg === '--no-auto-proceed') args.preflightDirectMode = false;
-    else if (arg === '--no-auto-preflight') args.autoPreflightMode = false;
     else if (arg === '--repo') args.repo = next();
     else if (arg === '--lock-path') args.lockPath = next();
     else if (arg === '--output-dir') {
@@ -256,8 +245,27 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
 }
 
 export function printHelp() {
-  console.log(`Claude runner scheduled wrapper\n\nUsage:\n  node scripts/ops/claude-runner-cron.mjs [--execute]\n\nDefault: dry-run. Selects at most one Claude issue and delegates to scripts/ops/claude-runner.mjs. In --execute mode it first runs a conservative Claude /usage preflight and refuses to start work when the current session is exhausted or too close to exhaustion.\n\nEligible first-run issue labels:\n  status:ready\n  agent:claude or agent:claude-code-cli\n\nEligible continuation issue labels:\n  status:in-progress\n  agent:claude or agent:claude-code-cli\n  plus a fresh ## Claude continue command not already claimed by this runner\n\nRequired manager preflight:\n  The latest Claude proceed/continue command, or (for direct dispatch) the issue itself, must have a ChatGPT/manager preflight marker, for example:\n  ## Manager preflight packet\n  This prevents Claude from spending tokens on repo-discovery/preflight work that ChatGPT should have already done.\n\nAgent Runner v2 dual dispatch:\n  proceed-command  compatibility mode — a Claude proceed/continue command drives selection, unchanged.\n  preflight-direct default for a status:ready issue with a manager preflight packet but no proceed command. No synthetic proceed comment is posted; scripts/ops/claude-runner.mjs builds the Claude prompt directly from the issue and the preflight packet.\n\nAgent Runner v2.2 local preflight generation:\n  When --execute is set and a status:ready issue has no proceed command and no manager preflight packet, the runner deterministically generates one (no external AI calls), posts it, then immediately re-evaluates selection so preflight-direct dispatch can proceed in the same run. Duplicate posts are prevented by a fingerprint embedded in the comment; unsafe/ambiguous issues are skipped with reason preflight-generation-needs-manager instead of a guess. Disable with --no-auto-preflight or CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT=true.\n\nAgent Runner v3 local state:\n  Each cron run also writes a SQLite state database for durable queue, quota, preflight, selection, claim and run-result history. JSON logs are still written as before.\n\nSelf-healing selection:\n  The queue scans up to 100 candidates by default and sorts by status, priority labels, then recency.\n\nOptions:\n  --config <path>         Agent Runner project config JSON (or AGENT_RUNNER_CONFIG).
-  --agent-label <label>    Add one accepted Claude agent label.\n  --agent-labels <labels>  Replace accepted Claude agent labels with a comma-separated list.\n  --limit <n>              Candidate scan limit, default ${DEFAULT_LIMIT}, max 200.\n  --state-db <path>        SQLite state DB path, default ${defaultRunnerStateDbPath(DEFAULT_OUTPUT)} or CLAUDE_RUNNER_STATE_DB.\n  --no-continue           Do not scan in-progress issues for continue commands.\n  --no-claim              Do not mutate ready labels or post runner-start comments before execution.\n  --no-preflight-direct   Disable direct dispatch from a manager preflight packet; require a literal proceed command (alias: --no-auto-proceed).\n  --no-auto-preflight     Disable local generation of manager preflight packets; keep skipping ready issues that have none.\n  --skip-quota-preflight  Do not run the Claude /usage preflight before --execute. Not recommended.\n  --skip-manager-preflight Emergency override for missing ChatGPT/manager preflight packet. Not recommended.\n`);
+  console.log(`Agent Runner scheduled wrapper
+
+Usage:
+  node scripts/ops/claude-runner-cron.mjs [--execute]
+
+Default: dry-run. New claims require exactly one current canonical ChatGPT manager packet with marker ${'<!-- agent-runner:manager-preflight -->'}, schema version, immutable revision, sha256 fingerprint, permitted producer type, approved agent and execution phase. Historical proceed/continue comments remain read-only evidence and never authorise a new claim. Missing, malformed, revoked or already-claimed manager authority is skipped without a child launch, attempt creation or GitHub mutation.
+
+Eligible labels:
+  status:ready or status:in-progress
+  agent:claude or agent:claude-code-cli
+
+Options:
+  --config <path>          Agent Runner project config JSON (or AGENT_RUNNER_CONFIG).
+  --agent-label <label>    Add one accepted agent label.
+  --agent-labels <labels>  Replace accepted agent labels with a comma-separated list.
+  --limit <n>              Candidate scan limit, default ${DEFAULT_LIMIT}, max 200.
+  --state-db <path>        SQLite state DB path.
+  --no-continue            Do not scan in-progress issues.
+  --no-claim               Do not mutate labels or post a runner-start marker.
+  --skip-quota-preflight   Skip the Claude quota check. Not recommended.
+`);
 }
 
 export function rootBlocked(uid = process.getuid?.(), allowRoot = false) {
@@ -579,13 +587,17 @@ export async function collectRecoveryRevalidation({
     ? cliCapabilityProbe({ claudeBin: args.claudeBin || process.env.CLAUDE_BIN || 'claude' })
     : null;
 
+  const immutableManagerAuthorityCurrent = attempt.manager_authority_key
+    ? managerAuthorityKeyIsCurrent(comments, attempt.manager_authority_key, attempt.manager_preflight_body_digest)
+    : null;
   const evidence = {
     issueOpen: String(issue.state || '').toUpperCase() === 'OPEN',
     expectedStatusCurrent: statusLabels.length === 1 && statusLabels[0] === STATUS_BLOCKED,
     agentOwnershipCurrent: agentLabels.length === 1 && sameAgent(issueAgent?.agentId, attempt.agent),
-    claimRevisionCurrent: Boolean(claimIdentity) && comments.some((comment) => sameCommentIdentity(comment, claimIdentity)),
-    preflightRevisionCurrent: Boolean(preflightIdentity)
-      && sameCommentIdentity(latestManagerPreflightComment(comments), preflightIdentity),
+    claimRevisionCurrent: immutableManagerAuthorityCurrent ?? (Boolean(claimIdentity)
+      && comments.some((comment) => sameCommentIdentity(comment, claimIdentity))),
+    preflightRevisionCurrent: immutableManagerAuthorityCurrent ?? (Boolean(preflightIdentity)
+      && sameCommentIdentity(latestManagerPreflightComment(comments), preflightIdentity)),
     authorizationFresh,
     authorizationCurrent: authMatches && (expectedAuthorizationIdentity === null
       || sameCommentIdentity(authorization.identity, expectedAuthorizationIdentity)),
@@ -639,25 +651,6 @@ export async function collectRecoveryRevalidation({
     authorizationIdentity: authorization?.identity || null,
     authorization,
     linkedPrs,
-  };
-}
-
-/**
- * Post a locally-generated `## Manager preflight packet` comment and return
- * a synthetic comment object (same shape `gh issue view --json comments`
- * would return) so the caller can re-run selection against an in-memory
- * comment list without a second GitHub round-trip.
- */
-export function postGeneratedPreflightComment(args, issue, packetBody, ghRunner = gh) {
-  const output = ghRunner(['issue', 'comment', String(issue.number), '--repo', args.repo, '--body', packetBody]);
-  const url = String(output || '').trim() || null;
-  const commentIdentity = normalizeCommentIdentity({ url });
-  return {
-    id: commentRevision(commentIdentity),
-    commentIdentity,
-    url,
-    body: packetBody,
-    createdAt: new Date().toISOString(),
   };
 }
 
@@ -811,18 +804,6 @@ function recordSelectionState(state, args, plan) {
     }) && persisted;
   }
 
-  for (const generated of plan.generatedPreflights || []) {
-    persisted = state.record('recordPreflightPacket', {
-      repo: args.repo,
-      issueNumber: generated.issue,
-      sourceCommentId: generated.sourceCommentId,
-      sourceCommentIdentity: generated.sourceCommentIdentity,
-      fingerprint: generated.fingerprint,
-      stale: generated.stale,
-      action: 'generated',
-      payload: generated,
-    }) && persisted;
-  }
   return persisted;
 }
 
@@ -971,13 +952,20 @@ function buildRestrictedRecoveryDispatch({ recoveryPreLaunch, issueNumber, attem
  * in Agent Runner v2 preflight-direct mode.
  */
 export function runnerStartedCommentBody(selection, action, args) {
-  const sourceLine = selection.mode === 'preflight-direct'
-    ? `- Source preflight comment: ${commentRevision(selection.preflight) || 'unknown'}`
-    : `- Source command comment: ${selection.command.sourceCommentId}`;
-  const commandKindLine = selection.mode === 'preflight-direct'
-    ? '- Command kind: (none — preflight-direct)'
-    : `- Command kind: ${selection.command.kind}`;
-  return `${RUNNER_STARTED_HEADING}\n\n- Runner action: ${action}\n- Selection mode: ${selection.mode}\n${sourceLine}\n${commandKindLine}\n- Started at: ${new Date().toISOString()}\n- Output directory: ${args.outputDir}\n\nThis marker prevents the scheduled runner from executing the same Claude command/preflight again. Add a new \`## Claude continue command\` comment if continuation is needed.`;
+  const authority = selection.managerAuthority || null;
+  return `${RUNNER_STARTED_HEADING}
+
+- Runner action: ${action}
+- Selection mode: preflight-direct
+- Source preflight comment: ${commentRevision(selection.preflight) || 'unknown'}
+- Manager packet revision: ${authority?.revision || 'unknown'}
+- Manager packet fingerprint: ${authority?.fingerprint || 'unknown'}
+- Manager packet authority: ${authority?.authorityKey || 'unknown'}
+- Manager packet body digest: ${authority?.packetDigest || 'unknown'}
+- Started at: ${new Date().toISOString()}
+- Output directory: ${args.outputDir}
+
+This marker records consumption of exactly this immutable manager packet revision and fingerprint. Editing comment prose without a new revision does not reauthorise work.`;
 }
 
 function postRunnerStartedComment(args, issue, selection, action, ghRunner = gh) {
@@ -987,12 +975,15 @@ function postRunnerStartedComment(args, issue, selection, action, ghRunner = gh)
 }
 
 export function claimIssueForExecution(args, issue, selection, ghRunner = gh) {
+  if (selection?.mode !== 'preflight-direct' || !selection?.managerAuthority?.authorityKey) {
+    throw new Error('manager-preflight-required-before-claim');
+  }
   const action = issue.statusLabel === STATUS_READY ? 'claim-ready-issue' : 'continue-in-progress-issue';
   if (issue.statusLabel === STATUS_READY) {
     ghRunner(['issue', 'edit', String(issue.number), '--repo', args.repo, '--remove-label', STATUS_READY, '--add-label', STATUS_IN_PROGRESS]);
   }
   const runnerStartedCommentIdentity = postRunnerStartedComment(args, issue, selection, action, ghRunner);
-  const sourceCommentIdentity = selection.command?.sourceCommentIdentity || null;
+  const sourceCommentIdentity = null;
   const sourcePreflightCommentIdentity = selection.preflight ? normalizeCommentIdentity(selection.preflight) : null;
   return {
     action,
@@ -1002,6 +993,10 @@ export function claimIssueForExecution(args, issue, selection, ghRunner = gh) {
     sourceCommentIdentity,
     sourcePreflightCommentIdentity,
     sourcePreflightCommentId: commentRevision(sourcePreflightCommentIdentity),
+    managerPreflightRevision: selection.managerAuthority?.revision || null,
+    managerPreflightFingerprint: selection.managerAuthority?.fingerprint || null,
+    managerPreflightBodyDigest: selection.managerAuthority?.packetDigest || null,
+    managerAuthorityKey: selection.managerAuthority?.authorityKey || null,
     runnerStartedCommentIdentity,
   };
 }
@@ -1222,6 +1217,10 @@ function runnerStartedMarkerClaimRevision(marker) {
     || null;
 }
 
+function runnerStartedMarkerManagerAuthority(marker) {
+  return String(marker?.body || '').match(/Manager packet authority:\s*`?([^\s`]+)`?/i)?.[1] || null;
+}
+
 function classifyManagerTimelineComment(comment) {
   const body = String(comment?.body || '');
   if (invalidatesManagerPreflight(body)) return 'revocation';
@@ -1365,7 +1364,7 @@ export function claimRevisionIsCurrent(comments, claimRevision) {
  */
 export async function activeRunBlockForIssue(issue, comments = [], selectionReason = null, { state = null, repo = null, processProbe = probeProcessIdentity } = {}) {
   if (issue?.statusLabel !== STATUS_IN_PROGRESS) return null;
-  if (selectionReason !== 'missing continue command') return null;
+  if (!['manager-preflight-already-claimed', 'manager-preflight-required', 'missing continue command'].includes(selectionReason)) return null;
 
   const marker = latestRunnerStartedComment(comments);
   if (!marker) return null;
@@ -1386,11 +1385,16 @@ export async function activeRunBlockForIssue(issue, comments = [], selectionReas
   }
 
   const claimRevision = runnerStartedMarkerClaimRevision(marker);
+  const markerManagerAuthority = runnerStartedMarkerManagerAuthority(marker);
   const activeRows = (state.invoke('activeRecoveryAttempts', repo) || []).filter((row) => row.issue_number === issue.number);
   let liveMatch = null;
   for (const row of activeRows) {
-    const persistedClaimIdentity = deserializeCommentIdentity(row.claim_identity_json || row.claim_id, 'active-attempt-claim');
-    if (claimRevision && !sameCommentIdentity(persistedClaimIdentity, claimRevision)) continue;
+    if (row.manager_authority_key) {
+      if (!markerManagerAuthority || row.manager_authority_key !== markerManagerAuthority) continue;
+    } else {
+      const persistedClaimIdentity = deserializeCommentIdentity(row.claim_identity_json || row.claim_id, 'active-attempt-claim');
+      if (claimRevision && !sameCommentIdentity(persistedClaimIdentity, claimRevision)) continue;
+    }
     let live = false;
     try {
       live = await processProbe({
@@ -1408,7 +1412,10 @@ export async function activeRunBlockForIssue(issue, comments = [], selectionReas
   // intervening revocation, means this live process is running under
   // superseded authority and belongs in front of an operator, not silently
   // trusted to keep reserving the issue.
-  if (liveMatch && (!claimRevision || claimRevisionIsCurrent(comments, claimRevision))) {
+  const liveAuthorityCurrent = liveMatch?.manager_authority_key
+    ? managerAuthorityKeyIsCurrent(comments, liveMatch.manager_authority_key, liveMatch.manager_preflight_body_digest)
+    : (!claimRevision || claimRevisionIsCurrent(comments, claimRevision));
+  if (liveMatch && liveAuthorityCurrent) {
     return {
       ...base,
       reason: 'active-runner-started-issue',
@@ -1558,7 +1565,9 @@ export async function computeAttemptLivenessEvidence(row, {
   // every ordinary attempt regardless of exclusivity.
   const leaseCurrent = otherLease !== true;
   const claimIdentity = deserializeCommentIdentity(row.claim_identity_json || row.claim_id, 'liveness-claim');
-  const authorityCurrent = Boolean(claimIdentity) && claimRevisionIsCurrent(comments, claimIdentity);
+  const authorityCurrent = row.manager_authority_key
+    ? managerAuthorityKeyIsCurrent(comments, row.manager_authority_key, row.manager_preflight_body_digest)
+    : Boolean(claimIdentity) && claimRevisionIsCurrent(comments, claimIdentity);
   const progressWithinStallWindow = (row.stalled_passes || 0) < stallPassLimit;
   // #698 round 5, finding 2: a bounded retry now requires the authoritative
   // persisted schedule (`next_retry_at`/`retry_attempt`/`retry_cap`/
@@ -1865,62 +1874,15 @@ export function runQuotaPreflight(args, env = process.env, runner = spawnSync) {
   };
 }
 
-/**
- * Give a status:ready candidate with no proceed command and no manager
- * preflight a chance at local preflight generation (Agent Runner v2.2)
- * before selection runs. Mutates GitHub (posts a comment) only when
- * `args.execute` is set, matching the no-mutation-in-dry-run convention used
- * elsewhere in this file (see claimIssueForExecution). Returns the (possibly
- * updated) comment list plus an optional skip entry for blocked/pending
- * cases so the caller can push it onto `skipped` and move on.
- */
-function maybeGeneratePreflight(args, issue, comments, openPrs, ghRunner) {
-  if (args.autoPreflightMode === false || issue.statusLabel !== STATUS_READY) {
-    return { comments, generated: null, skip: null };
-  }
-
-  const linkedOpenPrs = findLinkedOpenPullRequests({ issueNumber: issue.number, pullRequests: openPrs });
-  const action = resolvePreflightAction({
-    issue,
-    comments,
-    linkedOpenPrs,
-    autoPreflightEnabled: true,
-    requireManagerPreflight: args.requireManagerPreflight !== false,
-  });
-
-  if (action.action === 'blocked') {
-    return { comments, generated: null, skip: { issue: issue.number, statusLabel: issue.statusLabel, reason: action.reason, detail: action.detail } };
-  }
-
-  if (action.action !== 'generate') {
-    return { comments, generated: null, skip: null };
-  }
-
-  if (!args.execute) {
-    return { comments, generated: null, skip: { issue: issue.number, statusLabel: issue.statusLabel, reason: 'preflight-generation-pending-dry-run' } };
-  }
-
-  const posted = postGeneratedPreflightComment(args, issue, action.packet, ghRunner);
-  return {
-    comments: [...comments, posted],
-    generated: {
-      issue: issue.number,
-      fingerprint: action.fingerprint,
-      stale: action.stale,
-      sourceCommentId: posted.id,
-      sourceCommentIdentity: posted.commentIdentity,
-    },
-    skip: null,
-  };
-}
-
 export async function selectIssue(args, ghRunner = gh, { state = null, processProbe = probeProcessIdentity } = {}) {
   const skipped = [];
-  const generatedPreflights = [];
-  let openPrs;
   let candidates;
   try {
-    openPrs = args.autoPreflightMode === false ? [] : listOpenPullRequests(args.repo, ghRunner);
+    // Retain the repo-wide open-PR inventory as part of queue inspection.
+    // Selection no longer uses PR state to generate manager packets, but a
+    // failed PR inventory still means the queue was not fully inspected and
+    // must surface as queue_inspection_degraded rather than idle.
+    listOpenPullRequests(args.repo, ghRunner);
     candidates = listCandidateIssues(args.repo, args.limit, args.agentLabels, args.includeInProgress, ghRunner);
     // #698 round 5, finding 3: a successful repo-wide scan is exactly the
     // condition that clears `queue_inspection_degraded` — resolve it here,
@@ -1958,7 +1920,7 @@ export async function selectIssue(args, ghRunner = gh, { state = null, processPr
       payload: { error: String(error?.message || error) },
     });
     skipped.push({ issue: null, statusLabel: null, reason: 'candidate-scan-failed', error: String(error?.message || error) });
-    return { issue: null, selection: null, command: null, currentPreflight: null, skipped, generatedPreflights, blocked: null, queueInspectionDegraded: true };
+    return { issue: null, selection: null, command: null, currentPreflight: null, managerAuthority: null, skipped, blocked: null, queueInspectionDegraded: true };
   }
 
   for (const issue of candidates) {
@@ -1987,17 +1949,8 @@ export async function selectIssue(args, ghRunner = gh, { state = null, processPr
     try {
       comments = readIssueComments(args.repo, issue.number, ghRunner);
 
-      const preflightResult = maybeGeneratePreflight(args, issue, comments, openPrs, ghRunner);
-      comments = preflightResult.comments;
-      if (preflightResult.generated) generatedPreflights.push(preflightResult.generated);
-      if (preflightResult.skip) {
-        skipped.push(preflightResult.skip);
-        continue;
-      }
-
       selection = resolveIssueSelection(issue, comments, {
-        requireManagerPreflight: args.requireManagerPreflight !== false,
-        preflightDirectMode: args.preflightDirectMode !== false,
+        requireManagerPreflight: true,
       });
     } catch (error) {
       skipped.push({ issue: issue.number, statusLabel: issue.statusLabel, reason: 'candidate-read-failed', error: String(error?.message || error) });
@@ -2027,20 +1980,17 @@ export async function selectIssue(args, ghRunner = gh, { state = null, processPr
       issue,
       selection,
       command: selection.command,
-      // The actual latest authoritative manager preflight, independent of
-      // selection mode. `selection.preflight` is only populated in
-      // preflight-direct mode; a proceed-command attempt must never fall
-      // back to the command comment id as its preflight revision (#698
-      // finding 1), so callers persisting `preflight_revision` must use
-      // this field instead of `selection.preflight`.
-      currentPreflight: latestManagerPreflightComment(comments),
+      // The exact canonical manager packet selected for this claim.
+      // Historical proceed/continue comments are never substituted for this
+      // packet or its immutable revision/fingerprint.
+      currentPreflight: selection.preflight,
+      managerAuthority: selection.managerAuthority,
       skipped,
-      generatedPreflights,
       blocked: null,
       metadataConflicts: issueMetadataConflicts(issue),
     };
   }
-  return { issue: null, selection: null, command: null, currentPreflight: null, skipped, generatedPreflights, blocked: null };
+  return { issue: null, selection: null, command: null, currentPreflight: null, managerAuthority: null, skipped, blocked: null };
 }
 
 /**
@@ -2087,6 +2037,8 @@ function attemptRecordPayload(attempt, overrides = {}) {
   return {
     attemptId: attempt.attempt_id, repo: attempt.repo, project: attempt.project,
     issueNumber: attempt.issue_number, claimId: attempt.claim_id, preflightRevision: attempt.preflight_revision,
+    managerPreflightRevision: attempt.manager_preflight_revision, managerPreflightFingerprint: attempt.manager_preflight_fingerprint,
+    managerPreflightBodyDigest: attempt.manager_preflight_body_digest, managerAuthorityKey: attempt.manager_authority_key,
     phase: attempt.phase, agent: attempt.agent, model: attempt.model, harness: attempt.harness,
     startedAt: attempt.started_at, finishedAt: attempt.finished_at, outcome: attempt.outcome,
     exitCode: attempt.exit_code, signal: attempt.signal, recoveryEligible: Boolean(attempt.recovery_eligible),
@@ -2530,7 +2482,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     const selected = recoveryClaim ? {
       issue: recoveryPreLaunch.issue,
       selection: { mode: 'recovery', command: null, preflight: null }, command: null, currentPreflight: null,
-      skipped: [], generatedPreflights: [], blocked: null,
+      skipped: [], blocked: null, managerAuthority: null,
     } : await selectIssue(args, ghRunner, { state, processProbe: dependencies.processProbe || probeProcessIdentity });
     const selectedSourceCommentIdentity = selected.command?.sourceCommentIdentity || null;
     const selectedPreflightCommentIdentity = selected.currentPreflight
@@ -2541,7 +2493,6 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       agentLabels: args.agentLabels,
       includeInProgress: args.includeInProgress,
       claimOnExecute: args.claimOnExecute,
-      preflightDirectMode: args.preflightDirectMode,
       quotaPreflight,
       requireManagerPreflight: args.requireManagerPreflight,
       selectedIssue: selected.issue?.number || null,
@@ -2555,10 +2506,11 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       sourceCommentId: selected.command?.sourceCommentId || null,
       sourceCommentIdentity: selectedSourceCommentIdentity,
       sourcePreflightCommentIdentity: selectedPreflightCommentIdentity,
-      sourcePreflightRevision: commentRevision(selectedPreflightCommentIdentity),
+      sourcePreflightRevision: selected.managerAuthority?.revision || null,
+      sourcePreflightFingerprint: selected.managerAuthority?.fingerprint || null,
+      sourcePreflightBodyDigest: selected.managerAuthority?.packetDigest || null,
+      sourcePreflightAuthorityKey: selected.managerAuthority?.authorityKey || null,
       sourcePreflightCommentId: commentRevision(selectedPreflightCommentIdentity),
-      autoPreflightMode: args.autoPreflightMode,
-      generatedPreflights: selected.generatedPreflights,
       activeRunBlock: selected.blocked || null,
       skipped: selected.skipped,
       stateDbPath: args.stateDbPath,
@@ -2614,29 +2566,24 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     // identity) keyed consistently for a later native_resume/
     // same_agent_continuation to read back (#698 finding 2).
     let nodeArgs = recoveryInvocation?.args || runnerArgs(selected.issue.number, args, { attemptId });
-    // claimId identifies the comment that drove *selection* (a proceed/continue
-    // command in compatibility mode, or the preflight comment itself in
-    // preflight-direct mode). preflightRevision is a separate, independent
-    // fact: the actual latest authoritative manager-preflight comment id,
-    // sourced from selectIssue()'s unconditional currentPreflight lookup.
-    // A proceed-command claimId must never be reused as the preflight
-    // revision (#698 finding 1) — a normal proceed-command + separate
-    // preflight pair would otherwise be permanently unrecoverable because
-    // later revalidation compares this value against the live preflight
-    // comment id.
-    const schedulerClaimIdentity = selected.selection?.command?.sourceCommentIdentity
-      || normalizeCommentIdentity(selected.selection?.preflight);
+    // New attempts bind to the immutable manager authority key. The source
+    // comment identity remains evidence only; it cannot substitute for the
+    // manager-owned revision and fingerprint. Historical rows may still carry
+    // comment-derived claim ids for recovery compatibility.
+    const schedulerClaimIdentity = normalizeCommentIdentity(selected.selection?.preflight);
     const schedulerPreflightIdentity = selectedPreflightCommentIdentity;
-    const claimId = recoveryClaim?.claim_id || commentRevision(schedulerClaimIdentity);
-    const schedulerPreflightRevision = commentRevision(schedulerPreflightIdentity);
+    const claimId = recoveryClaim?.claim_id || selected.managerAuthority?.authorityKey || commentRevision(schedulerClaimIdentity);
+    const schedulerPreflightRevision = recoveryClaim?.preflight_revision || selected.managerAuthority?.revision || null;
+    const schedulerPreflightFingerprint = selected.managerAuthority?.fingerprint || null;
+    const schedulerPreflightBodyDigest = selected.managerAuthority?.packetDigest || null;
+    const schedulerAuthorityKey = selected.managerAuthority?.authorityKey || null;
 
     // Workspace ownership must be resolved *before* any irreversible claim
     // consumption (#686): the runner-start marker, the active
     // `recovery_attempts` row, and the status:ready -> status:in-progress
     // label flip all still lie ahead of this point for a fresh (non-
-    // recovery) attempt. Both dual-dispatch modes (`proceed-command` and
-    // `preflight-direct`) share this exact boundary — the gate below keys
-    // only on the derived execution phase, not on selection mode. A
+    // recovery) attempt. Every canonical manager-packet dispatch shares this
+    // exact boundary. A
     // recovery re-invocation (`recoveryClaim` truthy) already owns its
     // preserved workspace via `prepareContinuationWorkspace()`/
     // `verifyPreservedWorktree()` and is intentionally not re-gated here.
@@ -2741,6 +2688,10 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         claimIdentity: schedulerClaimIdentity,
         preflightRevision: schedulerPreflightRevision,
         preflightIdentity: schedulerPreflightIdentity,
+        managerPreflightRevision: schedulerPreflightRevision,
+        managerPreflightFingerprint: schedulerPreflightFingerprint,
+        managerPreflightBodyDigest: schedulerPreflightBodyDigest,
+        managerAuthorityKey: schedulerAuthorityKey,
         phase: 'starting', agent: plan.agent?.agentId, model: plan.agent?.model, harness: plan.agent?.agentType,
         startedAt, ...processIdentity, resolutionState: 'active',
       })) return emitSystemicStatePause(args, state, 'attempt-start', { now, logger: dependencies.logger }).exitCode;

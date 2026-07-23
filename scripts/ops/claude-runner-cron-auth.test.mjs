@@ -44,5 +44,5 @@ test('claude-runner-cron invokes main when executed directly', async () => {
   });
 
   assert.equal(result.status, 0);
-  assert.match(result.stdout, /Claude runner scheduled wrapper/);
+  assert.match(result.stdout, /Agent Runner scheduled wrapper/);
 });

@@ -25,8 +25,6 @@ export const DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG = Object.freeze({
   runner: {
     lockPath: '.var/claude-runner/cron.lock',
     candidateLimit: 100,
-    requireManagerPreflight: true,
-    autoProceedFromPreflight: true,
   },
 });
 
@@ -111,8 +109,6 @@ function normalizeLegacyShape(raw) {
     runner: {
       lockPath: raw.runner?.lockPath,
       candidateLimit: raw.runner?.candidateLimit,
-      requireManagerPreflight: raw.runner?.requireManagerPreflight ?? raw.github?.requireManagerPreflight,
-      autoProceedFromPreflight: raw.runner?.autoProceedFromPreflight ?? raw.github?.autoProceedFromPreflight,
     },
   };
 }

@@ -34,7 +34,6 @@ import {
   main,
   MAX_TRANSITION_MUTATION_ATTEMPTS,
   probeProcessIdentity,
-  postGeneratedPreflightComment,
   preflightAlreadyClaimed,
   quotaPreflightArgs,
   reconcileSchedulerAttempts,
@@ -54,10 +53,25 @@ import {
   upsertGitHubAttentionComment,
   waitForExplicitPlanApproval,
 } from './claude-runner-cron.mjs';
-import { PREFLIGHT_GENERATION_NEEDS_MANAGER } from './claude-runner-preflight.mjs';
 import { decideRecovery, normalizeTerminalOutcome } from './claude-runner-recovery.mjs';
 import { RUNNER_STATE_TABLES, openRunnerStateStore } from './claude-runner-state.mjs';
 import { readRestrictedRecoveryHandle, restrictedHandleBindingDigest, restrictedRecoveryDir, writeRestrictedRecoveryHandle } from './claude-runner-recovery-adapter.mjs';
+
+const TEST_MANAGER_FINGERPRINT = `sha256:${'a'.repeat(64)}`;
+function canonicalPreflightBody(revision = 'TEST.1', extra = '') {
+  return `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: ${revision}\nfingerprint: ${TEST_MANAGER_FINGERPRINT}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`\n${extra}`;
+}
+
+function canonicalPreflightComment(id, revision = `TEST.${id}`, extra = '', user = 'chatgpt-manager') {
+  return { id, databaseId: id, createdAt: '2026-07-23T09:00:00Z', user: { login: user }, body: canonicalPreflightBody(revision, extra) };
+}
+
+function withEmptyOpenPrInventory(ghRunner) {
+  return (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    return ghRunner(args);
+  };
+}
 
 test('truthy recognises explicit opt-in values only', () => {
   assert.equal(truthy('true'), true);
@@ -99,7 +113,7 @@ test('parseArgs can load reusable project defaults from explicit config', () => 
       priorityLabelRanking: ['priority:P0'],
       safeDefaultValidationCommands: ['npm test'],
       systemd: { serviceName: 'example.service', timerName: 'example.timer' },
-      runner: { lockPath: '.var/example-runner/cron.lock', candidateLimit: 42, autoProceedFromPreflight: false },
+      runner: { lockPath: '.var/example-runner/cron.lock', candidateLimit: 42 },
     }));
     const args = parseArgs(['--config', configPath], {});
     assert.equal(args.repo, 'owner/repo');
@@ -107,7 +121,6 @@ test('parseArgs can load reusable project defaults from explicit config', () => 
     assert.equal(args.stateDbPath, '.var/example-runner/state.sqlite');
     assert.deepEqual(args.agentLabels, ['agent:example']);
     assert.equal(args.limit, 42);
-    assert.equal(args.preflightDirectMode, false);
     assert.equal(args.project.id, 'example');
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -162,21 +175,13 @@ test('parseArgs enables quota preflight by default and supports explicit skip', 
   assert.equal(parseArgs(['--skip-quota-preflight'], {}).quotaPreflight, false);
 });
 
-test('parseArgs requires manager preflight by default and supports explicit emergency skip', () => {
+test('parseArgs always requires canonical manager authority and rejects retired bypass flags', () => {
   assert.equal(parseArgs([], {}).requireManagerPreflight, true);
-  assert.equal(parseArgs([], { CLAUDE_RUNNER_CRON_SKIP_MANAGER_PREFLIGHT: 'true' }).requireManagerPreflight, false);
-  assert.equal(parseArgs(['--skip-manager-preflight'], {}).requireManagerPreflight, false);
-});
-
-test('parseArgs enables Agent Runner v2 preflight-direct dispatch by default and supports disabling it', () => {
-  assert.equal(parseArgs([], {}).preflightDirectMode, true);
-  assert.equal(parseArgs(['--no-preflight-direct'], {}).preflightDirectMode, false);
-  assert.equal(parseArgs([], { CLAUDE_RUNNER_CRON_DISABLE_PREFLIGHT_DIRECT: 'true' }).preflightDirectMode, false);
-});
-
-test('parseArgs keeps the pre-v2 auto-proceed flag/env name as a compatibility alias for preflight-direct mode', () => {
-  assert.equal(parseArgs([], { CLAUDE_RUNNER_CRON_DISABLE_AUTO_PROCEED: 'true' }).preflightDirectMode, false);
-  assert.equal(parseArgs(['--no-auto-proceed'], {}).preflightDirectMode, false);
+  assert.equal(parseArgs([], { CLAUDE_RUNNER_CRON_SKIP_MANAGER_PREFLIGHT: 'true' }).requireManagerPreflight, true);
+  assert.throws(() => parseArgs(['--skip-manager-preflight'], {}), /Unknown argument/);
+  assert.throws(() => parseArgs(['--no-preflight-direct'], {}), /Unknown argument/);
+  assert.throws(() => parseArgs(['--no-auto-proceed'], {}), /Unknown argument/);
+  assert.throws(() => parseArgs(['--no-auto-preflight'], {}), /Unknown argument/);
 });
 
 test('parseArgs accepts both Claude agent labels by default', () => {
@@ -456,45 +461,37 @@ test('latestManagerPreflightComment accepts a fresh packet posted after a stale 
   assert.equal(latestManagerPreflightComment(comments).id, 3);
 });
 
-test('claimIssueForExecution records selection mode and source command comment for proceed-command mode', () => {
+test('claimIssueForExecution rejects historical proceed-command authority before GitHub mutation', () => {
   const ghCalls = [];
-  const fakeGhRunner = (ghArgs) => { ghCalls.push(ghArgs); return ''; };
-  const issue = { number: 701, statusLabel: 'status:ready' };
-  const selection = {
-    mode: 'proceed-command',
-    command: {
-      kind: 'proceed',
-      sourceCommentIdentity: { version: 1, nodeId: null, databaseId: 9 },
-      sourceCommentId: 'github-comment:database:9',
-    },
-    preflight: null,
-  };
-
-  const claim = claimIssueForExecution({ repo: 'TheTekTeam/modelspend', outputDir: '.var/out' }, issue, selection, fakeGhRunner);
-
-  assert.equal(claim.selectionMode, 'proceed-command');
-  assert.equal(claim.sourceCommentId, 'github-comment:database:9');
-  assert.equal(claim.sourcePreflightCommentId, null);
-  assert.deepEqual(ghCalls[0], ['issue', 'edit', '701', '--repo', 'TheTekTeam/modelspend', '--remove-label', 'status:ready', '--add-label', 'status:in-progress']);
-  const commentBody = ghCalls[1][ghCalls[1].indexOf('--body') + 1];
-  assert.match(commentBody, /Selection mode: proceed-command/);
-  assert.match(commentBody, /Source command comment: github-comment:database:9/);
+  const selection = { mode: 'proceed-command', command: { kind: 'proceed', sourceCommentId: 'github-comment:database:9' }, preflight: null };
+  assert.throws(() => claimIssueForExecution(
+    { repo: 'TheTekTeam/modelspend', outputDir: '.var/out' },
+    { number: 701, statusLabel: 'status:ready' },
+    selection,
+    (args) => { ghCalls.push(args); return ''; },
+  ), /manager-preflight-required-before-claim/);
+  assert.deepEqual(ghCalls, []);
 });
 
-test('claimIssueForExecution records selection mode and source preflight comment for preflight-direct mode', () => {
+test('claimIssueForExecution binds the immutable manager revision and fingerprint', () => {
   const ghCalls = [];
   const fakeGhRunner = (ghArgs) => { ghCalls.push(ghArgs); return ''; };
   const issue = { number: 702, statusLabel: 'status:ready' };
-  const selection = { mode: 'preflight-direct', command: null, preflight: { id: 77 } };
-
+  const preflight = canonicalPreflightComment(77, 'TEST.77');
+  const managerAuthority = {
+    valid: true, revision: 'TEST.77', fingerprint: TEST_MANAGER_FINGERPRINT,
+    authorityKey: `manager-preflight:TEST.77:${TEST_MANAGER_FINGERPRINT}`, comment: preflight,
+  };
+  const selection = { mode: 'preflight-direct', command: null, preflight, managerAuthority };
   const claim = claimIssueForExecution({ repo: 'TheTekTeam/modelspend', outputDir: '.var/out' }, issue, selection, fakeGhRunner);
-
   assert.equal(claim.selectionMode, 'preflight-direct');
   assert.equal(claim.sourceCommentId, null);
   assert.equal(claim.sourcePreflightCommentId, 'github-comment:database:77');
+  assert.equal(claim.managerPreflightRevision, 'TEST.77');
+  assert.equal(claim.managerPreflightFingerprint, TEST_MANAGER_FINGERPRINT);
   const commentBody = ghCalls[1][ghCalls[1].indexOf('--body') + 1];
-  assert.match(commentBody, /Selection mode: preflight-direct/);
-  assert.match(commentBody, /Source preflight comment: github-comment:database:77/);
+  assert.match(commentBody, /Manager packet revision: TEST.77/);
+  assert.match(commentBody, new RegExp(`Manager packet fingerprint: ${TEST_MANAGER_FINGERPRINT}`));
 });
 
 test('quarantineIssueAfterFailedRun releases the task and posts a machine-readable attention marker', () => {
@@ -749,7 +746,7 @@ test('process liveness requires boot identity and process start time, not PID al
 
 test('fresh recovery collector derives authorization, GitHub status, ownership and conflict booleans from live evidence', async () => {
   const comments = [
-    { id: 41, createdAt: '2026-07-17T18:00:00Z', body: '## Manager preflight packet\nOriginal revision.' },
+    { ...canonicalPreflightComment(41, 'TEST.41', 'Original revision.'), createdAt: '2026-07-17T18:00:00Z' },
     { id: 99, createdAt: '2026-07-17T18:31:00Z', body: '## Manager recovery authorization\n- Attempt: attempt-live\n- Action: fresh_retry\n- Claim revision: 41\n- Preflight revision: 41\n- Agent: claude-code-cli\n- Model: claude-sonnet-4-5\n- Harness: claude\n- Policy approved: yes' },
   ];
   assert.equal(latestManagerRecoveryAuthorization(comments).id, 'github-comment:database:99');
@@ -800,7 +797,7 @@ test('restart recovery revalidation keeps a GraphQL preflight current when GitHu
     store = openRunnerStateStore(stateDbPath);
     const attempt = store.recoveryAttempt('attempt-mixed-id');
     const comments = [
-      { id: databaseId, node_id: nodeId, created_at: '2026-07-19T18:00:00Z', body: '## Manager preflight packet\nPhase: implementation' },
+      { ...canonicalPreflightComment(databaseId, 'TEST.MIXED', 'Phase: implementation'), node_id: nodeId, created_at: '2026-07-19T18:00:00Z' },
       { id: 5018000000, node_id: 'IC_recoveryAuthorization', created_at: '2026-07-19T18:31:00Z', body: `## Manager recovery authorization\n- Attempt: attempt-mixed-id\n- Action: fresh_retry\n- Claim revision: github-comment:database:${databaseId}\n- Preflight revision: github-comment:database:${databaseId}\n- Agent: claude-code-cli\n- Model: claude-sonnet-4-5\n- Harness: claude\n- Policy approved: yes` },
     ];
     const ghRunner = (args) => {
@@ -872,7 +869,7 @@ test('collectRecoveryRevalidation accepts native_resume\'s own preserved worktre
   const { repoRoot, worktreePath } = initRepoWithWorktree(698, 'resume-marker', 'issue-698-own');
   try {
     const comments = [
-      { id: 41, createdAt: '2026-07-17T18:00:00Z', body: '## Manager preflight packet\nOriginal revision.' },
+      { ...canonicalPreflightComment(41, 'TEST.41', 'Original revision.'), createdAt: '2026-07-17T18:00:00Z' },
       { id: 99, createdAt: '2026-07-17T18:31:00Z', body: '## Manager recovery authorization\n- Attempt: attempt-f1\n- Action: native_resume\n- Claim revision: 41\n- Preflight revision: 41\n- Agent: claude-code-cli\n- Model: claude-sonnet-4-5\n- Harness: claude\n- Policy approved: yes' },
     ];
     const ghRunner = (args) => {
@@ -910,7 +907,7 @@ test('collectRecoveryRevalidation accepts native_resume\'s own preserved worktre
 
 test('collectRecoveryRevalidation verifies the restricted handle binding digest and fails closed on mismatch or absence (#698 finding 8)', async () => {
   const comments = [
-    { id: 41, createdAt: '2026-07-17T18:00:00Z', body: '## Manager preflight packet\nOriginal revision.' },
+    { ...canonicalPreflightComment(41, 'TEST.41', 'Original revision.'), createdAt: '2026-07-17T18:00:00Z' },
     { id: 99, createdAt: '2026-07-17T18:31:00Z', body: '## Manager recovery authorization\n- Attempt: attempt-f8\n- Action: native_resume\n- Claim revision: 41\n- Preflight revision: 41\n- Agent: claude-code-cli\n- Model: claude-sonnet-4-5\n- Harness: claude\n- Policy approved: yes' },
   ];
   const ghRunner = (args) => {
@@ -1837,7 +1834,7 @@ test('reconcilePendingRecoveryTransitions converges using the real (non-mocked) 
     });
     store.close();
     const comments = [
-      { id: 41, createdAt: '2026-07-17T18:00:00Z', body: '## Manager preflight packet\nOriginal revision.' },
+      { ...canonicalPreflightComment(41, 'TEST.41', 'Original revision.'), createdAt: '2026-07-17T18:00:00Z' },
       { id: 99, createdAt: '2026-07-17T18:31:00Z', body: '## Manager recovery authorization\n- Attempt: attempt-transition-reconcile-real\n- Action: fresh_retry\n- Claim revision: 41\n- Preflight revision: 41\n- Agent: claude-code-cli\n- Model: claude-sonnet-4-5\n- Harness: claude\n- Policy approved: yes' },
     ];
     const editCalls = [];
@@ -2164,7 +2161,7 @@ test('selected preflight-direct dry-run is persisted as a read-only scheduler in
   const dir = mkdtempSync(join(tmpdir(), 'runner-dry-run-inspection-'));
   const lockPath = join(dir, 'cron.lock');
   const stateDbPath = join(dir, 'state.sqlite');
-  const comments = [{ id: 72501, createdAt: '2026-07-19T16:30:00Z', body: '## Manager preflight packet\nBounded dry-run regression.' }];
+  const comments = [{ ...canonicalPreflightComment(72501, 'TEST.725', 'Bounded dry-run regression.'), createdAt: '2026-07-19T16:30:00Z' }];
   const githubCalls = [];
   let childCalls = 0;
   const output = [];
@@ -2191,7 +2188,7 @@ test('selected preflight-direct dry-run is persisted as a read-only scheduler in
   try {
     console.log = (value) => output.push(String(value));
     const exitCode = await main([
-      '--dry-run', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--dry-run', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
     ], { GH_TOKEN: 'test-token' }, {
       ghRunner,
@@ -2248,7 +2245,7 @@ test('captured #300 mixed GraphQL/REST preflight identity completes through the 
     id: nodeId,
     databaseId,
     createdAt: '2026-07-19T19:00:00Z',
-    body: '## Manager preflight packet\nPhase: implementation\nCaptured #300 mixed-identity regression.',
+    body: canonicalPreflightBody('TEST.300', 'Captured #300 mixed-identity regression.'),
   }];
   const githubCalls = [];
   const ghRunner = (args) => {
@@ -2281,7 +2278,7 @@ test('captured #300 mixed GraphQL/REST preflight identity completes through the 
   try {
     console.log = () => {};
     const exitCode = await main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
     ], { GH_TOKEN: 'test-token' }, {
       ghRunner,
@@ -2314,7 +2311,7 @@ test('#686 regression: a conflicting workspace is detected before claim consumpt
     id: 41,
     createdAt: '2026-07-23T09:00:00Z',
     user: { login: 'chatgpt-manager' },
-    body: '## Manager preflight packet\nPhase: implementation\nFix the workspace ownership bug.',
+    body: canonicalPreflightBody('TEST.686', 'Fix the workspace ownership bug.'),
   };
   const ghCalls = [];
   const ghRunner = (args) => {
@@ -2343,7 +2340,7 @@ test('#686 regression: a conflicting workspace is detected before claim consumpt
   try {
     console.log = () => {};
     const exitCode = await main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
     ], {
       GH_TOKEN: 'test-token',
@@ -2426,7 +2423,7 @@ test('#686 regression: a fresh implementation dispatch that clears the pre-claim
     id: 41,
     createdAt: '2026-07-23T09:00:00Z',
     user: { login: 'chatgpt-manager' },
-    body: '## Manager preflight packet\nPhase: implementation\nFix the workspace ownership bug.',
+    body: canonicalPreflightBody('TEST.686', 'Fix the workspace ownership bug.'),
   };
   const ghRunner = (args) => {
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
@@ -2452,7 +2449,7 @@ test('#686 regression: a fresh implementation dispatch that clears the pre-claim
   try {
     console.log = () => {};
     const exitCode = await main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
     ], {
       GH_TOKEN: 'test-token',
@@ -2526,7 +2523,7 @@ test('#686 regression: quarantining one issue for a workspace-ownership conflict
   const dir = mkdtempSync(join(tmpdir(), 'runner-686-queue-continues-'));
   const lockPath = join(dir, 'cron.lock');
   const stateDbPath = join(dir, 'state.sqlite');
-  const preflightBody = '## Manager preflight packet\nPhase: implementation\nScoped work.';
+  const preflightBody = canonicalPreflightBody('TEST.SCOPED', 'Scoped work.');
   let issue686Status = 'status:ready';
   const issues = () => [
     { number: 686, title: 'Conflicted issue', body: 'x', updatedAt: '2026-07-23T09:00:00Z', statusName: issue686Status },
@@ -2556,7 +2553,7 @@ test('#686 regression: quarantining one issue for a workspace-ownership conflict
   const originalLog = console.log;
   try {
     console.log = () => {};
-    const commonArgs = ['--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli'];
+    const commonArgs = ['--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli'];
 
     // First pass: issue 686 sorts first (lower number, same recency) and
     // hits the workspace-ownership conflict; it gets quarantined.
@@ -2595,7 +2592,7 @@ test('#686 regression: the workspace-ownership pre-claim boundary applies identi
   const lockPath = join(dir, 'cron.lock');
   const stateDbPath = join(dir, 'state.sqlite');
   const comments = [
-    { id: 41, createdAt: '2026-07-23T09:00:00Z', user: { login: 'chatgpt-manager' }, body: '## Manager preflight packet\nPhase: implementation\nOriginal scope.' },
+    { ...canonicalPreflightComment(41, 'TEST.41', 'Original scope.'), createdAt: '2026-07-23T09:00:00Z' },
     { id: 42, createdAt: '2026-07-23T09:01:00Z', user: { login: 'chatgpt-manager' }, body: '## Claude proceed command\nGo.' },
   ];
   const ghRunner = (args) => {
@@ -2620,7 +2617,7 @@ test('#686 regression: the workspace-ownership pre-claim boundary applies identi
   try {
     console.log = () => {};
     const exitCode = await main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
     ], {
       GH_TOKEN: 'test-token',
@@ -2665,7 +2662,7 @@ test('#686 regression fixture: when the pre-claim gate passes but the child itse
   const dir = mkdtempSync(join(tmpdir(), 'runner-686-backstop-'));
   const lockPath = join(dir, 'cron.lock');
   const stateDbPath = join(dir, 'state.sqlite');
-  const preflightComment = { id: 41, createdAt: '2026-07-23T09:00:00Z', user: { login: 'chatgpt-manager' }, body: '## Manager preflight packet\nPhase: implementation\nFix the workspace ownership bug.' };
+  const preflightComment = { ...canonicalPreflightComment(41, 'TEST.41', 'Fix the workspace ownership bug.'), createdAt: '2026-07-23T09:00:00Z' };
   const ghCalls = [];
   const ghRunner = (args) => {
     ghCalls.push(args);
@@ -2706,7 +2703,7 @@ test('#686 regression fixture: when the pre-claim gate passes but the child itse
   try {
     console.log = () => {};
     const exitCode = await main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
     ], {
       GH_TOKEN: 'test-token', CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true', CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'chatgpt-manager',
@@ -2750,7 +2747,7 @@ test('a fresh (initial) attempt with an authoritative preflight fails closed whe
   const dir = mkdtempSync(join(tmpdir(), 'runner-preflight-evidence-initial-'));
   const lockPath = join(dir, 'cron.lock');
   const stateDbPath = join(dir, 'state.sqlite');
-  const comments = [{ id: 7, createdAt: '2026-07-17T19:00:00Z', body: '## Manager preflight packet\nBounded task.' }];
+  const comments = [{ ...canonicalPreflightComment(7, 'TEST.7', 'Bounded task.'), createdAt: '2026-07-17T19:00:00Z' }];
   const ghRunner = (args) => {
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
     if (args[0] === 'issue' && args[1] === 'list') {
@@ -2773,7 +2770,7 @@ test('a fresh (initial) attempt with an authoritative preflight fails closed whe
   try {
     console.log = () => {};
     const exitCode = await main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
     ], { GH_TOKEN: 'test-token' }, {
       ghRunner,
@@ -3119,6 +3116,22 @@ test('computeAttemptLivenessEvidence derives authorityCurrent from the real mana
   assert.equal((await computeAttemptLivenessEvidence({ claim_id: null, resolution_state: 'active' }, { comments: currentComments })).authorityCurrent, false, 'a missing claim revision must not read as current authority');
 });
 
+test('computeAttemptLivenessEvidence uses immutable manager authority for new attempts and ignores later historical commands', async () => {
+  const preflight = canonicalPreflightComment(41, 'LIVE.1');
+  const authorityKey = `manager-preflight:LIVE.1:${TEST_MANAGER_FINGERPRINT}`;
+  const marker = {
+    id: 42,
+    createdAt: '2026-07-23T09:01:00Z',
+    body: `## Claude runner started\n\n- Manager packet authority: ${authorityKey}`,
+  };
+  const laterCommand = { id: 43, createdAt: '2026-07-23T09:02:00Z', body: '## Claude continue command\nHistorical compatibility evidence only.' };
+  const row = { manager_authority_key: authorityKey, resolution_state: 'active' };
+
+  assert.equal((await computeAttemptLivenessEvidence(row, { comments: [preflight, marker, laterCommand] })).authorityCurrent, true);
+  const revoked = { id: 44, createdAt: '2026-07-23T09:03:00Z', body: '## Manager preflight packet — revoked\nStop.' };
+  assert.equal((await computeAttemptLivenessEvidence(row, { comments: [preflight, marker, laterCommand, revoked] })).authorityCurrent, false);
+});
+
 test('computeAttemptLivenessEvidence derives progressWithinStallWindow=false once stalled_passes reaches the configured limit (#698 round 4, finding 1)', async () => {
   const fresh = { stalled_passes: 0, resolution_state: 'active' };
   const atLimit = { stalled_passes: 2, resolution_state: 'active' };
@@ -3279,10 +3292,10 @@ test('selectIssue attaches metadataConflicts to a skip payload when a candidate 
   };
 
   const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: false, autoPreflightMode: false };
-  const selected = await selectIssue(args, fakeGhRunner);
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(fakeGhRunner));
   assert.equal(selected.issue, null);
   assert.equal(selected.skipped.length, 1);
-  assert.equal(selected.skipped[0].reason, 'missing manager preflight packet');
+  assert.equal(selected.skipped[0].reason, 'manager-preflight-required');
   assert.deepEqual(selected.skipped[0].metadataConflicts, [
     { key: 'priority', field: 'Priority', fieldValue: 'P0', label: 'priority:P1', labelValue: 'P1' },
   ]);
@@ -3305,9 +3318,9 @@ test('selectIssue skips a ready issue when its command lacks manager preflight',
   };
 
   const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: false, autoProceedFromPreflight: true, autoPreflightMode: false };
-  const selected = await selectIssue(args, fakeGhRunner);
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(fakeGhRunner));
   assert.equal(selected.issue, null);
-  assert.deepEqual(selected.skipped, [{ issue: 701, statusLabel: 'status:ready', reason: 'missing manager preflight packet' }]);
+  assert.deepEqual(selected.skipped, [{ issue: 701, statusLabel: 'status:ready', reason: 'manager-preflight-required' }]);
 });
 
 test('selectIssue does not dispatch an older packet after a newer manager-preflight-stale notice (issue #599)', async () => {
@@ -3322,7 +3335,7 @@ test('selectIssue does not dispatch an older packet after a newer manager-prefli
     if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
       return JSON.stringify({
         comments: [
-          { id: 1, createdAt: '2026-07-15T18:00:00Z', body: '## Manager preflight packet\nOld dependency baseline.' },
+          { ...canonicalPreflightComment(1, 'TEST.DEP', 'Old dependency baseline.'), createdAt: '2026-07-15T18:00:00Z' },
           { id: 2, createdAt: '2026-07-15T19:00:00Z', body: '## Manager preflight stale\nMerged dependencies require a refresh. Do not dispatch.' },
         ],
       });
@@ -3331,12 +3344,12 @@ test('selectIssue does not dispatch an older packet after a newer manager-prefli
   };
 
   const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: true, preflightDirectMode: true, autoPreflightMode: false };
-  const selected = await selectIssue(args, fakeGhRunner);
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(fakeGhRunner));
   assert.equal(selected.issue, null);
-  assert.deepEqual(selected.skipped, [{ issue: 599, statusLabel: 'status:ready', reason: 'missing manager preflight packet' }]);
+  assert.deepEqual(selected.skipped, [{ issue: 599, statusLabel: 'status:ready', reason: 'manager-preflight-revoked' }]);
 });
 
-test('selectIssue picks a status:ready + agent:claude-code-cli issue with a manager-preflighted proceed command', async () => {
+test('selectIssue ignores a historical proceed command when a canonical manager packet is current', async () => {
   const fakeGhRunner = (ghArgs) => {
     assert.equal(ghArgs.includes('devplan'), false, 'no gh invocation in selection should reference devplan');
     if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
@@ -3347,15 +3360,19 @@ test('selectIssue picks a status:ready + agent:claude-code-cli issue with a mana
       return JSON.stringify([]);
     }
     if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
-      return JSON.stringify({ comments: [{ id: 1, createdAt: '2026-07-08T09:00:00Z', body: '## Claude proceed command\n\n## Manager preflight packet\nFiles checked by ChatGPT.\n\nTask: do the thing' }] });
+      return JSON.stringify({ comments: [
+        { id: 1, createdAt: '2026-07-08T08:59:00Z', body: '## Claude proceed command\n\nHistorical command.' },
+        { ...canonicalPreflightComment(2, 'TEST.701', 'Task: do the thing'), createdAt: '2026-07-08T09:00:00Z' },
+      ] });
     }
     throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
   };
 
   const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: false, autoProceedFromPreflight: true, autoPreflightMode: false };
-  const selected = await selectIssue(args, fakeGhRunner);
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(fakeGhRunner));
   assert.equal(selected.issue.number, 701);
-  assert.equal(selected.command.kind, 'proceed');
+  assert.equal(selected.command, null);
+  assert.equal(selected.selection.mode, 'preflight-direct');
   assert.deepEqual(selected.skipped, []);
 });
 
@@ -3390,7 +3407,7 @@ test('selectIssue reserves a runner-started task locally while continuing to eli
       if (issueNumber === 801) {
         return JSON.stringify({
           comments: [
-            { id: 101, createdAt: '2026-07-09T10:01:00Z', body: '## Manager preflight packet\nFiles checked by ChatGPT.' },
+            { ...canonicalPreflightComment(101, 'TEST.101', 'Files checked by ChatGPT.'), createdAt: '2026-07-09T10:01:00Z' },
           ],
         });
       }
@@ -3400,7 +3417,7 @@ test('selectIssue reserves a runner-started task locally while continuing to eli
   };
 
   const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: true, preflightDirectMode: true, autoPreflightMode: false };
-  const selected = await selectIssue(args, fakeGhRunner);
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(fakeGhRunner));
 
   assert.equal(selected.issue.number, 801);
   assert.equal(selected.selection.mode, 'preflight-direct');
@@ -3422,13 +3439,13 @@ test('selectIssue selects a status:ready issue directly from its manager preflig
       return JSON.stringify([]);
     }
     if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
-      return JSON.stringify({ comments: [{ id: 12, createdAt: '2026-07-08T09:00:00Z', body: '## Manager preflight packet\nFiles checked by ChatGPT.' }] });
+      return JSON.stringify({ comments: [{ ...canonicalPreflightComment(12, 'TEST.12', 'Files checked by ChatGPT.'), createdAt: '2026-07-08T09:00:00Z' }] });
     }
     throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
   };
 
   const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: true, preflightDirectMode: true, autoPreflightMode: false };
-  const selected = await selectIssue(args, fakeGhRunner);
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(fakeGhRunner));
   assert.equal(selected.issue.number, 550);
   assert.equal(selected.command, null);
   assert.equal(selected.selection.mode, 'preflight-direct');
@@ -3446,13 +3463,13 @@ test('selectIssue also uses preflight-direct selection in dry-run mode, fixing t
       return JSON.stringify([]);
     }
     if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
-      return JSON.stringify({ comments: [{ id: 21, createdAt: '2026-07-08T09:00:00Z', body: '### ChatGPT preflight\nFiles checked.' }] });
+      return JSON.stringify({ comments: [{ ...canonicalPreflightComment(21, 'TEST.21', 'Files checked.'), createdAt: '2026-07-08T09:00:00Z' }] });
     }
     throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
   };
 
   const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: false, preflightDirectMode: true, autoPreflightMode: false };
-  const selected = await selectIssue(args, fakeGhRunner);
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(fakeGhRunner));
   assert.equal(selected.issue.number, 551);
   assert.equal(selected.selection.mode, 'preflight-direct');
 });
@@ -3473,9 +3490,9 @@ test('selectIssue skips a status:ready issue with neither a proceed command nor 
   };
 
   const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: true, preflightDirectMode: true, autoPreflightMode: false };
-  const selected = await selectIssue(args, fakeGhRunner);
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(fakeGhRunner));
   assert.equal(selected.issue, null);
-  assert.deepEqual(selected.skipped, [{ issue: 552, statusLabel: 'status:ready', reason: 'missing manager preflight packet' }]);
+  assert.deepEqual(selected.skipped, [{ issue: 552, statusLabel: 'status:ready', reason: 'manager-preflight-required' }]);
 });
 
 test('selectIssue skips a preflight-direct candidate whose preflight was already claimed by a prior runner-started marker', async () => {
@@ -3490,8 +3507,8 @@ test('selectIssue skips a preflight-direct candidate whose preflight was already
     if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
       return JSON.stringify({
         comments: [
-          { id: 40, createdAt: '2026-07-08T09:00:00Z', body: '## Manager preflight packet\nFiles checked.' },
-          { id: 41, createdAt: '2026-07-08T09:05:00Z', body: '## Claude runner started\n\n- Selection mode: preflight-direct\n- Source preflight comment: 40' },
+          { ...canonicalPreflightComment(40, 'TEST.40', 'Files checked.'), createdAt: '2026-07-08T09:00:00Z' },
+          { id: 41, createdAt: '2026-07-08T09:05:00Z', body: `## Claude runner started\n\n- Selection mode: preflight-direct\n- Source preflight comment: 40\n- Manager packet revision: TEST.40\n- Manager packet fingerprint: ${TEST_MANAGER_FINGERPRINT}\n- Manager packet authority: manager-preflight:TEST.40:${TEST_MANAGER_FINGERPRINT}` },
         ],
       });
     }
@@ -3499,12 +3516,12 @@ test('selectIssue skips a preflight-direct candidate whose preflight was already
   };
 
   const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: true, preflightDirectMode: true, autoPreflightMode: false };
-  const selected = await selectIssue(args, fakeGhRunner);
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(fakeGhRunner));
   assert.equal(selected.issue, null);
-  assert.deepEqual(selected.skipped, [{ issue: 553, statusLabel: 'status:ready', reason: 'preflight already claimed' }]);
+  assert.deepEqual(selected.skipped, [{ issue: 553, statusLabel: 'status:ready', reason: 'manager-preflight-already-claimed' }]);
 });
 
-test('selectIssue falls back to requiring a literal proceed command when preflight-direct mode is disabled', async () => {
+test('selectIssue ignores retired preflight-direct toggle fields and still uses canonical manager authority', async () => {
   const fakeGhRunner = (ghArgs) => {
     if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
       const statusLabel = ghArgs[ghArgs.indexOf('--label') + 1];
@@ -3514,15 +3531,16 @@ test('selectIssue falls back to requiring a literal proceed command when preflig
       return JSON.stringify([]);
     }
     if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
-      return JSON.stringify({ comments: [{ id: 50, createdAt: '2026-07-08T09:00:00Z', body: '## Manager preflight packet\nFiles checked.' }] });
+      return JSON.stringify({ comments: [{ ...canonicalPreflightComment(50, 'TEST.50', 'Files checked.'), createdAt: '2026-07-08T09:00:00Z' }] });
     }
     throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
   };
 
   const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: true, preflightDirectMode: false, autoPreflightMode: false };
-  const selected = await selectIssue(args, fakeGhRunner);
-  assert.equal(selected.issue, null);
-  assert.deepEqual(selected.skipped, [{ issue: 554, statusLabel: 'status:ready', reason: 'missing proceed command' }]);
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(fakeGhRunner));
+  assert.equal(selected.issue.number, 554);
+  assert.equal(selected.selection.mode, 'preflight-direct');
+  assert.deepEqual(selected.skipped, []);
 });
 
 const SAFE_GENERATION_BODY = `## Goal\n\nDo a well-scoped, safely preflightable thing with enough detail that the runner does not have to guess anything, touching \`scripts/ops/example.mjs\`.\n\n## Acceptance criteria\n\n- Thing one happens.\n- Tests pass.\n`;
@@ -3535,145 +3553,12 @@ test('listOpenPullRequests requests open PRs with the fields findLinkedOpenPullR
   assert.equal(prs[0].state, 'open');
 });
 
-test('postGeneratedPreflightComment posts the packet body and returns a synthetic comment usable for re-selection', () => {
-  const calls = [];
-  const fakeGhRunner = (ghArgs) => { calls.push(ghArgs); return 'https://github.com/TheTekTeam/modelspend/issues/900#issuecomment-1\n'; };
-  const comment = postGeneratedPreflightComment({ repo: 'TheTekTeam/modelspend' }, { number: 900 }, '## Manager preflight packet\n...', fakeGhRunner);
-  assert.deepEqual(calls[0], ['issue', 'comment', '900', '--repo', 'TheTekTeam/modelspend', '--body', '## Manager preflight packet\n...']);
-  assert.equal(comment.url, 'https://github.com/TheTekTeam/modelspend/issues/900#issuecomment-1');
-  assert.equal(comment.body, '## Manager preflight packet\n...');
-});
-
-test('selectIssue (v2.2) generates a local preflight for a ready issue with no command/preflight, posts it, then dispatches it via preflight-direct in the same run', async () => {
-  const fakeGhRunner = (ghArgs) => {
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
-      const statusLabel = ghArgs[ghArgs.indexOf('--label') + 1];
-      if (statusLabel === 'status:ready') {
-        return JSON.stringify([{ number: 900, title: 'Safe generation candidate', body: SAFE_GENERATION_BODY, url: 'https://example.invalid/900', labels: [{ name: 'priority:P2' }], updatedAt: '2026-07-09T10:00:00Z' }]);
-      }
-      return JSON.stringify([]);
-    }
-    if (ghArgs[0] === 'pr' && ghArgs[1] === 'list') return JSON.stringify([]);
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') return JSON.stringify({ comments: [] });
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'comment') return 'https://example.invalid/900#issuecomment-1\n';
-    throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
-  };
-
-  const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: true, preflightDirectMode: true, autoPreflightMode: true };
-  const selected = await selectIssue(args, fakeGhRunner);
-
-  assert.equal(selected.issue.number, 900);
-  assert.equal(selected.selection.mode, 'preflight-direct');
-  assert.deepEqual(selected.skipped, []);
-  assert.equal(selected.generatedPreflights.length, 1);
-  assert.equal(selected.generatedPreflights[0].issue, 900);
-  assert.match(selected.selection.preflight.body, /## Manager preflight packet/);
-  assert.match(selected.selection.preflight.body, /_Generated locally by the Dell runner/);
-});
-
-test('selectIssue (v2.2) does not mutate GitHub in dry-run mode; it reports a pending-generation skip instead', async () => {
-  const fakeGhRunner = (ghArgs) => {
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
-      const statusLabel = ghArgs[ghArgs.indexOf('--label') + 1];
-      if (statusLabel === 'status:ready') {
-        return JSON.stringify([{ number: 901, title: 'Dry-run candidate', body: SAFE_GENERATION_BODY, url: 'https://example.invalid/901', labels: [], updatedAt: '2026-07-09T10:00:00Z' }]);
-      }
-      return JSON.stringify([]);
-    }
-    if (ghArgs[0] === 'pr' && ghArgs[1] === 'list') return JSON.stringify([]);
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') return JSON.stringify({ comments: [] });
-    throw new Error(`unexpected gh invocation (dry-run must not post): ${ghArgs.join(' ')}`);
-  };
-
-  const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: false, preflightDirectMode: true, autoPreflightMode: true };
-  const selected = await selectIssue(args, fakeGhRunner);
-
-  assert.equal(selected.issue, null);
-  assert.deepEqual(selected.skipped, [{ issue: 901, statusLabel: 'status:ready', reason: 'preflight-generation-pending-dry-run' }]);
-  assert.deepEqual(selected.generatedPreflights, []);
-});
-
-test('selectIssue (v2.2) skips an unsafe issue with a structured reason instead of guessing, and posts nothing', async () => {
-  const fakeGhRunner = (ghArgs) => {
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
-      const statusLabel = ghArgs[ghArgs.indexOf('--label') + 1];
-      if (statusLabel === 'status:ready') {
-        return JSON.stringify([{ number: 902, title: 'Too thin to preflight', body: 'Fix the thing.', url: 'https://example.invalid/902', labels: [], updatedAt: '2026-07-09T10:00:00Z' }]);
-      }
-      return JSON.stringify([]);
-    }
-    if (ghArgs[0] === 'pr' && ghArgs[1] === 'list') return JSON.stringify([]);
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') return JSON.stringify({ comments: [] });
-    throw new Error(`unexpected gh invocation (must not post for an unsafe issue): ${ghArgs.join(' ')}`);
-  };
-
-  const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: true, preflightDirectMode: true, autoPreflightMode: true };
-  const selected = await selectIssue(args, fakeGhRunner);
-
-  assert.equal(selected.issue, null);
-  assert.equal(selected.skipped.length, 1);
-  assert.equal(selected.skipped[0].issue, 902);
-  assert.equal(selected.skipped[0].reason, PREFLIGHT_GENERATION_NEEDS_MANAGER);
-});
-
-test('selectIssue (v2.2) reuses an existing current generated packet instead of posting a duplicate (fingerprint match)', async () => {
-  const issue = { number: 903, title: 'Already has a current generated packet', body: SAFE_GENERATION_BODY, url: 'https://example.invalid/903', labels: [], updatedAt: '2026-07-09T10:00:00Z' };
-  const { buildGeneratedPreflightPacket, computePreflightFingerprint } = await import('./claude-runner-preflight.mjs');
-  const packet = buildGeneratedPreflightPacket({ issue, comments: [], linkedOpenPrs: [] });
-
-  const fakeGhRunner = (ghArgs) => {
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
-      const statusLabel = ghArgs[ghArgs.indexOf('--label') + 1];
-      if (statusLabel === 'status:ready') return JSON.stringify([issue]);
-      return JSON.stringify([]);
-    }
-    if (ghArgs[0] === 'pr' && ghArgs[1] === 'list') return JSON.stringify([]);
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
-      return JSON.stringify({ comments: [{ id: 77, createdAt: '2026-07-09T09:00:00Z', body: packet }] });
-    }
-    throw new Error(`unexpected gh invocation (must not post a duplicate): ${ghArgs.join(' ')}`);
-  };
-
-  const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: true, preflightDirectMode: true, autoPreflightMode: true };
-  const selected = await selectIssue(args, fakeGhRunner);
-
-  assert.equal(selected.issue.number, 903);
-  assert.equal(selected.selection.mode, 'preflight-direct');
-  assert.equal(selected.selection.preflight.id, 77);
-  assert.deepEqual(selected.generatedPreflights, []);
-  assert.equal(computePreflightFingerprint({ issue, linkedPrs: [] }).length, 16);
-});
-
-test('selectIssue (v2.2) never touches an issue whose manager preflight was human-authored', async () => {
-  const fakeGhRunner = (ghArgs) => {
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
-      const statusLabel = ghArgs[ghArgs.indexOf('--label') + 1];
-      if (statusLabel === 'status:ready') {
-        return JSON.stringify([{ number: 904, title: 'Human packet', body: SAFE_GENERATION_BODY, url: 'https://example.invalid/904', labels: [], updatedAt: '2026-07-09T10:00:00Z' }]);
-      }
-      return JSON.stringify([]);
-    }
-    if (ghArgs[0] === 'pr' && ghArgs[1] === 'list') return JSON.stringify([]);
-    if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
-      return JSON.stringify({ comments: [{ id: 88, createdAt: '2026-07-09T09:00:00Z', body: '## Manager preflight packet\nWritten by a human manager, not the runner.' }] });
-    }
-    throw new Error(`unexpected gh invocation (must not touch a human packet): ${ghArgs.join(' ')}`);
-  };
-
-  const args = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: true, preflightDirectMode: true, autoPreflightMode: true };
-  const selected = await selectIssue(args, fakeGhRunner);
-
-  assert.equal(selected.issue.number, 904);
-  assert.equal(selected.selection.mode, 'preflight-direct');
-  assert.equal(selected.selection.preflight.id, 88);
-  assert.deepEqual(selected.generatedPreflights, []);
-});
-
 test('selectIssue skips a future configured agent label with structured unsupported-agent diagnostic', async () => {
   const calls = [];
   const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:codex-cli'], includeInProgress: false, requireManagerPreflight: true, execute: false, autoPreflightMode: false };
   const result = await selectIssue(args, (ghArgs) => {
     calls.push(ghArgs);
+    if (ghArgs[0] === 'pr' && ghArgs[1] === 'list') return JSON.stringify([]);
     if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
       return JSON.stringify([{ number: 655, title: 'Future agent', body: 'Body', updatedAt: '2026-01-01T00:00:00Z', labels: [{ name: 'status:ready' }, { name: 'agent:codex-cli' }] }]);
     }
@@ -3688,7 +3573,7 @@ test('selectIssue skips a future configured agent label with structured unsuppor
     detail: "Agent 'codex-cli' is registered for future use but is not implemented by this runner.",
     statusLabel: 'status:ready',
   }]);
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
 });
 
 for (const failure of [
@@ -3725,7 +3610,7 @@ test('live-stall watchdog runs twice while the real singleton lock is held and w
   const dir = mkdtempSync(join(tmpdir(), 'runner-in-lock-watchdog-'));
   const lockPath = join(dir, 'cron.lock');
   const stateDbPath = join(dir, 'state.sqlite');
-  const comments = [{ id: 1, createdAt: '2026-07-17T19:00:00Z', body: '## Manager preflight packet\nBounded task.' }];
+  const comments = [{ ...canonicalPreflightComment(1, 'TEST.1', 'Bounded task.'), createdAt: '2026-07-17T19:00:00Z' }];
   const ghCalls = [];
   let nextCommentId = 2;
   let attentionWhileLocked = 0;
@@ -3761,7 +3646,7 @@ test('live-stall watchdog runs twice while the real singleton lock is held and w
   const childPayload = JSON.stringify({ logPath: 'child.json', executionPhase: 'implementation', costAdmission: { allowed: true }, sourcePreflightCommentId: '1' });
   try {
     const exitCode = await main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
     ], { GH_TOKEN: 'test-token' }, {
       ghRunner,
@@ -3793,7 +3678,7 @@ test('a long-running child with changing durable progress is not reported stalle
   const dir = mkdtempSync(join(tmpdir(), 'runner-progressing-watchdog-'));
   const lockPath = join(dir, 'cron.lock');
   const stateDbPath = join(dir, 'state.sqlite');
-  const comments = [{ id: 1, createdAt: '2026-07-17T19:00:00Z', body: '## Manager preflight packet\nBounded task.' }];
+  const comments = [{ ...canonicalPreflightComment(1, 'TEST.1', 'Bounded task.'), createdAt: '2026-07-17T19:00:00Z' }];
   let attentionWrites = 0;
   const ghRunner = (args) => {
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
@@ -3846,7 +3731,7 @@ test('a long-running child with changing durable progress is not reported stalle
     console.log = () => {};
     let progressCounter = 0;
     const mainPromise = main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
     ], { GH_TOKEN: 'test-token' }, {
       ghRunner,

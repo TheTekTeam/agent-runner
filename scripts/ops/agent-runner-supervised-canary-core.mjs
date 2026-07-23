@@ -200,8 +200,6 @@ function executionEnv(env) {
     ...env,
     AGENT_RUNNER_EXECUTE: 'true',
     CLAUDE_RUNNER_CRON_EXECUTE: 'true',
-    CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT: 'true',
-    CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION: 'false',
   };
 }
 

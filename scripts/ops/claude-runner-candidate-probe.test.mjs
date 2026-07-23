@@ -8,7 +8,6 @@ test('candidate probe reports no candidate for an empty queue', () => {
     candidate: false,
     selectedIssue: null,
     selectionMode: null,
-    pendingAutoPreflight: false,
     skipCount: 0,
   });
 });
@@ -22,18 +21,16 @@ test('candidate probe recognises an already-runnable selected issue', () => {
     candidate: true,
     selectedIssue: 711,
     selectionMode: 'preflight-direct',
-    pendingAutoPreflight: false,
     skipCount: 0,
   });
 });
 
-test('candidate probe recognises a safe auto-preflight candidate without mutating GitHub', () => {
+test('candidate probe does not treat missing manager authority as locally repairable', () => {
   const result = candidateFromSelection({
     issue: null,
-    skipped: [{ issue: 711, reason: 'preflight-generation-pending-dry-run' }],
+    skipped: [{ issue: 711, reason: 'manager-preflight-required' }],
   });
-  assert.equal(result.candidate, true);
-  assert.equal(result.pendingAutoPreflight, true);
+  assert.equal(result.candidate, false);
 });
 
 test('empty-poll payload records no-selection without pretending a quota sample occurred', () => {

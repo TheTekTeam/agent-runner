@@ -129,8 +129,7 @@ MODELSPEND_REPO_DIR=$REPO_DIR
 CLAUDE_RUNNER_CRON_EXECUTE=$EXECUTE
 CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=$ALLOW_IMPLEMENTATION
 ${IMPLEMENTATION_APPROVERS:+CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS=$IMPLEMENTATION_APPROVERS
-}CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=false
-# Optional extra args, for example:
+}# Optional extra args, for example:
 # CLAUDE_RUNNER_ARGS=--agent-labels agent:claude,agent:claude-code-cli
 # GITHUB_TOKEN=github_pat_...
 # GH_TOKEN=github_pat_...
@@ -256,6 +255,32 @@ set_env_value() {
   mv "$tmp" "$file"
 }
 
+
+remove_env_key() {
+  local key="$1"
+  local file="$2"
+  local mode tmp file_dir
+
+  [ -f "$file" ] || return 0
+  mode="$(stat -c '%a' "$file" 2>/dev/null || stat -f '%Lp' "$file")"
+  file_dir="$(dirname "$file")"
+  tmp="$(mktemp "$file_dir/.claude-runner.env.XXXXXX")"
+
+  awk -v target_key="$key" '''
+    {
+      original = $0
+      probe = $0
+      sub(/^[[:space:]]*/, "", probe)
+      sub(/^export[[:space:]]+/, "", probe)
+      if (probe ~ ("^" target_key "[[:space:]]*=")) next
+      print original
+    }
+  ''' "$file" > "$tmp"
+
+  chmod "$mode" "$tmp"
+  mv "$tmp" "$file"
+}
+
 verify_env_value() {
   local key="$1"
   local expected="$2"
@@ -272,7 +297,7 @@ conflicting_dropins() {
   local dropin_dir="$UNIT_DIR/$SERVICE_NAME.d"
 
   [ -d "$dropin_dir" ] || return 0
-  grep -RIlE '^[[:space:]]*(EnvironmentFile=|Environment=.*(MODELSPEND_ENV_FILE|CLAUDE_RUNNER_CRON_EXECUTE|CLAUDE_RUNNER_ALLOW_IMPLEMENTATION|CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS|CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION)=)' \
+  grep -RIlE '^[[:space:]]*(EnvironmentFile=|Environment=.*(MODELSPEND_ENV_FILE|CLAUDE_RUNNER_CRON_EXECUTE|CLAUDE_RUNNER_ALLOW_IMPLEMENTATION|CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS)=)' \
     "$dropin_dir" 2>/dev/null || true
 }
 
@@ -338,7 +363,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
       info "--dry-run: would keep the scheduler execution setting in existing $ENV_FILE"
     fi
     if [ "$IMPLEMENTATION_PROVISIONING_REQUESTED" -eq 1 ]; then
-      info "--dry-run: would configure the explicit implementation gate, normalized approvers, and keep generated-preflight implementation disabled"
+      info "--dry-run: would configure the explicit implementation gate and normalized approvers"
     fi
   else
     info "--dry-run: would create $ENV_FILE without printing its contents"
@@ -363,7 +388,6 @@ else
   if [ "$IMPLEMENTATION_PROVISIONING_REQUESTED" -eq 1 ]; then
     set_env_value "CLAUDE_RUNNER_ALLOW_IMPLEMENTATION" "$ALLOW_IMPLEMENTATION" "$ENV_FILE"
     set_env_value "CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS" "$IMPLEMENTATION_APPROVERS" "$ENV_FILE"
-    set_env_value "CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION" "false" "$ENV_FILE"
     info "Configured explicit implementation authorisation in existing $ENV_FILE"
   fi
   if [ "$EXECUTE_EXPLICIT" -eq 0 ] && [ "$IMPLEMENTATION_PROVISIONING_REQUESTED" -eq 0 ]; then
@@ -371,13 +395,14 @@ else
   fi
 fi
 
+remove_env_key "CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION" "$ENV_FILE"
+
 if [ "$EXECUTE_EXPLICIT" -eq 1 ]; then
   verify_env_value "CLAUDE_RUNNER_CRON_EXECUTE" "true" "$ENV_FILE"
 fi
 if [ "$IMPLEMENTATION_PROVISIONING_REQUESTED" -eq 1 ]; then
   verify_env_value "CLAUDE_RUNNER_ALLOW_IMPLEMENTATION" "$ALLOW_IMPLEMENTATION" "$ENV_FILE"
   verify_env_value "CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS" "$IMPLEMENTATION_APPROVERS" "$ENV_FILE"
-  verify_env_value "CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION" "false" "$ENV_FILE"
 fi
 
 systemctl --user daemon-reload

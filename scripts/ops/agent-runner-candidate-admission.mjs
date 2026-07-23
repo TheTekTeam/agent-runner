@@ -3,6 +3,8 @@
 import { pathToFileURL } from 'node:url';
 
 import { normalizeImplementationApprovers } from './agent-runner-admission.mjs';
+import { resolveAgentForLabels } from './agent-runner-agents.mjs';
+import { parseManagerPreflightPacket } from './agent-runner-manager-authority.mjs';
 import { executionLabelAuthority } from './agent-runner-label-authority.mjs';
 import {
   commentRevision,
@@ -25,6 +27,9 @@ function preflightAuthor(preflight) {
 export function candidateSnapshot(selected = {}) {
   const commandIdentity = normalizeCommentIdentity(selected.command?.sourceCommentIdentity || selected.command?.sourceCommentId);
   const preflightIdentity = normalizeCommentIdentity(selected.currentPreflight);
+  const managerAuthority = selected.selection?.managerAuthority?.valid
+    ? selected.selection.managerAuthority
+    : parseManagerPreflightPacket(selected.currentPreflight);
   const labelAuthority = selected.issue ? executionLabelAuthority(selected.issue) : {
     allowed: false,
     reason: 'candidate-no-longer-runnable',
@@ -46,14 +51,21 @@ export function candidateSnapshot(selected = {}) {
     commandIdentity,
     commandRevision: commentRevision(commandIdentity),
     preflightIdentity,
-    preflightRevision: commentRevision(preflightIdentity),
+    preflightRevision: managerAuthority.valid ? managerAuthority.revision : null,
+    preflightFingerprint: managerAuthority.valid ? managerAuthority.fingerprint : null,
+    preflightAuthorityKey: managerAuthority.valid ? managerAuthority.authorityKey : null,
+    preflightBodyDigest: managerAuthority.valid ? managerAuthority.packetDigest : null,
+    preflightPacketValid: managerAuthority.valid === true,
+    preflightPacketReason: managerAuthority.valid ? null : managerAuthority.reason,
+    preflightApprovedAgent: managerAuthority.valid ? managerAuthority.approvedAgent : null,
+    preflightCommentRevision: commentRevision(preflightIdentity),
     preflightAuthor: preflightAuthor(selected.currentPreflight),
   };
 }
 
 export function normalizeCandidateSnapshot(snapshot = {}) {
   const commandIdentity = normalizeCommentIdentity(snapshot.commandIdentity || snapshot.commandRevision);
-  const preflightIdentity = normalizeCommentIdentity(snapshot.preflightIdentity || snapshot.preflightRevision);
+  const preflightIdentity = normalizeCommentIdentity(snapshot.preflightIdentity || snapshot.preflightCommentRevision);
   return {
     issueNumber: snapshot.issueNumber || null,
     statusLabel: snapshot.statusLabel || null,
@@ -68,7 +80,14 @@ export function normalizeCandidateSnapshot(snapshot = {}) {
     commandIdentity,
     commandRevision: commentRevision(commandIdentity),
     preflightIdentity,
-    preflightRevision: commentRevision(preflightIdentity),
+    preflightRevision: snapshot.preflightRevision || null,
+    preflightFingerprint: snapshot.preflightFingerprint || null,
+    preflightAuthorityKey: snapshot.preflightAuthorityKey || null,
+    preflightBodyDigest: snapshot.preflightBodyDigest || null,
+    preflightPacketValid: snapshot.preflightPacketValid === true,
+    preflightPacketReason: snapshot.preflightPacketReason || null,
+    preflightApprovedAgent: snapshot.preflightApprovedAgent ? String(snapshot.preflightApprovedAgent).trim().toLowerCase() : null,
+    preflightCommentRevision: commentRevision(preflightIdentity),
     preflightAuthor: snapshot.preflightAuthor ? String(snapshot.preflightAuthor).trim().toLowerCase() : null,
   };
 }
@@ -114,8 +133,21 @@ export function evaluateCandidateAdmission({ initial, current, approvers = [] } 
   if (commandRevisionChanged(initial, current)) {
     return { allowed: false, reason: 'candidate-proceed-command-not-authoritative' };
   }
-  if (!current.preflightIdentity || !sameCommentIdentity(initial.preflightIdentity, current.preflightIdentity)) {
+  if (current.preflightPacketValid !== true || !current.preflightAuthorityKey) {
+    return { allowed: false, reason: current.preflightPacketReason || 'candidate-manager-preflight-invalid' };
+  }
+  const selectedAgent = resolveAgentForLabels([current.agentLabel]);
+  if (!selectedAgent?.agentId || current.preflightApprovedAgent !== selectedAgent.agentId) {
+    return { allowed: false, reason: 'candidate-preflight-agent-not-approved' };
+  }
+  if (!initial.preflightAuthorityKey || initial.preflightAuthorityKey !== current.preflightAuthorityKey) {
     return { allowed: false, reason: 'candidate-preflight-revision-changed' };
+  }
+  if (!initial.preflightBodyDigest || initial.preflightBodyDigest !== current.preflightBodyDigest) {
+    return { allowed: false, reason: 'candidate-preflight-content-changed' };
+  }
+  if (!current.preflightIdentity) {
+    return { allowed: false, reason: 'candidate-preflight-comment-identity-unavailable' };
   }
   if (!current.preflightAuthor || !approvers.includes(current.preflightAuthor)) {
     return { allowed: false, reason: 'candidate-preflight-author-not-approved' };
@@ -131,6 +163,7 @@ export function candidatePausePayload(admission, snapshot) {
     safeNextAction: 'Repair execution-critical status/agent labels or provide a current immutable manager preflight from an approved ChatGPT manager identity. Proceed or continue comments cannot authorize a new claim.',
     selectedIssue: snapshot?.issueNumber || null,
     candidateRevision: snapshot?.preflightRevision || null,
+    candidateFingerprint: snapshot?.preflightFingerprint || null,
     childLaunched: false,
     attemptCreated: false,
     issueMutation: false,

@@ -62,8 +62,8 @@ test('validateAgentRunnerConfig reports actionable invalid config errors without
 test('validateAgentRunnerConfig fills missing optional runner fields from safe defaults', () => {
   const config = validateAgentRunnerConfig(validConfig);
   assert.equal(config.runner.candidateLimit, DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG.runner.candidateLimit);
-  assert.equal(config.runner.requireManagerPreflight, DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG.runner.requireManagerPreflight);
-  assert.equal(config.runner.autoProceedFromPreflight, DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG.runner.autoProceedFromPreflight);
+  assert.equal(Object.hasOwn(config.runner, 'requireManagerPreflight'), false);
+  assert.equal(Object.hasOwn(config.runner, 'autoProceedFromPreflight'), false);
 });
 
 test('loadAgentRunnerConfig supports the existing scaffold config shape', () => withTempConfig({

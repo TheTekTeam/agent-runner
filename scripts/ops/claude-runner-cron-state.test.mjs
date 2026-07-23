@@ -69,6 +69,10 @@ test('createStateRecorder degrades gracefully when the SQLite store cannot be op
 });
 
 test('scheduled wrapper accepts a linked Git worktree as MODELSPEND_REPO_DIR', (t) => {
+  if (process.getuid?.() === 0) {
+    t.skip('the production wrapper intentionally refuses root; GitHub CI exercises this as an ordinary user');
+    return;
+  }
   const root = mkdtempSync(join(tmpdir(), 'modelspend-runner-worktree-'));
   const repoDir = join(root, 'repo');
   const worktreeDir = join(root, 'validation-worktree');

@@ -22,32 +22,18 @@ Initial rollout for ModelSpend should keep the current working runner in place a
 - ready and in-progress status labels
 - accepted agent labels
 - priority label order
-- manager preflight requirement
-- preflight-direct dispatch setting (`autoProceedFromPreflight` in the config schema; pre-v2 name kept for compatibility)
+- canonical manager packet schema/producer policy (fixed by the runner, not configurable)
 - quota/session headroom thresholds by task profile
 - output directory and lock path
 - systemd service and timer names
 
-## Agent Runner v2: dual dispatch modes
+## Immutable manager dispatch authority
 
-`scripts/ops/claude-runner-cron.mjs` selects a `status:ready` issue in one of two modes:
+A first-run issue is runnable only when its latest current authority is a canonical ChatGPT manager packet. Proceed/continue comments are historical evidence only and cannot authorise a new claim.
 
-- `proceed-command` — a `## Claude proceed command` comment exists; behaviour is unchanged from the pre-v2 runner.
-- `preflight-direct` — no proceed command exists, but the issue has an unclaimed manager preflight packet (`## Manager preflight packet` / `### ChatGPT preflight`). The runner selects the issue directly from the packet; `scripts/ops/claude-runner.mjs` builds the Claude prompt from the issue title/body and the packet instead of relaying operator-authored comment text. No proceed command is posted to GitHub during selection.
+Required packet fields and behaviour are defined in [`AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md`](./AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md). The scheduler binds each new attempt to the packet revision and fingerprint, revalidates that exact authority before claim and in the pinned child, and fails closed without model calls or GitHub mutation when authority is missing, invalid, stale, revoked, mismatched to the selected agent, or already claimed.
 
-If neither a command nor a preflight packet exists, the issue is skipped with `missing manager preflight packet` — the runner never dispatches blindly. Duplicate claims are prevented for both modes: the `## Claude runner started` marker records the selection mode and either the source command comment id or the source preflight comment id, so a preflight already claimed by a prior run is not reselected.
-
-This is the mechanism that lets the Dell runner keep operating without a ChatGPT scheduled task adding a proceed command to every ready issue; see `.agent-runner/README.md` for operator-facing flag/env details.
-
-## Agent Runner v2.2: local preflight generation
-
-`preflight-direct` mode still requires a manager preflight packet to exist. Before v2.2, nothing on the Dell runner created one, so every ready issue without a proceed command was skipped with `missing manager preflight packet` — the last dependency on a ChatGPT scheduled task.
-
-`scripts/ops/claude-runner-preflight.mjs` closes that gap with local, deterministic generation (no external AI calls): for a `status:ready` issue with no working proceed command and no existing manager preflight, it builds a `## Manager preflight packet` from GitHub-visible issue/comment/linked-PR data plus a fixed default docs list, gated by a conservative safety check (minimum body length, an explicit `## Acceptance criteria` section, no blocking label, no linked open PR). Unsafe issues are skipped with `preflight-generation-needs-manager` instead of a guess.
-
-`scripts/ops/claude-runner-cron.mjs` wires this into selection: on `--execute` runs it posts a generated packet, appends it to the in-memory comment list, and re-runs selection immediately so `preflight-direct` dispatch can proceed in the same pass — "queue re-evaluation" happens without an extra cron tick. Dry-runs never post. A sha256 fingerprint over title/body/labels/linked-PR-state (embedded as an HTML comment in the packet) prevents duplicate posts and detects staleness — a fingerprint mismatch (label change, body edit, a blocking PR closing) triggers regeneration; a human-authored packet (no generator marker) is never touched. Disable with `--no-auto-preflight` / `CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT=true`.
-
-With this in place, the Dell runner can maintain its own ready-issue queue end to end — discovery, eligibility, preflight, quota/headroom, dispatch — without a ChatGPT scheduled task in the critical path.
+No flag, environment variable, worker adapter, or deterministic local generator can create manager authority.
 
 ## Quota and task-size policy
 

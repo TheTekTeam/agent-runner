@@ -28,6 +28,7 @@ import {
   buildAgentCommandArgs,
   resolveAgentById,
 } from './agent-runner-agents.mjs';
+import { resolveCurrentManagerAuthority } from './agent-runner-manager-authority.mjs';
 import {
   CLAUDE_COMMAND_HEADINGS,
   findLastMarkdownHeadingIndex,
@@ -266,12 +267,11 @@ Issue execution phases:
 Required implementation policy:
   CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=true
   CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS=<comma-separated GitHub logins>
-  CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=true  Optional; locally generated preflights otherwise remain fail-closed.
 
 Issue text cannot override permission mode or tool policy. The runner never enables bypassPermissions.
 
 Options:
-  --issue <number>          GitHub issue with a Claude proceed/continue command, or a manager preflight packet for direct dispatch
+  --issue <number>          GitHub issue with a current canonical immutable manager preflight packet
   --pr <number>             Generate (and optionally run) a PR review follow-up prompt instead of issue work
   --repo <owner/name>       GitHub repository, defaults to ${DEFAULT_REPO}
   --execute                 Actually run Claude. Default is dry-run.
@@ -398,17 +398,16 @@ export function buildClaudePrompt({ issue, commandText, currentPreflight = null,
 }
 
 /**
- * Agent Runner v2 direct-preflight prompt: built when a status:ready issue
- * has a manager preflight packet but no Claude proceed command. The runner
- * owns prompt construction here instead of relaying operator-authored
- * comment text.
+ * Canonical manager-packet prompt. The runner constructs the execution
+ * envelope from the issue plus the exact immutable packet; historical
+ * proceed/continue comments are not relayed as authority.
  */
 export function buildPreflightDirectPrompt({ issue, preflight, profile, clearContext, executionPhase = profile?.permissionMode === 'plan' ? EXECUTION_PHASE_PLAN : EXECUTION_PHASE_IMPLEMENTATION, worktreeIdentity = null, repositoryContext = null }) {
   const clearPrefix = clearContext
     ? 'Start a fresh task context. Do not carry assumptions or files from any previous Claude task.\n\n'
     : '';
 
-  return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nSelection mode: preflight-direct — this issue had no Claude proceed command. The runner built this prompt directly from the issue and its latest manager preflight packet.\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. Continue until the issue is complete or a genuine blocker is reached; remain within the configured monetary and safety policies.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- Use the manager preflight packet below as the durable implementation scope. Do not redo broad repo discovery/preflight.\n- Implement only the issue as scoped by its body and the preflight packet.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nIssue body:\n\n${issue.body || '(no issue body)'}\n\nLatest manager preflight packet (source comment ${commentRevision(preflight) || 'unknown'}):\n\n${preflight.body}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
+  return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nSelection mode: preflight-direct — the current canonical manager packet is the sole new-claim authority. Historical proceed/continue comments are ignored.\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. Continue until the issue is complete or a genuine blocker is reached; remain within the configured monetary and safety policies.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- Use the manager preflight packet below as the durable implementation scope. Do not redo broad repo discovery/preflight.\n- Implement only the issue as scoped by its body and the preflight packet.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nIssue body:\n\n${issue.body || '(no issue body)'}\n\nLatest manager preflight packet (source comment ${commentRevision(preflight) || 'unknown'}):\n\n${preflight.body}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
 }
 
 /**
@@ -436,12 +435,13 @@ export function resolveImplementationDispatchIdentity({
   if (!currentPreflight) {
     return { ok: false, failureReason: 'manager-preflight-missing' };
   }
-  const preflight = command ? null : currentPreflight;
-  const selectionMode = command ? 'proceed-command' : 'preflight-direct';
-  const referenceText = command ? command.body : preflight.body;
-  const preflightMeta = parseKeyValueBlock(currentPreflight.body || '');
-  const commandMeta = command ? parseKeyValueBlock(command.body) : {};
-  const executionMeta = { ...preflightMeta, ...commandMeta };
+  if (command) {
+    return { ok: false, failureReason: 'proceed-command-not-authoritative' };
+  }
+  const preflight = currentPreflight;
+  const selectionMode = 'preflight-direct';
+  const referenceText = preflight.body;
+  const executionMeta = parseKeyValueBlock(currentPreflight.body || '');
 
   const repositoryContextResult = resolveRepositoryContext({
     issueRepository: argsRepo,
@@ -460,9 +460,9 @@ export function resolveImplementationDispatchIdentity({
     issue,
   });
   const executionAuthorization = evaluateExecutionAuthorization({
-    command, currentPreflight, metadata: executionMeta, profileName, env,
+    command: null, currentPreflight, metadata: executionMeta, profileName, env,
   });
-  const sourceCommentIdentity = command?.sourceCommentIdentity || null;
+  const sourceCommentIdentity = null;
   const sourcePreflightCommentIdentity = normalizeCommentIdentity(currentPreflight, {
     context: 'child-manager-preflight',
     required: true,
@@ -1542,11 +1542,12 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   }
 
   const { issue, comments } = await fetchIssueAndComments({ repo: args.repo, issue: args.issue, token });
-  const command = findLatestClaudeCommand(comments);
-  const currentPreflight = latestManagerPreflightComment(comments);
-  if (!currentPreflight) {
-    throw new Error(`No current manager preflight packet found on issue #${args.issue}`);
+  const managerAuthority = resolveCurrentManagerAuthority(comments);
+  if (!managerAuthority.allowed) {
+    throw new Error(`No current canonical manager preflight authority found on issue #${args.issue}: ${managerAuthority.reason}`);
   }
+  const command = null;
+  const currentPreflight = managerAuthority.authority.comment;
 
   // Single derivation boundary (#686): the scheduler's pre-claim
   // workspace-ownership check in claude-runner-cron.mjs calls this exact
@@ -1624,7 +1625,9 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     sourceCommentId: command?.sourceCommentId || null,
     sourceCommentIdentity,
     sourcePreflightCommentIdentity,
-    sourcePreflightRevision: commentRevision(sourcePreflightCommentIdentity),
+    sourcePreflightRevision: managerAuthority.authority.revision,
+    sourcePreflightFingerprint: managerAuthority.authority.fingerprint,
+    sourcePreflightAuthorityKey: managerAuthority.authority.authorityKey,
     sourcePreflightCommentId: commentRevision(sourcePreflightCommentIdentity),
     executionPhase: executionAuthorization.phase,
     executionAuthorization,

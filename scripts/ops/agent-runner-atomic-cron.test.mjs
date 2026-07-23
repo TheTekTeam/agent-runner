@@ -8,6 +8,11 @@ import { CandidateRevalidationUnavailableError } from './agent-runner-atomic-can
 import { main } from './agent-runner-atomic-cron.mjs';
 import { openRunnerStateStore } from './claude-runner-state.mjs';
 
+const TEST_FP = `sha256:${'a'.repeat(64)}`;
+function managerPacket(id) {
+  return { id, databaseId: id, createdAt: '2026-07-17T19:00:00Z', user: { login: 'gpcola' }, body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: ATOMIC.${id}\nfingerprint: ${TEST_FP}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`\nBounded task.` };
+}
+
 function readyIssueGhRunner({ number, comments, mutatingCalls }) {
   return (args) => {
     if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
@@ -41,7 +46,7 @@ test('atomic cron reports a missing candidate-admission module as a code failure
   const dir = mkdtempSync(join(tmpdir(), 'atomic-cron-missing-module-'));
   const lockPath = join(dir, 'cron.lock');
   const stateDbPath = join(dir, 'state.sqlite');
-  const comments = [{ id: 7, createdAt: '2026-07-17T19:00:00Z', body: '## Manager preflight packet\nBounded task.' }];
+  const comments = [managerPacket(7)];
   const mutatingCalls = [];
   let childCalls = 0;
   const diagnostics = [];
@@ -49,10 +54,11 @@ test('atomic cron reports a missing candidate-admission module as a code failure
   try {
     console.log = () => {};
     const exitCode = await main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
-    ], { GH_TOKEN: 'test-token' }, {
+    ], { GH_TOKEN: 'test-token', CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true' }, {
       ghRunner: readyIssueGhRunner({ number: 686, comments, mutatingCalls }),
+      inspectWorkspaceOwnership: async () => ({ allowed: true }),
       revalidateCandidate: () => {
         throw new CandidateRevalidationUnavailableError(
           "atomic candidate revalidation failed with exit 1: Error [ERR_MODULE_NOT_FOUND]: Cannot find module "
@@ -110,17 +116,18 @@ test('atomic cron distinguishes a generic candidate-revalidation-subprocess fail
   const dir = mkdtempSync(join(tmpdir(), 'atomic-cron-revalidation-failure-'));
   const lockPath = join(dir, 'cron.lock');
   const stateDbPath = join(dir, 'state.sqlite');
-  const comments = [{ id: 8, createdAt: '2026-07-17T19:00:00Z', body: '## Manager preflight packet\nBounded task.' }];
+  const comments = [managerPacket(8)];
   const mutatingCalls = [];
   const diagnostics = [];
   const originalLog = console.log;
   try {
     console.log = () => {};
     const exitCode = await main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
-    ], { GH_TOKEN: 'test-token' }, {
+    ], { GH_TOKEN: 'test-token', CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true' }, {
       ghRunner: readyIssueGhRunner({ number: 687, comments, mutatingCalls }),
+      inspectWorkspaceOwnership: async () => ({ allowed: true }),
       revalidateCandidate: () => {
         throw new CandidateRevalidationUnavailableError('atomic candidate revalidation failed with exit 1: TypeError: boom', { missingModule: false });
       },
@@ -144,17 +151,18 @@ test('atomic cron leaves a genuine candidate denial (not a revalidation-subproce
   const dir = mkdtempSync(join(tmpdir(), 'atomic-cron-candidate-denied-'));
   const lockPath = join(dir, 'cron.lock');
   const stateDbPath = join(dir, 'state.sqlite');
-  const comments = [{ id: 9, createdAt: '2026-07-17T19:00:00Z', body: '## Manager preflight packet\nBounded task.' }];
+  const comments = [managerPacket(9)];
   const mutatingCalls = [];
   const originalLog = console.log;
   let printed = null;
   try {
     console.log = (value) => { printed = String(value); };
     const exitCode = await main([
-      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
-    ], { GH_TOKEN: 'test-token' }, {
+    ], { GH_TOKEN: 'test-token', CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true' }, {
       ghRunner: readyIssueGhRunner({ number: 688, comments, mutatingCalls }),
+      inspectWorkspaceOwnership: async () => ({ allowed: true }),
       revalidateCandidate: ({ expected }) => ({
         admission: { allowed: false, reason: 'candidate-preflight-revision-changed' },
         initial: expected,
