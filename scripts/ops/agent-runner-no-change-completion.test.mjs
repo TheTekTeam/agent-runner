@@ -5,9 +5,13 @@ import {
   evaluateManagerAuthorizedNoChange,
   parseNoChangeCompletionPolicy,
 } from './agent-runner-no-change-completion.mjs';
+import { packetBodyDigest } from './agent-runner-manager-authority.mjs';
 import { main as pinnedChildMain } from './agent-runner-pinned-child.mjs';
 
 const preflightRevision = 'github-comment:database:5059000001';
+const managerRevision = 'NOCHANGE.1';
+const managerFingerprint = `sha256:${'c'.repeat(64)}`;
+const managerAuthorityKey = `manager-preflight:${managerRevision}:${managerFingerprint}`;
 const expectedBranch = 'worktree-agent-runner-686-github-comment-database-5059000001';
 const baseHead = 'fb83e1c8ec6a918c100f0278a4aacc67f89560a9';
 
@@ -17,6 +21,10 @@ function authority() {
     issueNumber: 686,
     selectionMode: 'preflight-direct',
     preflightRevision,
+    preflightCommentRevision: preflightRevision,
+    managerPreflightRevision: managerRevision,
+    managerPreflightFingerprint: managerFingerprint,
+    managerAuthorityKey,
     preflightIdentity: { version: 1, databaseId: 5059000001, nodeId: 'IC_TEST_PREFLIGHT' },
     claimRevision: preflightRevision,
     claimIdentity: { version: 1, databaseId: 5059000001, nodeId: 'IC_TEST_PREFLIGHT' },
@@ -82,21 +90,38 @@ function managerPreflight({ allowNoChange = true } = {}) {
     author: { login: 'gpcola' },
     createdAt: '2026-07-23T13:29:00Z',
     body: [
-      '## Manager preflight packet — explicit no-change acceptance',
+      '<!-- agent-runner:manager-preflight -->',
       '',
-      'Phase: implementation',
+      '```yaml',
+      'schema_version: agent-runner-manager-preflight/v1',
+      `revision: ${managerRevision}`,
+      `fingerprint: ${managerFingerprint}`,
+      'producer_type: normal_chatgpt_manager_session',
+      'approved_agent: claude-code-cli',
+      'execution_phase: implementation',
+      'scope:',
+      '  - bounded no-change completion verification',
+      'required_validation:',
+      '  - node --test focused',
+      'stop_conditions:',
+      '  - stop on authority mismatch',
+      '```',
       ...(allowNoChange ? ['No-change completion: allowed'] : []),
       'Implementation repository: TheTekTeam/agent-runner',
     ].join('\n'),
   };
 }
 
-function pinnedEnv() {
+function pinnedEnv({ allowNoChange = true } = {}) {
+  const bodyDigest = packetBodyDigest(managerPreflight({ allowNoChange }).body);
   return {
     AGENT_RUNNER_PINNED_ISSUE: '686',
     AGENT_RUNNER_PINNED_SELECTION_MODE: 'preflight-direct',
-    AGENT_RUNNER_PINNED_PREFLIGHT_REVISION: preflightRevision,
-    AGENT_RUNNER_PINNED_CLAIM_REVISION: preflightRevision,
+    AGENT_RUNNER_PINNED_PREFLIGHT_COMMENT_REVISION: preflightRevision,
+    AGENT_RUNNER_PINNED_MANAGER_REVISION: managerRevision,
+    AGENT_RUNNER_PINNED_MANAGER_FINGERPRINT: managerFingerprint,
+    AGENT_RUNNER_PINNED_MANAGER_BODY_DIGEST: bodyDigest,
+    AGENT_RUNNER_PINNED_MANAGER_AUTHORITY_KEY: managerAuthorityKey,
     AGENT_RUNNER_PINNED_ATTEMPT_ID: authority().attemptId,
   };
 }
@@ -200,7 +225,7 @@ test('pinned child returns zero and emits explicit no-change evidence only when 
   assert.equal(payload.failureReason, null);
   assert.equal(payload.noChangeCompletion.accepted, true);
   assert.equal(payload.implementationEvidence.repositoryMutated, false);
-  assert.equal(payload.pinnedExecutionAuthority.preflightRevision, preflightRevision);
+  assert.equal(payload.pinnedExecutionAuthority.preflightCommentRevision, preflightRevision);
 });
 
 test('pinned child preserves failure when current preflight does not authorize no-change', async () => {
@@ -208,7 +233,7 @@ test('pinned child preserves failure when current preflight does not authorize n
   const originalLog = console.log;
   console.log = (...values) => output.push(values.join(' '));
   try {
-    const exitCode = await pinnedChildMain([], pinnedEnv(), {
+    const exitCode = await pinnedChildMain([], pinnedEnv({ allowNoChange: false }), {
       originalFetch: async () => new Response(JSON.stringify([managerPreflight({ allowNoChange: false })])),
       childMain: async () => {
         await fetch('https://api.github.com/repos/TheTekTeam/modelspend/issues/686/comments');

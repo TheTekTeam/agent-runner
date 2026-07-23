@@ -17,6 +17,10 @@ The standalone extraction and Dell cutover remain tracked by `TheTekTeam/modelsp
 
 ModelSpend is a configured project consumed by this runner. It is not the canonical owner of the runner implementation.
 
+## Dispatch authority
+
+New claims use one immutable ChatGPT manager packet revision and fingerprint. Legacy proceed/continue and local generated-preflight paths are retired. See [`docs/ops/AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md`](docs/ops/AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md).
+
 ## Validation
 
 ```bash

@@ -29,15 +29,10 @@ CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=true
 CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS=gpcola
 ```
 
-The latest current manager preflight author must appear in the comma-separated approver list. A proceed/continue command author must also appear there. GitHub issue text cannot change the permission mode, approver list, tool rules, branch, or worktree policy.
+The latest current canonical manager packet author must appear in the comma-separated approver list, and its `approved_agent` must match the issue agent label. Historical proceed/continue authors do not confer authority. GitHub issue text cannot change the permission mode, approver list, tool rules, branch, or worktree policy.
 
-Locally generated preflights have a separate opt-in and remain blocked from implementation by default:
+Runner-generated preflights are retired and cannot be enabled. Implementation requires a canonical immutable ChatGPT manager packet whose approved agent and author satisfy the machine policy.
 
-```bash
-CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=true
-```
-
-Leave that setting unset during the initial rollout. Human/manager-authored packets such as the current #658 packet do not need it.
 
 The implementation permission mode is fixed to `dontAsk`. Claude receives only an explicit set of read/edit tools and scoped build, test, validation, and local Git commands. Anything else is automatically denied. User/project/local setting sources are disabled for the scripted invocation so hidden permission rules or hooks cannot widen that list; the prompt requires Claude to read the tracked repository instructions directly. `Agent`, web tools, MCP tools, `gh`, `git push`, destructive Git commands, `rm`, `sudo`, `curl`, and `wget` are denied to the model. `bypassPermissions` and auto mode are disabled in invocation settings and can never be selected by issue metadata.
 
@@ -117,7 +112,7 @@ systemctl --user start modelspend-claude-runner.service
 journalctl --user -u modelspend-claude-runner.service -n 100 --no-pager
 ```
 
-Do not enable generated-preflight implementation during the initial #658 run.
+Do not create or accept worker/runner-generated manager authority during the initial #658 run.
 
 ## Failure behavior
 

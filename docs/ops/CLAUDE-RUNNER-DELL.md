@@ -27,11 +27,11 @@ The three production controls are deliberately independent:
 
 - `--execute` sets `CLAUDE_RUNNER_CRON_EXECUTE=true`, allowing the scheduler wrapper to invoke a selected child with `--execute`.
 - `--allow-implementation` explicitly sets `CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=true`, allowing an otherwise-authorised child to make repository changes.
-- `--implementation-approvers <csv>` sets the GitHub logins allowed to author the current manager preflight or command. The installer lowercases, deduplicates and writes these as one comma-separated list.
+- `--implementation-approvers <csv>` sets the GitHub logins allowed to author the current canonical manager packet. The installer lowercases, deduplicates and writes these as one comma-separated list.
 
 `--execute` alone does not authorise implementation. `--allow-implementation` fails unless the same invocation supplies a valid approver list or the existing env file already contains one. GitHub logins must be 1–39 alphanumeric-or-hyphen characters, cannot start or end with a hyphen, and cannot contain consecutive hyphens. Empty list entries are rejected.
 
-The installer never enables generated-preflight implementation. Whenever implementation settings are provisioned, it writes and verifies `CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=false` so only a current human-authored, allowlisted preflight or command can authorise writes.
+The installer removes the retired `CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION` key. No environment setting can authorise runner-generated manager packets; only a current canonical ChatGPT manager packet can authorise a new claim.
 
 Re-running the installer with the explicit flags above is safe and intentional. It updates only installer-managed keys in the existing runner env file, collapses their duplicates, preserves unrelated entries, secrets and file mode, rewrites the canonical units, explicitly restarts the timer, and fails unless the active timer has a next trigger. It verifies requested values by key without printing the complete env file or any secret values.
 
@@ -77,7 +77,6 @@ MODELSPEND_REPO_DIR=/home/gp/projects/modelspend
 CLAUDE_RUNNER_CRON_EXECUTE=true
 CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=true
 CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS=gpcola
-CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=false
 ```
 
 Optional values include `GITHUB_TOKEN`, `GH_TOKEN`, `CLAUDE_BIN` and `CLAUDE_RUNNER_ARGS`. Keep secrets out of git and never paste the complete env file into issue or PR evidence.

@@ -75,18 +75,20 @@ test('an issue comment cannot broaden permission mode or impersonate an approver
   assert.ok(result.violations.includes('command-author-not-allowlisted'));
 });
 
-test('locally generated preflights require their own machine opt-in before implementation', () => {
+test('runner-generated preflights are permanently prohibited for implementation', () => {
   const generated = { ...PREFLIGHT, body: `${PREFLIGHT.body}\n\n_Generated locally by the Dell runner_` };
   const env = {
     CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true',
     CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola',
   };
-  assert.ok(evaluateExecutionAuthorization({ currentPreflight: generated, profileName: 'narrow', env }).violations.includes('generated-preflight-implementation-not-enabled'));
+  const blocked = evaluateExecutionAuthorization({ currentPreflight: generated, profileName: 'narrow', env });
+  assert.equal(blocked.allowed, false);
+  assert.ok(blocked.violations.includes('runner-generated-manager-preflight-prohibited'));
   assert.equal(evaluateExecutionAuthorization({
     currentPreflight: generated,
     profileName: 'narrow',
     env: { ...env, CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION: 'true' },
-  }).allowed, true);
+  }).allowed, false, 'the retired compatibility variable cannot re-enable generated authority');
 });
 
 test('explicit plan skips write opt-in but still requires an allowlisted manager to prevent quota abuse', () => {

@@ -13,6 +13,7 @@ export const MINIMUM_IMPLEMENTATION_CLAUDE_VERSION = '2.1.208';
 const GENERATED_PREFLIGHT_MARKERS = [
   '_Generated locally by the Dell runner',
   'agent-runner:generated-preflight',
+  'claude-runner-generated-preflight',
 ];
 
 const REQUIRED_IMPLEMENTATION_FLAGS = Object.freeze([
@@ -124,9 +125,8 @@ export function evaluateExecutionAuthorization({
     if (!truthy(env.CLAUDE_RUNNER_ALLOW_IMPLEMENTATION)) {
       violations.push('implementation-requires-machine-opt-in');
     }
-    if (isGeneratedManagerPreflight(currentPreflight)
-      && !truthy(env.CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION)) {
-      violations.push('generated-preflight-implementation-not-enabled');
+    if (isGeneratedManagerPreflight(currentPreflight)) {
+      violations.push('runner-generated-manager-preflight-prohibited');
     }
   }
 
@@ -144,7 +144,6 @@ export function evaluateExecutionAuthorization({
     commandApprover: loginForComment(command) || null,
     machinePolicy: {
       implementationEnabled: truthy(env.CLAUDE_RUNNER_ALLOW_IMPLEMENTATION),
-      generatedPreflightImplementationEnabled: truthy(env.CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION),
       approverAllowlistConfigured: parseLoginAllowlist(env.CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS).size > 0,
     },
   };

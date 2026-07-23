@@ -292,7 +292,7 @@
       { label: 'Fingerprint', render: (row) => `<code>${escapeHtml(row.fingerprint)}</code>` },
       { label: 'Action', render: (row) => escapeHtml(row.action || '—') },
       { label: 'Created', render: (row) => escapeHtml(fmtDate(row.created_at)) },
-    ], dashboard.aggregates?.preflightFingerprints || [], 'No generated preflight fingerprints recorded yet.');
+    ], dashboard.aggregates?.preflightFingerprints || [], 'No manager packet authority fingerprints recorded yet.');
   }
 
   render(data);

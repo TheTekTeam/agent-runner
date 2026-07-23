@@ -100,7 +100,7 @@ test('installer shell syntax is valid', () => {
   assert.equal(result.status, 0, result.stderr);
 });
 
-test('explicit provisioning normalizes approvers, collapses managed duplicates, preserves secrets and mode, and disables generated preflights', async () => {
+test('explicit provisioning normalizes approvers, collapses managed duplicates, preserves secrets and mode, and removes retired generated-preflight settings', async () => {
   const harness = await createHarness();
   await writeEnv(harness, [
     'MODELSPEND_REPO_DIR=/old/path',
@@ -127,12 +127,11 @@ test('explicit provisioning normalizes approvers, collapses managed duplicates, 
   assert.match(envContents, /^CLAUDE_RUNNER_CRON_EXECUTE=true$/m);
   assert.match(envContents, /^CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=true$/m);
   assert.match(envContents, /^CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS=gpcola,second-user$/m);
-  assert.match(envContents, /^CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=false$/m);
+  assert.doesNotMatch(envContents, /^CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=/m);
   for (const key of [
     'CLAUDE_RUNNER_CRON_EXECUTE',
     'CLAUDE_RUNNER_ALLOW_IMPLEMENTATION',
     'CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS',
-    'CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION',
   ]) {
     assert.equal((envContents.match(new RegExp(`^${key}=`, 'gm')) ?? []).length, 1);
   }
@@ -220,7 +219,7 @@ test('--allow-implementation accepts and normalizes a valid existing approver li
   const envContents = await readFile(harness.envFile, 'utf8');
   assert.match(envContents, /^CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=true$/m);
   assert.match(envContents, /^CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS=gpcola,second-user$/m);
-  assert.match(envContents, /^CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=false$/m);
+  assert.doesNotMatch(envContents, /^CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=/m);
   assert.match(envContents, /^GH_TOKEN=preserved-secret$/m);
   assert.doesNotMatch(`${result.stdout}\n${result.stderr}`, /preserved-secret/);
 });
@@ -237,7 +236,7 @@ test('approvers can be provisioned without silently enabling implementation', as
   const envContents = await readFile(harness.envFile, 'utf8');
   assert.match(envContents, /^CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=false$/m);
   assert.match(envContents, /^CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS=gpcola$/m);
-  assert.match(envContents, /^CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=false$/m);
+  assert.doesNotMatch(envContents, /^CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION=/m);
 });
 
 test('custom interval is written as OnUnitInactiveSec', async () => {

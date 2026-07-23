@@ -21,8 +21,6 @@
   },
   "runner": {
     "lockPath": ".var/agent-runner/cron.lock",
-    "candidateLimit": 100,
-    "requireManagerPreflight": true,
-    "autoProceedFromPreflight": true
+    "candidateLimit": 100
   }
 }

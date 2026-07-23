@@ -8,9 +8,9 @@ import {
   parseNoChangeCompletionPolicy,
 } from './agent-runner-no-change-completion.mjs';
 import {
-  hasManagerPreflight,
-  latestManagerPreflightComment,
-} from './claude-runner-selection.mjs';
+  MANAGER_PREFLIGHT_ALREADY_CLAIMED,
+  resolveCurrentManagerAuthority,
+} from './agent-runner-manager-authority.mjs';
 import {
   commentRevision,
   normalizeCommentIdentity,
@@ -35,89 +35,64 @@ export function pinnedAuthorityFromEnv(env = process.env) {
   const issueNumber = Number.parseInt(env.AGENT_RUNNER_PINNED_ISSUE || '', 10);
   const selectionMode = String(env.AGENT_RUNNER_PINNED_SELECTION_MODE || '').trim();
   const preflightIdentity = normalizeCommentIdentity(
-    env.AGENT_RUNNER_PINNED_PREFLIGHT_REVISION,
+    env.AGENT_RUNNER_PINNED_PREFLIGHT_COMMENT_REVISION,
     { context: 'pinned-child-preflight' },
   );
-  const claimIdentity = normalizeCommentIdentity(
-    env.AGENT_RUNNER_PINNED_CLAIM_REVISION || null,
-    { context: 'pinned-child-claim' },
-  );
+  const managerPreflightRevision = String(env.AGENT_RUNNER_PINNED_MANAGER_REVISION || '').trim();
+  const managerPreflightFingerprint = String(env.AGENT_RUNNER_PINNED_MANAGER_FINGERPRINT || '').trim().toLowerCase();
+  const managerPreflightBodyDigest = String(env.AGENT_RUNNER_PINNED_MANAGER_BODY_DIGEST || '').trim().toLowerCase();
+  const managerAuthorityKey = String(env.AGENT_RUNNER_PINNED_MANAGER_AUTHORITY_KEY || '').trim();
 
-  if (!Number.isInteger(issueNumber) || issueNumber < 1) {
-    return { allowed: false, reason: 'pinned-child-issue-invalid' };
+  if (!Number.isInteger(issueNumber) || issueNumber < 1) return { allowed: false, reason: 'pinned-child-issue-invalid' };
+  if (selectionMode !== 'preflight-direct') return { allowed: false, reason: 'pinned-child-selection-mode-invalid', issueNumber };
+  if (!preflightIdentity) return { allowed: false, reason: 'pinned-child-preflight-invalid', issueNumber, selectionMode };
+  if (!managerPreflightRevision || !managerPreflightFingerprint || !managerPreflightBodyDigest || !managerAuthorityKey) {
+    return { allowed: false, reason: 'pinned-child-immutable-manager-packet-invalid', issueNumber, selectionMode };
   }
-  if (!['preflight-direct', 'proceed-command'].includes(selectionMode)) {
-    return { allowed: false, reason: 'pinned-child-selection-mode-invalid', issueNumber };
-  }
-  if (!preflightIdentity) {
-    return { allowed: false, reason: 'pinned-child-preflight-invalid', issueNumber, selectionMode };
-  }
-  if (selectionMode === 'proceed-command' && !claimIdentity) {
-    return { allowed: false, reason: 'pinned-child-command-invalid', issueNumber, selectionMode, preflightIdentity };
+  if (managerAuthorityKey !== `manager-preflight:${managerPreflightRevision}:${managerPreflightFingerprint}`) {
+    return { allowed: false, reason: 'pinned-child-manager-authority-key-mismatch', issueNumber, selectionMode };
   }
 
   return {
-    allowed: true,
-    reason: 'pinned-child-authority-valid',
-    issueNumber,
-    selectionMode,
-    preflightIdentity,
-    preflightRevision: commentRevision(preflightIdentity),
-    claimIdentity,
-    claimRevision: commentRevision(claimIdentity),
+    allowed: true, reason: 'pinned-child-authority-valid', issueNumber, selectionMode,
+    preflightIdentity, preflightCommentRevision: commentRevision(preflightIdentity),
+    managerPreflightRevision, managerPreflightFingerprint, managerPreflightBodyDigest, managerAuthorityKey,
+    claimIdentity: preflightIdentity, claimRevision: commentRevision(preflightIdentity),
     attemptId: String(env.AGENT_RUNNER_PINNED_ATTEMPT_ID || '').trim() || null,
   };
 }
 
 export function pinManagerAuthorityComments(comments = [], authority = {}) {
   if (authority.allowed !== true) return { allowed: false, reason: authority.reason, comments: [] };
-  if (!Array.isArray(comments)) {
-    return { allowed: false, reason: 'pinned-child-comments-invalid', comments: [] };
-  }
+  if (!Array.isArray(comments)) return { allowed: false, reason: 'pinned-child-comments-invalid', comments: [] };
 
   const pinnedPreflight = exactComment(comments, authority.preflightIdentity);
-  if (!pinnedPreflight) {
-    return { allowed: false, reason: 'pinned-child-preflight-not-found', comments: [] };
-  }
-  if (!hasManagerPreflight(pinnedPreflight.body || '')) {
-    return { allowed: false, reason: 'pinned-child-preflight-not-valid', comments: [] };
-  }
+  if (!pinnedPreflight) return { allowed: false, reason: 'pinned-child-preflight-not-found', comments: [] };
 
-  const currentPreflight = latestManagerPreflightComment(comments);
-  if (!currentPreflight || !sameCommentIdentity(currentPreflight, authority.preflightIdentity)) {
+  const current = resolveCurrentManagerAuthority(comments);
+  const currentForPinnedAttempt = current.allowed === true
+    || current.reason === MANAGER_PREFLIGHT_ALREADY_CLAIMED;
+  if (!currentForPinnedAttempt
+    || current.authority?.authorityKey !== authority.managerAuthorityKey
+    || current.authority?.packetDigest !== authority.managerPreflightBodyDigest) {
     return { allowed: false, reason: 'pinned-child-preflight-not-current', comments: [] };
   }
-
-  let pinnedCommand = null;
-  if (authority.selectionMode === 'proceed-command') {
-    pinnedCommand = exactComment(comments, authority.claimIdentity);
-    if (!pinnedCommand || !COMMAND_HEADING.test(String(pinnedCommand.body || ''))) {
-      COMMAND_HEADING.lastIndex = 0;
-      return { allowed: false, reason: 'pinned-child-command-not-found', comments: [] };
-    }
-    COMMAND_HEADING.lastIndex = 0;
+  if (!sameCommentIdentity(current.authority.comment, authority.preflightIdentity)) {
+    return { allowed: false, reason: 'pinned-child-preflight-comment-changed', comments: [] };
   }
 
-  const filtered = comments.map((comment) => {
-    if (authority.selectionMode === 'proceed-command'
-      && sameCommentIdentity(comment, authority.claimIdentity)) {
-      return comment;
-    }
-    return commentWithCommandAuthorityRemoved(comment);
-  });
-
+  const filtered = comments.map(commentWithCommandAuthorityRemoved);
   return {
-    allowed: true,
-    reason: 'pinned-child-comments-authorized',
-    comments: filtered,
+    allowed: true, reason: 'pinned-child-comments-authorized', comments: filtered,
     noChangePolicy: parseNoChangeCompletionPolicy(pinnedPreflight.body || ''),
     evidence: {
-      issueNumber: authority.issueNumber,
-      selectionMode: authority.selectionMode,
-      preflightRevision: authority.preflightRevision,
-      claimRevision: authority.claimRevision || null,
-      pinnedPreflightFound: true,
-      pinnedCommandFound: authority.selectionMode === 'preflight-direct' || Boolean(pinnedCommand),
+      issueNumber: authority.issueNumber, selectionMode: 'preflight-direct',
+      preflightCommentRevision: authority.preflightCommentRevision,
+      managerPreflightRevision: authority.managerPreflightRevision,
+      managerPreflightFingerprint: authority.managerPreflightFingerprint,
+      managerPreflightBodyDigest: authority.managerPreflightBodyDigest,
+      managerAuthorityKey: authority.managerAuthorityKey,
+      pinnedPreflightFound: true, pinnedCommandFound: false,
     },
   };
 }
@@ -161,15 +136,17 @@ function structuredFailure(authority, reason) {
     reason,
     failureReason: reason,
     issue: authority.issueNumber || null,
-    sourcePreflightCommentId: authority.preflightRevision || null,
+    sourcePreflightCommentId: authority.preflightCommentRevision || null,
     sourcePreflightCommentIdentity: authority.preflightIdentity || null,
     pinnedExecutionAuthority: {
       allowed: false,
       reason,
       issueNumber: authority.issueNumber || null,
       selectionMode: authority.selectionMode || null,
-      preflightRevision: authority.preflightRevision || null,
-      claimRevision: authority.claimRevision || null,
+      preflightCommentRevision: authority.preflightCommentRevision || null,
+      managerPreflightRevision: authority.managerPreflightRevision || null,
+      managerPreflightFingerprint: authority.managerPreflightFingerprint || null,
+      managerAuthorityKey: authority.managerAuthorityKey || null,
       attemptId: authority.attemptId || null,
     },
   };
@@ -183,8 +160,11 @@ function withPinnedAuthorityEvidence(payload, authority) {
       reason: 'pinned-child-authority-applied',
       issueNumber: authority.issueNumber,
       selectionMode: authority.selectionMode,
-      preflightRevision: authority.preflightRevision,
-      claimRevision: authority.claimRevision || null,
+      preflightCommentRevision: authority.preflightCommentRevision,
+      managerPreflightRevision: authority.managerPreflightRevision,
+      managerPreflightFingerprint: authority.managerPreflightFingerprint,
+      managerPreflightBodyDigest: authority.managerPreflightBodyDigest,
+      managerAuthorityKey: authority.managerAuthorityKey,
       attemptId: authority.attemptId || null,
     },
   };

@@ -17,9 +17,9 @@ The general dashboard uses a compact 16px base scale with 14–15px supporting c
 
 ## Scheduled quota admission
 
-The systemd/cron wrapper runs `scripts/ops/claude-runner-candidate-probe.mjs` before an execute-mode timer pass. The probe uses the normal GitHub queue selection logic in forced dry-run mode and recognises safely auto-preflightable work, but it cannot claim, mutate GitHub, launch an agent, or invoke Claude `/usage`.
+The systemd/cron wrapper runs `scripts/ops/claude-runner-candidate-probe.mjs` before an execute-mode timer pass. The probe uses the normal GitHub queue selection logic in forced dry-run mode and recognises only work with current canonical manager authority; it cannot claim, mutate GitHub, launch an agent, or invoke Claude `/usage`.
 
-- If the probe finds runnable or safely auto-preflightable work, the normal runner starts and performs its fail-closed quota check before claim and execution.
+- If the probe finds runnable work with current canonical manager authority, the normal runner starts and performs its fail-closed quota check before claim and execution.
 - If the probe finds no candidate, the wrapper records a dry-run `no-selection` scheduler result with quota preflight disabled. Empty timer ticks therefore do not start Claude just to discover that nothing can run.
 - An unexpected probe failure stops the scheduled pass instead of silently bypassing quota admission.
 

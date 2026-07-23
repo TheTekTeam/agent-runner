@@ -9,7 +9,6 @@ import {
 import {
   commentRevision,
   deserializeCommentIdentity,
-  sameCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 
 export const PINNED_CHILD_ENTRYPOINT = fileURLToPath(
@@ -24,55 +23,32 @@ function persistedIdentity(row, jsonKey, revisionKey, context) {
 }
 
 export function resolvePinnedExecutionAuthority({ state, attemptId } = {}) {
-  if (!attemptId) {
-    return { allowed: false, reason: 'pinned-authority-attempt-id-missing' };
-  }
-
+  if (!attemptId) return { allowed: false, reason: 'pinned-authority-attempt-id-missing' };
   const attempt = state?.invoke?.('recoveryAttempt', attemptId) || null;
-  if (!attempt) {
-    return {
-      allowed: false,
-      reason: 'pinned-authority-attempt-row-missing',
-      attemptId,
-    };
-  }
+  if (!attempt) return { allowed: false, reason: 'pinned-authority-attempt-row-missing', attemptId };
 
-  const preflightIdentity = persistedIdentity(
-    attempt,
-    'preflight_identity_json',
-    'preflight_revision',
-    'pinned-child-preflight',
-  );
+  const preflightIdentity = persistedIdentity(attempt, 'preflight_identity_json', 'preflight_revision', 'pinned-child-preflight');
   if (!preflightIdentity) {
-    return {
-      allowed: false,
-      reason: 'pinned-authority-preflight-identity-missing',
-      attemptId,
-      issueNumber: attempt.issue_number || null,
-    };
+    return { allowed: false, reason: 'pinned-authority-preflight-identity-missing', attemptId, issueNumber: attempt.issue_number || null };
   }
-
-  const claimIdentity = persistedIdentity(
-    attempt,
-    'claim_identity_json',
-    'claim_id',
-    'pinned-child-claim',
-  );
-  const selectionMode = claimIdentity
-    && sameCommentIdentity(claimIdentity, preflightIdentity)
-    ? 'preflight-direct'
-    : 'proceed-command';
+  if (!attempt.manager_preflight_revision || !attempt.manager_preflight_fingerprint || !attempt.manager_preflight_body_digest || !attempt.manager_authority_key) {
+    return { allowed: false, reason: 'pinned-authority-immutable-manager-packet-missing', attemptId, issueNumber: attempt.issue_number || null };
+  }
 
   return {
     allowed: true,
     reason: 'pinned-authority-resolved',
     attemptId,
     issueNumber: attempt.issue_number || null,
-    selectionMode,
+    selectionMode: 'preflight-direct',
     preflightIdentity,
-    preflightRevision: commentRevision(preflightIdentity),
-    claimIdentity,
-    claimRevision: commentRevision(claimIdentity),
+    preflightCommentRevision: commentRevision(preflightIdentity),
+    managerPreflightRevision: attempt.manager_preflight_revision,
+    managerPreflightFingerprint: attempt.manager_preflight_fingerprint,
+    managerPreflightBodyDigest: attempt.manager_preflight_body_digest,
+    managerAuthorityKey: attempt.manager_authority_key,
+    claimIdentity: preflightIdentity,
+    claimRevision: commentRevision(preflightIdentity),
   };
 }
 
@@ -127,8 +103,11 @@ export async function runChildWithPinnedAuthority(input, {
       AGENT_RUNNER_PINNED_CHILD_ENTRYPOINT: originalEntrypoint,
       AGENT_RUNNER_PINNED_ISSUE: String(authority.issueNumber || ''),
       AGENT_RUNNER_PINNED_SELECTION_MODE: authority.selectionMode,
-      AGENT_RUNNER_PINNED_PREFLIGHT_REVISION: authority.preflightRevision,
-      AGENT_RUNNER_PINNED_CLAIM_REVISION: authority.claimRevision || '',
+      AGENT_RUNNER_PINNED_PREFLIGHT_COMMENT_REVISION: authority.preflightCommentRevision,
+      AGENT_RUNNER_PINNED_MANAGER_REVISION: authority.managerPreflightRevision,
+      AGENT_RUNNER_PINNED_MANAGER_FINGERPRINT: authority.managerPreflightFingerprint,
+      AGENT_RUNNER_PINNED_MANAGER_BODY_DIGEST: authority.managerPreflightBodyDigest,
+      AGENT_RUNNER_PINNED_MANAGER_AUTHORITY_KEY: authority.managerAuthorityKey,
       AGENT_RUNNER_PINNED_ATTEMPT_ID: String(authority.attemptId),
     },
   };

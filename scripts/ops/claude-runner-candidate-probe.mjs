@@ -3,19 +3,17 @@
 // Cheap scheduled-run probe. It performs the same GitHub eligibility scan as
 // the cron runner but never runs Claude /usage, claims an issue or launches an
 // agent. The systemd wrapper uses its exit status to avoid quota subprocesses
-// when the queue has no runnable or safely auto-preflightable work.
+// when the queue has no issue backed by current canonical manager authority.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 
 export const NO_RUNNABLE_CANDIDATE_EXIT_CODE = 3;
 
 export function candidateFromSelection(selected = {}) {
-  const pendingAutoPreflight = (selected.skipped || []).some((item) => item?.reason === 'preflight-generation-pending-dry-run');
   return {
-    candidate: Boolean(selected.issue) || pendingAutoPreflight,
+    candidate: Boolean(selected.issue),
     selectedIssue: selected.issue?.number || null,
     selectionMode: selected.selection?.mode || null,
-    pendingAutoPreflight,
     skipCount: (selected.skipped || []).length,
   };
 }
@@ -27,7 +25,6 @@ export function buildNoSelectionPayload(args, selected = {}) {
     quotaPreflight: { blocked: false, skipped: true, reason: 'no-runnable-issue' },
     selectedIssue: null,
     selectionMode: null,
-    generatedPreflights: selected.generatedPreflights || [],
     skipped: selected.skipped || [],
     stateDbPath: args.stateDbPath,
   };

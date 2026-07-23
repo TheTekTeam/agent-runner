@@ -19,11 +19,14 @@ function selection({
   command = null,
   preflightId = 100,
   author = 'gpcola',
+  approvedAgent = 'claude-code-cli',
+  packetNote = '',
 } = {}) {
   const preflight = preflightId == null ? null : {
     id: preflightId,
     databaseId: preflightId,
-    body: '## Manager preflight packet',
+    createdAt: `2026-07-23T19:${String(preflightId).slice(-2).padStart(2, '0')}:00Z`,
+    body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: AR-${preflightId}\nfingerprint: sha256:${String(preflightId).padStart(64, '0')}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: ${approvedAgent}\nexecution_phase: implementation\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`\n${packetNote}`,
     user: { login: author },
   };
   return {
@@ -109,6 +112,20 @@ test('preflight revision change fails closed', () => {
   const initial = candidateSnapshot(selection({ preflightId: 100 }));
   const current = candidateSnapshot(selection({ preflightId: 101 }));
   assert.equal(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }).reason, 'candidate-preflight-revision-changed');
+});
+
+
+
+test('packet text edits without a new revision fail revalidation', () => {
+  const initial = candidateSnapshot(selection({ packetNote: 'Original bounded scope.' }));
+  const current = candidateSnapshot(selection({ packetNote: 'Expanded scope with the same revision.' }));
+  assert.equal(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }).reason, 'candidate-preflight-content-changed');
+});
+
+test('manager packet approved agent must match the selected adapter', () => {
+  const initial = candidateSnapshot(selection({ approvedAgent: 'codex-cli' }));
+  const current = candidateSnapshot(selection({ approvedAgent: 'codex-cli' }));
+  assert.equal(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }).reason, 'candidate-preflight-agent-not-approved');
 });
 
 test('unapproved manager author fails closed', () => {
