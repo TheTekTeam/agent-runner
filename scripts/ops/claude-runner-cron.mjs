@@ -39,6 +39,8 @@ import { resolvePreflightAction } from './claude-runner-preflight.mjs';
 import { defaultRunnerStateDbPath, openRunnerStateStore } from './claude-runner-state.mjs';
 import {
   RECOVERY_POLICY_REVISION,
+  WORKSPACE_OWNERSHIP_OUTCOMES,
+  WORKSPACE_OWNERSHIP_POLICY,
   backoffDeadline,
   buildAttentionEvent,
   decideRecovery,
@@ -47,6 +49,9 @@ import {
   normalizeTerminalOutcome,
   recoveryAttemptCapForOutcome,
 } from './claude-runner-recovery.mjs';
+import { inspectWorkspaceOwnership } from './agent-runner-workspace-ownership.mjs';
+import { withWorkspaceIdentitySupport } from './agent-runner-workspace-identity-store.mjs';
+import { EXECUTION_PHASE_IMPLEMENTATION, resolveImplementationDispatchIdentity } from './claude-runner.mjs';
 import {
   decorateIssueWithMetadata,
   priorityRank as metadataPriorityRank,
@@ -680,7 +685,7 @@ export function createStateRecorder(args, openStore = openRunnerStateStore) {
   const taskErrors = [];
   let store = null;
   try {
-    store = openStore(args.stateDbPath || defaultRunnerStateDbPath(args.outputDir));
+    store = withWorkspaceIdentitySupport(openStore(args.stateDbPath || defaultRunnerStateDbPath(args.outputDir)));
   } catch (error) {
     errors.push({ stage: 'open', message: String(error?.message || error) });
   }
@@ -995,6 +1000,40 @@ export function claimIssueForExecution(args, issue, selection, ghRunner = gh) {
   };
 }
 
+/**
+ * A dedicated, structured-evidence-only detail block for a workspace-
+ * ownership outcome (#686). Deliberately built from typed fields the caller
+ * supplies (`executionPhase`, `executionAuthorizationAllowed`,
+ * `workerStarted`, `reconciliationSteps`) rather than re-deriving or
+ * re-parsing anything from the raw manager-preflight comment body — recovery
+ * reporting must never independently reinterpret the preflight text, and
+ * must never claim a phase/authorization fact the persisted execution
+ * authorization result already contradicts.
+ */
+function workspaceOwnershipDetailBlock(issue, failure, outcome) {
+  if (!WORKSPACE_OWNERSHIP_OUTCOMES.includes(outcome)) return '';
+  const policy = WORKSPACE_OWNERSHIP_POLICY[outcome];
+  const steps = (failure.reconciliationSteps || policy?.reconciliationSteps || []);
+  const authorisedLine = failure.workerStarted === false
+    ? `The runner authorised issue #${issue.number} but did not start Claude.\n\n`
+    : '';
+  const workerLine = failure.workerStarted === false ? '\nNo worker process was started.\n' : '';
+  const phaseLine = failure.executionPhase ? `- Execution phase: \`${failure.executionPhase}\`\n` : '';
+  const authorizationLine = typeof failure.executionAuthorizationAllowed === 'boolean'
+    ? `- Execution authorization allowed: \`${failure.executionAuthorizationAllowed}\`\n`
+    : '';
+  const stepsBlock = steps.length ? `\nRequired reconciliation:\n${steps.map((step) => `- ${step};`).join('\n').replace(/;$/, '.')}\n` : '';
+  return `\n### Workspace ownership conflict
+
+${authorisedLine}Workspace preparation failed because the expected implementation branch or worktree already exists and exclusive ownership could not be proven.
+
+Failure:
+\`${outcome}\`
+${workerLine}${phaseLine}${authorizationLine}${stepsBlock}
+Do not add another manager preflight until workspace ownership is resolved.
+`;
+}
+
 export function runnerAttentionCommentBody(issue, failure = {}) {
   const outcome = normalizeTerminalOutcome(failure.reason);
   const finishedAt = failure.detectedAt || failure.finishedAt || failure.startedAt || 'unknown';
@@ -1020,7 +1059,7 @@ ${heading}
 - Safe next action: ${nextAction}
 - Queue action: ${queueAction}
 - Recovery rule: retry or hand off only from a safe checkpoint. Do not blind-retry a fresh session.
-
+${workspaceOwnershipDetailBlock(issue, failure, outcome)}
 ${footer}`;
 }
 
@@ -1111,6 +1150,54 @@ export function quarantineIssueAfterFailedRun(args, issue, failure, ghRunner = g
     statusUpdated,
     attentionPosted,
     attentionResult,
+    queueReleased: true,
+    errors,
+  };
+}
+
+/**
+ * The pre-claim counterpart to `quarantineIssueAfterFailedRun()` (#686): a
+ * workspace-ownership conflict is detected *before* `claimIssueForExecution`
+ * ever runs, so the issue is still carrying whatever status label selection
+ * found it under (`status:ready` for a fresh candidate, or `status:in-progress`
+ * for an unclaimed continue command) — never `status:in-progress` from this
+ * attempt, because this attempt never claimed it. No runner-start marker was
+ * posted and no manager packet was consumed; only the label moves, to
+ * `status:blocked`, so the scheduler does not reselect the same conflicted
+ * issue on the very next pass while every other eligible issue keeps
+ * scanning normally.
+ */
+export function quarantineIssueBeforeClaim(args, issue, failure, ghRunner = gh) {
+  const errors = [];
+  let statusUpdated = false;
+  let attentionPosted = false;
+  let attentionResult = null;
+  const fromLabel = issue.statusLabel || STATUS_READY;
+
+  try {
+    ghRunner(['issue', 'edit', String(issue.number), '--repo', args.repo, '--remove-label', fromLabel, '--add-label', STATUS_BLOCKED]);
+    statusUpdated = true;
+  } catch (error) {
+    errors.push({ stage: 'status-update', message: String(error?.message || error) });
+  }
+
+  try {
+    attentionResult = upsertGitHubAttentionComment(args, issue, failure, ghRunner);
+    attentionPosted = Boolean(attentionResult?.posted || attentionResult?.updated || attentionResult?.deduplicated);
+  } catch (error) {
+    errors.push({ stage: 'attention-comment', message: String(error?.message || error) });
+  }
+
+  return {
+    issue: issue.number,
+    reason: failure.reason,
+    fromStatus: fromLabel,
+    statusUpdated,
+    attentionPosted,
+    attentionResult,
+    markerPosted: false,
+    packetConsumed: false,
+    claimCommitted: false,
     queueReleased: true,
     errors,
   };
@@ -1631,8 +1718,27 @@ export async function reconcileSchedulerAttempts({ state, args, processProbe = p
     // classification, but only a confirmed-dead process is labeled an
     // orphaned claim; ambiguous evidence (including any OTHER demotion
     // reason — stale authority, conflicting lease, stalled progress — with
-    // a still-live process) is `unknown_failure`.
-    const outcome = evidence.liveProcessRaw === false ? 'orphaned_active_claim' : 'unknown_failure';
+    // a still-live process) is `unknown_failure`. This split is a
+    // deliberately preserved, separately fault-injection-tested invariant
+    // (see claude-runner-fault-injection.test.mjs) — it is not touched here.
+    //
+    // #686 finding (spec section 7) refines only the confirmed-dead
+    // (`liveProcessRaw === false`) case further: a bare confirmed-dead
+    // process is not enough on its own to justify the still-active-sounding
+    // `orphaned_active_claim` label. When the process is confirmed dead
+    // *and* no other attempt currently holds this issue's lease *and* this
+    // row's manager authority is no longer current, every fact needed to
+    // treat the claim as cleanly, deterministically resolved is already
+    // proven — that is `stale_unresolved_claim`, not an "active claim"
+    // description. A confirmed-dead process whose lease/authority evidence
+    // is still mixed (e.g. another attempt's lease, or this row's own
+    // authority, still reads current) keeps the original `orphaned_active_claim`
+    // label — a real "was this active?" question a human still has to
+    // resolve.
+    const staleAndUnresolved = evidence.leaseCurrent === false && evidence.authorityCurrent === false;
+    const outcome = evidence.liveProcessRaw === false
+      ? (staleAndUnresolved ? 'stale_unresolved_claim' : 'orphaned_active_claim')
+      : 'unknown_failure';
     const decision = decideRecovery({ outcome, evidence: { processOwner: false, conflictingLease: false, ownershipAmbiguous: false } });
     const event = buildAttentionEvent({
       repository: args.repo, project: args.project?.id, issueNumber: row.issue_number, attemptId: row.attempt_id,
@@ -2517,6 +2623,112 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     const schedulerPreflightIdentity = selectedPreflightCommentIdentity;
     const claimId = recoveryClaim?.claim_id || commentRevision(schedulerClaimIdentity);
     const schedulerPreflightRevision = commentRevision(schedulerPreflightIdentity);
+
+    // Workspace ownership must be resolved *before* any irreversible claim
+    // consumption (#686): the runner-start marker, the active
+    // `recovery_attempts` row, and the status:ready -> status:in-progress
+    // label flip all still lie ahead of this point for a fresh (non-
+    // recovery) attempt. Both dual-dispatch modes (`proceed-command` and
+    // `preflight-direct`) share this exact boundary — the gate below keys
+    // only on the derived execution phase, not on selection mode. A
+    // recovery re-invocation (`recoveryClaim` truthy) already owns its
+    // preserved workspace via `prepareContinuationWorkspace()`/
+    // `verifyPreservedWorktree()` and is intentionally not re-gated here.
+    //
+    // Computed once here (rather than inside the claimOnExecute-gated block
+    // below) so the same identity also seeds the `recovery_attempts` row's
+    // durable `worktreeIdentity` (spec section 5) regardless of the
+    // claimOnExecute flag — a future dispatch attributing a conflict to this
+    // row must be able to find its exact branch/worktree identity, not just
+    // whether this scheduler pass happened to gate on it.
+    const dispatchIdentity = !recoveryClaim
+      ? resolveImplementationDispatchIdentity({
+        issue: selected.issue, command: selected.command, currentPreflight: selected.currentPreflight,
+        config: { githubRepo: args.project?.repo, localRepoPath: args.project?.localRepoPath },
+        env: authEnv, argsRepo: args.repo,
+      })
+      : null;
+    const freshImplementationDispatch = Boolean(dispatchIdentity?.ok)
+      && dispatchIdentity.executionAuthorization.phase === EXECUTION_PHASE_IMPLEMENTATION
+      && dispatchIdentity.executionAuthorization.allowed === true;
+    if (!recoveryClaim && args.execute && args.claimOnExecute) {
+      if (freshImplementationDispatch) {
+        if (!state.healthy) return emitSystemicStatePause(args, state, 'pre-claim-workspace-read', { now, logger: dependencies.logger }).exitCode;
+        // Every recovery_attempts row for this exact issue -- not only the
+        // currently-active ones. A conflicting workspace is just as often
+        // left behind by a prior *terminal* (completed/failed) attempt as by
+        // a still-active one (the #686 recurrence itself: the failing
+        // attempt reaches a terminal outcome, but its branch/worktree is
+        // still on disk for the next dispatch to collide with).
+        const attemptsForIssue = (state.invoke('allRows', 'recovery_attempts') || [])
+          .filter((row) => row.repo === args.repo && row.issue_number === selected.issue.number);
+        if (!state.healthy) return emitSystemicStatePause(args, state, 'pre-claim-workspace-attempts-read', { now, logger: dependencies.logger }).exitCode;
+        let openPrsForOwnership = [];
+        try {
+          openPrsForOwnership = listOpenPullRequests(args.repo, ghRunner);
+        } catch (error) {
+          state.recordTaskError('pre-claim-workspace-pr-read', error);
+        }
+        const inspectOwnership = dependencies.inspectWorkspaceOwnership || inspectWorkspaceOwnership;
+        const ownership = await inspectOwnership({
+          worktreeIdentity: dispatchIdentity.worktreeIdentity,
+          implementationCheckout: dispatchIdentity.repositoryContext?.implementationCheckout,
+          attemptId,
+          issueNumber: selected.issue.number,
+          activeAttempts: attemptsForIssue,
+          pullRequests: openPrsForOwnership,
+          processProbe: dependencies.processProbe || probeProcessIdentity,
+          env: authEnv,
+        });
+        if (ownership.allowed !== true) {
+          const finishedAt = now();
+          const attentionEvent = buildAttentionEvent({
+            repository: args.repo, project: args.project?.id, issueNumber: selected.issue.number, attemptId,
+            reason: ownership.reason, agent: plan.agent?.agentId, startedAt, finishedAt,
+            recoveryStatus: 'forbidden',
+            nextAction: WORKSPACE_OWNERSHIP_POLICY[ownership.reason]?.nextAction
+              || 'Inspect the sanitized workspace-ownership evidence and provide an explicit manager decision.',
+            dashboardReference: `issue-${selected.issue.number}`,
+          });
+          const failure = {
+            ...attentionEvent,
+            workerStarted: false,
+            executionPhase: dispatchIdentity.executionAuthorization.phase,
+            executionAuthorizationAllowed: dispatchIdentity.executionAuthorization.allowed,
+            reconciliationSteps: WORKSPACE_OWNERSHIP_POLICY[ownership.reason]?.reconciliationSteps || [],
+          };
+          if (!state.ensureWritable('pre-claim-workspace-write-probe')) {
+            return emitSystemicStatePause(args, state, 'pre-claim-workspace-write', { now, logger: dependencies.logger }).exitCode;
+          }
+          const failureRecovery = quarantineIssueBeforeClaim(args, selected.issue, failure, ghRunner);
+          if (!state.record('recordQueueEvent', {
+            repo: args.repo, eventType: 'workspace-ownership-conflict', issueNumber: selected.issue.number,
+            statusLabel: STATUS_BLOCKED, reason: ownership.reason, payload: { ownership, failureRecovery },
+          })) return emitSystemicStatePause(args, state, 'pre-claim-workspace-queue-event', { now, logger: dependencies.logger }).exitCode;
+          const payload = {
+            ...plan,
+            claim: null,
+            startedAt,
+            finishedAt,
+            exitCode: 1,
+            childLaunched: false,
+            markerPosted: false,
+            packetConsumed: false,
+            workspaceOwnership: ownership,
+            failureRecovery,
+            terminalOutcome: ownership.reason,
+          };
+          const logPath = writeLog(args.outputDir, payload);
+          if (!state.record('recordRunResult', {
+            repo: args.repo, issueNumber: selected.issue.number, mode: 'workspace-ownership-blocked',
+            exitCode: 1, logPath, payload, startedAt, finishedAt,
+          })) return emitSystemicStatePause(args, state, 'pre-claim-workspace-result-persistence', { now, logger: dependencies.logger }).exitCode;
+          console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+          return 1;
+        }
+      }
+    }
+
     if (!recoveryClaim) {
       if (!state.record('recordRecoveryAttempt', {
         attemptId, repo: args.repo, project: args.project?.id, issueNumber: selected.issue.number, claimId,
@@ -2526,6 +2738,16 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         phase: 'starting', agent: plan.agent?.agentId, model: plan.agent?.model, harness: plan.agent?.agentType,
         startedAt, ...processIdentity, resolutionState: 'active',
       })) return emitSystemicStatePause(args, state, 'attempt-start', { now, logger: dependencies.logger }).exitCode;
+      // Durably bind this attempt to the exact deterministic worktree/branch
+      // identity it was dispatched against (#686 spec section 5), via the
+      // `agent-runner-workspace-identity-store.mjs` wrapper rather than
+      // `recordRecoveryAttempt` itself (byte-locked to the ModelSpend
+      // import). A future dispatch attributing a workspace conflict to a
+      // prior attempt must match this exact identity, never merely the
+      // issue number.
+      if (freshImplementationDispatch && !state.record('recordWorktreeIdentity', { attemptId, worktreeIdentity: dispatchIdentity.worktreeIdentity })) {
+        return emitSystemicStatePause(args, state, 'attempt-worktree-identity', { now, logger: dependencies.logger }).exitCode;
+      }
     }
     let claim = null;
     if (args.execute && args.claimOnExecute && !recoveryClaim) {
@@ -2771,6 +2993,20 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         }
       }
     }
+    // Section 6/8: recovery reporting for a workspace-ownership outcome
+    // discovered *inside the child* (the backstop path -- workspace
+    // preparation failed after this scheduler's own pre-claim check already
+    // passed, e.g. a race between the two) must be built from the same
+    // structured, persisted child evidence the pre-claim path uses, never
+    // reparsed from the raw preflight comment. Threaded onto the
+    // already-built attentionEvent rather than recomputed independently.
+    const workspaceFailureDetails = attentionEvent && WORKSPACE_OWNERSHIP_OUTCOMES.includes(outcome) ? {
+      ...attentionEvent,
+      workerStarted: false,
+      executionPhase: childPayload?.executionPhase ?? null,
+      executionAuthorizationAllowed: childPayload?.executionAuthorization?.allowed ?? null,
+      reconciliationSteps: WORKSPACE_OWNERSHIP_POLICY[outcome]?.reconciliationSteps || [],
+    } : attentionEvent;
     let failureRecovery = null;
     if (args.execute && args.claimOnExecute && (claim || recoveryClaim) && effectiveExitCode !== 0) {
       if (outcome === 'quota_paused') {
@@ -2780,7 +3016,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       } else if (outcome === 'plan_only_awaiting_approval') {
         failureRecovery = waitForExplicitPlanApproval(args, selected.issue, attentionEvent || { reason: outcome, finishedAt }, ghRunner);
       } else {
-        failureRecovery = quarantineIssueAfterFailedRun(args, selected.issue, attentionEvent || { reason: outcome, finishedAt }, ghRunner);
+        failureRecovery = quarantineIssueAfterFailedRun(args, selected.issue, workspaceFailureDetails || { reason: outcome, finishedAt }, ghRunner);
       }
       const eventType = outcome === 'quota_paused' ? 'pause' : outcome === 'plan_only_awaiting_approval' ? 'approval-wait' : 'quarantine';
       if (!state.record('recordQueueEvent', {

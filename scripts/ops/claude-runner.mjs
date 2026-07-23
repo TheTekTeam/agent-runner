@@ -411,6 +411,82 @@ export function buildPreflightDirectPrompt({ issue, preflight, profile, clearCon
   return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nSelection mode: preflight-direct — this issue had no Claude proceed command. The runner built this prompt directly from the issue and its latest manager preflight packet.\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. Continue until the issue is complete or a genuine blocker is reached; remain within the configured monetary and safety policies.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- Use the manager preflight packet below as the durable implementation scope. Do not redo broad repo discovery/preflight.\n- Implement only the issue as scoped by its body and the preflight packet.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nIssue body:\n\n${issue.body || '(no issue body)'}\n\nLatest manager preflight packet (source comment ${commentRevision(preflight) || 'unknown'}):\n\n${preflight.body}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
 }
 
+/**
+ * Single derivation boundary for the implementation dispatch identity a
+ * fresh (non-recovery) attempt is built from: repository context, execution
+ * phase/authorization and the deterministic worktree/branch identity. Both
+ * this module's own `main()` (which actually runs Claude) and
+ * `claude-runner-cron.mjs`'s scheduler pre-claim workspace-ownership check
+ * (#686) call this exact function so they can never derive two different
+ * `worktreeIdentity` values for the same command/preflight pair — a
+ * scheduler check that inspected the wrong worktree would guard nothing.
+ */
+export function resolveImplementationDispatchIdentity({
+  issue,
+  command = null,
+  currentPreflight = null,
+  config = {},
+  env = process.env,
+  argsRepo,
+  argsProfile,
+  argsModel,
+  argsEffort,
+  argsMaxBudgetUsd,
+} = {}) {
+  if (!currentPreflight) {
+    return { ok: false, failureReason: 'manager-preflight-missing' };
+  }
+  const preflight = command ? null : currentPreflight;
+  const selectionMode = command ? 'proceed-command' : 'preflight-direct';
+  const referenceText = command ? command.body : preflight.body;
+  const preflightMeta = parseKeyValueBlock(currentPreflight.body || '');
+  const commandMeta = command ? parseKeyValueBlock(command.body) : {};
+  const executionMeta = { ...preflightMeta, ...commandMeta };
+
+  const repositoryContextResult = resolveRepositoryContext({
+    issueRepository: argsRepo,
+    projectRepository: config.githubRepo,
+    projectCheckout: config.localRepoPath,
+    runnerCheckout: RUNNER_OWN_CHECKOUT,
+    requestedImplementationRepository: executionMeta.implementation_repository,
+  });
+  if (!repositoryContextResult.allowed) {
+    return { ok: false, failureReason: repositoryContextResult.failureReason };
+  }
+
+  const profileName = inferProfile({
+    explicitProfile: argsProfile || executionMeta.profile,
+    commandText: referenceText,
+    issue,
+  });
+  const executionAuthorization = evaluateExecutionAuthorization({
+    command, currentPreflight, metadata: executionMeta, profileName, env,
+  });
+  const sourceCommentIdentity = command?.sourceCommentIdentity || null;
+  const sourcePreflightCommentIdentity = normalizeCommentIdentity(currentPreflight, {
+    context: 'child-manager-preflight',
+    required: true,
+  });
+  const sourceAttemptCommentId = commentRevision(sourceCommentIdentity || sourcePreflightCommentIdentity);
+  const worktreeIdentity = executionAuthorization.phase === EXECUTION_PHASE_IMPLEMENTATION
+    ? buildWorktreeIdentity({ issueNumber: issue.number, sourceCommentId: sourceAttemptCommentId })
+    : null;
+
+  return {
+    ok: true,
+    preflight,
+    selectionMode,
+    executionMeta,
+    repositoryContext: repositoryContextResult.context,
+    profileName,
+    executionAuthorization,
+    sourceCommentIdentity,
+    sourcePreflightCommentIdentity,
+    sourceAttemptCommentId,
+    worktreeIdentity,
+  };
+}
+
 export function buildClaudeArgs({ prompt, profile, resumeSession }) {
   return buildAgentCommandArgs({ agent: resolveAgentById('claude-code-cli'), prompt, profile, resumeSession });
 }
@@ -1468,63 +1544,33 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const { issue, comments } = await fetchIssueAndComments({ repo: args.repo, issue: args.issue, token });
   const command = findLatestClaudeCommand(comments);
   const currentPreflight = latestManagerPreflightComment(comments);
-  const preflight = command ? null : currentPreflight;
   if (!currentPreflight) {
     throw new Error(`No current manager preflight packet found on issue #${args.issue}`);
   }
 
-  const selectionMode = command ? 'proceed-command' : 'preflight-direct';
-  const referenceText = command ? command.body : preflight.body;
-  const preflightMeta = parseKeyValueBlock(currentPreflight?.body || '');
-  const commandMeta = command ? parseKeyValueBlock(command.body) : {};
-  const executionMeta = { ...preflightMeta, ...commandMeta };
-
-  // Typed repository-context boundary (#686): implementationRepository
-  // defaults to the configured project and only diverges when the current
-  // preflight/command explicitly names a known repository via a plain
-  // `Implementation repository: <owner>/<repo>` metadata line. This keeps
-  // prompt identity, worktree root and draft-PR target in lockstep and
-  // fails closed instead of silently collapsing onto the issue's repo.
-  const repositoryContextResult = resolveRepositoryContext({
-    issueRepository: args.repo,
-    projectRepository: config.githubRepo,
-    projectCheckout: config.localRepoPath,
-    runnerCheckout: RUNNER_OWN_CHECKOUT,
-    requestedImplementationRepository: executionMeta.implementation_repository,
+  // Single derivation boundary (#686): the scheduler's pre-claim
+  // workspace-ownership check in claude-runner-cron.mjs calls this exact
+  // function too, so it can never guard a different worktreeIdentity than
+  // the one this run actually dispatches against.
+  const dispatchIdentity = resolveImplementationDispatchIdentity({
+    issue, command, currentPreflight, config, env,
+    argsRepo: args.repo, argsProfile: args.profile, argsModel: args.model,
+    argsEffort: args.effort, argsMaxBudgetUsd: args.maxBudgetUsd,
   });
-  if (!repositoryContextResult.allowed) {
+  if (!dispatchIdentity.ok) {
     const payload = {
       blocked: true,
-      reason: repositoryContextResult.failureReason,
+      reason: dispatchIdentity.failureReason,
       issue: args.issue,
-      message: `The repository context for issue #${args.issue} could not be resolved unambiguously (${repositoryContextResult.failureReason}). No Claude process was started.`,
+      message: `The repository context for issue #${args.issue} could not be resolved unambiguously (${dispatchIdentity.failureReason}). No Claude process was started.`,
     };
     console.log(JSON.stringify(payload, null, 2));
     return EXECUTION_POLICY_EXIT_CODE;
   }
-  const repositoryContext = repositoryContextResult.context;
-
-  const profileName = inferProfile({
-    explicitProfile: args.profile || executionMeta.profile,
-    commandText: referenceText,
-    issue,
-  });
-  const executionAuthorization = evaluateExecutionAuthorization({
-    command,
-    currentPreflight,
-    metadata: executionMeta,
-    profileName,
-    env,
-  });
-  const sourceCommentIdentity = command?.sourceCommentIdentity || null;
-  const sourcePreflightCommentIdentity = normalizeCommentIdentity(currentPreflight, {
-    context: 'child-manager-preflight',
-    required: true,
-  });
-  const sourceAttemptCommentId = commentRevision(sourceCommentIdentity || sourcePreflightCommentIdentity);
-  const worktreeIdentity = executionAuthorization.phase === EXECUTION_PHASE_IMPLEMENTATION
-    ? buildWorktreeIdentity({ issueNumber: args.issue, sourceCommentId: sourceAttemptCommentId })
-    : null;
+  const {
+    preflight, selectionMode, executionMeta, repositoryContext, profileName,
+    executionAuthorization, sourceCommentIdentity, sourcePreflightCommentIdentity, worktreeIdentity,
+  } = dispatchIdentity;
   const implementationToolPolicy = worktreeIdentity
     ? buildImplementationToolPolicy({ expectedBranch: worktreeIdentity.expectedBranch })
     : null;
