@@ -71,11 +71,7 @@ function sanitizeDiagnosticText(value) {
 export function boundedDiagnostic(value, maxChars = MAX_DIAGNOSTIC_CHARS) {
   const sanitized = sanitizeDiagnosticText(value);
   if (sanitized.length <= maxChars) {
-    return {
-      text: sanitized,
-      truncated: false,
-      originalChars: sanitized.length,
-    };
+    return { text: sanitized, truncated: false, originalChars: sanitized.length };
   }
   return {
     text: sanitized.slice(-maxChars),
@@ -116,34 +112,52 @@ function samePreflightRow(row, sourceIdentity, jsonField, fallbackField, context
 }
 
 export function inspectCanaryExecutionEvidence(db, { issueNumber, sourcePreflightComment, since } = {}) {
-  const sourceIdentity = normalizeCommentIdentity(sourcePreflightComment, { context: 'supervised-canary-inspection', required: true });
+  const sourceIdentity = normalizeCommentIdentity(sourcePreflightComment, {
+    context: 'supervised-canary-inspection',
+    required: true,
+  });
   if (!db) throw new Error('state database is required');
-  if (!sourceIdentity) throw new Error('source preflight identity is required');
 
-  const claims = db.prepare('SELECT * FROM claims WHERE issue_number = ? ORDER BY created_at, id').all(issueNumber)
+  const claim = db.prepare('SELECT * FROM claims WHERE issue_number = ? ORDER BY created_at, id').all(issueNumber)
     .filter((row) => atOrAfter(row.created_at, since))
-    .filter((row) => samePreflightRow(row, sourceIdentity, 'source_preflight_comment_identity_json', 'source_preflight_comment_id', 'supervised-canary-claim'));
-  const claim = claims[0] || null;
+    .find((row) => samePreflightRow(
+      row,
+      sourceIdentity,
+      'source_preflight_comment_identity_json',
+      'source_preflight_comment_id',
+      'supervised-canary-claim',
+    )) || null;
 
-  const attempts = db.prepare('SELECT * FROM recovery_attempts WHERE issue_number = ? ORDER BY started_at, attempt_id').all(issueNumber)
+  const attempt = db.prepare('SELECT * FROM recovery_attempts WHERE issue_number = ? ORDER BY started_at, attempt_id').all(issueNumber)
     .filter((row) => atOrAfter(row.started_at, since))
-    .filter((row) => samePreflightRow(row, sourceIdentity, 'preflight_identity_json', 'preflight_revision', 'supervised-canary-attempt'));
-  const attempt = attempts[0] || null;
+    .find((row) => samePreflightRow(
+      row,
+      sourceIdentity,
+      'preflight_identity_json',
+      'preflight_revision',
+      'supervised-canary-attempt',
+    )) || null;
 
-  const runs = db.prepare('SELECT * FROM run_results WHERE issue_number = ? ORDER BY created_at, id').all(issueNumber)
+  const terminal = db.prepare('SELECT * FROM run_results WHERE issue_number = ? ORDER BY created_at, id').all(issueNumber)
     .filter((row) => atOrAfter(row.started_at || row.created_at, since))
     .map((row) => ({ row, payload: parseObject(row.payload_json) || {} }))
-    .filter(({ row, payload }) => attempt
+    .find(({ row, payload }) => attempt
+      && Boolean(row.finished_at)
       && String(payload.startedAt || row.started_at || '') === String(attempt.started_at || '')
       && sameCommentIdentity(
         normalizeCommentIdentity(
-          payload.sourcePreflightCommentIdentity || payload.sourcePreflightCommentId || payload.sourcePreflightRevision || null,
+          payload.sourcePreflightCommentIdentity
+            || payload.sourcePreflightCommentId
+            || payload.sourcePreflightRevision
+            || null,
           { context: 'supervised-canary-run' },
         ),
         sourceIdentity,
-      ));
-  const terminal = runs.find(({ row }) => Boolean(row.finished_at)) || null;
-  const workerStarted = Boolean(terminal || (attempt?.phase && attempt.phase !== 'starting') || attempt?.finished_at);
+      )) || null;
+
+  const workerStarted = Boolean(terminal
+    || (attempt?.phase && attempt.phase !== 'starting')
+    || attempt?.finished_at);
   const terminalSucceeded = Boolean(terminal?.row?.finished_at
     && Number(terminal.row.exit_code) === 0
     && terminal.payload.terminalOutcome === 'completed');
@@ -153,9 +167,8 @@ export function inspectCanaryExecutionEvidence(db, { issueNumber, sourcePrefligh
     state: terminalSucceeded ? 'terminal_success'
       : terminalFailed ? 'terminal_failure'
         : workerStarted ? 'worker_started'
-          : attempt ? 'claim_persisted'
-            : claim ? 'claim_persisted'
-              : 'handled_noop',
+          : (attempt || claim) ? 'claim_persisted'
+            : 'handled_noop',
     claimPersisted: Boolean(claim),
     attemptPersisted: Boolean(attempt),
     workerStarted,
@@ -182,6 +195,16 @@ function diagnostics(run) {
   };
 }
 
+function executionEnv(env) {
+  return {
+    ...env,
+    AGENT_RUNNER_EXECUTE: 'true',
+    CLAUDE_RUNNER_CRON_EXECUTE: 'true',
+    CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT: 'true',
+    CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION: 'false',
+  };
+}
+
 export function runSupervisedCanary(args, env = process.env, dependencies = {}) {
   const spawn = dependencies.spawn || spawnSync;
   if (timerIsActive(args.timerUnit, spawn)) {
@@ -198,17 +221,11 @@ export function runSupervisedCanary(args, env = process.env, dependencies = {}) 
     };
   }
 
-  const probeScript = resolve(ROOT, 'scripts/ops/claude-runner-candidate-probe.mjs');
-  const probe = spawn(process.execPath, [probeScript, '--execute'], {
-    encoding: 'utf8',
-    env: {
-      ...env,
-      AGENT_RUNNER_EXECUTE: 'true',
-      CLAUDE_RUNNER_CRON_EXECUTE: 'true',
-      CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT: 'true',
-      CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION: 'false',
-    },
-  });
+  const probe = spawn(
+    process.execPath,
+    [resolve(ROOT, 'scripts/ops/claude-runner-candidate-probe.mjs'), '--execute'],
+    { encoding: 'utf8', env: executionEnv(env) },
+  );
   if (probe.error) throw probe.error;
   const probePayload = parseLastJsonLine(probe.stdout);
   if (probe.status !== 0 || Number(probePayload?.selectedIssue) !== args.issueNumber) {
@@ -226,9 +243,36 @@ export function runSupervisedCanary(args, env = process.env, dependencies = {}) 
     };
   }
 
-  const probePreflight = probePayload?.sourcePreflightCommentId || null;
-  const requestedPreflight = args.sourcePreflightComment || probePreflight;
-  if (!normalizeCommentIdentity(requestedPreflight, { context: 'supervised-canary-probe-preflight' })) {
+  // The imported probe is byte-locked and intentionally exposes only cheap
+  // selection metadata. The standalone-owned candidate-admission boundary
+  // performs the second non-mutating read and supplies the exact authoritative
+  // preflight identity without changing the imported module.
+  const admission = spawn(
+    process.execPath,
+    [resolve(ROOT, 'scripts/ops/agent-runner-candidate-admission.mjs'), '--execute'],
+    { encoding: 'utf8', env: executionEnv(env) },
+  );
+  if (admission.error) throw admission.error;
+  const admissionPayload = parseLastJsonLine(admission.stdout);
+  if (admission.status !== 0
+    || admissionPayload?.admission?.allowed !== true
+    || Number(admissionPayload?.current?.issueNumber) !== args.issueNumber) {
+    return {
+      exitCode: 3,
+      payload: {
+        schemaVersion: 'agent-runner-supervised-canary/v2',
+        launched: false,
+        state: 'probe_selected',
+        issueNumber: args.issueNumber,
+        reason: admissionPayload?.admission?.reason || 'candidate-admission-refused',
+        safeNextAction: 'Keep the timer disabled and repair the candidate authority mismatch before retrying.',
+      },
+    };
+  }
+
+  const admittedPreflight = admissionPayload.current.preflightRevision || null;
+  const requestedPreflight = args.sourcePreflightComment || admittedPreflight;
+  if (!normalizeCommentIdentity(requestedPreflight, { context: 'supervised-canary-admitted-preflight' })) {
     return {
       exitCode: 3,
       payload: {
@@ -237,11 +281,12 @@ export function runSupervisedCanary(args, env = process.env, dependencies = {}) 
         state: 'probe_selected',
         issueNumber: args.issueNumber,
         reason: 'selected-preflight-identity-unavailable',
-        safeNextAction: 'Keep the timer disabled and repair candidate-probe preflight identity reporting.',
+        safeNextAction: 'Keep the timer disabled and repair candidate-admission preflight identity reporting.',
       },
     };
   }
-  if (args.sourcePreflightComment && !sameCommentIdentity(args.sourcePreflightComment, probePreflight)) {
+  if (args.sourcePreflightComment
+    && !sameCommentIdentity(args.sourcePreflightComment, admittedPreflight)) {
     return {
       exitCode: 3,
       payload: {
@@ -259,17 +304,12 @@ export function runSupervisedCanary(args, env = process.env, dependencies = {}) 
   const startedAt = new Date().toISOString();
   const temporaryDir = dependencies.temporaryDir || mkdtempSync(join(tmpdir(), 'agent-runner-canary-'));
   const wrapperResultPath = join(temporaryDir, 'run-project-result.json');
-  const launcher = resolve(ROOT, 'bin/run-project.sh');
-  const run = spawn(launcher, [], {
+  const run = spawn(resolve(ROOT, 'bin/run-project.sh'), [], {
     encoding: 'utf8',
     env: {
-      ...env,
-      AGENT_RUNNER_EXECUTE: 'true',
-      CLAUDE_RUNNER_CRON_EXECUTE: 'true',
+      ...executionEnv(env),
       AGENT_RUNNER_CANARY_ISSUE: String(args.issueNumber),
       AGENT_RUNNER_RUN_RESULT_FILE: wrapperResultPath,
-      CLAUDE_RUNNER_CRON_DISABLE_AUTO_PREFLIGHT: 'true',
-      CLAUDE_RUNNER_ALLOW_GENERATED_PREFLIGHT_IMPLEMENTATION: 'false',
     },
   });
   if (run.error) throw run.error;
@@ -296,6 +336,7 @@ export function runSupervisedCanary(args, env = process.env, dependencies = {}) 
   const runnerExitCode = run.status ?? 1;
   let exitCode = 4;
   let reason = null;
+
   if (!timerRemainedDisabled) {
     exitCode = 1;
     reason = 'execution-timer-became-active';
