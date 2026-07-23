@@ -20,7 +20,14 @@ test('run-project records handled no-op reason while preserving shell exit zero'
   const resultFile = join(root, 'run-result.json');
   mkdirSync(join(project, '.git'), { recursive: true });
   writeFileSync(config, JSON.stringify({ localRepoPath: project }));
-  writeFileSync(fakeNode, `#!/usr/bin/env bash\nset -euo pipefail\nif [ "\${1:-}" = "-e" ]; then exec "$REAL_NODE" "$@"; fi\ncase "\${1:-}" in\n  *agent-runner-circuit-breaker.mjs) [ "\${2:-}" = "check" ] && exit 3 ;;\nesac\nexit 99\n`);
+  writeFileSync(fakeNode, `#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -eq 0 ] || [ "\${1:-}" = "-e" ]; then exec "$REAL_NODE" "$@"; fi
+case "\${1:-}" in
+  *agent-runner-circuit-breaker.mjs) [ "\${2:-}" = "check" ] && exit 3 ;;
+esac
+exit 99
+`);
   chmodSync(fakeNode, 0o755);
 
   const run = spawnSync('bash', [join(ROOT, 'bin/run-project.sh')], {
