@@ -210,6 +210,7 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
       localRepoPath: config.localRepoPath,
     },
   };
+  let explicitStateDbPath = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -232,9 +233,14 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
     else if (arg === '--lock-path') args.lockPath = next();
     else if (arg === '--output-dir') {
       args.outputDir = next();
-      if (!env.CLAUDE_RUNNER_STATE_DB) args.stateDbPath = defaultRunnerStateDbPath(args.outputDir);
+      if (!env.CLAUDE_RUNNER_STATE_DB && !explicitStateDbPath) {
+        args.stateDbPath = defaultRunnerStateDbPath(args.outputDir);
+      }
     }
-    else if (arg === '--state-db') args.stateDbPath = next();
+    else if (arg === '--state-db') {
+      args.stateDbPath = next();
+      explicitStateDbPath = true;
+    }
     else if (arg === '--limit') args.limit = Number.parseInt(next(), 10);
     else if (arg === '--agent-label') args.agentLabels = parseAgentLabels([...args.agentLabels, next()]);
     else if (arg === '--agent-labels') args.agentLabels = parseAgentLabels(next());
