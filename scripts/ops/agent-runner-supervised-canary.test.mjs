@@ -28,13 +28,25 @@ function spawnSequence(results) {
 function baseResults(run = { status: 0, stdout: '', stderr: '' }) {
   return [
     { status: 3, stdout: '', stderr: '' },
-    { status: 0, stdout: JSON.stringify({ selectedIssue: 5, sourcePreflightCommentId: PREFLIGHT }), stderr: '' },
+    { status: 0, stdout: JSON.stringify({ selectedIssue: 5 }), stderr: '' },
+    {
+      status: 0,
+      stdout: JSON.stringify({
+        admission: { allowed: true },
+        current: { issueNumber: 5, preflightRevision: PREFLIGHT },
+      }),
+      stderr: '',
+    },
     run,
     { status: 3, stdout: '', stderr: '' },
   ];
 }
 
-function dependenciesFor(evidence, wrapperResult = { state: 'canonical_runner_invoked', reason: 'canonical-runner-executed' }, run = { status: 0, stdout: '', stderr: '' }) {
+function dependenciesFor(
+  evidence,
+  wrapperResult = { state: 'canonical_runner_invoked', reason: 'canonical-runner-executed' },
+  run = { status: 0, stdout: '', stderr: '' },
+) {
   const { spawn, calls } = spawnSequence(baseResults(run));
   return {
     dependencies: {
@@ -61,7 +73,11 @@ test('requires explicit execute and a positive issue', () => {
 
 test('refuses to launch while the execution timer is active', () => {
   const { spawn, calls } = spawnSequence([{ status: 0, stdout: '', stderr: '' }]);
-  const result = runSupervisedCanary({ issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: null }, {}, { spawn });
+  const result = runSupervisedCanary(
+    { issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: null },
+    {},
+    { spawn },
+  );
   assert.equal(result.exitCode, 3);
   assert.equal(result.payload.reason, 'execution-timer-active');
   assert.equal(result.payload.launched, false);
@@ -73,27 +89,63 @@ test('refuses when the exact requested issue is not selected', () => {
     { status: 3, stdout: '', stderr: '' },
     { status: 0, stdout: '{"selectedIssue":6}\n', stderr: '' },
   ]);
-  const result = runSupervisedCanary({ issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: null }, {}, { spawn });
+  const result = runSupervisedCanary(
+    { issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: null },
+    {},
+    { spawn },
+  );
   assert.equal(result.exitCode, 3);
   assert.equal(result.payload.reason, 'requested-canary-not-selected');
   assert.equal(result.payload.selectedIssue, 6);
   assert.equal(calls.length, 2);
 });
 
+test('refuses when standalone candidate admission cannot prove the exact authority', () => {
+  const { spawn } = spawnSequence([
+    { status: 3, stdout: '', stderr: '' },
+    { status: 0, stdout: '{"selectedIssue":5}\n', stderr: '' },
+    {
+      status: 3,
+      stdout: JSON.stringify({ admission: { allowed: false, reason: 'candidate-preflight-revision-changed' } }),
+      stderr: '',
+    },
+  ]);
+  const result = runSupervisedCanary(
+    { issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: null },
+    {},
+    { spawn },
+  );
+  assert.equal(result.exitCode, 3);
+  assert.equal(result.payload.state, 'probe_selected');
+  assert.equal(result.payload.reason, 'candidate-preflight-revision-changed');
+  assert.equal(result.payload.launched, false);
+});
+
 test('reports terminal success only after correlated durable evidence exists', () => {
   const { dependencies, calls } = dependenciesFor({
-    state: 'terminal_success', claimPersisted: true, attemptPersisted: true, workerStarted: true,
-    terminalSucceeded: true, terminalFailed: false, claimId: 41, attemptId: 'attempt-41', runResultId: 51,
+    state: 'terminal_success',
+    claimPersisted: true,
+    attemptPersisted: true,
+    workerStarted: true,
+    terminalSucceeded: true,
+    terminalFailed: false,
+    claimId: 41,
+    attemptId: 'attempt-41',
+    runResultId: 51,
   });
-  const result = runSupervisedCanary({ issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: PREFLIGHT }, {}, dependencies);
+  const result = runSupervisedCanary(
+    { issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: PREFLIGHT },
+    {},
+    dependencies,
+  );
   assert.equal(result.exitCode, 0);
   assert.equal(result.payload.launched, true);
   assert.equal(result.payload.state, 'terminal_success');
   assert.equal(result.payload.evidence.claimId, 41);
   assert.equal(result.payload.timerRemainedDisabled, true);
   assert.equal(result.payload.runnerDiagnostics, undefined);
-  assert.equal(calls[2].options.env.AGENT_RUNNER_CANARY_ISSUE, '5');
-  assert.equal(calls[2].options.env.AGENT_RUNNER_RUN_RESULT_FILE, '/tmp/fixed-canary-test/run-project-result.json');
+  assert.equal(calls[3].options.env.AGENT_RUNNER_CANARY_ISSUE, '5');
+  assert.equal(calls[3].options.env.AGENT_RUNNER_RUN_RESULT_FILE, '/tmp/fixed-canary-test/run-project-result.json');
 });
 
 test('handled wrapper no-op remains non-execution even when the shell exits zero', () => {
@@ -102,7 +154,11 @@ test('handled wrapper no-op remains non-execution even when the shell exits zero
     { state: 'handled_noop', reason: 'circuit-paused' },
     { status: 0, stdout: 'paused', stderr: '' },
   );
-  const result = runSupervisedCanary({ issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: PREFLIGHT }, {}, dependencies);
+  const result = runSupervisedCanary(
+    { issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: PREFLIGHT },
+    {},
+    dependencies,
+  );
   assert.equal(result.exitCode, 3);
   assert.equal(result.payload.launched, false);
   assert.equal(result.payload.state, 'handled_noop');
@@ -114,7 +170,11 @@ test('canonical wrapper invocation without a new claim or attempt fails closed',
   const { dependencies } = dependenciesFor(
     { state: 'handled_noop', claimPersisted: false, attemptPersisted: false, workerStarted: false },
   );
-  const result = runSupervisedCanary({ issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: PREFLIGHT }, {}, dependencies);
+  const result = runSupervisedCanary(
+    { issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: PREFLIGHT },
+    {},
+    dependencies,
+  );
   assert.equal(result.exitCode, 3);
   assert.equal(result.payload.launched, false);
   assert.equal(result.payload.reason, 'handled-noop-without-attempt');
@@ -122,10 +182,21 @@ test('canonical wrapper invocation without a new claim or attempt fails closed',
 
 test('worker start without terminal persistence is not success', () => {
   const { dependencies } = dependenciesFor({
-    state: 'worker_started', claimPersisted: true, attemptPersisted: true, workerStarted: true,
-    terminalSucceeded: false, terminalFailed: false, claimId: 41, attemptId: 'attempt-41', runResultId: null,
+    state: 'worker_started',
+    claimPersisted: true,
+    attemptPersisted: true,
+    workerStarted: true,
+    terminalSucceeded: false,
+    terminalFailed: false,
+    claimId: 41,
+    attemptId: 'attempt-41',
+    runResultId: null,
   });
-  const result = runSupervisedCanary({ issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: PREFLIGHT }, {}, dependencies);
+  const result = runSupervisedCanary(
+    { issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: PREFLIGHT },
+    {},
+    dependencies,
+  );
   assert.equal(result.exitCode, 4);
   assert.equal(result.payload.launched, true);
   assert.equal(result.payload.reason, 'worker-started-without-terminal-result');
@@ -141,7 +212,11 @@ test('nonzero launcher exit exposes bounded sanitized diagnostics', () => {
       stderr: 'Bearer abc.def.ghi\nstartup failed',
     },
   );
-  const result = runSupervisedCanary({ issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: PREFLIGHT }, {}, dependencies);
+  const result = runSupervisedCanary(
+    { issueNumber: 5, execute: true, timerUnit: 'timer.service', sourcePreflightComment: PREFLIGHT },
+    {},
+    dependencies,
+  );
   assert.equal(result.exitCode, 1);
   assert.equal(result.payload.runnerDiagnostics.restricted, true);
   assert.equal(result.payload.runnerDiagnostics.maxCharsPerStream, 4096);
