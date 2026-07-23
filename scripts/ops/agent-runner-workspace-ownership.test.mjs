@@ -52,13 +52,15 @@ test('inspectWorkspaceOwnership reports workspace-ownership-unknown for a confli
   assert.equal(result.evidence.gitFailureReason, 'implementation-worktree-branch-already-exists');
 });
 
-test('inspectWorkspaceOwnership attributes a conflict to the issue-scoped attempt row even though real recovery_attempts rows carry no branch/worktree column (production shape)', async () => {
-  // `recovery_attempts` only ever persists `worktree_available`/
-  // `branch_available` booleans, never the actual branch/worktree name --
-  // this fixture deliberately omits `expected_branch`/`worktree_name` to
-  // match what a real row looks like. Attribution must not degrade to
-  // workspace-ownership-unknown just because that column doesn't exist.
-  const activeAttempts = [{ attempt_id: 'attempt-old', issue_number: 686, worktree_available: 1, branch_available: 1 }];
+test('inspectWorkspaceOwnership attributes a conflict to an attempt row whose persisted worktree_identity_json exactly matches (production shape, post-migration)', async () => {
+  // `recovery_attempts.worktree_identity_json` (#686 spec section 5) is the
+  // durable, write-once column a fresh dispatch persists its exact
+  // branch/worktree identity into. Attribution requires an exact match
+  // against it -- never mere issue-scoping.
+  const activeAttempts = [{
+    attempt_id: 'attempt-old', issue_number: 686, worktree_available: 1, branch_available: 1,
+    worktree_identity_json: JSON.stringify(WORKTREE_IDENTITY),
+  }];
   const result = await inspectWorkspaceOwnership({
     worktreeIdentity: WORKTREE_IDENTITY,
     attemptId: 'attempt-new',
@@ -70,6 +72,44 @@ test('inspectWorkspaceOwnership attributes a conflict to the issue-scoped attemp
   assert.equal(result.allowed, false);
   assert.equal(result.reason, 'workspace-owned-by-unresolved-attempt');
   assert.equal(result.evidence.matchingAttempt.attemptId, 'attempt-old');
+});
+
+test('inspectWorkspaceOwnership rejects issue-number-only attribution: a same-issue row with a different persisted branch is not the owner', async () => {
+  const activeAttempts = [{
+    attempt_id: 'attempt-old', issue_number: 686, worktree_available: 1, branch_available: 1,
+    worktree_identity_json: JSON.stringify({ name: 'agent-runner-686-other', expectedBranch: 'worktree-agent-runner-686-other' }),
+  }];
+  const result = await inspectWorkspaceOwnership({
+    worktreeIdentity: WORKTREE_IDENTITY,
+    attemptId: 'attempt-new',
+    issueNumber: 686,
+    activeAttempts,
+    processProbe: async () => false,
+    prepareWorkspace: fakePrepareWorkspace({ allowed: false, failureReason: 'implementation-worktree-branch-already-exists' }),
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.reason, 'workspace-ownership-unknown');
+  assert.equal(result.evidence.matchingAttempt, null);
+});
+
+test('inspectWorkspaceOwnership fails closed to workspace-ownership-unknown for a legacy attempt row with no persisted workspace identity', async () => {
+  // A row written before the worktree_identity_json column existed (or by a
+  // caller that never populated it) must never be inferred as the owner
+  // merely because it is scoped to the same issue -- issue N can have many
+  // historical attempts (#686 spec section 5).
+  const activeAttempts = [{ attempt_id: 'attempt-old', issue_number: 686, worktree_available: 1, branch_available: 1 }];
+  const result = await inspectWorkspaceOwnership({
+    worktreeIdentity: WORKTREE_IDENTITY,
+    attemptId: 'attempt-new',
+    issueNumber: 686,
+    activeAttempts,
+    processProbe: async () => false,
+    prepareWorkspace: fakePrepareWorkspace({ allowed: false, failureReason: 'implementation-worktree-branch-already-exists' }),
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.reason, 'workspace-ownership-unknown');
+  assert.deepEqual(result.safeActions, ['preserve-untouched', 'manual-operator-inspection']);
+  assert.equal(result.evidence.matchingAttempt, null);
 });
 
 test('inspectWorkspaceOwnership attributes a conflict to a live other attempt', async () => {

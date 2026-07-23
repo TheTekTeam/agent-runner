@@ -2370,6 +2370,116 @@ test('#686 regression: a conflicting workspace is detected before claim consumpt
   }
 });
 
+test('#686 regression: a fresh implementation dispatch that clears the pre-claim ownership check durably persists its exact worktree identity', async () => {
+  // Spec section 5: the whole point of persisting worktreeIdentity on the
+  // attempt row is so a *later* dispatch can attribute a conflict to this
+  // exact attempt instead of falling back to issue-number-only inference.
+  // That only works if the successful (allowed:true) path actually writes
+  // the row -- the conflict-path test above only proves nothing is written
+  // when ownership fails; it says nothing about the success path.
+  const dir = mkdtempSync(join(tmpdir(), 'runner-686-identity-persisted-'));
+  const lockPath = join(dir, 'cron.lock');
+  const stateDbPath = join(dir, 'state.sqlite');
+  const preflightComment = {
+    id: 41,
+    createdAt: '2026-07-23T09:00:00Z',
+    user: { login: 'chatgpt-manager' },
+    body: '## Manager preflight packet\nPhase: implementation\nFix the workspace ownership bug.',
+  };
+  const ghRunner = (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'list') {
+      const labels = args.flatMap((value, index) => (value === '--label' ? [args[index + 1]] : []));
+      if (labels.includes('status:ready') && labels.includes('agent:claude-code-cli')) {
+        return JSON.stringify([{
+          number: 686,
+          title: 'Repair supervised canary workspace ownership',
+          body: 'Fix the workspace ownership bug.',
+          updatedAt: '2026-07-23T09:00:00Z',
+          labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }],
+        }]);
+      }
+      return JSON.stringify([]);
+    }
+    if (args[0] === 'issue' && args[1] === 'view') return JSON.stringify({ comments: [preflightComment] });
+    if (args[0] === 'issue' && ['edit', 'comment'].includes(args[1])) return '';
+    throw new Error(`unexpected GitHub call: ${args.join(' ')}`);
+  };
+  let ownershipCalledWith = null;
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--no-auto-preflight', '--output-dir', dir,
+      '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
+    ], {
+      GH_TOKEN: 'test-token',
+      CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true',
+      CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'chatgpt-manager',
+    }, {
+      ghRunner,
+      now: () => '2026-07-23T09:05:00.000Z',
+      inspectWorkspaceOwnership: async ({ worktreeIdentity }) => {
+        ownershipCalledWith = worktreeIdentity;
+        return { allowed: true, action: 'create', ownership: 'new', worktreePath: '/repo/.claude/worktrees/agent-runner-686-x', branchName: worktreeIdentity.expectedBranch };
+      },
+      runChild: async () => ({
+        status: 0, signal: null, stdout: JSON.stringify({ logPath: 'child.json', executionPhase: 'implementation', costAdmission: { allowed: true }, sourcePreflightCommentId: 41 }), stderr: '', error: null,
+      }),
+    });
+    assert.equal(exitCode, 0);
+    assert.ok(ownershipCalledWith, 'the real dispatch identity was passed into the ownership check');
+
+    const state = openRunnerStateStore(stateDbPath);
+    const attempt = state.allRows('recovery_attempts')[0];
+    assert.ok(attempt, 'a recovery_attempts row was committed for the cleared dispatch');
+    assert.ok(attempt.worktree_identity_json, 'the attempt row durably persisted its worktree identity');
+    assert.deepEqual(JSON.parse(attempt.worktree_identity_json), ownershipCalledWith);
+    state.close();
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#686 concurrency: a second scheduler invocation cannot dispatch while another already holds the singleton lock', async () => {
+  // Section 4: the pre-claim workspace-ownership inspection this PR adds
+  // creates a time gap between "inspected as available" and the child
+  // actually creating the worktree. Two concurrent `main()` invocations
+  // could only both walk through that gap if they could both run at all at
+  // the same time. They cannot: acquireLock() opens the lock file with the
+  // exclusive 'wx' flag and is called before anything else in main() --
+  // before selection, before the ownership check, before the state store is
+  // even opened -- and is only released in main()'s top-level `finally`,
+  // after the child has already completed. A second invocation that finds
+  // the lock file already present (simulating a second concurrent scheduler
+  // process) must fail closed immediately, touching neither GitHub nor the
+  // state store, rather than proceeding to race the first.
+  const dir = mkdtempSync(join(tmpdir(), 'runner-686-concurrent-lock-'));
+  const lockPath = join(dir, 'cron.lock');
+  const stateDbPath = join(dir, 'state.sqlite');
+  writeFileSync(lockPath, `${process.pid}\n${new Date().toISOString()}\n`);
+  let ghCalled = false;
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    await assert.rejects(
+      main([
+        '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
+        '--state-db', stateDbPath, '--lock-path', lockPath,
+      ], { GH_TOKEN: 'test-token' }, {
+        ghRunner: () => { ghCalled = true; throw new Error('must not be called: lock was already held'); },
+      }),
+      /EEXIST/,
+    );
+    assert.equal(ghCalled, false, 'a locked-out invocation must never reach GitHub selection/dispatch');
+    assert.equal(existsSync(stateDbPath), false, 'a locked-out invocation must never even open the state store');
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('#686 regression: quarantining one issue for a workspace-ownership conflict does not stop the next pass from selecting a different runnable issue', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'runner-686-queue-continues-'));
   const lockPath = join(dir, 'cron.lock');

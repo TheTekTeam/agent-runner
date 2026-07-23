@@ -75,26 +75,39 @@ function sanitizedEvidence({
   });
 }
 
-function attemptReferencesWorktree(row, worktreeIdentity) {
-  // `recovery_attempts` does not currently persist a branch/worktree
-  // identity column on the plain row — only `worktree_available`/
-  // `branch_available` booleans (the restricted recovery handle store keeps
-  // the actual branch/worktree name, and is not queried here). When a row
-  // *does* carry an explicit identity (forward-compatible schema, or a
-  // caller/test that supplies one), require an exact match. Otherwise fall
-  // back to attributing any row the caller already scoped to this exact
-  // issue: `buildWorktreeIdentity()` derives the branch deterministically
-  // from issue number + source comment, so a worktree conflict on issue N
-  // is attributable to one of issue N's own attempts, not a stranger's.
-  // Without this fallback every real production conflict would silently
-  // degrade to `workspace-ownership-unknown` — the persisted row simply has
-  // no column to match against.
+function parsePersistedWorktreeIdentity(row) {
   if (row.expected_branch || row.worktree_name) {
-    const branch = String(worktreeIdentity?.expectedBranch || '');
-    return (Boolean(row.expected_branch) && String(row.expected_branch) === branch)
-      || (Boolean(row.worktree_name) && row.worktree_name === worktreeIdentity?.name);
+    // Flat fields supplied directly on the row object (test fixtures /
+    // forward-compatible callers) rather than the durable JSON column.
+    return { expectedBranch: row.expected_branch || null, name: row.worktree_name || null };
   }
-  return true;
+  try {
+    const parsed = row.worktree_identity_json ? JSON.parse(row.worktree_identity_json) : null;
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `recovery_attempts.worktree_identity_json` (#686 spec section 5) persists
+ * the exact deterministic branch/worktree identity a fresh attempt was
+ * dispatched against. A row attributes a present conflict to itself only
+ * when that identity exactly matches — never merely because the caller
+ * already scoped the row to this issue. A single issue can have many
+ * historical attempts; matching on issue number alone would misattribute a
+ * conflict to the wrong attempt (or the wrong branch of the same issue) and
+ * is exactly the inference spec section 5 forbids. A row with no persisted
+ * identity at all (a legacy row written before this column existed) is
+ * therefore never treated as a match — it falls through to
+ * `workspace-ownership-unknown`, which fails closed rather than guessing.
+ */
+function attemptReferencesWorktree(row, worktreeIdentity) {
+  const stored = parsePersistedWorktreeIdentity(row);
+  if (!stored || (!stored.expectedBranch && !stored.name)) return false;
+  const branch = String(worktreeIdentity?.expectedBranch || '');
+  return (Boolean(stored.expectedBranch) && String(stored.expectedBranch) === branch)
+    || (Boolean(stored.name) && stored.name === worktreeIdentity?.name);
 }
 
 function attemptIsUnresolved(row) {
@@ -122,7 +135,7 @@ function pickMatchingAttempt(activeAttempts, worktreeIdentity) {
  * @param {string} [input.implementationCheckout]
  * @param {string} input.attemptId - this fresh attempt's own (not yet persisted) id
  * @param {number} input.issueNumber
- * @param {Array<object>} [input.activeAttempts] - every `recovery_attempts` row already scoped to this exact repo/issue (both active and terminal) — the caller must scope by issue, since attribution treats any row here as evidence for a conflict on this issue's worktree
+ * @param {Array<object>} [input.activeAttempts] - every `recovery_attempts` row already scoped to this exact repo/issue (both active and terminal); attribution still requires each row's own persisted `worktree_identity_json` to exactly match — issue-scoping alone is never sufficient evidence of ownership
  * @param {Array<object>} [input.pullRequests] - already-fetched open PRs for the repo
  * @param {(identity:object) => Promise<boolean|null>} [input.processProbe]
  * @param {object} [input.env]

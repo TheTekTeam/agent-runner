@@ -50,6 +50,7 @@ import {
   recoveryAttemptCapForOutcome,
 } from './claude-runner-recovery.mjs';
 import { inspectWorkspaceOwnership } from './agent-runner-workspace-ownership.mjs';
+import { withWorkspaceIdentitySupport } from './agent-runner-workspace-identity-store.mjs';
 import { EXECUTION_PHASE_IMPLEMENTATION, resolveImplementationDispatchIdentity } from './claude-runner.mjs';
 import {
   decorateIssueWithMetadata,
@@ -684,7 +685,7 @@ export function createStateRecorder(args, openStore = openRunnerStateStore) {
   const taskErrors = [];
   let store = null;
   try {
-    store = openStore(args.stateDbPath || defaultRunnerStateDbPath(args.outputDir));
+    store = withWorkspaceIdentitySupport(openStore(args.stateDbPath || defaultRunnerStateDbPath(args.outputDir)));
   } catch (error) {
     errors.push({ stage: 'open', message: String(error?.message || error) });
   }
@@ -2633,15 +2634,25 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     // recovery re-invocation (`recoveryClaim` truthy) already owns its
     // preserved workspace via `prepareContinuationWorkspace()`/
     // `verifyPreservedWorktree()` and is intentionally not re-gated here.
-    if (!recoveryClaim && args.execute && args.claimOnExecute) {
-      const dispatchIdentity = resolveImplementationDispatchIdentity({
+    //
+    // Computed once here (rather than inside the claimOnExecute-gated block
+    // below) so the same identity also seeds the `recovery_attempts` row's
+    // durable `worktreeIdentity` (spec section 5) regardless of the
+    // claimOnExecute flag — a future dispatch attributing a conflict to this
+    // row must be able to find its exact branch/worktree identity, not just
+    // whether this scheduler pass happened to gate on it.
+    const dispatchIdentity = !recoveryClaim
+      ? resolveImplementationDispatchIdentity({
         issue: selected.issue, command: selected.command, currentPreflight: selected.currentPreflight,
         config: { githubRepo: args.project?.repo, localRepoPath: args.project?.localRepoPath },
         env: authEnv, argsRepo: args.repo,
-      });
-      if (dispatchIdentity.ok
-        && dispatchIdentity.executionAuthorization.phase === EXECUTION_PHASE_IMPLEMENTATION
-        && dispatchIdentity.executionAuthorization.allowed === true) {
+      })
+      : null;
+    const freshImplementationDispatch = Boolean(dispatchIdentity?.ok)
+      && dispatchIdentity.executionAuthorization.phase === EXECUTION_PHASE_IMPLEMENTATION
+      && dispatchIdentity.executionAuthorization.allowed === true;
+    if (!recoveryClaim && args.execute && args.claimOnExecute) {
+      if (freshImplementationDispatch) {
         if (!state.healthy) return emitSystemicStatePause(args, state, 'pre-claim-workspace-read', { now, logger: dependencies.logger }).exitCode;
         // Every recovery_attempts row for this exact issue -- not only the
         // currently-active ones. A conflicting workspace is just as often
@@ -2727,6 +2738,16 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         phase: 'starting', agent: plan.agent?.agentId, model: plan.agent?.model, harness: plan.agent?.agentType,
         startedAt, ...processIdentity, resolutionState: 'active',
       })) return emitSystemicStatePause(args, state, 'attempt-start', { now, logger: dependencies.logger }).exitCode;
+      // Durably bind this attempt to the exact deterministic worktree/branch
+      // identity it was dispatched against (#686 spec section 5), via the
+      // `agent-runner-workspace-identity-store.mjs` wrapper rather than
+      // `recordRecoveryAttempt` itself (byte-locked to the ModelSpend
+      // import). A future dispatch attributing a workspace conflict to a
+      // prior attempt must match this exact identity, never merely the
+      // issue number.
+      if (freshImplementationDispatch && !state.record('recordWorktreeIdentity', { attemptId, worktreeIdentity: dispatchIdentity.worktreeIdentity })) {
+        return emitSystemicStatePause(args, state, 'attempt-worktree-identity', { now, logger: dependencies.logger }).exitCode;
+      }
     }
     let claim = null;
     if (args.execute && args.claimOnExecute && !recoveryClaim) {
