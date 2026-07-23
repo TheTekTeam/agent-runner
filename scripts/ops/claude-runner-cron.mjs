@@ -35,7 +35,10 @@ import {
   sameCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 import { findLinkedOpenPullRequests } from './claude-runner-review-followup.mjs';
-import { managerAuthorityKeyIsCurrent } from './agent-runner-manager-authority.mjs';
+import {
+  managerAuthorityKeyIsCurrent,
+  resolveCurrentManagerAuthority,
+} from './agent-runner-manager-authority.mjs';
 import { defaultRunnerStateDbPath, openRunnerStateStore } from './claude-runner-state.mjs';
 import {
   RECOVERY_POLICY_REVISION,
@@ -590,14 +593,18 @@ export async function collectRecoveryRevalidation({
   const immutableManagerAuthorityCurrent = attempt.manager_authority_key
     ? managerAuthorityKeyIsCurrent(comments, attempt.manager_authority_key, attempt.manager_preflight_body_digest)
     : null;
+  const currentManagerAuthority = resolveCurrentManagerAuthority(comments).authority;
+  const legacyPreflightCurrent = Boolean(preflightIdentity) && (
+    sameCommentIdentity(currentManagerAuthority?.commentIdentity, preflightIdentity)
+    || sameCommentIdentity(latestManagerPreflightComment(comments), preflightIdentity)
+  );
   const evidence = {
     issueOpen: String(issue.state || '').toUpperCase() === 'OPEN',
     expectedStatusCurrent: statusLabels.length === 1 && statusLabels[0] === STATUS_BLOCKED,
     agentOwnershipCurrent: agentLabels.length === 1 && sameAgent(issueAgent?.agentId, attempt.agent),
     claimRevisionCurrent: immutableManagerAuthorityCurrent ?? (Boolean(claimIdentity)
       && comments.some((comment) => sameCommentIdentity(comment, claimIdentity))),
-    preflightRevisionCurrent: immutableManagerAuthorityCurrent ?? (Boolean(preflightIdentity)
-      && sameCommentIdentity(latestManagerPreflightComment(comments), preflightIdentity)),
+    preflightRevisionCurrent: immutableManagerAuthorityCurrent ?? legacyPreflightCurrent,
     authorizationFresh,
     authorizationCurrent: authMatches && (expectedAuthorizationIdentity === null
       || sameCommentIdentity(authorization.identity, expectedAuthorizationIdentity)),
