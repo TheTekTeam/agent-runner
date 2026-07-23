@@ -8,7 +8,7 @@ export function parseNoChangeCompletionPolicy(markdown = '') {
   if (matches.length !== 1) return { explicit: true, allowed: false, reason: 'no-change-completion-field-ambiguous', value: null };
 
   const value = matches[0];
-  const allowed = ['allowed', 'approved', 'yes', 'true'].includes(value);
+  const allowed = value === 'allowed';
   return {
     explicit: true,
     allowed,
@@ -37,12 +37,17 @@ function ownedCleanWorktree(payload = {}, evidence = {}) {
     && Number(worktree.dirtyEntryCount || 0) === 0;
 }
 
+function payloadPreflightRevision(payload = {}) {
+  return String(payload.sourcePreflightCommentId || payload.sourcePreflightRevision || '').trim() || null;
+}
+
 export function evaluateManagerAuthorizedNoChange({ payload = {}, policy = {}, authority = {} } = {}) {
   const evidence = payload.implementationEvidence || null;
   const failedChecks = [];
 
   if (authority.allowed !== true || !authority.preflightRevision) failedChecks.push('pinnedAuthority');
-  if (policy.explicit !== true || policy.allowed !== true) failedChecks.push('managerAuthorization');
+  if (policy.explicit !== true || policy.allowed !== true || policy.value !== 'allowed') failedChecks.push('managerAuthorization');
+  if (payloadPreflightRevision(payload) !== authority.preflightRevision) failedChecks.push('payloadPreflightCorrelation');
   if (payload.executionPhase !== 'implementation') failedChecks.push('implementationPhase');
   if (Number(payload.exitCode) !== 0 || payload.signal) failedChecks.push('successfulProcessExit');
   if (payload.blocked === true || payload.spawnError) failedChecks.push('noProcessBlocker');
