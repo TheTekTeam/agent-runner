@@ -668,3 +668,85 @@ test('false dry-run attention repair is idempotent (#725)', () => withStore((sto
   assert.equal(store.countRows('attention_events'), 0);
   assert.equal(store.countRows('run_results'), 1);
 }));
+
+// -- Issue #50: routing_events durable, deduplicated evidence --
+
+test('recordRoutingEvent inserts a new row and reports inserted true on the first write for a dedupe key', () => withStore((store) => {
+  const result = store.recordRoutingEvent({
+    repo: 'TheTekTeam/agent-runner',
+    issueNumber: 50,
+    eventType: 'no-qualified-agent',
+    reason: 'no-qualified-agent',
+    settingsRevision: 'sha256:aaa',
+    dedupeKey: 'agent-runner/50:no-qualified-agent:sha256:aaa',
+    payload: { note: 'bounded evidence only' },
+  });
+  assert.equal(result.inserted, true);
+  assert.equal(store.countRows('routing_events'), 1);
+}));
+
+test('recordRoutingEvent is idempotent on a repeated dedupe key -- repeated reconciliation never duplicates events', () => withStore((store) => {
+  const args = {
+    repo: 'TheTekTeam/agent-runner',
+    issueNumber: 50,
+    eventType: 'no-qualified-agent',
+    reason: 'no-qualified-agent',
+    dedupeKey: 'agent-runner/50:no-qualified-agent:sha256:aaa',
+  };
+  const first = store.recordRoutingEvent(args);
+  const second = store.recordRoutingEvent(args);
+  const third = store.recordRoutingEvent(args);
+  assert.equal(first.inserted, true);
+  assert.equal(second.inserted, false);
+  assert.equal(third.inserted, false);
+  assert.equal(store.countRows('routing_events'), 1, 'exactly one durable row survives repeated reconciliation');
+}));
+
+test('recordRoutingEvent records a reassignment event with from/to agent ids', () => withStore((store) => {
+  const result = store.recordRoutingEvent({
+    repo: 'TheTekTeam/agent-runner',
+    issueNumber: 51,
+    eventType: 'reassignment-applied',
+    fromAgentId: 'claude-code-cli',
+    toAgentId: 'ollama-agent',
+    reason: 'agent-disabled',
+    settingsRevision: 'sha256:bbb',
+    dedupeKey: 'agent-runner/51:reassignment-applied:sha256:bbb',
+  });
+  assert.equal(result.inserted, true);
+  const row = store.allRows('routing_events')[0];
+  assert.equal(row.from_agent_id, 'claude-code-cli');
+  assert.equal(row.to_agent_id, 'ollama-agent');
+  assert.equal(row.event_type, 'reassignment-applied');
+}));
+
+test('recordRoutingEvent requires a dedupeKey', () => withStore((store) => {
+  assert.throws(() => store.recordRoutingEvent({ repo: 'TheTekTeam/agent-runner', eventType: 'no-qualified-agent' }), /dedupeKey/);
+}));
+
+test('hasRoutingEvent reflects whether a dedupe key has already been recorded', () => withStore((store) => {
+  const dedupeKey = 'agent-runner/52:no-qualified-agent:sha256:ccc';
+  assert.equal(store.hasRoutingEvent({ dedupeKey }), false);
+  store.recordRoutingEvent({ repo: 'TheTekTeam/agent-runner', issueNumber: 52, eventType: 'no-qualified-agent', dedupeKey });
+  assert.equal(store.hasRoutingEvent({ dedupeKey }), true);
+}));
+
+test('a routing_events row (full serialized shape, including payload_json) never contains raw settings, secretref, credential, executable path, endpoint, or prompt text', () => withStore((store) => {
+  store.recordRoutingEvent({
+    repo: 'TheTekTeam/agent-runner',
+    issueNumber: 53,
+    eventType: 'reassignment-applied',
+    fromAgentId: 'claude-code-cli',
+    toAgentId: 'ollama-agent',
+    reason: 'agent-disabled',
+    settingsRevision: 'sha256:ddd',
+    dedupeKey: 'agent-runner/53:reassignment-applied:sha256:ddd',
+    // A bounded payload only -- the exact shape claude-runner-cron.mjs
+    // actually passes (verification/eligibility reasons), never a raw
+    // settings entry.
+    payload: { verification: { ok: true, liveLabels: ['status:ready', 'agent:ollama'] } },
+  });
+  const row = store.allRows('routing_events')[0];
+  const serialized = JSON.stringify(row);
+  assert.doesNotMatch(serialized, /executablePath|sessionSecretRef|vault:\/\/|http:\/\/|https:\/\/|Bearer\s/);
+}));

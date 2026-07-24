@@ -10,7 +10,7 @@ import {
   serializeCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 
-export const RUNNER_STATE_SCHEMA_VERSION = 10;
+export const RUNNER_STATE_SCHEMA_VERSION = 11;
 export const DEFAULT_RUNNER_STATE_DB_NAME = 'runner-state.sqlite';
 
 const TABLES = new Set([
@@ -25,6 +25,7 @@ const TABLES = new Set([
   'recovery_revalidations',
   'attention_events',
   'runner_health_conditions',
+  'routing_events',
 ]);
 
 export const RUNNER_STATE_TABLES = Object.freeze([...TABLES]);
@@ -295,6 +296,29 @@ export class RunnerStateStore {
         UNIQUE(repo, condition_type)
       );
 
+      -- Schema v11 (#50): durable, deduplicated evidence for the serial
+      -- multi-agent selector -- queued reassignment planning/application and
+      -- the no-qualified-agent outcome. dedupe_key is UNIQUE so repeated
+      -- reconciliation passes over the same unresolved condition insert
+      -- exactly one row (and the caller can gate a duplicate GitHub comment
+      -- on whether this insert actually happened). payload_json is bounded
+      -- server-side by the caller -- this table never receives raw settings,
+      -- credentials, paths, endpoints, prompts, or provider responses.
+      CREATE TABLE IF NOT EXISTS routing_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        issue_number INTEGER,
+        event_type TEXT NOT NULL,
+        from_agent_id TEXT,
+        to_agent_id TEXT,
+        reason TEXT,
+        settings_revision TEXT,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        payload_json TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS routing_events_issue_idx ON routing_events(repo, issue_number, event_type, created_at);
       CREATE INDEX IF NOT EXISTS queue_events_issue_idx ON queue_events(issue_number, created_at);
       CREATE INDEX IF NOT EXISTS quota_history_created_idx ON quota_history(created_at);
       CREATE INDEX IF NOT EXISTS preflight_packets_issue_idx ON preflight_packets(issue_number, created_at);
@@ -364,6 +388,27 @@ export class RunnerStateStore {
     if (!attemptColumns.has('retry_cap')) this.db.exec('ALTER TABLE recovery_attempts ADD COLUMN retry_cap INTEGER');
     if (!attemptColumns.has('retry_reason')) this.db.exec('ALTER TABLE recovery_attempts ADD COLUMN retry_reason TEXT');
     this.db.prepare('INSERT OR IGNORE INTO runner_state_schema (version, applied_at) VALUES (?, ?)').run(RUNNER_STATE_SCHEMA_VERSION, this.now());
+  }
+
+  /**
+   * Idempotent (issue #50): a `dedupe_key` collision is silently ignored,
+   * and the return value's `inserted` flag tells the caller whether this
+   * was a genuinely new event -- the intended gate for "post a GitHub
+   * comment only the first time", so repeated reconciliation passes over an
+   * unresolved condition never produce duplicate comments or duplicate
+   * durable events.
+   */
+  recordRoutingEvent({ repo, issueNumber = null, eventType, fromAgentId = null, toAgentId = null, reason = null, settingsRevision = null, dedupeKey, payload = null, createdAt = this.now() }) {
+    if (!dedupeKey) throw new Error('recordRoutingEvent requires a dedupeKey');
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO routing_events (created_at, repo, issue_number, event_type, from_agent_id, to_agent_id, reason, settings_revision, dedupe_key, payload_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(createdAt, repo, asInteger(issueNumber), eventType, fromAgentId, toAgentId, reason, settingsRevision, dedupeKey, json(payload));
+    return { inserted: result.changes > 0 };
+  }
+
+  hasRoutingEvent({ dedupeKey }) {
+    return Boolean(this.db.prepare('SELECT 1 FROM routing_events WHERE dedupe_key = ?').get(dedupeKey));
   }
 
   recordQueueEvent({ repo, eventType, issueNumber = null, statusLabel = null, reason = null, payload = null, createdAt = this.now() }) {

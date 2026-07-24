@@ -8,11 +8,26 @@ import { fileURLToPath } from 'node:url';
 
 import { loadAgentRunnerConfig, stripConfigArgs } from './agent-runner-config.mjs';
 import {
+  AGENT_ADAPTERS,
   agentRunMetadata,
   allAgentLabels,
   resolveAgentForLabels,
   unsupportedAgentSkip,
 } from './agent-runner-agents.mjs';
+import {
+  CLAUDE_AGENT_ID,
+  settingsRevisionUnchanged,
+  snapshotAgentSettings,
+} from './agent-runner-agent-settings.mjs';
+import { classifyIssueTaskRisk } from './agent-runner-qualification.mjs';
+import { evaluateAgentEligibility, selectAgentForIssue } from './agent-runner-routing.mjs';
+import {
+  applyPlannedReassignment,
+  buildNoQualifiedAgentEvidenceCommentBody,
+  noQualifiedAgentDedupeKey,
+  planReassignment,
+  reassignmentDedupeKey,
+} from './agent-runner-reassignment.mjs';
 
 import {
   RUNNER_STARTED_HEADING,
@@ -35,7 +50,7 @@ import {
   sameCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 import { findLinkedOpenPullRequests } from './claude-runner-review-followup.mjs';
-import { managerAuthorityKeyIsCurrent } from './agent-runner-manager-authority.mjs';
+import { managerAuthorityApprovesAgent, managerAuthorityKeyIsCurrent } from './agent-runner-manager-authority.mjs';
 import { defaultRunnerStateDbPath, openRunnerStateStore } from './claude-runner-state.mjs';
 import {
   RECOVERY_POLICY_REVISION,
@@ -1874,7 +1889,41 @@ export function runQuotaPreflight(args, env = process.env, runner = spawnSync) {
   };
 }
 
-export async function selectIssue(args, ghRunner = gh, { state = null, processProbe = probeProcessIdentity } = {}) {
+/**
+ * Cheap, catalogue-level pre-check (issue #50, "Claude quota is agent-local"):
+ * is there *any* implemented, routable agent other than Claude at all? Real
+ * deployments today have zero implemented alternatives (Codex CLI/Grok
+ * CLI/Ollama all stay `implemented:false`), so this is always false in
+ * production and the quota-blocked global idle below is unchanged. Only
+ * once a real alternative adapter is implemented and enabled does this
+ * unlock the per-issue path where Claude alone is excluded by its own
+ * quota block instead of idling the whole queue.
+ */
+export function hasImplementedRoutableAlternative(settingsSnapshot) {
+  return Object.values(AGENT_ADAPTERS).some((adapter) => (
+    adapter.agentId !== CLAUDE_AGENT_ID
+    && adapter.implemented
+    && settingsSnapshot?.agents?.[adapter.agentId]?.routable
+  ));
+}
+
+/** Deterministic, catalogue-ordered candidate list for the serial selector -- no weighting or randomness. */
+export function buildRoutingCandidates(settingsSnapshot, claudeResourceState = null) {
+  return Object.values(AGENT_ADAPTERS).map((adapter) => ({
+    agentId: adapter.agentId,
+    adapter,
+    settingsEntry: settingsSnapshot?.agents?.[adapter.agentId] || null,
+    resourceState: adapter.agentId === CLAUDE_AGENT_ID ? claudeResourceState : null,
+  }));
+}
+
+export async function selectIssue(args, ghRunner = gh, {
+  state = null,
+  processProbe = probeProcessIdentity,
+  settingsSnapshot = null,
+  claudeResourceState = null,
+  classifyIssue = classifyIssueTaskRisk,
+} = {}) {
   const skipped = [];
   let candidates;
   try {
@@ -1939,6 +1988,56 @@ export async function selectIssue(args, ghRunner = gh, { state = null, processPr
       continue;
     }
 
+    // Issue #50 serial selector: only evaluated when a caller opts in by
+    // supplying `settingsSnapshot` (real dispatch always does; the many
+    // pre-existing unit tests that call selectIssue() directly do not, and
+    // are therefore completely unaffected by this block). Retains an
+    // eligible explicit assignment; otherwise routes to a qualified
+    // alternative or records why none exists, without guessing, weighting,
+    // or randomness -- see agent-runner-routing.mjs for the eligibility
+    // rules themselves.
+    if (settingsSnapshot) {
+      const classification = classifyIssue(issue);
+      const routingResult = selectAgentForIssue({
+        explicitAgentId: agent.agentId,
+        candidates: buildRoutingCandidates(settingsSnapshot, claudeResourceState),
+        classification,
+        globalSlotAvailable: true,
+      });
+      if (routingResult.selectedAgentId !== agent.agentId) {
+        const explicitDecision = routingResult.decisions.find((decision) => decision.agentId === agent.agentId);
+        const isQueuedReady = issue.statusLabel === STATUS_READY;
+        if (routingResult.selectedAgentId && isQueuedReady) {
+          // A qualified alternative exists for this queued, unclaimed issue
+          // -- a reassignment *candidate*, not yet a mutation. main() proves
+          // the full queued-only precondition set (lease/PR/recovery/
+          // workspace/branch/settings-revision/live-label stability) before
+          // any label mutation is attempted.
+          skipped.push({
+            issue: issue.number,
+            statusLabel: issue.statusLabel,
+            reason: 'reassignment-candidate',
+            agentId: agent.agentId,
+            eligibilityReasons: explicitDecision?.reasons || [],
+            reassignmentCandidate: true,
+            routingResult,
+            classification,
+            labels: issue.labels || [],
+          });
+        } else {
+          skipped.push({
+            issue: issue.number,
+            statusLabel: issue.statusLabel,
+            reason: routingResult.selectedAgentId ? 'agent-not-eligible' : 'no-qualified-agent',
+            agentId: agent.agentId,
+            eligibilityReasons: explicitDecision?.reasons || [],
+            ...(isQueuedReady && !routingResult.selectedAgentId ? { noQualifiedAgent: true, classification } : {}),
+          });
+        }
+        continue;
+      }
+    }
+
     // A transient GitHub read failure for one candidate must not crash the
     // whole selection scan — it is task-local to this one issue, and every
     // other ready candidate must still be reachable (#698's governing
@@ -1973,6 +2072,26 @@ export async function selectIssue(args, ghRunner = gh, { state = null, processPr
         statusLabel: issue.statusLabel,
         reason: selection.reason,
         ...(conflicts.length ? { metadataConflicts: conflicts } : {}),
+      });
+      continue;
+    }
+
+    // Issue #50, requirement 9: an existing packet whose approved_agent
+    // does not name the agent this pass actually resolved for the issue
+    // fails closed here, before any claim, status mutation, runner-start
+    // comment, or worker launch. This only ever fires when settingsSnapshot
+    // opted this pass into the new selector; existing callers are
+    // unaffected. In real dispatch every packet's approved_agent already
+    // matches the sole implemented adapter it names, so this is inert
+    // unless a reassignment (or a hand-authored packet) names a different
+    // agent than the one this pass would actually select.
+    if (settingsSnapshot && !managerAuthorityApprovesAgent(selection.managerAuthority, agent.agentId)) {
+      skipped.push({
+        issue: issue.number,
+        statusLabel: issue.statusLabel,
+        reason: 'manager-authority-approved-agent-mismatch',
+        agentId: agent.agentId,
+        approvedAgent: selection.managerAuthority?.approvedAgent || null,
       });
       continue;
     }
@@ -2316,6 +2435,124 @@ export async function reconcilePendingRecoveryTransitions({ state, args, ghRunne
   return { checked: pending.length, converged, skipped };
 }
 
+/**
+ * Queued-only reassignment (issue #50, requirement 7-9). Every precondition
+ * is proven fresh, right now, against real GitHub/SQLite state -- never
+ * against the stale signals gathered during selectIssue()'s scan. Any
+ * blocker (including a settings-revision or live-label change since
+ * planning) fails closed with no mutation and no durable write at all --
+ * silence, not a comment, is the correct behaviour for legitimately
+ * ambiguous/active work, and it also means repeated reconciliation passes
+ * over a currently-blocked candidate never spam duplicate evidence.
+ */
+async function attemptQueuedReassignment({ args, state, ghRunner, candidateSkip, settingsSnapshot, snapshotSettings, env }) {
+  const issueNumber = candidateSkip.issue;
+  let liveIssue;
+  let openPullRequests;
+  try {
+    liveIssue = readRecoveryIssue(args.repo, issueNumber, ghRunner);
+    openPullRequests = listOpenPullRequests(args.repo, ghRunner);
+  } catch (error) {
+    state.recordTaskError('reassignment-precondition-read-failed', error);
+    return { applied: false, reason: 'precondition-read-failed' };
+  }
+
+  const freshSettingsSnapshot = snapshotSettings({ env, agentIds: Object.keys(AGENT_ADAPTERS) });
+  const activeRows = (state.invoke('activeRecoveryAttempts', args.repo) || []).filter((row) => row.issue_number === issueNumber);
+  const hasHandoff = /^## (?:Manager|Agent) handoff\s*$/im.test((liveIssue.comments || []).map((comment) => comment?.body || '').join('\n'));
+  const linkedOpenPrs = findLinkedOpenPullRequests({ issueNumber, pullRequests: openPullRequests });
+  const branchConflicts = localRecoveryConflicts(issueNumber, args.project?.localRepoPath, null);
+
+  const plan = planReassignment({
+    issue: { number: issueNumber, statusLabel: liveIssue.statusLabel },
+    currentLabels: liveIssue.labels,
+    explicitAgentId: candidateSkip.agentId,
+    routingSelection: candidateSkip.routingResult,
+    settingsRevisionAtPlanning: settingsSnapshot.revision,
+    settingsRevisionNow: freshSettingsSnapshot.revision,
+    liveLabelsAtPlanning: candidateSkip.labels || [],
+    liveLabelsNow: liveIssue.labels,
+    repo: args.repo,
+    hasActiveLease: activeRows.length === 0 ? false : true,
+    hasUnfinishedAttempt: activeRows.length === 0 ? false : true,
+    hasInProgressOwnership: liveIssue.statusLabel === STATUS_IN_PROGRESS,
+    hasLinkedOpenPullRequest: linkedOpenPrs.length === 0 ? false : true,
+    // A never-claimed status:ready issue has no review/recovery/workspace
+    // state of its own beyond what the lease check above already proves --
+    // there is no attempt row, no preserved worktree, no checkpoint to
+    // evaluate for it.
+    hasReviewOrRecoveryState: activeRows.length === 0 ? false : true,
+    hasHandoffInProgress: hasHandoff,
+    hasConflictingBranchOrWorktree: (branchConflicts.noConflictingBranch && branchConflicts.noConflictingWorktree) ? false : true,
+    hasUnresolvedWorkspaceOwnership: false,
+  });
+
+  if (!plan.allowed) return { applied: false, reason: 'blocked', blockers: plan.blockers };
+
+  const result = applyPlannedReassignment({
+    plan,
+    mutateLabels: ({ removeLabels, addLabels }) => {
+      const editArgs = ['issue', 'edit', String(issueNumber), '--repo', args.repo];
+      for (const label of removeLabels) editArgs.push('--remove-label', label);
+      for (const label of addLabels) editArgs.push('--add-label', label);
+      ghRunner(editArgs);
+    },
+    readLiveIssue: () => readRecoveryIssue(args.repo, issueNumber, ghRunner),
+  });
+
+  const recorded = state.invoke('recordRoutingEvent', {
+    repo: args.repo,
+    issueNumber,
+    eventType: result.applied ? 'reassignment-applied' : 'reassignment-mutation-failed',
+    fromAgentId: candidateSkip.agentId,
+    toAgentId: plan.replacementAgentId,
+    reason: result.applied ? 'explicit-agent-ineligible' : (result.reason || 'unknown'),
+    settingsRevision: freshSettingsSnapshot.revision,
+    dedupeKey: result.applied ? plan.dedupeKey : `${plan.dedupeKey}:failed:${result.reason}`,
+    payload: { verification: result.verification || null },
+  });
+
+  if (result.applied && recorded?.inserted) {
+    try {
+      ghRunner(['issue', 'comment', String(issueNumber), '--repo', args.repo, '--body', plan.evidenceCommentBody]);
+    } catch (error) {
+      state.recordTaskError('reassignment-evidence-comment-failed', error);
+    }
+  }
+
+  return { applied: result.applied, reason: result.reason || null, replacementAgentId: plan.replacementAgentId };
+}
+
+/**
+ * No-qualified-agent evidence (issue #50, requirement 10): visible,
+ * deduplicated, sanitized, and worker-free. Launches nothing, consumes no
+ * manager packet, creates no claim, and never touches active work --
+ * dedupe on `(repo, issue, settings revision)` means repeated
+ * reconciliation passes over the same unresolved condition record exactly
+ * one durable event and post exactly one comment.
+ */
+function recordNoQualifiedAgentEvidence({ args, state, ghRunner, candidateSkip, settingsSnapshot }) {
+  const dedupeKey = noQualifiedAgentDedupeKey({ repo: args.repo, issueNumber: candidateSkip.issue, settingsRevision: settingsSnapshot.revision });
+  const recorded = state.invoke('recordRoutingEvent', {
+    repo: args.repo,
+    issueNumber: candidateSkip.issue,
+    eventType: 'no-qualified-agent',
+    reason: 'no-qualified-agent',
+    settingsRevision: settingsSnapshot.revision,
+    dedupeKey,
+    payload: { eligibilityReasons: candidateSkip.eligibilityReasons || [] },
+  });
+  if (recorded?.inserted) {
+    const body = buildNoQualifiedAgentEvidenceCommentBody({ issueNumber: candidateSkip.issue, settingsRevision: settingsSnapshot.revision });
+    try {
+      ghRunner(['issue', 'comment', String(candidateSkip.issue), '--repo', args.repo, '--body', body]);
+    } catch (error) {
+      state.recordTaskError('no-qualified-agent-comment-failed', error);
+    }
+  }
+  return recorded;
+}
+
 export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
   const now = dependencies.now || (() => new Date().toISOString());
   const ghRunner = dependencies.ghRunner || gh;
@@ -2353,7 +2590,23 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     if (!state.record('recordQuotaHistory', { repo: args.repo, quotaPreflight })) {
       return emitSystemicStatePause(args, state, 'quota-history', { now, logger: dependencies.logger }).exitCode;
     }
-    if (quotaPreflight.blocked) {
+
+    // Issue #50: one atomic machine-local settings snapshot for this whole
+    // pass. Retained through selection and re-read (with an exact-revision
+    // match required) immediately before any reassignment mutation or
+    // execution claim below.
+    const snapshotSettings = dependencies.snapshotAgentSettings || snapshotAgentSettings;
+    const settingsSnapshot = snapshotSettings({ env, agentIds: Object.keys(AGENT_ADAPTERS) });
+
+    if (quotaPreflight.blocked && !hasImplementedRoutableAlternative(settingsSnapshot)) {
+      // Claude is the only implemented agent in every real deployment
+      // today, so a Claude quota block is structurally a full-queue block
+      // and this idle is unchanged from before issue #50. Once a real
+      // alternative adapter is implemented, enabled, and qualified, this
+      // condition is false and the pass instead falls through to per-issue
+      // selection below, where Claude alone is excluded by its own quota
+      // block (requirement 6) while an independently eligible alternative
+      // is still assessed.
       const payload = {
         dryRun: !args.execute,
         quotaBlocked: true,
@@ -2371,6 +2624,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       console.log(JSON.stringify({ ...payload, quotaPreflight: { ...quotaPreflight, stdout: '<see log>', stderr: '<see log>' }, logPath }, null, 2));
       return 0;
     }
+    const claudeResourceState = quotaPreflight.blocked ? { blocked: true, reason: 'claude-quota-blocked' } : null;
 
     if (args.execute) {
       // Crash-safe convergence for a prior pass's incomplete GitHub status
@@ -2483,7 +2737,12 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       issue: recoveryPreLaunch.issue,
       selection: { mode: 'recovery', command: null, preflight: null }, command: null, currentPreflight: null,
       skipped: [], blocked: null, managerAuthority: null,
-    } : await selectIssue(args, ghRunner, { state, processProbe: dependencies.processProbe || probeProcessIdentity });
+    } : await selectIssue(args, ghRunner, {
+      state,
+      processProbe: dependencies.processProbe || probeProcessIdentity,
+      settingsSnapshot,
+      claudeResourceState,
+    });
     const selectedSourceCommentIdentity = selected.command?.sourceCommentIdentity || null;
     const selectedPreflightCommentIdentity = selected.currentPreflight
       ? normalizeCommentIdentity(selected.currentPreflight, { context: 'scheduler-manager-preflight', required: true })
@@ -2520,6 +2779,24 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       return emitSystemicStatePause(args, state, 'selection-persistence', { now, logger: dependencies.logger }).exitCode;
     }
     if (!selected.issue) {
+      // Issue #50, requirements 7 and 10: at most one queued-only
+      // reassignment or no-qualified-agent evidence write per pass, mirroring
+      // the single global execution slot -- this is bookkeeping around an
+      // empty pass, never itself a claim or a worker launch. Both branches
+      // are execute-only: a dry-run pass proves and reports selection state
+      // without mutating GitHub, exactly like every other mutation below.
+      if (args.execute && state.healthy) {
+        const reassignmentCandidate = selected.skipped.find((entry) => entry.reassignmentCandidate);
+        const noQualifiedCandidate = !reassignmentCandidate && selected.skipped.find((entry) => entry.noQualifiedAgent);
+        if (reassignmentCandidate) {
+          await attemptQueuedReassignment({
+            args, state, ghRunner, candidateSkip: reassignmentCandidate, settingsSnapshot,
+            snapshotSettings: dependencies.snapshotAgentSettings || snapshotAgentSettings, env,
+          });
+        } else if (noQualifiedCandidate) {
+          recordNoQualifiedAgentEvidence({ args, state, ghRunner, candidateSkip: noQualifiedCandidate, settingsSnapshot });
+        }
+      }
       const logPath = writeLog(args.outputDir, plan);
       if (!state.record('recordRunResult', { repo: args.repo, mode: 'no-selection', exitCode: 0, logPath, payload: plan })) {
         return emitSystemicStatePause(args, state, 'no-selection-result', { now, logger: dependencies.logger }).exitCode;
@@ -2751,6 +3028,31 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     let claim = null;
     if (args.execute && args.claimOnExecute && !recoveryClaim) {
       if (!state.ensureWritable('pre-issue-mutation-write-probe')) return emitSystemicStatePause(args, state, 'pre-issue-mutation', { now, logger: dependencies.logger }).exitCode;
+
+      // Issue #50, requirement 1: immediately before this execution claim, a
+      // second whole-file settings snapshot must exactly match the one
+      // selection used, or this fails closed before any GitHub mutation,
+      // claim persistence, runner-start comment, or worker launch.
+      const preClaimSettingsSnapshot = (dependencies.snapshotAgentSettings || snapshotAgentSettings)({ env, agentIds: Object.keys(AGENT_ADAPTERS) });
+      if (!settingsRevisionUnchanged(settingsSnapshot, preClaimSettingsSnapshot)) {
+        const payload = {
+          dryRun: false,
+          settingsRevisionChanged: true,
+          selectedIssue: selected.issue.number,
+          stateDbPath: args.stateDbPath,
+          statePersistenceErrors: state.errors,
+        };
+        const logPath = writeLog(args.outputDir, payload);
+        state.record('recordQueueEvent', {
+          repo: args.repo, eventType: 'settings-revision-changed-before-claim', issueNumber: selected.issue.number, reason: 'settings-revision-changed',
+        });
+        if (!state.record('recordRunResult', { repo: args.repo, issueNumber: selected.issue.number, mode: 'settings-revision-changed', exitCode: 1, logPath, payload })) {
+          return emitSystemicStatePause(args, state, 'settings-revision-changed-result', { now, logger: dependencies.logger }).exitCode;
+        }
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return 1;
+      }
+
       claim = claimIssueForExecution(args, selected.issue, selected.selection, ghRunner);
       if (!state.record('recordClaim', { repo: args.repo, issueNumber: selected.issue.number, claim })) {
         return emitSystemicStatePause(args, state, 'claim-persistence', { now, logger: dependencies.logger }).exitCode;

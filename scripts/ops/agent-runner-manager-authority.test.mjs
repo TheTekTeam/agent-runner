@@ -6,6 +6,7 @@ import {
   MANAGER_PREFLIGHT_INVALID,
   MANAGER_PREFLIGHT_REQUIRED,
   MANAGER_PREFLIGHT_REVOKED,
+  managerAuthorityApprovesAgent,
   managerAuthorityKeyIsCurrent,
   packetBodyDigest,
   parseManagerPreflightPacket,
@@ -110,4 +111,18 @@ test('revocation or a fresh packet invalidates the prior immutable authority key
 
   const fresh = packet({ id: 3, revision: 'AR43.2', fingerprint: FINGERPRINT_B });
   assert.equal(managerAuthorityKeyIsCurrent([old, fresh], oldAuthority.authorityKey), false);
+});
+
+test('managerAuthorityApprovesAgent requires an exact approved_agent match to the candidate agent id', () => {
+  const authority = parseManagerPreflightPacket(packet());
+  assert.equal(managerAuthorityApprovesAgent(authority, 'claude-code-cli'), true);
+  assert.equal(managerAuthorityApprovesAgent(authority, 'codex-cli'), false);
+});
+
+test('managerAuthorityApprovesAgent fails closed on a missing authority or a missing/blank candidate agent id', () => {
+  const authority = parseManagerPreflightPacket(packet());
+  assert.equal(managerAuthorityApprovesAgent(null, 'claude-code-cli'), false);
+  assert.equal(managerAuthorityApprovesAgent(authority, null), false);
+  assert.equal(managerAuthorityApprovesAgent(authority, ''), false);
+  assert.equal(managerAuthorityApprovesAgent({}, 'claude-code-cli'), false);
 });
