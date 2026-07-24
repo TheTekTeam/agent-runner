@@ -346,10 +346,26 @@ transition did not apply) is recorded as a fixed local diagnostic
 
 ## Bounded delivery, never starving the serial execution lock
 
-`reconcileNotifications()` is called once per `--execute` scheduler pass
-from `claude-runner-cron.mjs::main()`, before candidate selection, in the
-same place and style as the existing `reconcilePendingRoutingEvents()`
-call. Every delivery attempt races against a bounded per-call timeout
+`reconcileNotifications()` is called at most once per `--execute` scheduler
+pass from `claude-runner-cron.mjs::main()` — a single bounded notification-
+reconciliation budget, not one call per admission path. The call site sits
+immediately after the current pass's `quota_history` row is durably
+recorded, but before three things that could otherwise hide a required
+notification: the quota-blocked early return, this pass's resolution of any
+prior open `systemic_pause` health condition, and process-identity capture
+(itself an early-return admission gate on failure). This ordering is load-
+bearing (#53 manager review round 5): a genuinely blocked quota pass must
+create/observe its `quota_blocked` notification before it returns, and a
+still-open `systemic_pause` from a prior pass — including one reopened by a
+repeatable early fault such as process-identity capture failing every pass —
+must be visible to reconciliation before this pass resolves or replaces it.
+`main()` checks `state.healthy` immediately after this call; if the
+reconciliation itself surfaced a genuine durable-state failure (as opposed
+to a task-local fault, which never flips `state.healthy`), the pass stops
+via the existing systemic-pause path rather than continuing admission on
+unhealthy state. There is exactly one call site — no later duplicate call
+during routing/recovery reconciliation. Every delivery attempt races against
+a bounded per-call timeout
 (default 5s, clamped `[100ms, 30s]`); the whole pass is additionally bounded
 by a total duration budget (default 10s, clamped `[500ms, 60s]`). A hung,
 rejected or throwing transport therefore can never hold delivery open

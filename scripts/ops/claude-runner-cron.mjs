@@ -2904,6 +2904,34 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
   const state = createStateRecorder(args, dependencies.openStore || openRunnerStateStore);
   try {
     if (!state.ensureWritable('startup-write-probe')) return emitSystemicStatePause(args, state, 'startup', { now, logger: dependencies.logger }).exitCode;
+    const quotaPreflight = runQuotaPreflight(args, authEnv, dependencies.quotaRunner || spawnSync);
+    if (!state.record('recordQuotaHistory', { repo: args.repo, quotaPreflight })) {
+      return emitSystemicStatePause(args, state, 'quota-history', { now, logger: dependencies.logger }).exitCode;
+    }
+    // #53 review round 5: exactly one bounded notification-reconciliation
+    // budget per execute pass, placed here -- after the current
+    // quota_history row is durably recorded, but before the quota-blocked
+    // early return below, before the previous pass's still-open
+    // `systemic_pause` health condition is resolved, and before
+    // process-identity capture (whose failure itself returns early via
+    // emitSystemicStatePause). A still-open prior pause and a freshly
+    // recorded quota-blocked episode must both be visible to reconciliation
+    // before either can be cleared or an early admission failure returns --
+    // otherwise a repeatable early fault (e.g. process-identity) resolves
+    // and reopens `systemic_pause` every pass without the outbox ever
+    // observing it, and every genuinely blocked quota pass returns before a
+    // `quota_blocked` intent can be created. This whole block is
+    // execute-gated, so a dry-run pass never discovers or delivers here,
+    // matching the existing dry-run non-delivery contract. A
+    // notification-local fault stays task-local (recorded via
+    // state.recordTaskError inside reconcileNotifications) and cannot flip
+    // state.healthy; only a genuine durable-state failure does, and that is
+    // checked immediately below before admission continues.
+    if (args.execute) {
+      const reconcileNotificationEvents = dependencies.reconcileNotifications || reconcileNotifications;
+      await reconcileNotificationEvents({ state, args, transport: dependencies.notificationTransport, now });
+      if (!state.healthy) return emitSystemicStatePause(args, state, 'notification-reconcile', { now, logger: dependencies.logger }).exitCode;
+    }
     // #698 round 5, finding 3: a pass that proves the store writable again
     // is exactly the condition that cleared `systemic_pause` — resolve it
     // here rather than leaving an operator to infer resolution from a
@@ -2912,14 +2940,13 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     state.record('resolveHealthCondition', { repo: args.repo, conditionType: 'systemic_pause' });
     let processIdentity;
     try {
-      processIdentity = dependencies.processIdentity || captureProcessIdentity(process.pid, env);
+      // dependencies.captureProcessIdentity lets tests inject a repeatable
+      // capture failure (e.g. simulated /proc unavailability) without
+      // touching the real filesystem-backed default (#53 review round 5).
+      processIdentity = dependencies.processIdentity || (dependencies.captureProcessIdentity || captureProcessIdentity)(process.pid, env);
     } catch (error) {
       state.errors.push({ stage: 'process-identity', message: String(error?.message || error) });
       return emitSystemicStatePause(args, state, 'process-identity', { now, logger: dependencies.logger }).exitCode;
-    }
-    const quotaPreflight = runQuotaPreflight(args, authEnv, dependencies.quotaRunner || spawnSync);
-    if (!state.record('recordQuotaHistory', { repo: args.repo, quotaPreflight })) {
-      return emitSystemicStatePause(args, state, 'quota-history', { now, logger: dependencies.logger }).exitCode;
     }
 
     // Issue #50: one atomic machine-local settings snapshot for this whole
@@ -3009,14 +3036,12 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         const reconcileRoutingEvents = dependencies.reconcilePendingRoutingEvents || reconcilePendingRoutingEvents;
         await reconcileRoutingEvents({ state, args, ghRunner });
       }
-      // #53: agent-agnostic notification outbox reconciliation. Reads only
-      // already-durable normalized state and never touches GitHub, so it is
-      // safe unconditionally (independent of multiAgentSelectorEngaged).
-      // Never throws -- a notification-local fault is recorded via
-      // state.recordTaskError and cannot corrupt queue/claim/run/routing/
-      // recovery state or delay the `finally` block's unlock() below.
-      const reconcileNotificationEvents = dependencies.reconcileNotifications || reconcileNotifications;
-      await reconcileNotificationEvents({ state, args, transport: dependencies.notificationTransport, now });
+      // #53 review round 5: notification outbox reconciliation now runs
+      // exactly once per execute pass, earlier in this function (before the
+      // quota-blocked early return and before `systemic_pause` is resolved
+      // for this pass) -- see the single call site above. Do not add a
+      // second call here; a duplicate reconciliation is unbounded work
+      // relative to the one-budget-per-pass contract those tests assert.
     }
 
     let recoveryClaim = null;
