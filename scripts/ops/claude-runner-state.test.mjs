@@ -987,11 +987,11 @@ test('unresolvedStatefulNotificationEvents covers every pre-terminal status, exc
   store.claimNotificationForDelivery({ dedupeKey: 'u-delivered', owner: 'p', at: '2026-07-24T10:00:01.000Z' });
   store.markNotificationDelivered({ dedupeKey: 'u-delivered', deliveredAt: '2026-07-24T10:00:02.000Z' });
 
-  const keys = store.unresolvedStatefulNotificationEvents(repo).map((row) => row.dedupe_key).sort();
+  const keys = store.unresolvedStatefulNotificationEvents(repo, 0).map((row) => row.dedupe_key).sort();
   assert.deepEqual(keys, ['u-delivered', 'u-pending', 'u-retryable'], 'pending, retryable-failed and delivered stateful rows are all rescanned; the one-shot row is not');
   // The delivered-only view is strictly narrower -- the exact gap round 2 had.
   assert.deepEqual(store.deliveredUnresolvedNotificationEvents(repo).map((row) => row.dedupe_key), ['u-delivered']);
-  assert.equal(store.unresolvedStatefulNotificationEvents(repo, 2).length, 2, 'the batch bound is applied by SQL LIMIT');
+  assert.equal(store.unresolvedStatefulNotificationEvents(repo, 0, 2).length, 2, 'the batch bound is applied by SQL LIMIT');
 }));
 
 test('adversarial direct-store writes: project, source_table and last_error are bounded by the state-store methods themselves (#53 round 3, item 8)', () => withStore((store) => {
@@ -1141,4 +1141,133 @@ test('a notification_events row (full serialized shape, including content_json) 
   const row = store.allRows('notification_events')[0];
   const serialized = JSON.stringify(row);
   assert.doesNotMatch(serialized, /executablePath|sessionSecretRef|vault:\/\/|http:\/\/|https:\/\/|Bearer\s|\/home\/|Authorization:/);
+}));
+
+// ---------------------------------------------------------------------------
+// #53 review round 4: the durable deferred-row frontier, the rotating
+// resolution cursor, and the bounded stale in-flight sweep.
+// ---------------------------------------------------------------------------
+
+function seedNotification(store, { dedupeKey, eventType = 'failed_attention', reasonCode = 'attention-required', repo = 'TheTekTeam/agent-runner', createdAt = '2026-07-24T10:00:00.000Z' }) {
+  store.recordNotificationEvent({
+    repo, eventType, reasonCode, sourceTable: 'attention_events', sourceRef: dedupeKey,
+    occurredAt: createdAt, dedupeKey, createdAt,
+    content: { eventType, reasonCode, repo, issueNumber: null, agent: null, occurredAt: createdAt },
+  });
+  return store.allRows('notification_events').find((row) => row.dedupe_key === dedupeKey);
+}
+
+test('#53 round 4: deferred source rows are durable, idempotent, rotating and individually clearable', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  assert.deepEqual(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 10), []);
+
+  assert.deepEqual(store.deferNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 7, at: '2026-07-24T10:00:00.000Z' }), { deferred: true, alreadyDeferred: false });
+  // Idempotent: re-deferring keeps the original first_deferred_at.
+  assert.deepEqual(store.deferNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 7, at: '2026-07-24T11:00:00.000Z' }), { deferred: false, alreadyDeferred: true });
+  assert.equal(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 10)[0].first_deferred_at, '2026-07-24T10:00:00.000Z');
+
+  store.deferNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 8, at: '2026-07-24T10:00:01.000Z' });
+  store.deferNotificationSourceRow({ repo, sourceTable: 'routing_events', rowKey: 9, at: '2026-07-24T10:00:02.000Z' });
+  assert.deepEqual(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 10).map((row) => row.row_key), [7, 8], 'deferred rows are scoped per source table');
+  assert.equal(store.deferredNotificationSourceRowCount(repo, 'routing_events'), 1);
+
+  // A bounded batch, least-recently-checked first: touching row 7 rotates it behind row 8.
+  assert.deepEqual(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 1).map((row) => row.row_key), [7]);
+  assert.equal(store.touchDeferredNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 7, at: '2026-07-24T12:00:00.000Z' }), true);
+  assert.deepEqual(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 1).map((row) => row.row_key), [8], 'a still-blocked row moves to the back of the rotation');
+
+  assert.equal(store.clearDeferredNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 8 }), true);
+  assert.equal(store.clearDeferredNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 8 }), false, 'clearing an unknown identity is a no-op, never a throw');
+  assert.deepEqual(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 10).map((row) => row.row_key), [7]);
+
+  // A non-integer row key can never be persisted or interpolated.
+  assert.deepEqual(store.deferNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: "1); DROP TABLE notification_events; --" }), { deferred: false });
+  assert.equal(store.deferredNotificationSourceRowCount(repo, 'recovery_attempts'), 1);
+}));
+
+test('#53 round 4: deferred source rows survive a reopen of the same database file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'modelspend-runner-state-'));
+  const dbPath = join(dir, 'state.sqlite');
+  const repo = 'TheTekTeam/agent-runner';
+  try {
+    const first = openRunnerStateStore(dbPath, { now: () => '2026-07-24T10:00:00.000Z' });
+    first.deferNotificationSourceRow({ repo, sourceTable: 'routing_events', rowKey: 42, at: '2026-07-24T10:00:00.000Z' });
+    first.advanceNotificationSourceCursor(repo, 'routing_events', 99, '2026-07-24T10:00:00.000Z');
+    first.setNotificationResolutionCursor(repo, 17, '2026-07-24T10:00:00.000Z');
+    first.close();
+
+    const reopened = openRunnerStateStore(dbPath, { now: () => '2026-07-24T11:00:00.000Z' });
+    try {
+      assert.deepEqual(reopened.deferredNotificationSourceRows(repo, 'routing_events', 10).map((row) => row.row_key), [42]);
+      assert.equal(reopened.getNotificationSourceCursor(repo, 'routing_events'), '99', 'the high-water frontier survives a reopen');
+      assert.equal(reopened.getNotificationResolutionCursor(repo), 17, 'the rotating resolution cursor survives a reopen');
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53 round 4: targeted by-row-key lookups return only the requested rows and reject non-integer keys', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  for (let i = 0; i < 3; i += 1) {
+    store.recordRoutingEvent({
+      repo, issueNumber: 200 + i, eventType: 'reassignment', fromAgentId: 'claude-code-cli', toAgentId: 'codex-cli',
+      reason: 'explicit-agent-ineligible', settingsRevision: 'rev-1', dedupeKey: `route-${i}`, deliveryStatus: 'resolved',
+    });
+  }
+  const all = store.allRows('routing_events');
+  assert.equal(all.length, 3);
+  const wanted = [all[0].id, all[2].id];
+  assert.deepEqual(store.routingEventsByIds(repo, wanted).map((row) => row.id), wanted);
+  assert.deepEqual(store.routingEventsByIds(repo, []), []);
+  assert.deepEqual(store.routingEventsByIds(repo, ["1 OR 1=1", null, undefined]), [], 'non-integer keys are dropped, never interpolated');
+  assert.deepEqual(store.routingEventsByIds('TheTekTeam/other', wanted), [], 'lookups stay repository-scoped');
+}));
+
+test('#53 round 4: the unresolved-stateful sweep is cursored, bounded, wraps, and excludes one-shot rows in SQL', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  const rows = [];
+  for (let i = 0; i < 5; i += 1) rows.push(seedNotification(store, { dedupeKey: `stateful-${i}`, createdAt: `2026-07-24T10:0${i}:00.000Z` }));
+  seedNotification(store, { dedupeKey: 'one-shot-1', eventType: 'completed', reasonCode: 'run-completed', createdAt: '2026-07-24T10:06:00.000Z' });
+
+  const first = store.unresolvedStatefulNotificationEvents(repo, 0, 2);
+  assert.deepEqual(first.map((row) => row.dedupe_key), ['stateful-0', 'stateful-1']);
+  const second = store.unresolvedStatefulNotificationEvents(repo, first[first.length - 1].id, 2);
+  assert.deepEqual(second.map((row) => row.dedupe_key), ['stateful-2', 'stateful-3']);
+  const third = store.unresolvedStatefulNotificationEvents(repo, second[second.length - 1].id, 2);
+  assert.deepEqual(third.map((row) => row.dedupe_key), ['stateful-4'], 'a short batch means the tail was reached');
+  assert.deepEqual(store.unresolvedStatefulNotificationEvents(repo, third[0].id, 2), []);
+  // Wrapping back to 0 revisits the whole set -- the one-shot row never appears.
+  assert.deepEqual(
+    store.unresolvedStatefulNotificationEvents(repo, 0, 50).map((row) => row.event_type),
+    rows.map(() => 'failed_attention'),
+  );
+
+  assert.equal(store.getNotificationResolutionCursor(repo), 0, 'a never-swept repo starts at the beginning');
+  assert.equal(store.setNotificationResolutionCursor(repo, third[0].id, '2026-07-24T10:10:00.000Z'), third[0].id);
+  assert.equal(store.getNotificationResolutionCursor(repo), third[0].id);
+  assert.equal(store.setNotificationResolutionCursor(repo, -5, '2026-07-24T10:11:00.000Z'), 0, 'a nonsense cursor wraps to the start rather than being trusted');
+}));
+
+test('#53 round 4: stale in-flight reconciliation is bounded by a SQL LIMIT, oldest claim first', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  for (let i = 0; i < 5; i += 1) {
+    const row = seedNotification(store, { dedupeKey: `stale-${i}`, createdAt: `2026-07-24T10:0${i}:00.000Z` });
+    store.claimNotificationForDelivery({ dedupeKey: row.dedupe_key, owner: 'crashed', at: `2026-07-24T10:0${i}:30.000Z` });
+  }
+  assert.equal(store.allRows('notification_events').filter((row) => row.delivery_status === 'in-flight').length, 5);
+
+  const first = store.reconcileStaleInFlightNotifications({ repo, staleBeforeAt: '2026-07-24T11:00:00.000Z', at: '2026-07-24T11:00:00.000Z', limit: 2 });
+  assert.deepEqual(first, { checked: 2, recovered: 2 }, 'one pass may only touch a bounded window');
+  const recoveredKeys = store.allRows('notification_events').filter((row) => row.stale_recovery_count > 0).map((row) => row.dedupe_key).sort();
+  assert.deepEqual(recoveredKeys, ['stale-0', 'stale-1'], 'the oldest claims are recovered first');
+
+  let recovered = first.recovered;
+  for (let pass = 0; pass < 4 && recovered < 5; pass += 1) {
+    recovered += store.reconcileStaleInFlightNotifications({ repo, staleBeforeAt: '2026-07-24T11:00:00.000Z', at: '2026-07-24T11:00:00.000Z', limit: 2 }).recovered;
+  }
+  assert.equal(recovered, 5, 'repeated bounded passes drain the whole backlog');
+  assert.equal(store.allRows('notification_events').every((row) => row.attempt_count === 0), true, 'a stale claim never consumes the delivery budget');
 }));

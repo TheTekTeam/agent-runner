@@ -3,7 +3,7 @@
 Durable, agent-agnostic operator notifications for meaningful Agent Runner
 transitions, without coupling the contract to Claude or any specific
 provider. Implements the MVP scoped by issue #53 under parent #41, hardened
-per manager review rounds 2 and 3 on PR #66.
+per manager review rounds 2, 3 and 4 on PR #66.
 
 ## Delivery guarantee
 
@@ -91,6 +91,24 @@ row could suppress later notifications is `quota_blocked`, and its
 resolution branch does not parse `source_ref` at all: it re-reads live quota
 truth for the repository.
 
+#### A source-truth read failure is fail-closed
+
+`createStateRecorder().invoke()` converts a state-store exception into
+`null` **and** flips `state.healthy` false. That `null` is not source truth
+and must never be read as one: for the attention and recovery branches it
+would look like "still unresolved" (delivery would proceed), and for the
+health and quota branches like "source cleared" (the row would be resolved).
+Both readings are guesses about state nobody actually observed.
+
+The pass therefore **stops immediately** after any source-truth lookup makes
+the state unhealthy — before the pre-delivery revalidation decides anything,
+and again inside the resolution sweep. On that path there is **no transport
+call and no resolution**, no summary counter moves, and the failure stays in
+`state.errors` (which gates `healthy` and the caller's systemic pause)
+rather than being downgraded into a task-local `taskErrors` entry. A row
+already claimed simply remains `in-flight` and is picked up by the ordinary
+stale-claim recovery path, which requeues it without consuming an attempt.
+
 ### No double notification for the same task failure
 
 A `recovery_attempts` row carrying an `attention_dedupe_key` defers entirely
@@ -144,19 +162,27 @@ uses the row's exact captured `opened_at`: a later episode of the same
 condition type neither falsely resolves nor permanently blocks an older
 episode's notification.
 
-## Activation-gated, bounded, cursor-based discovery
+## Activation-gated, bounded, two-frontier discovery
 
 `attention_events`, `routing_events` and `recovery_attempts` are scanned via
-a durable per-`(repo, source_table)` cursor (`notification_source_cursors`).
-On first activation for a pair, the cursor is set to the current tail of
-that table — deliberately skipping **all** pre-existing history in one
-step, so deploying this outbox never floods notifications for years of
-already-settled data. Every later pass reads only a bounded batch (default
-25, configurable, clamped to `[1, 200]`) strictly past the cursor, and the
-cursor only advances past a row once its outbox intent is durably
-persisted — never blindly to the end of a fetched batch, and never past a
-row whose fate is not yet final (still running, might still retry, or a
-mutation not yet proven applied).
+**two durable frontiers**:
+
+1. a monotonic high-water cursor per `(repo, source_table)`
+   (`notification_source_cursors`), and
+2. a durable set of undecided row identities
+   (`notification_deferred_source_rows`), rechecked on its own bounded,
+   rotating schedule.
+
+On first activation for a pair, the high-water cursor is set to the current
+tail of that table — deliberately skipping **all** pre-existing history in
+one step, so deploying this outbox never floods notifications for years of
+already-settled data, and deferring none of it. Every later pass reads only
+a bounded batch (default 25, configurable, clamped to `[1, 200]`) strictly
+past the cursor. The cursor advances across every row the pass actually
+evaluated, including undecided ones — but never past a row whose durable
+write (its outbox intent, or its deferral record) failed, so a mid-batch
+store failure resumes correctly rather than silently skipping the
+remainder.
 
 `recovery_attempts` is cursored on its SQLite **`rowid`**, not on
 `started_at`. A timestamp cursor (`started_at > ?`) silently dropped any
@@ -170,21 +196,38 @@ integer `id`. A stored cursor whose shape none of these understands (a
 pre-round-3 timestamp cursor) is re-activated past the current tail rather
 than trusted or replayed.
 
-### An undecided row never blocks later rows
+### An undecided row never blocks later rows, at any backlog length
 
-A row whose fate is not yet final holds **its own** cursor position, but
-scanning does not stop there. Later rows in the same batch are still
-evaluated and still persist their outbox intents; only the durable cursor
-stays parked before the undecided row, so that row is re-evaluated fresh on
-every later pass and its eventual in-place update is never missed. The rows
-past it are simply re-scanned then, and `dedupe_key` makes re-persisting
-them an exact no-op.
+A row whose fate is not yet final (still running, might still retry, or a
+mutation not yet proven applied) is recorded in
+`notification_deferred_source_rows` under the source table's own monotonic
+integer identity — `id` for `attention_events`/`routing_events`, `rowid` for
+`recovery_attempts`, never source text. The high-water cursor then moves
+past it, so later rows keep flowing.
 
-Stopping the scan at the first undecided row — the round-2 behaviour — meant
-a stale running recovery attempt or a permanently `mutation-pending` routing
-row made every later row in that source table invisible for as long as it
-stayed undecided: head-of-line blocking on an outbox whose entire purpose is
-not losing events.
+Each pass rechecks a bounded batch of deferred identities first,
+least-recently-checked first, via targeted by-row-key lookups
+(`attentionEventsByIds`, `routingEventsByIds`, `recoveryAttemptsByRowIds`).
+A row that is still undecided is *touched*, moving it to the back of the
+rotation so one permanently-stuck row cannot monopolise the recheck budget.
+A row that has become final persists its outbox intent and is only then
+dropped from the deferred set — so a crash between those two writes simply
+rechecks it next pass, and `dedupe_key` makes the re-persist an exact no-op.
+The result is **exactly one** notification for a row that was blocked for
+any number of passes. A deferred row whose source row no longer exists at
+all is dropped: there is no fate left to wait for.
+
+Two earlier designs failed here. Round 2 stopped the scan at the first
+undecided row, making every later row in that source table invisible for as
+long as it stayed undecided. Round 3 kept scanning later rows but parked the
+single durable cursor before the undecided one — which only worked inside
+the batch window that pass happened to fetch: with a blocked **first** row
+and more than `batchSize - 1` later rows, every pass refetched the identical
+window and nothing beyond it was ever reached. Both are head-of-line
+blocking on an outbox whose entire purpose is not losing events; the
+two-frontier design holds across an arbitrarily long bounded backlog, with
+no unbounded query, no growing in-memory list, and no permanently skipped
+row.
 
 `quota_history` and `runner_health_conditions` are deliberately **not**
 cursor sources (see above) — both are scanned directly every pass, which is
@@ -196,8 +239,10 @@ never the full history.
 
 No stage loads a table and then limits, filters or slices it in JavaScript.
 Due rows (`dueNotificationEvents`), the unresolved-stateful rescan
-(`unresolvedStatefulNotificationEvents`), and each cursor batch all carry an
-explicit SQL `LIMIT`; health discovery queries only the closed
+(`unresolvedStatefulNotificationEvents`), the deferred-row recheck
+(`deferredNotificationSourceRows`), stale in-flight selection
+(`reconcileStaleInFlightNotifications`, oldest claim first) and each cursor
+batch all carry an explicit SQL `LIMIT`; health discovery queries only the closed
 `HEALTH_CONDITION_REASON_CODES` condition types, still-open, with a `LIMIT`
 (`openHealthConditionsForTypes`), rather than loading every historical or
 unknown health row. Source-truth revalidation uses targeted single-row,
@@ -207,6 +252,30 @@ index-served lookups keyed on the notification's own persisted `source_ref`
 `allRows(<table>)` full scan per notification. A large outbox or a long
 history therefore cannot cause unbounded query or memory work while the
 serial scheduler lock is held.
+
+### The resolution sweep is fair
+
+The unresolved-stateful rescan walks a **durable rotating cursor** over
+`notification_events.id` (`notification_resolution_cursors`), advancing past
+each checked batch and wrapping back to the start once the tail is reached.
+
+Ordering that sweep oldest-first by `created_at` under a fixed `LIMIT` — the
+round-3 behaviour — meant a permanently-open set of older attention or
+systemic rows larger than one batch occupied every single sweep forever. A
+newer cleared or *exhausted* `quota_blocked` row was then never rechecked,
+stayed unresolved, and kept the `openNotificationExists()` occurrence gate
+suppressing every later quota-blocked episode for that repository.
+
+With rotation, every unresolved row of every stateful event type — quota,
+attention and systemic alike — receives a bounded recurring check within
+`ceil(unresolved / batchSize)` passes; no fixed group can starve another;
+the progress survives restart/reopen; one-shot rows remain excluded in SQL;
+and no query is unbounded.
+
+Stale in-flight recovery is fair by construction rather than by cursor:
+every recovered row leaves `in-flight`, so the next pass's identical
+oldest-claim-first bounded query naturally picks up the next window until a
+crash backlog of any size is drained.
 
 ## Delivery state machine
 
@@ -222,7 +291,7 @@ pending --(claim)--> in-flight --(deliver ok)-->        delivered --(source clea
 
 `notification_events.delivery_status` is a CHECK-constrained closed set:
 `pending`, `in-flight`, `delivered`, `retryable-failed`, `exhausted`,
-`resolved` (schema v15; `event_type`, `reason_code`, `source_table`,
+`resolved` (schema v16; `event_type`, `reason_code`, `source_table`,
 `last_error`, `attempt_count`, `max_attempts` and `stale_recovery_count` are
 all CHECK-constrained too, and `project` is length-bounded). A due row is atomically
 **claimed** into `in-flight` (with an owner and claim timestamp) immediately

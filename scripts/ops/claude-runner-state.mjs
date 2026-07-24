@@ -10,7 +10,7 @@ import {
   serializeCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 
-export const RUNNER_STATE_SCHEMA_VERSION = 15;
+export const RUNNER_STATE_SCHEMA_VERSION = 16;
 export const DEFAULT_RUNNER_STATE_DB_NAME = 'runner-state.sqlite';
 
 /**
@@ -100,11 +100,13 @@ const TABLES = new Set([
   'notification_events',
 ]);
 
-// notification_source_cursors (#53 round 2) is deliberately NOT a member of
-// TABLES/RUNNER_STATE_TABLES: it is pure internal reconciliation bookkeeping
-// with a composite (repo, source_table) key and no `id`/`started_at` column,
-// so it cannot use the generic allRows()/latestRows() ordering convention
-// the rest of this file shares, and has no dashboard/history purpose.
+// notification_source_cursors (#53 round 2), notification_deferred_source_rows
+// and notification_resolution_cursors (#53 round 4) are deliberately NOT
+// members of TABLES/RUNNER_STATE_TABLES: they are pure internal
+// reconciliation bookkeeping with composite/repo keys and no
+// `id`/`started_at` column, so they cannot use the generic
+// allRows()/latestRows() ordering convention the rest of this file shares,
+// and have no dashboard/history purpose.
 
 export const RUNNER_STATE_TABLES = Object.freeze([...TABLES]);
 
@@ -197,6 +199,23 @@ function isIntegerCursor(value) {
 function boundedBatchLimit(limit, max = 200) {
   if (!Number.isInteger(limit) || limit < 1) return Math.min(50, max);
   return Math.min(limit, max);
+}
+
+/**
+ * A bounded, de-duplicated list of non-negative integer row keys for an
+ * `IN (...)` lookup (#53 review round 4, item 2). Non-integers are dropped
+ * rather than interpolated, and the list is itself capped so a caller can
+ * never build an unbounded statement out of a growing key set.
+ */
+function boundedIntegerKeys(rowKeys, max = 200) {
+  const keys = (Array.isArray(rowKeys) ? rowKeys : [])
+    .map((value) => Number(value))
+    .filter((value) => Number.isInteger(value) && value >= 0);
+  return [...new Set(keys)].slice(0, max);
+}
+
+function sqlPlaceholders(values) {
+  return values.map(() => '?').join(', ');
 }
 
 function parseJsonObject(value) {
@@ -514,6 +533,56 @@ export class RunnerStateStore {
         PRIMARY KEY (repo, source_table)
       );
 
+      -- Schema v16 (#53 review round 4, item 2): the second frontier.
+      --
+      -- notification_source_cursors above is now a strictly monotonic
+      -- HIGH-WATER mark: it advances through every scanned row, including
+      -- rows whose fate is not yet decided. Round 3 instead parked that
+      -- single cursor immediately before the first undecided row, which
+      -- meant a blocked FIRST row pinned the whole source: every later pass
+      -- refetched the same batchSize window and rows beyond it were never
+      -- reached at all -- head-of-line blocking across an arbitrarily long
+      -- backlog rather than only within one batch.
+      --
+      -- Undecided row identities are therefore persisted here instead, and
+      -- rechecked in their own bounded, rotating batches (oldest
+      -- last_checked_at first). A deferred row is deleted the moment its
+      -- fate becomes final and its outbox intent is durably persisted, so a
+      -- blocked row still produces exactly one notification -- while later
+      -- independent rows, however many batch windows away, keep flowing.
+      --
+      -- row_key is the source table's own monotonic integer identity
+      -- (id for attention_events/routing_events, rowid for
+      -- recovery_attempts) -- never source text.
+      CREATE TABLE IF NOT EXISTS notification_deferred_source_rows (
+        repo TEXT NOT NULL,
+        source_table TEXT NOT NULL,
+        row_key INTEGER NOT NULL,
+        first_deferred_at TEXT NOT NULL,
+        last_checked_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (repo, source_table, row_key)
+      );
+
+      -- Schema v16 (#53 review round 4, item 3): a durable rotating cursor
+      -- over notification_events.id for the unresolved-stateful resolution
+      -- sweep. Round 3 always rescanned the oldest unresolved rows by
+      -- created_at under a fixed LIMIT, so a permanently-open set of older
+      -- attention/systemic rows occupied every batch forever and a newer
+      -- cleared/exhausted quota row was never rechecked -- which in turn let
+      -- openNotificationExists() suppress every future quota episode. The
+      -- cursor advances past each checked batch and wraps back to 0 once the
+      -- tail is reached, so every unresolved row of every event type is
+      -- rechecked within a bounded number of passes and no group can
+      -- permanently starve another.
+      CREATE TABLE IF NOT EXISTS notification_resolution_cursors (
+        repo TEXT PRIMARY KEY,
+        cursor_value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS notification_deferred_source_rows_idx
+        ON notification_deferred_source_rows(repo, source_table, last_checked_at, row_key);
       CREATE INDEX IF NOT EXISTS routing_events_issue_idx ON routing_events(repo, issue_number, event_type, created_at);
       CREATE INDEX IF NOT EXISTS notification_events_status_idx ON notification_events(repo, delivery_status);
       CREATE INDEX IF NOT EXISTS notification_events_issue_idx ON notification_events(repo, issue_number, created_at);
@@ -521,6 +590,12 @@ export class RunnerStateStore {
       -- per-source targeted lookups must both be index-served, so a large
       -- settled outbox never costs a full scan while the serial lock is held.
       CREATE INDEX IF NOT EXISTS notification_events_unresolved_idx ON notification_events(repo, resolved_at, event_type, created_at);
+      -- #53 review round 4, item 3: the rotating resolution sweep filters on
+      -- (repo, resolved_at) and both orders and bounds by id.
+      CREATE INDEX IF NOT EXISTS notification_events_resolution_scan_idx ON notification_events(repo, resolved_at, id);
+      -- #53 review round 4, additional boundedness: stale in-flight selection
+      -- is now ordered and LIMITed in SQL, so it must be index-served too.
+      CREATE INDEX IF NOT EXISTS notification_events_in_flight_idx ON notification_events(repo, delivery_status, in_flight_claimed_at);
       CREATE INDEX IF NOT EXISTS notification_events_source_idx ON notification_events(repo, source_table, source_ref);
       CREATE INDEX IF NOT EXISTS recovery_attempts_repo_attempt_idx ON recovery_attempts(repo, attempt_id);
       CREATE INDEX IF NOT EXISTS queue_events_issue_idx ON queue_events(issue_number, created_at);
@@ -759,13 +834,47 @@ export class RunnerStateStore {
    * pass, which revalidates source truth itself immediately before calling a
    * transport. Bounded by a SQL `LIMIT` and filtered to the closed stateful
    * event-type set in SQL, never in JavaScript (item 7).
+   *
+   * `afterId` is the durable rotating resolution cursor (#53 review round 4,
+   * item 3). Round 3 ordered by `created_at` from the very beginning on every
+   * pass, so a permanently-open set of older attention/systemic rows larger
+   * than one batch occupied every single sweep forever: a newer cleared or
+   * exhausted quota row was never reached, stayed unresolved, and kept
+   * `openNotificationExists()` suppressing every later quota episode for that
+   * repo. Scanning strictly past a durable cursor and wrapping back to 0 at
+   * the tail gives every unresolved row -- quota, attention and systemic
+   * alike -- a bounded recurring check, with no unbounded scan and no fixed
+   * group able to starve another.
    */
-  unresolvedStatefulNotificationEvents(repo, limit) {
+  unresolvedStatefulNotificationEvents(repo, afterId = 0, limit) {
+    const boundedAfterId = Number.isInteger(afterId) && afterId > 0 ? afterId : 0;
     return this.db.prepare(`SELECT * FROM notification_events WHERE repo = ?
+      AND id > ?
       AND resolved_at IS NULL
       AND delivery_status IN ('pending', 'retryable-failed', 'delivered', 'exhausted')
       AND event_type IN ('failed_attention', 'quota_blocked', 'systemic_pause')
-      ORDER BY created_at ASC LIMIT ?`).all(repo, boundedBatchLimit(limit));
+      ORDER BY id ASC LIMIT ?`).all(repo, boundedAfterId, boundedBatchLimit(limit));
+  }
+
+  /**
+   * The durable rotating resolution cursor for a repo (#53 review round 4,
+   * item 3). `0` means "start from the beginning" -- the value a never-swept
+   * repo and a just-wrapped repo share, which is exactly the intended
+   * semantics.
+   */
+  getNotificationResolutionCursor(repo) {
+    const value = this.db.prepare('SELECT cursor_value FROM notification_resolution_cursors WHERE repo = ?').get(repo)?.cursor_value;
+    return isIntegerCursor(value ?? '') ? Number(value) : 0;
+  }
+
+  /** Persist the rotating resolution cursor. Callers pass 0 to wrap back to the start once a sweep reached the tail. */
+  setNotificationResolutionCursor(repo, cursorValue, at = this.now()) {
+    const bounded = Number.isInteger(cursorValue) && cursorValue > 0 ? cursorValue : 0;
+    this.db.prepare(`INSERT INTO notification_resolution_cursors (repo, cursor_value, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(repo) DO UPDATE SET cursor_value = excluded.cursor_value, updated_at = excluded.updated_at`)
+      .run(repo, String(bounded), at);
+    return bounded;
   }
 
   /**
@@ -882,11 +991,18 @@ export class RunnerStateStore {
    * 'exhausted' and discard it forever. Stale recoveries are instead counted
    * in their own `stale_recovery_count` column so a repeatedly-abandoned row
    * is still visible to an operator without becoming undeliverable.
+   *
+   * Bounded by a SQL `LIMIT`, oldest claim first (#53 review round 4,
+   * additional boundedness): a large crash backlog must not be loaded and
+   * updated in one pass. Because every recovered row leaves 'in-flight', the
+   * next pass's identical query naturally picks up the next oldest window --
+   * fair progress without any extra bookkeeping.
    */
-  reconcileStaleInFlightNotifications({ repo, staleBeforeAt, at = this.now(), errorCode = 'stale-in-flight-recovered' }) {
+  reconcileStaleInFlightNotifications({ repo, staleBeforeAt, at = this.now(), errorCode = 'stale-in-flight-recovered', limit }) {
     const boundedError = boundedNotificationErrorCode(errorCode);
     const stale = this.db.prepare(`SELECT dedupe_key FROM notification_events
-      WHERE repo = ? AND delivery_status = 'in-flight' AND in_flight_claimed_at < ?`).all(repo, staleBeforeAt);
+      WHERE repo = ? AND delivery_status = 'in-flight' AND in_flight_claimed_at < ?
+      ORDER BY in_flight_claimed_at ASC LIMIT ?`).all(repo, staleBeforeAt, boundedBatchLimit(limit));
     let recovered = 0;
     for (const row of stale) {
       const result = this.db.prepare(`UPDATE notification_events SET
@@ -927,6 +1043,84 @@ export class RunnerStateStore {
       VALUES (?, ?, ?, ?)
       ON CONFLICT(repo, source_table) DO UPDATE SET cursor_value = excluded.cursor_value, updated_at = excluded.updated_at`)
       .run(repo, sourceTable, String(newValue), at);
+  }
+
+  /**
+   * Record a source row whose fate is not yet decided, so the monotonic
+   * high-water cursor can keep advancing past it without ever losing it
+   * (#53 review round 4, item 2). Idempotent: re-deferring an already-
+   * deferred row keeps its original `first_deferred_at` and does not reset
+   * its rotation position.
+   */
+  deferNotificationSourceRow({ repo, sourceTable, rowKey, at = this.now() }) {
+    const key = asInteger(Number(rowKey));
+    if (key === null) return { deferred: false };
+    const result = this.db.prepare(`INSERT INTO notification_deferred_source_rows
+      (repo, source_table, row_key, first_deferred_at, last_checked_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(repo, source_table, row_key) DO NOTHING`).run(repo, sourceTable, key, at, at, at);
+    return { deferred: result.changes > 0, alreadyDeferred: result.changes === 0 };
+  }
+
+  /**
+   * A bounded, rotating batch of deferred row identities for one source,
+   * least-recently-checked first (#53 review round 4, item 2). The rotation
+   * ordering is what keeps a permanently-undecided row from monopolising the
+   * recheck budget: `touchDeferredNotificationSourceRow()` moves a row that
+   * is still blocked to the back of the queue.
+   */
+  deferredNotificationSourceRows(repo, sourceTable, limit) {
+    return this.db.prepare(`SELECT * FROM notification_deferred_source_rows
+      WHERE repo = ? AND source_table = ?
+      ORDER BY last_checked_at ASC, row_key ASC LIMIT ?`).all(repo, sourceTable, boundedBatchLimit(limit));
+  }
+
+  /** Mark a still-undecided deferred row as checked now, moving it to the back of the rotation. */
+  touchDeferredNotificationSourceRow({ repo, sourceTable, rowKey, at = this.now() }) {
+    const key = asInteger(Number(rowKey));
+    if (key === null) return false;
+    const result = this.db.prepare(`UPDATE notification_deferred_source_rows SET last_checked_at = ?, updated_at = ?
+      WHERE repo = ? AND source_table = ? AND row_key = ?`).run(at, at, repo, sourceTable, key);
+    return result.changes === 1;
+  }
+
+  /** Drop a deferred row once its fate is final and its outbox intent is durably persisted (or its source row no longer exists). */
+  clearDeferredNotificationSourceRow({ repo, sourceTable, rowKey }) {
+    const key = asInteger(Number(rowKey));
+    if (key === null) return false;
+    const result = this.db.prepare('DELETE FROM notification_deferred_source_rows WHERE repo = ? AND source_table = ? AND row_key = ?')
+      .run(repo, sourceTable, key);
+    return result.changes === 1;
+  }
+
+  /** How many source rows are currently deferred for a (repo, source_table) pair -- operator/diagnostic visibility only. */
+  deferredNotificationSourceRowCount(repo, sourceTable) {
+    return this.db.prepare('SELECT COUNT(*) AS total FROM notification_deferred_source_rows WHERE repo = ? AND source_table = ?')
+      .get(repo, sourceTable)?.total ?? 0;
+  }
+
+  /** Targeted re-read of specific attention_events rows by id -- the deferred-row recheck path (#53 review round 4, item 2). The id list is already bounded by the caller's deferred batch limit. */
+  attentionEventsByIds(repo, rowKeys) {
+    const keys = boundedIntegerKeys(rowKeys);
+    if (keys.length === 0) return [];
+    return this.db.prepare(`SELECT * FROM attention_events WHERE repo = ? AND id IN (${sqlPlaceholders(keys)}) ORDER BY id ASC`)
+      .all(repo, ...keys);
+  }
+
+  /** Targeted re-read of specific routing_events rows by id. */
+  routingEventsByIds(repo, rowKeys) {
+    const keys = boundedIntegerKeys(rowKeys);
+    if (keys.length === 0) return [];
+    return this.db.prepare(`SELECT * FROM routing_events WHERE repo = ? AND id IN (${sqlPlaceholders(keys)}) ORDER BY id ASC`)
+      .all(repo, ...keys);
+  }
+
+  /** Targeted re-read of specific recovery_attempts rows by SQLite rowid, aliased to `row_id` to match `recoveryAttemptsSince()`. */
+  recoveryAttemptsByRowIds(repo, rowKeys) {
+    const keys = boundedIntegerKeys(rowKeys);
+    if (keys.length === 0) return [];
+    return this.db.prepare(`SELECT rowid AS row_id, * FROM recovery_attempts
+      WHERE repo = ? AND rowid IN (${sqlPlaceholders(keys)}) ORDER BY rowid ASC`).all(repo, ...keys);
   }
 
   /** Bounded batch of attention_events rows strictly newer than `cursorValue` (an id, as text), oldest first. `cursorValue = null` returns none -- the caller must activate the cursor first. */

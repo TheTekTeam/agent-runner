@@ -1250,3 +1250,429 @@ test('round 3, item 8: every last_error this module can ever persist is a member
     assert.doesNotMatch(JSON.stringify(row), /Bearer|sk-live|\/home\//);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Manager review round 4, item 1: a source-truth read failure is fail-closed.
+//
+// createStateRecorder().invoke() converts a store exception into `null` while
+// pushing onto `errors` (which flips `healthy` false). These helpers reproduce
+// that behaviour exactly for one targeted lookup, so the tests exercise the
+// real failure shape rather than a hand-made one.
+// ---------------------------------------------------------------------------
+
+function withFailingLookup(state, failingMethod, { afterCalls = 0 } = {}) {
+  let seen = 0;
+  return {
+    errors: state.errors,
+    taskErrors: state.taskErrors,
+    get healthy() { return state.healthy; },
+    get available() { return state.available; },
+    recordTaskError: (...values) => state.recordTaskError(...values),
+    record: (...values) => state.record(...values),
+    close: () => state.close(),
+    invoke(method, ...values) {
+      if (method === failingMethod) {
+        seen += 1;
+        if (seen > afterCalls) {
+          // Exactly what createStateRecorder does when the store throws.
+          state.errors.push({ stage: method, message: 'simulated sqlite read failure' });
+          return null;
+        }
+      }
+      return state.invoke(method, ...values);
+    },
+  };
+}
+
+test('round 4, item 1: a throwing targeted attention lookup after the claim delivers nothing and resolves nothing', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedAttentionEvent(state, { attemptId: 'failclosed-attention-attempt', issueNumber: 900 });
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:05:00.000Z' });
+    assert.equal(notificationRows(state)[0].delivery_status, 'pending');
+
+    const { transport, attempts } = createSyntheticNotificationTransport();
+    const failing = withFailingLookup(state, 'attentionEventByDedupeKey');
+    const summary = await reconcileNotifications({ state: failing, args: { repo: REPO }, transport, now: () => '2026-07-24T10:10:00.000Z' });
+
+    assert.equal(attempts.length, 0, 'no transport call may occur after a source-truth read failure');
+    assert.equal(summary.delivered, 0);
+    assert.equal(summary.resolved, 0);
+    const [row] = notificationRows(state);
+    assert.equal(row.resolved_at, null, 'a failed lookup must never resolve a notification');
+    assert.equal(row.delivery_status, 'in-flight', 'the claimed row stays in-flight for the ordinary stale-claim recovery path');
+    assert.equal(row.attempt_count, 0, 'no delivery attempt was made, so none may be charged');
+    assert.equal(state.healthy, false, 'the store failure stays systemic');
+  });
+});
+
+test('round 4, item 1: a throwing targeted recovery-attempt lookup after the claim delivers nothing and resolves nothing', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedFailedAttemptWithoutAttention(state, { attemptId: `${REPO}#901:2026-07-24T10:00:00.000Z`, issueNumber: 901 });
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:05:00.000Z' });
+    const [seeded] = notificationRows(state);
+    assert.equal(seeded.event_type, 'failed_attention');
+    assert.equal(seeded.source_table, 'recovery_attempts');
+
+    const { transport, attempts } = createSyntheticNotificationTransport();
+    const failing = withFailingLookup(state, 'recoveryAttemptByAttemptId');
+    const summary = await reconcileNotifications({ state: failing, args: { repo: REPO }, transport, now: () => '2026-07-24T10:10:00.000Z' });
+
+    assert.equal(attempts.length, 0);
+    assert.equal(summary.resolved, 0);
+    const [row] = notificationRows(state);
+    assert.equal(row.resolved_at, null);
+    assert.equal(row.delivery_status, 'in-flight');
+    assert.equal(state.healthy, false);
+  });
+});
+
+test('round 4, item 1: a throwing targeted quota lookup leaves an exhausted quota notification unresolved', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedQuotaBlocked(state, { createdAt: '2026-07-24T10:00:00.000Z' });
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:05:00.000Z' });
+    const [created] = notificationRows(state);
+    assert.equal(created.event_type, 'quota_blocked');
+
+    // Walk the row to `exhausted` without any transport involvement.
+    state.invoke('claimNotificationForDelivery', { dedupeKey: created.dedupe_key, owner: 'p', at: '2026-07-24T10:06:00.000Z' });
+    state.invoke('markNotificationDeliveryFailed', { dedupeKey: created.dedupe_key, attemptedAt: '2026-07-24T10:06:01.000Z', errorCode: 'transport-rejected-permanent', retryable: false });
+    assert.equal(notificationRows(state)[0].delivery_status, 'exhausted');
+
+    // Quota has genuinely cleared -- but the lookup that would prove it fails.
+    seedQuotaAvailable(state, { createdAt: '2026-07-24T10:07:00.000Z' });
+    const { transport, attempts } = createSyntheticNotificationTransport();
+    const failing = withFailingLookup(state, 'latestQuotaHistoryForRepo', { afterCalls: 1 });
+    const summary = await reconcileNotifications({ state: failing, args: { repo: REPO }, transport, now: () => '2026-07-24T10:10:00.000Z' });
+
+    assert.equal(attempts.length, 0);
+    assert.equal(summary.resolved, 0);
+    assert.equal(notificationRows(state)[0].resolved_at, null, 'a failed quota lookup is not evidence the source cleared');
+    assert.equal(notificationRows(state)[0].delivery_status, 'exhausted');
+    assert.equal(state.healthy, false);
+  });
+});
+
+test('round 4, item 1: a throwing targeted health lookup leaves a systemic_pause notification unresolved', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedSystemicPause(state, { at: '2026-07-24T10:00:00.000Z' });
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:05:00.000Z' });
+    const [created] = notificationRows(state);
+    assert.equal(created.event_type, 'systemic_pause');
+
+    const { transport, attempts } = createSyntheticNotificationTransport();
+    const failing = withFailingLookup(state, 'healthConditionForType');
+    const summary = await reconcileNotifications({ state: failing, args: { repo: REPO }, transport, now: () => '2026-07-24T10:10:00.000Z' });
+
+    assert.equal(attempts.length, 0);
+    assert.equal(summary.resolved, 0);
+    assert.equal(notificationRows(state)[0].resolved_at, null);
+    assert.equal(state.healthy, false);
+  });
+});
+
+test('round 4, item 1: the pass returns boundedly and the source-truth store failure stays systemic, never a task-local success', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    for (let i = 0; i < 6; i += 1) seedAttentionEvent(state, { attemptId: `failclosed-bounded-${i}`, issueNumber: 910 + i });
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:05:00.000Z' });
+    assert.equal(notificationRows(state).length, 6);
+
+    const { transport, attempts } = createSyntheticNotificationTransport();
+    const failing = withFailingLookup(state, 'attentionEventByDedupeKey');
+    const startedAt = Date.now();
+    const summary = await reconcileNotifications({
+      state: failing, args: { repo: REPO }, transport, now: () => '2026-07-24T10:10:00.000Z', maxPassDurationMs: 2_000,
+    });
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(elapsed < 2_000, true, `the pass must return within its bounded duration (took ${elapsed}ms)`);
+    assert.equal(attempts.length, 0, 'the pass must stop at the first failed lookup, not keep delivering the rest of the batch');
+    assert.deepEqual({ delivered: summary.delivered, resolved: summary.resolved }, { delivered: 0, resolved: 0 });
+    // Systemic, not downgraded: the failure is in `errors` (which gates
+    // `healthy` and the caller's systemic pause), not only in `taskErrors`.
+    assert.equal(state.healthy, false);
+    assert.equal(state.errors.some((entry) => entry.stage === 'attentionEventByDedupeKey'), true);
+    assert.equal(notificationRows(state).filter((row) => row.resolved_at !== null).length, 0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manager review round 4, item 2: no head-of-line blocking across a backlog
+// longer than one batch window. The durable cursor is a monotonic high-water
+// mark; undecided rows live in their own durable deferred set.
+// ---------------------------------------------------------------------------
+
+function seedRunningAttempt(state, { attemptId = 'running-attempt-1', repo = REPO, issueNumber = 950, startedAt = '2026-07-24T10:00:00.000Z' } = {}) {
+  state.invoke('recordRecoveryAttempt', {
+    attemptId, repo, project: 'agent-runner', issueNumber, agent: 'claude-code-cli', model: 'claude-sonnet-5', harness: 'claude',
+    startedAt, finishedAt: null, outcome: null, recoveryEligible: false, resolutionState: 'unresolved',
+  });
+}
+
+function deferredRowKeys(state, sourceTable, repo = REPO) {
+  return (state.invoke('deferredNotificationSourceRows', repo, sourceTable, 200) || []).map((row) => row.row_key);
+}
+
+const BATCH = 3;
+const LATER_ROWS = 2 * BATCH + 1; // 7 -- strictly more than two batch windows
+
+test('round 4, item 2: a blocked first recovery attempt never stops later rows more than two batch windows away, and is itself notified exactly once', async () => {
+  await withState(async (state, { stateDbPath }) => {
+    await activateCursors(state);
+    // The very first post-activation row is blocked (still running).
+    seedRunningAttempt(state, { attemptId: `${REPO}#950:2026-07-24T10:00:00.000Z`, issueNumber: 950 });
+    for (let i = 0; i < LATER_ROWS; i += 1) {
+      seedCompletedAttempt(state, {
+        attemptId: `${REPO}#${960 + i}:2026-07-24T10:0${i}:00.000Z`, issueNumber: 960 + i,
+        startedAt: `2026-07-24T10:0${i}:00.000Z`, finishedAt: `2026-07-24T10:0${i}:30.000Z`,
+      });
+    }
+
+    const pass = async (target, at) => reconcileNotifications({ state: target, args: { repo: REPO }, now: () => at, batchSize: BATCH });
+
+    await pass(state, '2026-07-24T11:00:00.000Z');
+    assert.deepEqual(deferredRowKeys(state, 'recovery_attempts').length, 1, 'the undecided row is durably deferred, not parked in memory');
+    await pass(state, '2026-07-24T11:01:00.000Z');
+
+    // Restart/reopen mid-backlog: both frontiers must survive.
+    state.close();
+    const reopened = createStateRecorder({ stateDbPath, outputDir: '/tmp', repo: REPO });
+    try {
+      assert.equal(deferredRowKeys(reopened, 'recovery_attempts').length, 1, 'the deferred set survives a restart');
+      assert.equal(/^\d+$/.test(String(reopened.invoke('getNotificationSourceCursor', REPO, 'recovery_attempts'))), true, 'the high-water frontier survives a restart');
+      await pass(reopened, '2026-07-24T11:02:00.000Z');
+      await pass(reopened, '2026-07-24T11:03:00.000Z');
+
+      const completed = reopened.invoke('allRows', 'notification_events').filter((row) => row.event_type === 'completed');
+      assert.equal(completed.length, LATER_ROWS, `all ${LATER_ROWS} later rows must become intents while the first stays blocked`);
+      assert.equal(reopened.invoke('allRows', 'notification_events').some((row) => row.issue_number === 950), false, 'the blocked row must not be notified while undecided');
+
+      // The blocked row finally becomes final -- in place, on the same rowid.
+      seedCompletedAttempt(reopened, {
+        attemptId: `${REPO}#950:2026-07-24T10:00:00.000Z`, issueNumber: 950,
+        startedAt: '2026-07-24T10:00:00.000Z', finishedAt: '2026-07-24T11:30:00.000Z',
+      });
+      await pass(reopened, '2026-07-24T11:31:00.000Z');
+      await pass(reopened, '2026-07-24T11:32:00.000Z');
+      await pass(reopened, '2026-07-24T11:33:00.000Z');
+
+      const forBlocked = reopened.invoke('allRows', 'notification_events').filter((row) => row.issue_number === 950);
+      assert.equal(forBlocked.length, 1, 'the once-blocked row must be notified exactly once, however many passes run');
+      assert.deepEqual(deferredRowKeys(reopened, 'recovery_attempts'), [], 'a decided row is dropped from the deferred set');
+      assert.equal(reopened.invoke('allRows', 'notification_events').length, LATER_ROWS + 1);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+test('round 4, item 2: a mutation-pending routing row never stops later routing rows more than two batch windows away, and is itself notified exactly once', async () => {
+  await withState(async (state, { stateDbPath }) => {
+    await activateCursors(state);
+    seedReassignment(state, { issueNumber: 970, dedupeKey: 'r4-routing-blocked', deliveryStatus: 'mutation-pending' });
+    for (let i = 0; i < LATER_ROWS; i += 1) {
+      seedNoQualifiedAgent(state, { issueNumber: 980 + i, dedupeKey: `r4-routing-later-${i}`, deliveryStatus: 'resolved' });
+    }
+
+    const pass = async (target, at) => reconcileNotifications({ state: target, args: { repo: REPO }, now: () => at, batchSize: BATCH });
+
+    await pass(state, '2026-07-24T11:00:00.000Z');
+    assert.equal(deferredRowKeys(state, 'routing_events').length, 1);
+    await pass(state, '2026-07-24T11:01:00.000Z');
+
+    state.close();
+    const reopened = createStateRecorder({ stateDbPath, outputDir: '/tmp', repo: REPO });
+    try {
+      assert.equal(deferredRowKeys(reopened, 'routing_events').length, 1, 'the deferred routing identity survives a restart');
+      await pass(reopened, '2026-07-24T11:02:00.000Z');
+      await pass(reopened, '2026-07-24T11:03:00.000Z');
+
+      const later = reopened.invoke('allRows', 'notification_events').filter((row) => row.event_type === 'no_qualified_agent');
+      assert.equal(later.length, LATER_ROWS, `all ${LATER_ROWS} later routing rows must become intents while the first stays blocked`);
+      assert.equal(reopened.invoke('allRows', 'notification_events').some((row) => row.event_type === 'agent_reassigned'), false);
+
+      // The mutation is finally proven applied, in place on the same row.
+      reopened.invoke('updateRoutingEventDeliveryStatus', { dedupeKey: 'r4-routing-blocked', deliveryStatus: 'resolved' });
+      await pass(reopened, '2026-07-24T11:31:00.000Z');
+      await pass(reopened, '2026-07-24T11:32:00.000Z');
+
+      const reassignments = reopened.invoke('allRows', 'notification_events').filter((row) => row.event_type === 'agent_reassigned');
+      assert.equal(reassignments.length, 1, 'the once-blocked routing row must be notified exactly once');
+      assert.deepEqual(deferredRowKeys(reopened, 'routing_events'), []);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+test('round 4, item 2: first activation still skips all pre-existing history, deferring nothing', async () => {
+  await withState(async (state) => {
+    seedRunningAttempt(state, { attemptId: `${REPO}#990:2026-07-24T09:00:00.000Z`, issueNumber: 990 });
+    seedCompletedAttempt(state, { attemptId: `${REPO}#991:2026-07-24T09:00:00.000Z`, issueNumber: 991 });
+    seedReassignment(state, { issueNumber: 992, dedupeKey: 'r4-preexisting-routing', deliveryStatus: 'mutation-pending' });
+    seedAttentionEvent(state, { attemptId: 'r4-preexisting-attention', issueNumber: 993 });
+
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:00:00.000Z', batchSize: BATCH });
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:01:00.000Z', batchSize: BATCH });
+
+    assert.deepEqual(notificationRows(state), [], 'activation must skip every pre-existing row');
+    for (const table of ['recovery_attempts', 'routing_events', 'attention_events']) {
+      assert.deepEqual(deferredRowKeys(state, table), [], `activation must not defer pre-existing ${table} history`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manager review round 4, item 3: the unresolved-stateful resolution sweep is
+// fair -- a permanently-open older group can never starve a newer row.
+// ---------------------------------------------------------------------------
+
+test('round 4, item 3: more than one batch of permanently-open older rows cannot starve a newer exhausted quota row, and a later blocked episode is notified', async () => {
+  await withState(async (state, { stateDbPath }) => {
+    await activateCursors(state);
+    // More than `batchSize` genuinely-open older stateful rows. These never
+    // resolve: their attention_events rows stay unresolved for the whole test.
+    const OLDER = BATCH + 2;
+    for (let i = 0; i < OLDER; i += 1) seedAttentionEvent(state, { attemptId: `r4-fair-older-${i}`, issueNumber: 1000 + i });
+    for (let pass = 0; pass < 3; pass += 1) {
+      await reconcileNotifications({ state, args: { repo: REPO }, now: () => `2026-07-24T10:0${pass}:00.000Z`, batchSize: BATCH });
+    }
+    assert.equal(notificationRows(state).filter((row) => row.event_type === 'failed_attention').length, OLDER);
+
+    // A NEWER quota_blocked row, walked to `exhausted` without any transport.
+    seedQuotaBlocked(state, { createdAt: '2026-07-24T10:06:00.000Z' });
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:07:00.000Z', batchSize: BATCH });
+    const quota = notificationRows(state).find((row) => row.event_type === 'quota_blocked');
+    assert.ok(quota, 'the quota episode must have been discovered');
+    state.invoke('claimNotificationForDelivery', { dedupeKey: quota.dedupe_key, owner: 'p', at: '2026-07-24T10:08:00.000Z' });
+    state.invoke('markNotificationDeliveryFailed', { dedupeKey: quota.dedupe_key, attemptedAt: '2026-07-24T10:08:01.000Z', errorCode: 'transport-rejected-permanent', retryable: false });
+    assert.equal(notificationRows(state).find((row) => row.dedupe_key === quota.dedupe_key).delivery_status, 'exhausted');
+
+    // Quota clears while every older attention row stays open.
+    seedQuotaAvailable(state, { createdAt: '2026-07-24T10:09:00.000Z' });
+
+    // Bounded repeated passes, with a restart in the middle: the rotating
+    // resolution cursor must reach the newer row despite the older group
+    // filling more than one batch.
+    let store = state;
+    let resolvedAt = null;
+    for (let pass = 0; pass < 6 && resolvedAt === null; pass += 1) {
+      if (pass === 2) {
+        store.close();
+        store = createStateRecorder({ stateDbPath, outputDir: '/tmp', repo: REPO });
+      }
+      await reconcileNotifications({ state: store, args: { repo: REPO }, now: () => `2026-07-24T10:1${pass}:00.000Z`, batchSize: BATCH });
+      resolvedAt = store.invoke('allRows', 'notification_events').find((row) => row.dedupe_key === quota.dedupe_key).resolved_at;
+    }
+    try {
+      assert.notEqual(resolvedAt, null, 'the newer cleared quota row must be reached and resolved within a bounded number of passes');
+      assert.equal(
+        store.invoke('allRows', 'notification_events').filter((row) => row.event_type === 'failed_attention' && row.resolved_at !== null).length,
+        0,
+        'the genuinely-open older rows must stay unresolved -- fairness, not indiscriminate resolution',
+      );
+
+      // The resolved episode no longer suppresses the next genuine one.
+      store.record('recordQuotaHistory', { repo: REPO, quotaPreflight: { blocked: true, status: 'exhausted', reason: 'session-quota-exhausted' }, createdAt: '2026-07-24T10:20:00.000Z' });
+      await reconcileNotifications({ state: store, args: { repo: REPO }, now: () => '2026-07-24T10:21:00.000Z', batchSize: BATCH });
+      const quotaRows = store.invoke('allRows', 'notification_events').filter((row) => row.event_type === 'quota_blocked');
+      assert.equal(quotaRows.length, 2, 'a later blocked episode must create a new notification once the earlier one resolved');
+      assert.equal(quotaRows.filter((row) => row.resolved_at === null).length, 1);
+    } finally {
+      if (store !== state) store.close();
+    }
+  });
+});
+
+test('round 4, item 3: the resolution sweep rotates over every unresolved stateful event type and wraps at the tail', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    for (let i = 0; i < BATCH + 2; i += 1) seedAttentionEvent(state, { attemptId: `r4-rotate-${i}`, issueNumber: 1100 + i });
+    seedSystemicPause(state, { at: '2026-07-24T10:00:00.000Z' });
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:05:00.000Z', batchSize: BATCH });
+
+    const seen = new Set();
+    const spied = {
+      ...state,
+      get healthy() { return state.healthy; },
+      get available() { return state.available; },
+      recordTaskError: (...values) => state.recordTaskError(...values),
+      invoke(method, ...values) {
+        const result = state.invoke(method, ...values);
+        if (method === 'unresolvedStatefulNotificationEvents') for (const row of result || []) seen.add(row.id);
+        return result;
+      },
+    };
+    const cursors = [];
+    for (let pass = 0; pass < 4; pass += 1) {
+      await reconcileNotifications({ state: spied, args: { repo: REPO }, now: () => `2026-07-24T10:2${pass}:00.000Z`, batchSize: BATCH });
+      cursors.push(state.invoke('getNotificationResolutionCursor', REPO));
+    }
+
+    const unresolvedIds = notificationRows(state).filter((row) => row.resolved_at === null).map((row) => row.id);
+    for (const id of unresolvedIds) {
+      assert.equal(seen.has(id), true, `unresolved row ${id} must be rechecked within a bounded number of passes`);
+    }
+    assert.equal(cursors.includes(0), true, 'the durable cursor must wrap back to the start once the tail is reached');
+  });
+});
+
+test('round 4, item 3: one-shot event types are excluded from the rotating resolution sweep in SQL', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedCompletedAttempt(state, { attemptId: `${REPO}#1200:2026-07-24T10:00:00.000Z`, issueNumber: 1200 });
+    seedAttentionEvent(state, { attemptId: 'r4-oneshot-attention', issueNumber: 1201 });
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:05:00.000Z', batchSize: BATCH });
+
+    const swept = state.invoke('unresolvedStatefulNotificationEvents', REPO, 0, 50);
+    assert.deepEqual([...new Set(swept.map((row) => row.event_type))], ['failed_attention']);
+    assert.equal(swept.some((row) => row.event_type === 'completed'), false, 'a one-shot row must never appear in the stateful sweep');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Manager review round 4, additional boundedness: stale in-flight selection.
+// ---------------------------------------------------------------------------
+
+test('round 4: stale in-flight recovery is bounded per pass in SQL and drains a larger crash backlog across passes', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    const BACKLOG = 2 * BATCH + 1;
+    for (let i = 0; i < BACKLOG; i += 1) seedAttentionEvent(state, { attemptId: `r4-stale-${i}`, issueNumber: 1300 + i });
+    // Discover all of them, then strand every row in-flight as if the owning
+    // processes all crashed mid-delivery.
+    for (let pass = 0; pass < 4; pass += 1) {
+      await reconcileNotifications({ state, args: { repo: REPO }, now: () => `2026-07-24T10:0${pass}:00.000Z`, batchSize: 50 });
+    }
+    assert.equal(notificationRows(state).length, BACKLOG);
+    for (const row of notificationRows(state)) {
+      state.invoke('claimNotificationForDelivery', { dedupeKey: row.dedupe_key, owner: 'crashed', at: '2026-07-24T10:00:00.000Z' });
+    }
+    assert.equal(notificationRows(state).filter((row) => row.delivery_status === 'in-flight').length, BACKLOG);
+
+    const inFlightAfter = async (at) => {
+      const summary = await reconcileNotifications({
+        state, args: { repo: REPO }, now: () => at, batchSize: BATCH, staleInFlightMs: 1_000,
+        transport: async () => ({ ok: false, paused: true, reasonCode: 'transport-disabled' }),
+      });
+      return summary;
+    };
+
+    const first = await inFlightAfter('2026-07-24T12:00:00.000Z');
+    assert.equal(first.staleRecovered, BATCH, 'one pass may only recover a bounded batch of stale claims');
+    assert.equal(notificationRows(state).filter((row) => row.stale_recovery_count > 0).length, BATCH);
+
+    let recovered = first.staleRecovered;
+    for (let pass = 1; pass < 5 && recovered < BACKLOG; pass += 1) {
+      const summary = await inFlightAfter(`2026-07-24T1${2 + pass}:00:00.000Z`);
+      assert.equal(summary.staleRecovered <= BATCH, true, 'every pass stays bounded');
+      recovered += summary.staleRecovered;
+    }
+    assert.equal(recovered, BACKLOG, 'repeated bounded passes make fair progress through the whole backlog');
+    assert.equal(notificationRows(state).every((row) => row.attempt_count === 0), true, 'a stale claim is never charged to the delivery budget');
+  });
+});

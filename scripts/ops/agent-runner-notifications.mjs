@@ -37,7 +37,7 @@ import { createHash } from 'node:crypto';
 
 import { TERMINAL_OUTCOMES } from './claude-runner-recovery.mjs';
 
-export const NOTIFICATION_STATE_SCHEMA_VERSION = 3;
+export const NOTIFICATION_STATE_SCHEMA_VERSION = 4;
 
 export const NOTIFICATION_EVENT_TYPES = Object.freeze([
   'completed',
@@ -390,6 +390,7 @@ const CURSOR_SOURCES = Object.freeze([
   {
     table: 'attention_events',
     fetchSince: (state, repo, cursor, limit) => state.invoke('attentionEventsSince', repo, cursor, limit) || [],
+    fetchByRowKeys: (state, repo, rowKeys) => state.invoke('attentionEventsByIds', repo, rowKeys),
     tailValue: (state, repo) => state.invoke('maxRowId', 'attention_events', repo),
     rowCursorValue: (row) => row.id,
     buildCandidates: attentionCandidates,
@@ -397,6 +398,7 @@ const CURSOR_SOURCES = Object.freeze([
   {
     table: 'routing_events',
     fetchSince: (state, repo, cursor, limit) => state.invoke('routingEventsSince', repo, cursor, limit) || [],
+    fetchByRowKeys: (state, repo, rowKeys) => state.invoke('routingEventsByIds', repo, rowKeys),
     tailValue: (state, repo) => state.invoke('maxRowId', 'routing_events', repo),
     rowCursorValue: (row) => row.id,
     buildCandidates: (row, context) => routingCandidates(row, context),
@@ -409,6 +411,7 @@ const CURSOR_SOURCES = Object.freeze([
     // `recordRecoveryAttempt()` performs on an existing attempt_id.
     table: 'recovery_attempts',
     fetchSince: (state, repo, cursor, limit) => state.invoke('recoveryAttemptsSince', repo, cursor, limit) || [],
+    fetchByRowKeys: (state, repo, rowKeys) => state.invoke('recoveryAttemptsByRowIds', repo, rowKeys),
     tailValue: (state, repo) => state.invoke('maxRecoveryAttemptRowId', repo),
     rowCursorValue: (row) => row.row_id,
     buildCandidates: recoveryAttemptCandidates,
@@ -430,19 +433,103 @@ function persistCandidate(state, item, maxAttempts) {
 }
 
 /**
- * Activate-then-scan exactly one cursor source. Returns the count of
- * genuinely new notification rows inserted. Never throws: a per-row
+ * Evaluate one already-fetched source row. Never throws: a per-row
  * candidate-build exception is caught, recorded as a fixed local
  * diagnostic, and treated as "no candidate for this row" so one malformed
  * source row can never abort the whole batch or escalate to a systemic
  * failure (#53 review, item 8).
  */
-function scanCursorSource({ state, repo, source, batchSize, maxAttempts }) {
+function evaluateSourceRow(state, source, row) {
+  try {
+    const built = source.buildCandidates(row, {
+      onUnknownStatus: () => state.recordTaskError('notification-source-status-unknown', new Error('source-row-invalid')),
+    });
+    return Array.isArray(built) ? { items: built, blocked: false } : (built || { items: [], blocked: false });
+  } catch (error) {
+    state.recordTaskError('notification-source-row-invalid', new Error('source-row-invalid'));
+    return { items: [], blocked: false };
+  }
+}
+
+/** Persist every candidate a decided row produced. Returns `false` on a systemic write failure (never a per-row skip), so the caller can stop without advancing any frontier past it. */
+function persistRowCandidates(state, items, maxAttempts, onInserted) {
+  for (const item of items) {
+    const recorded = persistCandidate(state, item, maxAttempts);
+    if (recorded == null) return false; // state.invoke returned null: a systemic write failure
+    if (recorded.inserted) onInserted();
+  }
+  return true;
+}
+
+/**
+ * Frontier 2 (#53 review round 4, item 2): recheck a bounded, rotating batch
+ * of durably-deferred row identities for one source.
+ *
+ * Round 3 kept undecided rows revisitable by parking the single durable
+ * cursor immediately before the first one. That only worked inside the batch
+ * window that pass happened to fetch: if the blocked row was first and more
+ * than `batchSize - 1` later rows existed, every pass refetched the identical
+ * window and nothing beyond it was ever reached. The cursor is now a pure
+ * monotonic high-water mark that advances through blocked rows too, and the
+ * undecided identities live here instead -- so an arbitrarily long backlog
+ * keeps flowing while a blocked row is still rechecked on every pass and
+ * still produces exactly one intent when it finally becomes final.
+ *
+ * A deferred row whose source row no longer exists is dropped (nothing left
+ * to decide). A row that is still blocked is touched, moving it to the back
+ * of the rotation so no single permanently-undecided row can monopolise the
+ * recheck budget.
+ */
+function recheckDeferredSourceRows({ state, repo, source, batchSize, maxAttempts, at }) {
+  const deferred = state.invoke('deferredNotificationSourceRows', repo, source.table, batchSize) || [];
+  if (deferred.length === 0) return { inserted: 0, cleared: 0, stillDeferred: 0 };
+  const rows = source.fetchByRowKeys(state, repo, deferred.map((entry) => entry.row_key)) || [];
+  const byRowKey = new Map(rows.map((row) => [Number(source.rowCursorValue(row)), row]));
+  let inserted = 0;
+  let cleared = 0;
+  let stillDeferred = 0;
+  for (const entry of deferred) {
+    if (!state.healthy) break;
+    const row = byRowKey.get(Number(entry.row_key));
+    if (!row) {
+      // The source row is gone entirely -- there is no fate left to wait for.
+      state.invoke('clearDeferredNotificationSourceRow', { repo, sourceTable: source.table, rowKey: entry.row_key });
+      cleared += 1;
+      continue;
+    }
+    const result = evaluateSourceRow(state, source, row);
+    if (result.blocked) {
+      state.invoke('touchDeferredNotificationSourceRow', { repo, sourceTable: source.table, rowKey: entry.row_key, at });
+      stillDeferred += 1;
+      continue;
+    }
+    if (!persistRowCandidates(state, result.items, maxAttempts, () => { inserted += 1; })) break;
+    // Only drop the deferred identity once its intent is durably persisted,
+    // so a crash between the two simply rechecks the row next pass and
+    // `dedupe_key` makes the re-persist an exact no-op -- exactly one intent.
+    state.invoke('clearDeferredNotificationSourceRow', { repo, sourceTable: source.table, rowKey: entry.row_key });
+    cleared += 1;
+  }
+  return { inserted, cleared, stillDeferred };
+}
+
+/**
+ * Frontier 1 (#53 review round 4, item 2): activate-then-scan exactly one
+ * cursor source from its monotonic high-water mark. Returns the count of
+ * genuinely new notification rows inserted.
+ *
+ * The cursor now advances across every row this pass actually evaluated,
+ * including undecided ones -- those are handed to the durable deferred set
+ * instead (`recheckDeferredSourceRows()` above). It is still never advanced
+ * past a row whose durable write failed, so a mid-batch store failure resumes
+ * correctly rather than silently skipping the remainder.
+ */
+function scanCursorSource({ state, repo, source, batchSize, maxAttempts, at }) {
   const cursor = state.invoke('getNotificationSourceCursor', repo, source.table);
   if (cursor === null) {
     const tail = source.tailValue(state, repo);
     state.invoke('activateNotificationSourceCursor', repo, source.table, tail ?? 0);
-    return { inserted: 0, activated: true };
+    return { inserted: 0, deferred: 0, activated: true };
   }
   if (!isUsableCursor(cursor)) {
     // A stored cursor in a shape this source no longer understands (the
@@ -451,52 +538,30 @@ function scanCursorSource({ state, repo, source, batchSize, maxAttempts }) {
     // "skip everything that already exists", which is the safe reading of an
     // uninterpretable cursor (#53 review round 3, item 3).
     state.invoke('advanceNotificationSourceCursor', repo, source.table, source.tailValue(state, repo) ?? 0);
-    return { inserted: 0, activated: true };
+    return { inserted: 0, deferred: 0, activated: true };
   }
   const rows = source.fetchSince(state, repo, cursor, batchSize);
   let inserted = 0;
-  let lastProcessed = cursor;
-  // The cursor may only advance across a contiguous run of rows whose fate is
-  // final. `blockedAt` records where that run ended -- but scanning does NOT
-  // stop there (#53 review round 3, item 4). A stale running recovery attempt
-  // or a permanently mutation-pending routing row used to break the loop,
-  // which meant every later row in that source table was invisible for as
-  // long as the blocked row stayed undecided -- head-of-line blocking on an
-  // outbox whose whole job is to not lose events. Later rows are now still
-  // processed and still persist their outbox intents; only the durable cursor
-  // stays parked before the blocked row, so that row is re-evaluated fresh on
-  // every later pass and its eventual in-place update is never missed. The
-  // rows past it are simply re-scanned then, and `dedupe_key` makes
-  // re-persisting them an exact no-op.
-  let blockedAt = null;
+  let deferred = 0;
+  let highWater = cursor;
   for (const row of rows) {
-    let result = { items: [], blocked: false };
-    try {
-      const built = source.buildCandidates(row, {
-        onUnknownStatus: () => state.recordTaskError('notification-source-status-unknown', new Error('source-row-invalid')),
-      });
-      result = Array.isArray(built) ? { items: built, blocked: false } : (built || { items: [], blocked: false });
-    } catch (error) {
-      state.recordTaskError('notification-source-row-invalid', new Error('source-row-invalid'));
-      result = { items: [], blocked: false };
-    }
+    const rowKey = source.rowCursorValue(row);
+    const result = evaluateSourceRow(state, source, row);
     if (result.blocked) {
-      if (blockedAt === null) blockedAt = source.rowCursorValue(row);
+      const recorded = state.invoke('deferNotificationSourceRow', { repo, sourceTable: source.table, rowKey, at });
+      // A failed defer must NOT let the high-water mark move past this row:
+      // the row would then be unreachable from both frontiers.
+      if (recorded == null) break;
+      if (recorded.deferred) deferred += 1;
+      highWater = rowKey;
       continue;
     }
-    let rowOk = true;
-    for (const item of result.items) {
-      const recorded = persistCandidate(state, item, maxAttempts);
-      if (recorded == null) { rowOk = false; break; } // state.invoke returned null: a systemic write failure, not a per-row skip
-      if (recorded.inserted) inserted += 1;
-    }
-    if (!rowOk || !state.healthy) break;
-    // Only extend the durable cursor while no earlier row in this batch is
-    // still awaiting a final fate.
-    if (blockedAt === null) lastProcessed = source.rowCursorValue(row);
+    if (!persistRowCandidates(state, result.items, maxAttempts, () => { inserted += 1; })) break;
+    if (!state.healthy) break;
+    highWater = rowKey;
   }
-  if (lastProcessed !== cursor) state.invoke('advanceNotificationSourceCursor', repo, source.table, lastProcessed);
-  return { inserted, activated: false, blockedAt };
+  if (String(highWater) !== String(cursor)) state.invoke('advanceNotificationSourceCursor', repo, source.table, highWater);
+  return { inserted, deferred, activated: false };
 }
 
 /**
@@ -563,6 +628,14 @@ function boundedDeliveryReasonCode(reasonCode) {
  * `allRows(<table>)` full scan repeated per notification (#53 review round
  * 3, item 7).
  *
+ * This function reports only what it could actually read. Because
+ * `state.invoke()` converts a store exception into `null` while flipping
+ * `state.healthy` false, a `null` here is indistinguishable from real source
+ * truth -- so every caller MUST re-check `state.healthy` immediately after
+ * calling this and, if it is false, perform no delivery and no resolution
+ * (#53 review round 4, item 1). This function deliberately does not try to
+ * guess: guessing is exactly the failure mode being corrected.
+ *
  * Unparseable/unrecognized `source_ref` shapes fail CLOSED (return `false`,
  * "not proven cleared"). A reference this module cannot interpret is not
  * evidence a condition ended, and an attention or systemic-pause alert that
@@ -613,9 +686,12 @@ function isSourceResolvedNow({ row, state }) {
 /**
  * The full reconciliation pass (#53, hardened per manager review round 2):
  *
- * 1. Reconcile stale in-flight rows (a prior process crashed mid-delivery).
- * 2. Activation-gated, bounded-batch, cursor-based discovery+persistence for
- *    attention/routing/recovery-attempt sources.
+ * 1. Reconcile a bounded batch of stale in-flight rows (a prior process
+ *    crashed mid-delivery).
+ * 2. Activation-gated, bounded-batch, TWO-FRONTIER discovery+persistence for
+ *    attention/routing/recovery-attempt sources: a durable rotating recheck
+ *    of previously-undecided row identities, then a forward scan from a
+ *    monotonic high-water cursor (#53 review round 4, item 2).
  * 3. Direct (non-cursor) discovery+persistence for runner_health_conditions
  *    -- upserted in place per condition type, so it cannot use the cursor
  *    mechanism; bounded because at most one row exists per known type.
@@ -627,8 +703,12 @@ function isSourceResolvedNow({ row, state }) {
  *    engineering issue (#53 review, item 5). A stateful row whose source
  *    condition has cleared since discovery is resolved in place instead of
  *    delivered (#53 review round 3, item 1).
- * 6. Recheck every unresolved stateful row -- pending, retryable-failed,
- *    delivered or exhausted -- for source resolution.
+ * 6. Recheck a bounded, durably-rotating batch of unresolved stateful rows
+ *    -- pending, retryable-failed, delivered or exhausted -- for source
+ *    resolution, so no long-lived group can starve another (round 4, item 3).
+ *
+ * Any source-truth lookup that makes the state unhealthy stops the pass
+ * immediately, with no transport call and no resolution (round 4, item 1).
  *
  * Never throws: every per-row/per-stage failure is caught and recorded via
  * `state.recordTaskError()` using only a fixed reason code (never a raw
@@ -642,7 +722,7 @@ export async function reconcileNotifications({
   deliveryTimeoutMs = DEFAULT_DELIVERY_TIMEOUT_MS, maxPassDurationMs = DEFAULT_MAX_PASS_DURATION_MS,
   staleInFlightMs = DEFAULT_STALE_IN_FLIGHT_MS,
 }) {
-  const summary = { discovered: 0, inserted: 0, delivered: 0, paused: 0, retried: 0, exhausted: 0, resolved: 0, staleRecovered: 0 };
+  const summary = { discovered: 0, inserted: 0, delivered: 0, paused: 0, retried: 0, exhausted: 0, resolved: 0, staleRecovered: 0, deferred: 0 };
   if (!state.healthy) return summary;
   const repo = args.repo;
   const boundedMaxAttempts = clampInt(maxAttempts, 1, 20, DEFAULT_MAX_ATTEMPTS);
@@ -655,8 +735,12 @@ export async function reconcileNotifications({
 
   // Step 1: crash-safe in-flight reconciliation, onto the SAME notification identity.
   try {
+    // Bounded in SQL (#53 review round 4, additional boundedness): a large
+    // crash backlog is drained across repeated passes, oldest claim first,
+    // never loaded and updated in one unbounded sweep while the caller holds
+    // the serial scheduler lock.
     const staleResult = state.invoke('reconcileStaleInFlightNotifications', {
-      repo, staleBeforeAt: addMs(now(), -boundedStaleInFlightMs), at: now(), errorCode: 'stale-in-flight-recovered',
+      repo, staleBeforeAt: addMs(now(), -boundedStaleInFlightMs), at: now(), errorCode: 'stale-in-flight-recovered', limit: boundedBatchSize,
     });
     summary.staleRecovered = staleResult?.recovered || 0;
   } catch (error) {
@@ -664,13 +748,22 @@ export async function reconcileNotifications({
   }
   if (!state.healthy) return summary;
 
-  // Step 2: activation-gated, bounded, cursor-based discovery for the cursor sources.
+  // Step 2: two-frontier, activation-gated, bounded discovery for the cursor
+  // sources (#53 review round 4, item 2). The deferred frontier is rechecked
+  // first (older, already-known work before newly-scanned work), then the
+  // monotonic high-water cursor scans forward -- so a permanently blocked row
+  // never prevents rows an arbitrary number of batch windows later from
+  // becoming outbox intents.
   for (const source of CURSOR_SOURCES) {
     if (!state.healthy) return summary;
     try {
-      const result = scanCursorSource({ state, repo, source, batchSize: boundedBatchSize, maxAttempts: boundedMaxAttempts });
+      const revisited = recheckDeferredSourceRows({ state, repo, source, batchSize: boundedBatchSize, maxAttempts: boundedMaxAttempts, at: now() });
+      summary.inserted += revisited.inserted;
+      summary.discovered += revisited.inserted;
+      const result = scanCursorSource({ state, repo, source, batchSize: boundedBatchSize, maxAttempts: boundedMaxAttempts, at: now() });
       summary.inserted += result.inserted;
       summary.discovered += result.inserted;
+      summary.deferred += result.deferred;
     } catch (error) {
       state.recordTaskError('notification-source-scan-failed', new Error('source-row-invalid'));
     }
@@ -718,6 +811,7 @@ export async function reconcileNotifications({
   const due = state.invoke('dueNotificationEvents', repo, now(), boundedBatchSize) || [];
   for (const row of due) {
     if (passDeadlineExceeded()) break;
+    if (!state.healthy) return summary;
     const owner = `pass:${now()}`;
     const claim = state.invoke('claimNotificationForDelivery', { dedupeKey: row.dedupe_key, owner, at: now() });
     if (!claim?.claimed) continue; // already claimed/moved by another pass -- never double-claim
@@ -737,6 +831,18 @@ export async function reconcileNotifications({
       } catch (error) {
         state.recordTaskError('notification-resolution-check-failed', new Error('source-row-invalid'));
       }
+      // FAIL CLOSED (#53 review round 4, item 1). `state.invoke()` turns a
+      // store exception into `null` AND flips `state.healthy` false, and
+      // `isSourceResolvedNow()` cannot distinguish that `null` from genuine
+      // source truth: for attention/recovery it reads as "still unresolved"
+      // (delivery would continue), and for health/quota as "source cleared"
+      // (the row would be resolved). Neither is knowledge. A source-truth
+      // read failure must therefore produce NO transport call and NO
+      // resolution -- the pass stops here, the store failure stays systemic
+      // rather than being downgraded to a task-local success, and this row
+      // simply remains 'in-flight' for the ordinary stale-claim recovery path
+      // to requeue (without consuming an attempt).
+      if (!state.healthy) return summary;
       if (clearedNow) {
         const resolved = state.invoke('resolveStatefulNotificationEvent', { dedupeKey: row.dedupe_key, resolvedAt: now() });
         if (resolved) summary.resolved += 1;
@@ -805,22 +911,50 @@ export async function reconcileNotifications({
   // kept `openNotificationExists()` suppressing every subsequent
   // quota_blocked episode for that repo forever. Bounded by SQL LIMIT and
   // filtered to the stateful event types in SQL (item 7).
-  const unresolved = state.invoke('unresolvedStatefulNotificationEvents', repo, boundedBatchSize) || [];
+  //
+  // The sweep is FAIR (#53 review round 4, item 3): it walks a durable
+  // rotating cursor over `notification_events.id` and wraps back to the start
+  // once it reaches the tail, instead of always rescanning the oldest rows by
+  // `created_at`. Round 3's fixed oldest-first window meant a
+  // permanently-open set of older attention/systemic rows larger than one
+  // batch occupied every sweep forever: a newer cleared or exhausted quota
+  // row was never rechecked, stayed unresolved, and kept
+  // `openNotificationExists()` suppressing every later quota episode for the
+  // repo. With rotation, every unresolved row of every event type -- quota,
+  // attention and systemic alike -- is rechecked within a bounded number of
+  // passes, the progress survives restart/reopen, one-shot types stay
+  // excluded in SQL, and no query is unbounded.
+  const resolutionCursor = state.invoke('getNotificationResolutionCursor', repo) ?? 0;
+  const unresolved = state.invoke('unresolvedStatefulNotificationEvents', repo, resolutionCursor, boundedBatchSize) || [];
+  let sweptToId = resolutionCursor;
+  let sweptWholeWindow = true;
   for (const row of unresolved) {
-    if (passDeadlineExceeded()) break;
+    if (passDeadlineExceeded()) { sweptWholeWindow = false; break; }
     let resolvedNow = false;
     try {
       resolvedNow = isSourceResolvedNow({ row, state });
     } catch (error) {
       state.recordTaskError('notification-resolution-check-failed', new Error('source-row-invalid'));
+      sweptToId = Number(row.id);
       continue;
     }
+    // Same fail-closed rule as the pre-delivery revalidation above (#53
+    // review round 4, item 1): a store read failure is not evidence a source
+    // cleared, so nothing is resolved and the cursor is not advanced past a
+    // row whose truth was never actually established.
+    if (!state.healthy) return summary;
     if (resolvedNow) {
       const resolved = state.invoke('resolveStatefulNotificationEvent', { dedupeKey: row.dedupe_key, resolvedAt: now() });
       if (resolved) summary.resolved += 1;
       else state.recordTaskError('notification-state-transition-mismatch', new Error('state-transition-mismatch'));
     }
+    sweptToId = Number(row.id);
   }
+  // Wrap back to the start once this sweep reached the tail (a short batch
+  // means there is nothing past it right now), so long-lived unresolved rows
+  // are revisited on a bounded rotation instead of only once.
+  const reachedTail = sweptWholeWindow && unresolved.length < boundedBatchSize;
+  state.invoke('setNotificationResolutionCursor', repo, reachedTail ? 0 : sweptToId, now());
 
   return summary;
 }
