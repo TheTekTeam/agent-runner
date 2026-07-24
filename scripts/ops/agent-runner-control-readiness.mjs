@@ -78,3 +78,39 @@ export function computeInstanceLoad({ agentId, env = process.env, dbPath, histor
   const active = dashboard?.activity?.status === 'active-or-unresolved' ? 1 : 0;
   return { capacity: 1, active, note: null };
 }
+
+/**
+ * Cost-class/budget-cap/quota-resource read (issue #47 required view:
+ * "cost class, budget/cap and quota/resource state"). This adds no new
+ * sink: for `claude-code-cli` it reuses the exact same read-only
+ * `buildRunnerDashboard()` summary `computeInstanceLoad()` already reads —
+ * the same bounded, already-safe `quota` block the static dashboard has
+ * displayed since before this issue (`blockedCount`,
+ * `latestSessionUsagePercent`, `latestWeeklyUsagePercent` — no raw
+ * prompts, tokens, or provider payload). Every other adapter is either a
+ * zero-spend local runtime or not yet implemented, so its cost class is a
+ * static, honest label; there is no live billing or provider call in this
+ * function for any adapter.
+ */
+export function computeInstanceQuota({ agentId, env = process.env, dbPath, buildDashboard = buildRunnerDashboard } = {}) {
+  if (agentId === 'ollama-agent') {
+    return { costClass: 'free-local-zero-spend', paid: false, quota: null };
+  }
+  if (agentId !== 'claude-code-cli') {
+    return { costClass: 'not-yet-qualified', paid: false, quota: null };
+  }
+  const resolvedDbPath = resolveDbPath({ env, dbPath });
+  const dashboard = buildDashboard(resolvedDbPath, { historyLimit: 1, strict: false });
+  const rawQuota = dashboard?.quota || null;
+  return {
+    costClass: 'paid-metered',
+    paid: true,
+    quota: rawQuota
+      ? {
+          blockedCount: typeof rawQuota.blockedCount === 'number' ? rawQuota.blockedCount : null,
+          latestSessionUsagePercent: typeof rawQuota.latestSessionUsagePercent === 'number' ? rawQuota.latestSessionUsagePercent : null,
+          latestWeeklyUsagePercent: typeof rawQuota.latestWeeklyUsagePercent === 'number' ? rawQuota.latestWeeklyUsagePercent : null,
+        }
+      : null,
+  };
+}

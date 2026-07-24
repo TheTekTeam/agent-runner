@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Agent Runner — Agents</title>
+  <link rel="stylesheet" href="./agents-dashboard.css">
+</head>
+<body>
+  <header class="hero">
+    <div>
+      <p class="eyebrow">Agent Runner — authenticated</p>
+      <h1>Agents</h1>
+      <p class="subtitle">Approved agent catalogue, lifecycle control and credential management. Machine-local, loopback-only. The existing static read-only operational dashboard (scheduler/quota history) remains available separately as a fallback.</p>
+    </div>
+    <div class="button-row" id="session-controls" hidden>
+      <span class="muted" id="session-identity"></span>
+      <button type="button" class="secondary" id="logout-button">Log out</button>
+    </div>
+  </header>
+
+  <main>
+    <section class="login-wrap" id="login-section">
+      <form class="panel login-panel stacked" id="login-form" aria-labelledby="login-heading">
+        <h2 id="login-heading">Operator sign-in</h2>
+        <p class="muted">This session is loopback-only and never persists across a service restart.</p>
+        <label>Username
+          <input type="text" name="username" autocomplete="username" required>
+        </label>
+        <label>Password
+          <input type="password" name="password" autocomplete="current-password" required>
+        </label>
+        <button type="submit">Sign in</button>
+        <p class="error-text" id="login-error" role="alert" hidden></p>
+      </form>
+    </section>
+
+    <section id="dashboard-section" hidden>
+      <section class="panel" aria-labelledby="add-instance-heading">
+        <h2 id="add-instance-heading">Add instance</h2>
+        <p class="muted">Restricted to the approved adapter catalogue below — there is no path to register an arbitrary adapter id.</p>
+        <form class="stacked" id="add-instance-form">
+          <label>Adapter
+            <select name="agentId" id="add-instance-select" required></select>
+          </label>
+          <button type="submit">Add instance</button>
+          <p class="status-text" id="add-instance-status" role="status"></p>
+        </form>
+      </section>
+
+      <section aria-labelledby="instances-heading">
+        <h2 id="instances-heading">Approved agent catalogue &amp; registered instances</h2>
+        <div class="grid instances-grid" id="instances-grid"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="audit-heading">
+        <h2 id="audit-heading">Audit / history &amp; rollback</h2>
+        <p class="muted">Actor, source, time, revision and changed <em>field names</em> only — never a changed value.</p>
+        <div class="two-col grid">
+          <div>
+            <h3>Recent audit entries</h3>
+            <div class="table-wrap"><table>
+              <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Revision</th><th>Changed fields</th></tr></thead>
+              <tbody id="audit-rows"></tbody>
+            </table></div>
+          </div>
+          <div>
+            <h3>Settings revisions</h3>
+            <p>Current revision: <strong id="current-revision">—</strong></p>
+            <div class="table-wrap"><table>
+              <thead><tr><th>Revision</th><th></th></tr></thead>
+              <tbody id="revision-rows"></tbody>
+            </table></div>
+          </div>
+        </div>
+      </section>
+    </section>
+
+    <section class="panel" id="fatal-error" role="alert" hidden></section>
+  </main>
+
+  <template id="instance-card-template">
+    <article class="panel instance-card">
+      <div class="button-row" style="justify-content: space-between; align-items: baseline;">
+        <h3 class="instance-title"></h3>
+        <span class="badge state-badge"></span>
+      </div>
+      <p class="muted state-explanation"></p>
+      <dl class="fact-grid">
+        <dt>Adapter / runtime</dt><dd class="fact-adapter"></dd>
+        <dt>Execution surface</dt><dd class="fact-surface"></dd>
+        <dt>Version policy</dt><dd class="fact-version"></dd>
+        <dt>Capability classes</dt><dd class="fact-capabilities"></dd>
+        <dt>Model / profile</dt><dd class="fact-model"></dd>
+        <dt>Context / output limits</dt><dd class="fact-limits"></dd>
+        <dt>Authentication status</dt><dd class="fact-auth"></dd>
+        <dt>Cost class</dt><dd class="fact-cost"></dd>
+        <dt>Budget / cap</dt><dd class="fact-budget"></dd>
+        <dt>Quota / resource state</dt><dd class="fact-quota"></dd>
+        <dt>Current task/slot</dt><dd class="fact-slot"></dd>
+        <dt>Readiness</dt><dd class="fact-readiness"></dd>
+        <dt>Last readiness check</dt><dd class="fact-readiness-time"></dd>
+        <dt>Settings revision</dt><dd class="fact-revision"></dd>
+        <dt>Last state change</dt><dd class="fact-last-change"></dd>
+      </dl>
+
+      <div class="confirm-panel paid-confirm" role="alertdialog" aria-label="Confirm paid-agent enablement" hidden>
+        <p class="paid-confirm-copy"></p>
+        <div class="button-row">
+          <button type="button" class="danger confirm-enable-button">Yes, enable paid agent</button>
+          <button type="button" class="secondary cancel-enable-button">Cancel</button>
+        </div>
+      </div>
+
+      <div class="button-row lifecycle-actions">
+        <button type="button" class="secondary" data-action="enabled">Enable</button>
+        <button type="button" class="secondary" data-action="paused">Pause</button>
+        <button type="button" class="secondary" data-action="draining">Drain</button>
+        <button type="button" class="secondary" data-action="disabled">Disable</button>
+      </div>
+      <p class="action-note lifecycle-note"></p>
+
+      <details>
+        <summary>Non-secret settings</summary>
+        <form class="stacked settings-form">
+          <label>Model <span class="hint">(free text; validated server-side)</span>
+            <input type="text" name="model">
+          </label>
+          <label>Profile
+            <input type="text" name="profile">
+          </label>
+          <label>Endpoint <span class="hint">(loopback http(s) only)</span>
+            <input type="text" name="endpoint">
+          </label>
+          <label>Timeout (ms)
+            <input type="number" name="timeout" min="1000" max="3600000">
+          </label>
+          <label>
+            <input type="checkbox" name="requireHumanApproval" style="width:auto">
+            Require human approval
+          </label>
+          <label>Notes <span class="hint">(max 256 characters)</span>
+            <input type="text" name="notes" maxlength="256">
+          </label>
+          <button type="submit">Save settings</button>
+          <p class="status-text settings-status" role="status"></p>
+        </form>
+      </details>
+
+      <details>
+        <summary>Credential (write-only)</summary>
+        <p class="muted">Values are write-only: they are sent once, cleared from this form immediately, and never read back.</p>
+        <p>Status: <strong class="secret-status"></strong></p>
+        <form class="stacked secret-form">
+          <label>New credential value
+            <input type="password" name="value" autocomplete="new-password">
+          </label>
+          <div class="button-row">
+            <button type="submit" data-secret-action="create">Create</button>
+            <button type="submit" data-secret-action="rotate">Rotate</button>
+            <button type="button" data-secret-action="remove" class="danger">Remove</button>
+          </div>
+          <p class="status-text secret-status-message" role="status"></p>
+        </form>
+      </details>
+    </article>
+  </template>
+
+  <script type="module" src="./agents-dashboard.js"></script>
+</body>
+</html>

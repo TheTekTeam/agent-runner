@@ -25,7 +25,8 @@ import {
   transitionInstanceLifecycle,
   updateInstanceSettings,
 } from './agent-runner-control-instances.mjs';
-import { computeInstanceLoad, computeInstanceReadiness } from './agent-runner-control-readiness.mjs';
+import { computeInstanceLoad, computeInstanceQuota, computeInstanceReadiness } from './agent-runner-control-readiness.mjs';
+import { readStaticAsset, STATIC_CSP_HEADER } from './agent-runner-control-static.mjs';
 import {
   ControlSettingsInvalidDocumentError,
   ControlSettingsLockedError,
@@ -47,22 +48,30 @@ import {
 } from './agent-runner-secret-store.mjs';
 
 /**
- * Loopback-bound authenticated machine-local control service (issue #46).
+ * Loopback-bound authenticated machine-local control service (issue #46),
+ * now also serving the authenticated Agents dashboard shell (issue #47).
  *
- * Every request handler in this file only ever touches four sinks: the
- * control settings document (metadata + `secretref:`-shaped strings only,
- * never a secret value), the #45 protected secret store (values, write-only
- * — nothing here ever reads a value back out), the control audit log
- * (actor/source/time/revision/changed-field-*names* only), and the
- * operator-credential verifier (hash comparison only). Nothing in this
- * module opens the runner SQLite state DB for writing, and the only SQLite
- * *read* is `computeInstanceLoad()`'s existing dashboard summary, reused
- * read-only exactly as the static dashboard already uses it.
+ * Every `/api/*` request handler in this file only ever touches four sinks:
+ * the control settings document (metadata + `secretref:`-shaped strings
+ * only, never a secret value), the #45 protected secret store (values,
+ * write-only — nothing here ever reads a value back out), the control
+ * audit log (actor/source/time/revision/changed-field-*names* only), and
+ * the operator-credential verifier (hash comparison only). Nothing in this
+ * module opens the runner SQLite state DB for writing; the only SQLite
+ * *reads* are `computeInstanceLoad()`'s and `computeInstanceQuota()`'s
+ * reuse of the existing dashboard summary, read-only, exactly as the
+ * static dashboard already uses it.
  *
- * No route ever logs a request body. Validation-failure responses report a
- * bounded machine-readable reason code, never an echo of submitted input —
- * this is the concrete containment for "never return, log, audit, serialize,
- * display or publish a secret value".
+ * `tryServeStaticAsset()` is a separate, non-API concern: it serves a fixed
+ * set of repository-shipped HTML/CSS/JS shell files (see
+ * `agent-runner-control-static.mjs`) that carry no agent, settings, secret,
+ * session or audit data — not a fifth sink, since nothing it reads is
+ * conditioned on request input.
+ *
+ * No `/api/*` route ever logs a request body. Validation-failure responses
+ * report a bounded machine-readable reason code, never an echo of submitted
+ * input — this is the concrete containment for "never return, log, audit,
+ * serialize, display or publish a secret value".
  */
 
 const ALLOWED_BIND_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
@@ -161,8 +170,12 @@ function normalizeExpectedRevision(value) {
   return Number.isInteger(number) ? number : NaN;
 }
 
-function decorateWithLoad(instance, ctx) {
-  return { ...instance, load: computeInstanceLoad({ agentId: instance.agentId, env: ctx.env, dbPath: ctx.dbPath }) };
+function decorateInstance(instance, ctx) {
+  return {
+    ...instance,
+    load: computeInstanceLoad({ agentId: instance.agentId, env: ctx.env, dbPath: ctx.dbPath }),
+    quota: computeInstanceQuota({ agentId: instance.agentId, env: ctx.env, dbPath: ctx.dbPath }),
+  };
 }
 
 // -- route handlers ----------------------------------------------------
@@ -187,14 +200,14 @@ async function handleLogout(ctx) {
 
 async function handleListInstances(ctx) {
   const instances = listInstanceSnapshots({ path: ctx.settingsPath, readinessByAgent: buildReadinessMap() })
-    .map((instance) => decorateWithLoad(instance, ctx));
+    .map((instance) => decorateInstance(instance, ctx));
   return sendJson(ctx.res, 200, { ok: true, instances });
 }
 
 async function handleGetInstance(ctx) {
   const agentId = ctx.match[1];
   const readiness = buildReadinessMap()[agentId] || null;
-  const instance = decorateWithLoad(getInstanceSnapshot({ path: ctx.settingsPath, agentId, readiness }), ctx);
+  const instance = decorateInstance(getInstanceSnapshot({ path: ctx.settingsPath, agentId, readiness }), ctx);
   return sendJson(ctx.res, 200, { ok: true, instance });
 }
 
@@ -213,7 +226,7 @@ async function handleCreateInstance(ctx) {
       actor: ctx.actor,
       source: ctx.source,
     });
-    return sendJson(ctx.res, 201, { ok: true, revision: result.revision, instance: decorateWithLoad(result.snapshot, ctx) });
+    return sendJson(ctx.res, 201, { ok: true, revision: result.revision, instance: decorateInstance(result.snapshot, ctx) });
   } catch (error) {
     return sendMappedError(ctx.res, error);
   }
@@ -237,7 +250,7 @@ async function handleUpdateInstanceSettings(ctx) {
       actor: ctx.actor,
       source: ctx.source,
     });
-    return sendJson(ctx.res, 200, { ok: true, revision: result.revision, instance: decorateWithLoad(result.snapshot, ctx) });
+    return sendJson(ctx.res, 200, { ok: true, revision: result.revision, instance: decorateInstance(result.snapshot, ctx) });
   } catch (error) {
     return sendMappedError(ctx.res, error);
   }
@@ -259,7 +272,7 @@ async function handleTransitionLifecycle(ctx) {
       actor: ctx.actor,
       source: ctx.source,
     });
-    return sendJson(ctx.res, 200, { ok: true, revision: result.revision, instance: decorateWithLoad(result.snapshot, ctx) });
+    return sendJson(ctx.res, 200, { ok: true, revision: result.revision, instance: decorateInstance(result.snapshot, ctx) });
   } catch (error) {
     return sendMappedError(ctx.res, error);
   }
@@ -387,6 +400,32 @@ function getAllowedOrigins(server) {
   return [`http://127.0.0.1:${port}`, `http://localhost:${port}`];
 }
 
+/**
+ * Serve the Agents dashboard shell (issue #47). GET-only, served *before*
+ * the `/api/*` origin/auth/CSRF gate below — a top-level navigation to load
+ * the page sends no `Origin` header, so gating the shell itself behind
+ * `validateOrigin()` would make the page un-loadable. Safe because
+ * `readStaticAsset()` only ever returns one of a handful of fixed,
+ * repository-shipped files carrying no agent/settings/secret/session/audit
+ * data; every dynamic value is fetched afterward through the fully gated
+ * `/api/*` surface. Not a fifth sink: this reads only its own static asset
+ * directory, never anything conditioned on request input.
+ */
+function tryServeStaticAsset(req, res, pathname) {
+  if (req.method !== 'GET' && req.method !== 'HEAD') return false;
+  const asset = readStaticAsset(pathname);
+  if (!asset) return false;
+  res.writeHead(200, {
+    'Content-Type': asset.contentType,
+    'Content-Length': Buffer.byteLength(asset.body),
+    'Cache-Control': 'no-store',
+    'Content-Security-Policy': STATIC_CSP_HEADER,
+    'X-Content-Type-Options': 'nosniff',
+  });
+  res.end(req.method === 'HEAD' ? undefined : asset.body);
+  return true;
+}
+
 async function handleRequest(req, res, server, config) {
   let url;
   try {
@@ -394,6 +433,8 @@ async function handleRequest(req, res, server, config) {
   } catch {
     return sendJson(res, 400, { ok: false, reason: 'invalid-request-target' });
   }
+
+  if (tryServeStaticAsset(req, res, url.pathname)) return undefined;
 
   const found = matchRoute(req.method, url.pathname);
   if (!found) return sendJson(res, 404, { ok: false, reason: 'not-found' });
