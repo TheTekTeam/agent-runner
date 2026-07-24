@@ -240,15 +240,18 @@ export function applyPlannedReassignment({ plan, mutateLabels, readLiveIssue } =
 
   try {
     mutateLabels({ removeLabels: plan.labelMutation.removeLabels, addLabels: plan.labelMutation.addLabels });
-  } catch (error) {
-    return { applied: false, reason: 'github-mutation-failed', detail: String(error?.message || error).slice(0, 300) };
+  } catch {
+    // Issue #50 review, sink hardening: a fixed reason code only -- never
+    // the raw exception message, which could carry a token, path, or
+    // provider response fragment from the gh CLI transport.
+    return { applied: false, reason: 'github-mutation-failed' };
   }
 
   let liveIssueAfter;
   try {
     liveIssueAfter = readLiveIssue();
-  } catch (error) {
-    return { applied: false, reason: 'post-mutation-read-failed', detail: String(error?.message || error).slice(0, 300) };
+  } catch {
+    return { applied: false, reason: 'post-mutation-read-failed' };
   }
   if (!liveIssueAfter) return { applied: false, reason: 'post-mutation-verification-unavailable' };
 

@@ -5,30 +5,18 @@ import { isAbsolute, resolve } from 'node:path';
 
 const DEFAULT_SETTINGS_RELATIVE = '.config/agent-runner/agent-settings.json';
 
-// claude-code-cli is the only implemented, always-on adapter today: unlike
-// the foundation-only adapters, cron.mjs's existing claim path has never
-// consulted this settings file for it, so an absent entry must default to
-// "enabled" here or every deployment without a claude-code-cli settings
-// entry would suddenly become non-routable. Every other agent id keeps the
-// fail-closed SAFE_DEFAULT_AGENT_LIFECYCLE default.
+// claude-code-cli's agent id. Note that once a machine-local settings
+// document is present (the multi-agent selector is "engaged" -- see
+// claude-runner-cron.mjs's engageMultiAgentSelector()), claude-code-cli is
+// held to the exact same fail-closed lifecycle/qualification defaults as
+// every other agent id below: an absent or malformed entry is unqualified
+// and non-routable, with no implicit wildcard/enabled fallback. When no
+// settings document exists at all, the selector is never engaged and the
+// pre-issue-#50 legacy Claude execution path (which never reads this file)
+// is untouched.
 const CLAUDE_AGENT_ID = 'claude-code-cli';
-const SAFE_DEFAULT_CLAUDE_LIFECYCLE = Object.freeze({
-  enabled: true,
-  paused: false,
-  draining: false,
-  disabled: false,
-});
 
 const WILDCARD = '*';
-// Only claude-code-cli's *absent-entry* default is permissive (preserves
-// today's "Claude just works" behaviour). Every other agent id, and any
-// explicit-but-incomplete qualification block, fails closed to "unqualified".
-const SAFE_DEFAULT_CLAUDE_QUALIFICATION = Object.freeze({
-  taskClasses: Object.freeze([WILDCARD]),
-  riskClasses: Object.freeze([WILDCARD]),
-  models: Object.freeze([WILDCARD]),
-  harness: WILDCARD,
-});
 const SAFE_DEFAULT_QUALIFICATION = Object.freeze({
   taskClasses: Object.freeze([]),
   riskClasses: Object.freeze([]),
@@ -212,16 +200,36 @@ export const AGENT_SETTINGS_EXAMPLE = Object.freeze({
   }),
 });
 
-function normalizeStringList(value, fallback) {
+// Sink hardening (issue #50 review): qualification identifiers read from a
+// machine-local settings file are bounded to a closed, safe token grammar
+// before they can ever reach a decision, log, SQLite row, or GitHub comment.
+// A qualification value that fails this grammar is dropped, never coerced
+// or truncated into something that still looks plausible.
+const QUALIFICATION_TOKEN_MAX_LENGTH = 64;
+const QUALIFICATION_TOKEN_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+function isSafeQualificationToken(value) {
+  return value === WILDCARD || (
+    typeof value === 'string'
+    && value.length > 0
+    && value.length <= QUALIFICATION_TOKEN_MAX_LENGTH
+    && QUALIFICATION_TOKEN_PATTERN.test(value)
+  );
+}
+
+function normalizeBoundedTokenList(value, fallback) {
   if (!Array.isArray(value)) return fallback;
-  const cleaned = value.map((item) => String(item || '').trim()).filter(Boolean);
+  const cleaned = value
+    .map((item) => (typeof item === 'string' ? item.trim() : String(item ?? '')))
+    .filter(isSafeQualificationToken);
   return Object.freeze(cleaned.length ? cleaned : []);
 }
 
-function normalizeHarnessValue(value, fallback) {
+function normalizeBoundedHarnessValue(value, fallback) {
   if (value === null) return null;
-  if (typeof value !== 'string' || !value.trim()) return fallback;
-  return value.trim();
+  if (typeof value !== 'string') return fallback;
+  const trimmed = value.trim();
+  return isSafeQualificationToken(trimmed) ? trimmed : fallback;
 }
 
 /**
@@ -231,14 +239,14 @@ function normalizeHarnessValue(value, fallback) {
  * etc.) is ever copied into this or any downstream decision/log/snapshot.
  */
 export function normalizeAgentQualification(agentId, entry) {
-  const fallback = agentId === CLAUDE_AGENT_ID ? SAFE_DEFAULT_CLAUDE_QUALIFICATION : SAFE_DEFAULT_QUALIFICATION;
+  const fallback = SAFE_DEFAULT_QUALIFICATION;
   const raw = isPlainObject(entry) && isPlainObject(entry.qualification) ? entry.qualification : null;
   if (!raw) return { ...fallback };
   return {
-    taskClasses: normalizeStringList(raw.taskClasses, fallback.taskClasses),
-    riskClasses: normalizeStringList(raw.riskClasses, fallback.riskClasses),
-    models: normalizeStringList(raw.models, fallback.models),
-    harness: normalizeHarnessValue(raw.harness, fallback.harness),
+    taskClasses: normalizeBoundedTokenList(raw.taskClasses, fallback.taskClasses),
+    riskClasses: normalizeBoundedTokenList(raw.riskClasses, fallback.riskClasses),
+    models: normalizeBoundedTokenList(raw.models, fallback.models),
+    harness: normalizeBoundedHarnessValue(raw.harness, fallback.harness),
   };
 }
 
@@ -259,14 +267,13 @@ export function normalizeAgentPaidUsePolicy(entry) {
   };
 }
 
-function normalizeLifecycleForAgent(agentId, entry) {
-  const fallback = agentId === CLAUDE_AGENT_ID ? SAFE_DEFAULT_CLAUDE_LIFECYCLE : SAFE_DEFAULT_AGENT_LIFECYCLE;
-  if (!isPlainObject(entry)) return { ...fallback };
+function normalizeLifecycleForAgent(_agentId, entry) {
+  if (!isPlainObject(entry)) return { ...SAFE_DEFAULT_AGENT_LIFECYCLE };
   return {
-    enabled: entry.enabled === undefined ? fallback.enabled : entry.enabled === true,
+    enabled: entry.enabled === true,
     paused: entry.paused === true,
     draining: entry.draining === true,
-    disabled: entry.disabled === undefined ? fallback.disabled : entry.disabled !== false,
+    disabled: entry.disabled === false ? false : true,
   };
 }
 
@@ -345,11 +352,15 @@ export function snapshotAgentSettings({
 }
 
 /**
- * True only when a fresh snapshot's revision exactly matches the revision
- * captured at selection time and neither snapshot recorded a parse error.
- * Any mismatch, missing revision, or malformed snapshot fails closed.
+ * True only when both snapshots are valid, present, whole-file snapshots
+ * (fileFound === true, no parseError, a revision present) and their
+ * revisions match exactly. Two "file not found" snapshots never count as
+ * unchanged -- fileFound must be true on both sides, not merely equal.
+ * Any mismatch, missing/false fileFound, missing revision, or parse error
+ * on either side fails closed.
  */
 export function settingsRevisionUnchanged(snapshotAtSelection, freshSnapshot) {
+  if (snapshotAtSelection?.fileFound !== true || freshSnapshot?.fileFound !== true) return false;
   if (!snapshotAtSelection?.revision || !freshSnapshot?.revision) return false;
   if (snapshotAtSelection.parseError || freshSnapshot.parseError) return false;
   return snapshotAtSelection.revision === freshSnapshot.revision;

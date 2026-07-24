@@ -40,16 +40,19 @@ function labelValueForPrefix(issue, prefix) {
  * One field's classification: a project-field value and a label value that
  * actively disagree resolve to `null` (never guessed toward either side);
  * otherwise whichever of the two is present wins, and absence of both is
- * `null` (unclassified) -- never a guessed permissive default.
+ * `null` (unclassified) -- never a guessed permissive default. The raw
+ * field/label values that disagreed are intentionally not returned here --
+ * only a boolean conflict flag -- so no issue-authored text can reach a
+ * decision, log, SQLite row, or comment (issue #50 review, sink hardening).
  */
 function classifyOneField(issue, { names, labelPrefix }) {
   const field = findFieldValue(issue, names);
   const fieldValue = field ? (String(field.value || '').trim() || null) : null;
   const labelValue = labelValueForPrefix(issue, labelPrefix);
   if (fieldValue && labelValue && normaliseToken(fieldValue) !== normaliseToken(labelValue)) {
-    return { value: null, conflict: { fieldValue, labelValue } };
+    return { value: null, conflict: true };
   }
-  return { value: fieldValue || labelValue || null, conflict: null };
+  return { value: fieldValue || labelValue || null, conflict: false };
 }
 
 /**
@@ -64,24 +67,25 @@ export function classifyIssueTaskRisk(issue) {
   const model = classifyOneField(issue, CLASSIFICATION_FIELDS.model);
   const harness = classifyOneField(issue, CLASSIFICATION_FIELDS.harness);
   const conflicts = [];
-  if (taskClass.conflict) conflicts.push({ key: 'taskClass', ...taskClass.conflict });
-  if (riskClass.conflict) conflicts.push({ key: 'riskClass', ...riskClass.conflict });
-  if (model.conflict) conflicts.push({ key: 'model', ...model.conflict });
-  if (harness.conflict) conflicts.push({ key: 'harness', ...harness.conflict });
+  if (taskClass.conflict) conflicts.push({ key: 'taskClass' });
+  if (riskClass.conflict) conflicts.push({ key: 'riskClass' });
+  if (model.conflict) conflicts.push({ key: 'model' });
+  if (harness.conflict) conflicts.push({ key: 'harness' });
   return { taskClass: taskClass.value, riskClass: riskClass.value, model: model.value, harness: harness.value, conflicts };
 }
 
 /**
- * Core classification match (task class / risk class). A wildcard entry
- * matches anything, including an unclassified (`null`) issue. Otherwise an
- * unclassified issue never matches -- unclassified metadata must not be
- * guessed into a permissive class -- and a classified issue must appear
- * verbatim in the agent's explicit list.
+ * Core classification match (task class / risk class). An unclassified
+ * (`null`/`undefined`) value never matches -- not even a wildcard-qualified
+ * agent -- because missing or conflicting task/risk metadata must never be
+ * turned into an eligible class. A wildcard entry matches any *known,
+ * explicit* class; otherwise a classified value must appear verbatim in the
+ * agent's explicit list.
  */
 export function matchesClassification(qualifiedList = [], value = null) {
+  if (value === null || value === undefined) return false;
   const list = Array.isArray(qualifiedList) ? qualifiedList : [];
   if (list.includes(WILDCARD)) return true;
-  if (value === null || value === undefined) return false;
   return list.includes(value);
 }
 

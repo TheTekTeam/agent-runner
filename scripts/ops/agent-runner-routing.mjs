@@ -82,7 +82,11 @@ export function evaluateAgentEligibility({
     if (settingsEntry.lifecycle?.draining) reasons.push('agent-draining');
   }
 
-  if (readiness && (readiness.healthy === false || readiness.ready === false)) reasons.push('agent-unhealthy-or-not-ready');
+  // Readiness is mandatory (issue #50 review, requirement 5): a candidate
+  // whose readiness was never proven is excluded exactly like one proven
+  // unhealthy -- absence of a probe result must never be read as "passing".
+  if (!readiness || typeof readiness !== 'object') reasons.push('readiness-not-proven');
+  else if (readiness.healthy !== true || readiness.ready !== true) reasons.push('agent-unhealthy-or-not-ready');
 
   if (settingsEntry) {
     const qualification = assessQualification({ agentId, qualification: settingsEntry.qualification, classification });

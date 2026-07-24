@@ -21,9 +21,10 @@ test('matchesClassification: an empty list never matches anything, including an 
   assert.equal(matchesClassification([], 'code'), false);
 });
 
-test('matchesClassification: a wildcard entry matches any value, including unclassified', () => {
-  assert.equal(matchesClassification([WILDCARD], null), true);
+test('matchesClassification: a wildcard entry matches any explicit, known value, but never an unclassified issue', () => {
   assert.equal(matchesClassification([WILDCARD], 'anything'), true);
+  assert.equal(matchesClassification([WILDCARD], null), false, 'a wildcard must not turn missing classification into an eligible class');
+  assert.equal(matchesClassification([WILDCARD], undefined), false);
 });
 
 test('matchesClassification: an unclassified (null) issue never matches a specific, non-wildcard list -- it is never guessed permissive', () => {
@@ -69,11 +70,21 @@ test('ollamaRiskBoundaryPasses: an unclassified (null) risk never satisfies the 
   assert.equal(ollamaRiskBoundaryPasses(OLLAMA_AGENT_ID, null), false);
 });
 
-test('assessQualification: claude-code-cli with wildcard qualification is qualified for an unclassified issue', () => {
+test('assessQualification: wildcard task/risk qualification is NOT qualified for an unclassified issue -- explicit classification is required', () => {
   const decision = assessQualification({
     agentId: 'claude-code-cli',
     qualification: { taskClasses: [WILDCARD], riskClasses: [WILDCARD], models: [WILDCARD], harness: WILDCARD },
     classification: { taskClass: null, riskClass: null, model: null, harness: null },
+  });
+  assert.equal(decision.qualified, false);
+  assert.deepEqual(decision.reasons.sort(), ['risk-class-not-qualified', 'task-class-not-qualified']);
+});
+
+test('assessQualification: wildcard task/risk qualification is qualified for an explicitly classified issue', () => {
+  const decision = assessQualification({
+    agentId: 'claude-code-cli',
+    qualification: { taskClasses: [WILDCARD], riskClasses: [WILDCARD], models: [WILDCARD], harness: WILDCARD },
+    classification: { taskClass: 'code', riskClass: 'low', model: null, harness: null },
   });
   assert.equal(decision.qualified, true);
   assert.deepEqual(decision.reasons, []);
@@ -184,6 +195,19 @@ test('classifyIssueTaskRisk forces riskClass to null when the project field and 
   const classification = classifyIssueTaskRisk(issue);
   assert.equal(classification.riskClass, null);
   assert.equal(classification.conflicts[0].key, 'riskClass');
+});
+
+test('classifyIssueTaskRisk conflict evidence carries only a bounded key, never the raw field/label values that disagreed', () => {
+  const issue = {
+    labels: [{ name: 'task:SECRET-token-abc123-should-never-leak' }],
+    fields: { Task: 'sk-live-fake-credential-should-never-leak' },
+  };
+  const classification = classifyIssueTaskRisk(issue);
+  assert.equal(classification.taskClass, null);
+  assert.deepEqual(classification.conflicts, [{ key: 'taskClass' }]);
+  const serialized = JSON.stringify(classification);
+  assert.ok(!serialized.includes('SECRET'), 'raw label value must never appear in serialized classification');
+  assert.ok(!serialized.includes('sk-live'), 'raw field value must never appear in serialized classification');
 });
 
 test('classifyIssueTaskRisk agrees on a value (no conflict) when the project field and label match', () => {

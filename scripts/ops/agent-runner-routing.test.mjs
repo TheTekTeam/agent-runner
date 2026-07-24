@@ -17,6 +17,16 @@ const GROK_ADAPTER = AGENT_ADAPTERS['grok-cli'];
 const OLLAMA_ADAPTER = AGENT_ADAPTERS['ollama-agent'];
 
 const UNCLASSIFIED = { taskClass: null, riskClass: null, model: null, harness: null };
+// A concrete, explicit, non-conflicting task/risk classification -- used
+// wherever a test expects a candidate to actually be found *eligible*.
+// Issue #50 review, requirement 4: even a wildcard-qualified agent is never
+// eligible for an unclassified issue, so every "this candidate is eligible"
+// scenario below needs one of these rather than UNCLASSIFIED.
+const CLASSIFIED = { taskClass: 'code', riskClass: 'low', model: null, harness: null };
+// Issue #50 review, requirement 5: readiness is mandatory. Every "this
+// candidate is eligible" scenario also needs an explicit proven-ready
+// readiness object -- an absent one now excludes the candidate.
+const READY = { healthy: true, ready: true };
 
 function wildcardSettings(overrides = {}) {
   return {
@@ -41,12 +51,25 @@ test('hasGlobalSlotAvailable enforces exactly capacity 1 -- this issue adds no c
 test('explicit eligible Claude assignment is retained', () => {
   const result = selectAgentForIssue({
     explicitAgentId: 'claude-code-cli',
-    classification: UNCLASSIFIED,
-    candidates: [{ agentId: 'claude-code-cli', adapter: CLAUDE_ADAPTER, settingsEntry: wildcardSettings() }],
+    classification: CLASSIFIED,
+    candidates: [{ agentId: 'claude-code-cli', adapter: CLAUDE_ADAPTER, settingsEntry: wildcardSettings(), readiness: READY }],
   });
   assert.equal(result.selectedAgentId, 'claude-code-cli');
   assert.equal(result.reassigned, false);
   assert.equal(result.reason, 'explicit-assignment-retained');
+});
+
+test('an unclassified issue excludes even a wildcard-qualified, otherwise-eligible candidate -- a wildcard never turns missing classification into an eligible class', () => {
+  const result = selectAgentForIssue({
+    explicitAgentId: 'claude-code-cli',
+    classification: UNCLASSIFIED,
+    candidates: [{ agentId: 'claude-code-cli', adapter: CLAUDE_ADAPTER, settingsEntry: wildcardSettings(), readiness: READY }],
+  });
+  assert.equal(result.selectedAgentId, null);
+  assert.equal(result.reason, 'no-qualified-agent');
+  const decision = result.decisions.find((d) => d.agentId === 'claude-code-cli');
+  assert.ok(decision.reasons.includes('task-class-not-qualified'));
+  assert.ok(decision.reasons.includes('risk-class-not-qualified'));
 });
 
 // -- disabled / paused / draining / unhealthy Claude --
@@ -96,16 +119,39 @@ test('unhealthy Claude (readiness probe failed) is excluded with a bounded reaso
   assert.ok(decision.reasons.includes('agent-unhealthy-or-not-ready'));
 });
 
+test('a candidate with no readiness result at all is excluded -- absence of a probe result is never read as passing', () => {
+  const decision = evaluateAgentEligibility({
+    agentId: 'claude-code-cli',
+    adapter: CLAUDE_ADAPTER,
+    settingsEntry: wildcardSettings(),
+    classification: CLASSIFIED,
+  });
+  assert.equal(decision.status, 'excluded');
+  assert.ok(decision.reasons.includes('readiness-not-proven'));
+});
+
+test('an otherwise-eligible, fully proven-ready and explicitly classified candidate is eligible', () => {
+  const decision = evaluateAgentEligibility({
+    agentId: 'claude-code-cli',
+    adapter: CLAUDE_ADAPTER,
+    settingsEntry: wildcardSettings(),
+    readiness: READY,
+    classification: CLASSIFIED,
+  });
+  assert.equal(decision.status, 'eligible');
+  assert.deepEqual(decision.reasons, []);
+});
+
 // -- Claude quota blocked while a synthetic alternative remains eligible --
 
 test('Claude quota blocked excludes only Claude; a synthetic eligible alternative is still selected (Claude quota is agent-local)', () => {
   const syntheticAdapter = { agentId: 'future-agent', type: 'future', command: 'future-cli', implemented: true };
   const result = selectAgentForIssue({
     explicitAgentId: 'claude-code-cli',
-    classification: UNCLASSIFIED,
+    classification: CLASSIFIED,
     candidates: [
-      { agentId: 'claude-code-cli', adapter: CLAUDE_ADAPTER, settingsEntry: wildcardSettings(), resourceState: { blocked: true, reason: 'claude-quota-blocked' } },
-      { agentId: 'future-agent', adapter: syntheticAdapter, settingsEntry: wildcardSettings() },
+      { agentId: 'claude-code-cli', adapter: CLAUDE_ADAPTER, settingsEntry: wildcardSettings(), readiness: READY, resourceState: { blocked: true, reason: 'claude-quota-blocked' } },
+      { agentId: 'future-agent', adapter: syntheticAdapter, settingsEntry: wildcardSettings(), readiness: READY },
     ],
   });
   assert.equal(result.selectedAgentId, 'future-agent');
@@ -245,7 +291,8 @@ test('an implemented paid adapter with automaticRoutingApproved, paidUseApproved
     agentId: 'grok-cli',
     adapter: { ...GROK_ADAPTER, implemented: true },
     settingsEntry: wildcardSettings({ paidUse: { paidUseApproved: true, automaticRoutingApproved: true, hasPositiveCap: true } }),
-    classification: UNCLASSIFIED,
+    readiness: READY,
+    classification: CLASSIFIED,
   });
   assert.equal(decision.status, 'eligible');
   assert.equal(PAID_AGENT_IDS.includes('grok-cli'), true);
@@ -312,18 +359,20 @@ test('global-slot-unavailable short-circuits selection even with an eligible exp
 
 test('selection is deterministic: repeated calls with identical inputs produce identical results, in candidate order', () => {
   const candidates = [
-    { agentId: 'claude-code-cli', adapter: CLAUDE_ADAPTER, settingsEntry: wildcardSettings({ lifecycle: { enabled: true, paused: false, draining: false, disabled: true } }) },
-    { agentId: 'ollama-agent', adapter: { ...OLLAMA_ADAPTER, implemented: true }, settingsEntry: wildcardSettings() },
-    { agentId: 'codex-cli', adapter: { ...CODEX_ADAPTER, implemented: true }, settingsEntry: wildcardSettings({ paidUse: { paidUseApproved: true, automaticRoutingApproved: true, hasPositiveCap: true } }) },
+    { agentId: 'claude-code-cli', adapter: CLAUDE_ADAPTER, settingsEntry: wildcardSettings({ lifecycle: { enabled: true, paused: false, draining: false, disabled: true } }), readiness: READY },
+    { agentId: 'ollama-agent', adapter: { ...OLLAMA_ADAPTER, implemented: true }, settingsEntry: wildcardSettings(), readiness: READY },
+    { agentId: 'codex-cli', adapter: { ...CODEX_ADAPTER, implemented: true }, settingsEntry: wildcardSettings({ paidUse: { paidUseApproved: true, automaticRoutingApproved: true, hasPositiveCap: true } }), readiness: READY },
   ];
-  const first = selectAgentForIssue({ explicitAgentId: 'claude-code-cli', classification: UNCLASSIFIED, candidates });
-  const second = selectAgentForIssue({ explicitAgentId: 'claude-code-cli', classification: UNCLASSIFIED, candidates });
+  const first = selectAgentForIssue({ explicitAgentId: 'claude-code-cli', classification: CLASSIFIED, candidates });
+  const second = selectAgentForIssue({ explicitAgentId: 'claude-code-cli', classification: CLASSIFIED, candidates });
   assert.deepEqual(first, second);
-  // ollama-agent is structurally excluded (its low-risk boundary requires an
-  // explicit "low" classification; this test uses an unclassified issue),
-  // so the first eligible candidate in caller order is codex-cli -- not a
-  // scored/random pick between the two remaining eligible candidates.
-  assert.equal(first.selectedAgentId, 'codex-cli');
+  // ollama-agent is structurally excluded by its own low-risk boundary (this
+  // test's classification's riskClass is "low", so ollama-agent actually
+  // *is* eligible here -- it is the first eligible candidate in caller
+  // order, not codex-cli). Determinism, not the specific winner, is what
+  // this test proves; ollama-agent winning over codex-cli demonstrates
+  // caller-order-only selection just as well.
+  assert.equal(first.selectedAgentId, 'ollama-agent');
 });
 
 // -- sanitization: no raw settings/secret/credential/path/endpoint/prompt/provider text survives serialization --
