@@ -4884,23 +4884,30 @@ test('#53: main() reconciles the notification outbox using an injected synthetic
   const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-wiring-'));
   const stateDbPath = join(dir, 'state.sqlite');
   const lockPath = join(dir, 'cron.lock');
-  const store = openRunnerStateStore(stateDbPath);
-  store.recordRecoveryAttempt({
-    attemptId: 'notif-wiring-attempt', repo: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 911,
-    agent: 'claude-code-cli', model: 'claude-sonnet-5', harness: 'claude',
-    startedAt: '2026-07-24T09:00:00.000Z', finishedAt: '2026-07-24T09:05:00.000Z', outcome: 'completed', exitCode: 0,
-  });
-  store.close();
   const { transport, deliveries } = createSyntheticNotificationTransport();
   const originalLog = console.log;
   try {
     console.log = () => {};
-    const exitCode = await main([
+    const runPass = async () => main([
       '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
-    ], { GH_TOKEN: 'test-token' }, {
-      ghRunner: () => '',
-      notificationTransport: transport,
+    ], { GH_TOKEN: 'test-token' }, { ghRunner: () => '', notificationTransport: transport });
+
+    // The very first --execute pass only activates the notification source
+    // cursors (#53 review round 2, item 4) -- it must never backfill
+    // history that predates activation, so this warm-up pass runs against
+    // an empty store before anything is seeded.
+    assert.equal(await runPass(), 0);
+    assert.equal(deliveries.length, 0, 'the activation pass must not deliver anything');
+
+    const store = openRunnerStateStore(stateDbPath);
+    store.recordRecoveryAttempt({
+      attemptId: 'notif-wiring-attempt', repo: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 911,
+      agent: 'claude-code-cli', model: 'claude-sonnet-5', harness: 'claude',
+      startedAt: '2026-07-24T09:00:00.000Z', finishedAt: '2026-07-24T09:05:00.000Z', outcome: 'completed', exitCode: 0,
     });
+    store.close();
+
+    const exitCode = await runPass();
     assert.equal(exitCode, 0);
     assert.equal(deliveries.length, 1, 'main() must actually invoke reconcileNotifications on an --execute pass');
     assert.equal(deliveries[0].eventType, 'completed');
@@ -4920,13 +4927,6 @@ test('#53: a task-local notification transport failure releases the serial lock 
   const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-task-local-failure-'));
   const stateDbPath = join(dir, 'state.sqlite');
   const lockPath = join(dir, 'cron.lock');
-  const store = openRunnerStateStore(stateDbPath);
-  store.recordRecoveryAttempt({
-    attemptId: 'notif-failure-attempt', repo: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 912,
-    agent: 'claude-code-cli', model: 'claude-sonnet-5', harness: 'claude',
-    startedAt: '2026-07-24T09:00:00.000Z', finishedAt: '2026-07-24T09:05:00.000Z', outcome: 'completed', exitCode: 0,
-  });
-  store.close();
   const throwingTransport = async () => { throw new Error('synthetic notification transport explosion'); };
   const originalLog = console.log;
   const runPass = async () => main([
@@ -4937,6 +4937,17 @@ test('#53: a task-local notification transport failure releases the serial lock 
   });
   try {
     console.log = () => {};
+    // Warm-up activation pass, before anything is seeded (#53 review round 2, item 4).
+    assert.equal(await runPass(), 0);
+
+    const store = openRunnerStateStore(stateDbPath);
+    store.recordRecoveryAttempt({
+      attemptId: 'notif-failure-attempt', repo: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 912,
+      agent: 'claude-code-cli', model: 'claude-sonnet-5', harness: 'claude',
+      startedAt: '2026-07-24T09:00:00.000Z', finishedAt: '2026-07-24T09:05:00.000Z', outcome: 'completed', exitCode: 0,
+    });
+    store.close();
+
     const firstExitCode = await runPass();
     assert.equal(firstExitCode, 0, 'a notification-local transport fault must not fail the scheduler pass');
     assert.equal(existsSync(lockPath), false, 'the serial lock must still be released even when notification delivery throws');
@@ -4954,7 +4965,7 @@ test('#53: a task-local notification transport failure releases the serial lock 
     assert.equal(recoveryRows.length, 1, 'the notification transport fault must never touch unrelated durable state');
     assert.equal(recoveryRows[0].outcome, 'completed');
     assert.equal(notificationRows.length, 1);
-    assert.equal(['pending', 'retryable-failed'].includes(notificationRows[0].delivery_status), true);
+    assert.equal(['pending', 'retryable-failed', 'in-flight'].includes(notificationRows[0].delivery_status), true);
   } finally {
     console.log = originalLog;
     rmSync(dir, { recursive: true, force: true });

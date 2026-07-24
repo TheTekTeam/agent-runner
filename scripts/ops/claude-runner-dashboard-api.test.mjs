@@ -456,7 +456,8 @@ test('dashboard API allowlists notification_events output and never exposes dedu
       dedupeKey: `${SENTINEL}-dedupe`,
       content: { eventType: 'failed_attention', reasonCode: 'attention-required', repo: 'TheTekTeam/agent-runner', issueNumber: 53, agent: null, occurredAt: '2026-07-24T12:00:00.000Z', leaked: `${SENTINEL}-content` },
     });
-    store.markNotificationDeliveryFailed({ dedupeKey: `${SENTINEL}-dedupe`, attemptedAt: '2026-07-24T12:05:00.000Z', error: `${SENTINEL}-error`, nextAttemptAt: '2026-07-24T12:10:00.000Z' });
+    store.claimNotificationForDelivery({ dedupeKey: `${SENTINEL}-dedupe`, owner: 'test-pass', at: '2026-07-24T12:04:00.000Z' });
+    store.markNotificationDeliveryFailed({ dedupeKey: `${SENTINEL}-dedupe`, attemptedAt: '2026-07-24T12:05:00.000Z', errorCode: `${SENTINEL}-error`, nextAttemptAt: '2026-07-24T12:10:00.000Z' });
 
     const dashboard = buildRunnerDashboard(dbPath, { now: () => '2026-07-24T13:01:00.000Z' });
     const serialized = JSON.stringify(dashboard);
@@ -472,6 +473,8 @@ test('dashboard API allowlists notification_events output and never exposes dedu
     assert.equal('source_ref' in notification, false);
     assert.equal('content_json' in notification, false);
     assert.equal('last_error' in notification, false);
+    assert.equal('in_flight_owner' in notification, false);
+    assert.equal('in_flight_claimed_at' in notification, false);
   } finally {
     store.close();
   }

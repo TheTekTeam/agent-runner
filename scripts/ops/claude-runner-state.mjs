@@ -10,7 +10,7 @@ import {
   serializeCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 
-export const RUNNER_STATE_SCHEMA_VERSION = 13;
+export const RUNNER_STATE_SCHEMA_VERSION = 14;
 export const DEFAULT_RUNNER_STATE_DB_NAME = 'runner-state.sqlite';
 
 const TABLES = new Set([
@@ -28,6 +28,12 @@ const TABLES = new Set([
   'routing_events',
   'notification_events',
 ]);
+
+// notification_source_cursors (#53 round 2) is deliberately NOT a member of
+// TABLES/RUNNER_STATE_TABLES: it is pure internal reconciliation bookkeeping
+// with a composite (repo, source_table) key and no `id`/`started_at` column,
+// so it cannot use the generic allRows()/latestRows() ordering convention
+// the rest of this file shares, and has no dashboard/history purpose.
 
 export const RUNNER_STATE_TABLES = Object.freeze([...TABLES]);
 
@@ -106,6 +112,15 @@ function serialiseError(error) {
 function boundedLimit(limit) {
   if (!Number.isInteger(limit) || limit < 1) return 5;
   return Math.min(limit, 50);
+}
+
+// Distinct from boundedLimit() (dashboard history windows, capped at 50):
+// notification source-cursor batches (#53 round 2) get their own, larger
+// bound so a reconciliation pass can make real forward progress through a
+// backlog while still never scanning unbounded history in one call.
+function boundedBatchLimit(limit, max = 200) {
+  if (!Number.isInteger(limit) || limit < 1) return Math.min(50, max);
+  return Math.min(limit, max);
 }
 
 function parseJsonObject(value) {
@@ -328,25 +343,39 @@ export class RunnerStateStore {
         payload_json TEXT NOT NULL
       );
 
-      -- Schema v13 (#53): a durable, agent-agnostic notification outbox.
-      -- Rows are derived only from already-durable normalized runner state
+      -- Schema v14 (#53 round 2): a durable, agent-agnostic notification
+      -- outbox, hardened after manager review of the v13 draft. Rows are
+      -- derived only from already-durable normalized runner state
       -- (recovery_attempts, attention_events, quota_history, routing_events,
       -- runner_health_conditions) -- never from prompts, provider output,
-      -- raw logs/payloads, comments or arbitrary text. dedupe_key is UNIQUE
-      -- and scoped to the specific source occurrence (an attempt id, an
-      -- attention/routing dedupe key, a health-condition open episode, a
-      -- quota reset window) so a genuinely new transition after a prior
-      -- resolved one always gets its own row, while repeated reconciliation
-      -- passes over the same occurrence insert nothing new. delivery_status
-      -- is a small state machine: 'pending' (intent persisted, delivery not
-      -- yet attempted) -> 'delivered' or 'retryable-failed' -> ('delivered'
-      -- again, or 'exhausted' once attempt_count reaches max_attempts) ->
-      -- 'resolved' once the underlying source condition itself clears (or
-      -- immediately for one-shot event types with no further "unresolved"
-      -- concept). content_json holds only the bounded allowlisted fields a
-      -- notification may ever surface (event type, reason code, repo, issue
-      -- number, agent id, occurrence timestamp) -- it is never a passthrough
-      -- of the source row's own payload.
+      -- raw logs/payloads, comments or arbitrary text. dedupe_key is UNIQUE,
+      -- scoped to the specific source occurrence, and doubles as the stable
+      -- idempotency key handed to a transport across every retry/restart --
+      -- this outbox's delivery guarantee is at-least-once, never claimed as
+      -- exactly-once (see docs/ops/AGENT-RUNNER-NOTIFICATIONS.md).
+      --
+      -- delivery_status is a bounded state machine:
+      --   pending -> in-flight -> delivered|retryable-failed
+      --   retryable-failed -> in-flight (bounded retry) -> ... -> exhausted
+      --   delivered -> resolved (once the source condition itself clears)
+      -- 'in-flight' is a crash-safe claim taken immediately before a
+      -- transport is invoked (in_flight_owner/in_flight_claimed_at record
+      -- who/when); a disabled/paused transport reverts a claimed row back to
+      -- 'pending' untouched (no attempt consumed, no error); a stale
+      -- in-flight claim (a prior process crashed mid-delivery) is reconciled
+      -- back onto the SAME row/dedupe_key -- never a new notification
+      -- identity -- because the external side effect may already have
+      -- happened and only the same idempotency key lets a real transport's
+      -- provider-side dedupe collapse a resend.
+      --
+      -- CHECK constraints are the last line of defense: application code
+      -- must validate event_type/reason_code/delivery_status against the
+      -- same closed vocabularies *before* ever reaching this INSERT/UPDATE,
+      -- so a violation here indicates a bug, not expected control flow.
+      -- content_json is retained only as a non-authoritative audit trail --
+      -- delivery must rebuild outbound content from the validated columns
+      -- (event_type, reason_code, repo, project, issue_number, agent,
+      -- occurred_at), never by trusting this stored JSON blob.
       CREATE TABLE IF NOT EXISTS notification_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         dedupe_key TEXT NOT NULL UNIQUE,
@@ -355,21 +384,47 @@ export class RunnerStateStore {
         repo TEXT NOT NULL,
         project TEXT,
         issue_number INTEGER,
-        event_type TEXT NOT NULL,
-        reason_code TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK (event_type IN (
+          'completed', 'failed_attention', 'quota_blocked', 'agent_reassigned', 'no_qualified_agent', 'systemic_pause'
+        )),
+        reason_code TEXT NOT NULL CHECK (reason_code IN (
+          'run-completed', 'attention-required', 'quota-or-paid-use-blocked',
+          'agent-disabled-reassigned', 'no-qualified-agent', 'systemic-pause', 'control-service-failure'
+        )),
         agent TEXT,
         source_table TEXT NOT NULL,
         source_ref TEXT NOT NULL,
         occurred_at TEXT NOT NULL,
-        delivery_status TEXT NOT NULL DEFAULT 'pending',
-        attempt_count INTEGER NOT NULL DEFAULT 0,
-        max_attempts INTEGER NOT NULL DEFAULT 5,
+        delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_status IN (
+          'pending', 'in-flight', 'delivered', 'retryable-failed', 'exhausted', 'resolved'
+        )),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        max_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts >= 1 AND max_attempts <= 20),
+        in_flight_owner TEXT,
+        in_flight_claimed_at TEXT,
         next_attempt_at TEXT,
         last_attempt_at TEXT,
         delivered_at TEXT,
         resolved_at TEXT,
         last_error TEXT,
         content_json TEXT NOT NULL
+      );
+
+      -- Schema v14 (#53 round 2): durable per-(repo, source table)
+      -- reconciliation cursors. On first activation for a given
+      -- (repo, source_table) pair, the cursor is initialized to the current
+      -- tail of that table -- deliberately skipping the entire pre-existing
+      -- history in one step -- so deploying this outbox never floods
+      -- notifications for years of already-settled historical data. Every
+      -- later pass only reads rows strictly past the cursor, and the cursor
+      -- only advances past a row once its outbox intent is durably
+      -- persisted (never blindly to the end of a fetched batch).
+      CREATE TABLE IF NOT EXISTS notification_source_cursors (
+        repo TEXT NOT NULL,
+        source_table TEXT NOT NULL,
+        cursor_value TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (repo, source_table)
       );
 
       CREATE INDEX IF NOT EXISTS routing_events_issue_idx ON routing_events(repo, issue_number, event_type, created_at);
@@ -503,24 +558,37 @@ export class RunnerStateStore {
    * `dedupeKey` is UNIQUE, so a repeated reconciliation pass over the same
    * durable source occurrence is a safe no-op (`inserted: false`); a
    * genuinely new occurrence (different attempt/attention/routing/health
-   * episode) always carries a different key and always inserts. Mirrors
-   * `recordRoutingEvent()`'s INSERT-OR-IGNORE-then-return-existing shape.
+   * episode) always carries a different key and always inserts.
+   * `maxAttempts` is clamped to the CHECK constraint's bound so a caller
+   * passing an unbounded configured value can never violate the schema.
+   *
+   * Uses `ON CONFLICT(dedupe_key) DO NOTHING` -- deliberately NOT the
+   * simpler `INSERT OR IGNORE` used elsewhere in this file (e.g.
+   * `recordRoutingEvent()`). `INSERT OR IGNORE` suppresses a violation of
+   * ANY constraint on the statement, including the CHECK constraints on
+   * event_type/reason_code/delivery_status/attempt_count/max_attempts --
+   * silently discarding a bad row with no error at all, defeating their
+   * purpose as a last-line-of-defense (#53 review, item 8). Naming the
+   * exact conflict target instead means only a genuine dedupe_key
+   * collision is swallowed; every other constraint still throws normally.
    */
   recordNotificationEvent({
     repo, project = null, issueNumber = null, eventType, reasonCode, agent = null,
     sourceTable, sourceRef, occurredAt, dedupeKey, content, maxAttempts = 5, createdAt = this.now(),
   }) {
     if (!dedupeKey) throw new Error('recordNotificationEvent requires a dedupeKey');
+    const boundedMaxAttempts = Math.min(20, Math.max(1, Number.isInteger(maxAttempts) ? maxAttempts : 5));
     const result = this.db.prepare(`
-      INSERT OR IGNORE INTO notification_events
+      INSERT INTO notification_events
         (dedupe_key, created_at, updated_at, repo, project, issue_number, event_type, reason_code, agent, source_table, source_ref, occurred_at, delivery_status, attempt_count, max_attempts, content_json)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
-    `).run(dedupeKey, createdAt, createdAt, repo, project, asInteger(issueNumber), eventType, reasonCode, agent, sourceTable, sourceRef, occurredAt, maxAttempts, json(content));
+      ON CONFLICT(dedupe_key) DO NOTHING
+    `).run(dedupeKey, createdAt, createdAt, repo, project, asInteger(issueNumber), eventType, reasonCode, agent, sourceTable, sourceRef, occurredAt, boundedMaxAttempts, json(content));
     if (result.changes > 0) return { inserted: true, existing: null };
     return { inserted: false, existing: this.db.prepare('SELECT * FROM notification_events WHERE dedupe_key = ?').get(dedupeKey) || null };
   }
 
-  /** Rows never delivered, or eligible for a bounded retry -- the exact set a reconciliation pass must (re)attempt. */
+  /** Rows never delivered, or eligible for a bounded retry -- the exact set a reconciliation pass must (re)attempt. Excludes 'in-flight': those are claimed by a specific pass/owner already. */
   dueNotificationEvents(repo, at = this.now()) {
     return this.db.prepare(`SELECT * FROM notification_events WHERE repo = ?
       AND delivery_status IN ('pending', 'retryable-failed')
@@ -528,32 +596,96 @@ export class RunnerStateStore {
       ORDER BY created_at ASC`).all(repo, at);
   }
 
+  /**
+   * Atomically claim exactly one due row into 'in-flight' immediately before
+   * a transport is invoked (#53 review: crash-safe delivery ownership). The
+   * WHERE clause re-checks the same pending/retryable-failed + due
+   * conditions `dueNotificationEvents()` used, so a row already claimed (or
+   * moved on) by a concurrent pass is safely skipped rather than double-
+   * claimed. Returns `{ claimed: false }` rather than throwing on a miss.
+   */
+  claimNotificationForDelivery({ dedupeKey, owner, at = this.now() }) {
+    const result = this.db.prepare(`UPDATE notification_events SET
+      delivery_status = 'in-flight', in_flight_owner = ?, in_flight_claimed_at = ?, updated_at = ?
+      WHERE dedupe_key = ? AND delivery_status IN ('pending', 'retryable-failed')
+      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)`)
+      .run(owner, at, at, dedupeKey, at);
+    return { claimed: result.changes === 1 };
+  }
+
+  /**
+   * A disabled/paused transport must pause delivery without consuming an
+   * attempt (#53 review, item 1): revert a claimed row back to 'pending'
+   * exactly as it was before the claim -- attempt_count, next_attempt_at and
+   * last_error all untouched -- so the row remains deliverable indefinitely
+   * once a real transport is later enabled.
+   */
+  revertNotificationInFlightToPending({ dedupeKey, at = this.now() }) {
+    const result = this.db.prepare(`UPDATE notification_events SET
+      delivery_status = 'pending', in_flight_owner = NULL, in_flight_claimed_at = NULL, updated_at = ?
+      WHERE dedupe_key = ? AND delivery_status = 'in-flight'`).run(at, dedupeKey);
+    return result.changes === 1;
+  }
+
   /** Delivered, but not yet resolved -- rows a reconciliation pass must recheck against current source state (#53: unresolved dashboard attention must stay visible even once delivered). */
   deliveredUnresolvedNotificationEvents(repo) {
     return this.db.prepare(`SELECT * FROM notification_events WHERE repo = ? AND delivery_status = 'delivered' AND resolved_at IS NULL ORDER BY created_at ASC`).all(repo);
   }
 
-  /** Advance a row to 'delivered' (and 'resolved' in the same write when the caller already knows the underlying source has nothing further to wait on -- e.g. a one-shot event type). */
+  /**
+   * Whether an unresolved (not `resolved`) notification of this event type
+   * already exists for a repo (#53 round 2, item 3): the quota_blocked
+   * source has no stable per-occurrence identity to key a dedupe_key on
+   * (quota_history rows are polled every tick), so discovery instead gates
+   * creation of a new episode on this existence check -- itself the
+   * occurrence boundary -- rather than on dedupe_key collision.
+   */
+  openNotificationExists(repo, eventType) {
+    return Boolean(this.db.prepare(`SELECT 1 FROM notification_events
+      WHERE repo = ? AND event_type = ? AND delivery_status != 'resolved' LIMIT 1`).get(repo, eventType));
+  }
+
+  /**
+   * Advance a claimed ('in-flight') row to 'delivered' (and 'resolved' in
+   * the same write for a one-shot event type with nothing further to wait
+   * on). Only transitions from 'in-flight' -- the state this row must be in
+   * immediately after a successful transport call in the intended flow --
+   * so a caller that skips the claim step, or whose claim was lost, fails
+   * closed (`false`) instead of silently marking an unclaimed row delivered.
+   */
   markNotificationDelivered({ dedupeKey, deliveredAt = this.now(), resolveNow = false }) {
     const result = this.db.prepare(`UPDATE notification_events SET
       delivery_status = CASE WHEN ? THEN 'resolved' ELSE 'delivered' END,
       attempt_count = attempt_count + 1, last_attempt_at = ?, delivered_at = COALESCE(delivered_at, ?),
-      resolved_at = CASE WHEN ? THEN ? ELSE resolved_at END, updated_at = ?, last_error = NULL
-      WHERE dedupe_key = ? AND delivery_status IN ('pending', 'retryable-failed')`)
+      resolved_at = CASE WHEN ? THEN ? ELSE resolved_at END, in_flight_owner = NULL, in_flight_claimed_at = NULL,
+      updated_at = ?, last_error = NULL
+      WHERE dedupe_key = ? AND delivery_status = 'in-flight'`)
       .run(resolveNow ? 1 : 0, deliveredAt, deliveredAt, resolveNow ? 1 : 0, deliveredAt, deliveredAt, dedupeKey);
     return result.changes === 1;
   }
 
-  /** Bounded retry: 'retryable-failed' while attempts remain, 'exhausted' once `max_attempts` is reached. Never throws on an unknown key -- caller fails closed instead of assuming the transition happened. */
-  markNotificationDeliveryFailed({ dedupeKey, attemptedAt = this.now(), error = null, nextAttemptAt = null }) {
-    const row = this.db.prepare('SELECT attempt_count, max_attempts FROM notification_events WHERE dedupe_key = ?').get(dedupeKey);
+  /**
+   * Advance a claimed ('in-flight') row on delivery failure. `retryable:
+   * false` is a genuine non-retryable rejection -- it moves directly to
+   * 'exhausted' in this one call regardless of `attempt_count`/
+   * `max_attempts` (#53 review, item 1: distinct from the bounded-retry
+   * path). `retryable: true` (the default) uses the existing bounded-retry
+   * logic: 'retryable-failed' while attempts remain, 'exhausted' once
+   * `max_attempts` is reached. `errorCode` must already be one of this
+   * module's fixed reason codes -- never a raw exception message. Only
+   * transitions from 'in-flight'; never throws on an unknown/already-moved
+   * key.
+   */
+  markNotificationDeliveryFailed({ dedupeKey, attemptedAt = this.now(), errorCode = null, nextAttemptAt = null, retryable = true }) {
+    const row = this.db.prepare('SELECT attempt_count, max_attempts FROM notification_events WHERE dedupe_key = ? AND delivery_status = \'in-flight\'').get(dedupeKey);
     if (!row) return { updated: false, exhausted: false };
     const nextCount = row.attempt_count + 1;
-    const exhausted = nextCount >= row.max_attempts;
-    const boundedError = error == null ? null : String(error).slice(0, 300);
+    const exhausted = !retryable || nextCount >= row.max_attempts;
+    const boundedError = errorCode == null ? null : String(errorCode).slice(0, 80);
     const result = this.db.prepare(`UPDATE notification_events SET
-      delivery_status = ?, attempt_count = ?, last_attempt_at = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
-      WHERE dedupe_key = ? AND delivery_status IN ('pending', 'retryable-failed')`)
+      delivery_status = ?, attempt_count = ?, last_attempt_at = ?, next_attempt_at = ?, last_error = ?,
+      in_flight_owner = NULL, in_flight_claimed_at = NULL, updated_at = ?
+      WHERE dedupe_key = ? AND delivery_status = 'in-flight'`)
       .run(exhausted ? 'exhausted' : 'retryable-failed', nextCount, attemptedAt, exhausted ? null : nextAttemptAt, boundedError, attemptedAt, dedupeKey);
     return { updated: result.changes === 1, exhausted };
   }
@@ -565,11 +697,123 @@ export class RunnerStateStore {
     return result.changes === 1;
   }
 
+  /**
+   * Rows still 'in-flight' after `staleBeforeAt` were claimed by a process
+   * that never came back -- a crash between the claim and the terminal
+   * write, not a live delivery attempt. Reconciled back onto the SAME row
+   * (same dedupe_key/idempotency key), never a new notification identity
+   * (#53 review, item 2): the external side effect may already have
+   * happened, so a real transport's provider-side idempotency is what
+   * collapses the eventual resend, not this reconciliation step. Bounded by
+   * the same max_attempts as any other failure.
+   */
+  reconcileStaleInFlightNotifications({ repo, staleBeforeAt, at = this.now(), errorCode = 'stale-in-flight-recovered' }) {
+    const stale = this.db.prepare(`SELECT dedupe_key, attempt_count, max_attempts FROM notification_events
+      WHERE repo = ? AND delivery_status = 'in-flight' AND in_flight_claimed_at < ?`).all(repo, staleBeforeAt);
+    let recovered = 0;
+    for (const row of stale) {
+      const nextCount = row.attempt_count + 1;
+      const exhausted = nextCount >= row.max_attempts;
+      const result = this.db.prepare(`UPDATE notification_events SET
+        delivery_status = ?, attempt_count = ?, last_attempt_at = ?, next_attempt_at = ?, last_error = ?,
+        in_flight_owner = NULL, in_flight_claimed_at = NULL, updated_at = ?
+        WHERE dedupe_key = ? AND delivery_status = 'in-flight' AND in_flight_claimed_at < ?`)
+        .run(exhausted ? 'exhausted' : 'retryable-failed', nextCount, at, exhausted ? null : at, errorCode, at, row.dedupe_key, staleBeforeAt);
+      if (result.changes === 1) recovered += 1;
+    }
+    return { checked: stale.length, recovered };
+  }
+
+  /**
+   * Durable per-(repo, source_table) reconciliation cursor (#53 review,
+   * item 4). `null` means never activated for this pair -- the caller must
+   * activate it (skipping current history) before treating any row as new.
+   */
+  getNotificationSourceCursor(repo, sourceTable) {
+    return this.db.prepare('SELECT cursor_value FROM notification_source_cursors WHERE repo = ? AND source_table = ?').get(repo, sourceTable)?.cursor_value ?? null;
+  }
+
+  /**
+   * Idempotent first-activation: if a cursor already exists for this pair,
+   * this is a no-op (the existing value is authoritative and is returned
+   * unchanged) -- never resets a live cursor back to the initial value.
+   */
+  activateNotificationSourceCursor(repo, sourceTable, initialValue, at = this.now()) {
+    this.db.prepare(`INSERT INTO notification_source_cursors (repo, source_table, cursor_value, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(repo, source_table) DO NOTHING`).run(repo, sourceTable, String(initialValue), at);
+    return this.getNotificationSourceCursor(repo, sourceTable);
+  }
+
+  /** Advance a cursor -- callers must only do this after the corresponding batch's outbox intent is durably persisted (#53 review, item 4). */
+  advanceNotificationSourceCursor(repo, sourceTable, newValue, at = this.now()) {
+    this.db.prepare(`INSERT INTO notification_source_cursors (repo, source_table, cursor_value, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(repo, source_table) DO UPDATE SET cursor_value = excluded.cursor_value, updated_at = excluded.updated_at`)
+      .run(repo, sourceTable, String(newValue), at);
+  }
+
+  /** Bounded batch of attention_events rows strictly newer than `cursorValue` (an id, as text), oldest first. `cursorValue = null` returns none -- the caller must activate the cursor first. */
+  attentionEventsSince(repo, cursorValue, limit) {
+    if (cursorValue == null) return [];
+    return this.db.prepare('SELECT * FROM attention_events WHERE repo = ? AND id > ? ORDER BY id ASC LIMIT ?').all(repo, Number(cursorValue), boundedBatchLimit(limit));
+  }
+
+  /** Bounded batch of routing_events rows strictly newer than `cursorValue` (an id, as text), oldest first. */
+  routingEventsSince(repo, cursorValue, limit) {
+    if (cursorValue == null) return [];
+    return this.db.prepare('SELECT * FROM routing_events WHERE repo = ? AND id > ? ORDER BY id ASC LIMIT ?').all(repo, Number(cursorValue), boundedBatchLimit(limit));
+  }
+
+  /**
+   * Bounded batch of recovery_attempts rows strictly newer than
+   * `cursorValue` (a `started_at` timestamp, as text), oldest first. Strict
+   * `>` (not `>=`): the cursor is always set to a row this pass already
+   * fully finished processing (either at activation, past the pre-existing
+   * tail, or past the last row a prior batch actually reached), so `>=`
+   * would re-fetch that exact boundary row every following pass -- wasting
+   * a batch slot every time, and, at activation specifically, causing the
+   * tail row (deliberately meant to be skipped as pre-existing history) to
+   * be freshly evaluated and wrongly notified on the very next real pass.
+   * The accepted tradeoff is a genuinely-new row sharing the exact same
+   * millisecond `started_at` as the boundary row being missed -- not
+   * realistic for real wall-clock attempt timestamps. This table has no
+   * integer id to cursor on instead (its primary key is the text
+   * attempt_id).
+   */
+  recoveryAttemptsSince(repo, cursorValue, limit) {
+    if (cursorValue == null) return [];
+    return this.db.prepare('SELECT * FROM recovery_attempts WHERE repo = ? AND started_at > ? ORDER BY started_at ASC LIMIT ?').all(repo, cursorValue, boundedBatchLimit(limit));
+  }
+
+  /** The current tail (max id) of a table for a repo -- used only to activate a fresh cursor past all pre-existing history. */
+  maxRowId(table, repo) {
+    if (!['attention_events', 'routing_events'].includes(table)) throw new Error(`maxRowId unsupported for ${table}`);
+    return this.db.prepare(`SELECT MAX(id) AS maxId FROM ${table} WHERE repo = ?`).get(repo)?.maxId ?? 0;
+  }
+
+  /** The current tail (max started_at) of recovery_attempts for a repo -- used only to activate a fresh cursor past all pre-existing history. */
+  maxRecoveryAttemptStartedAt(repo) {
+    return this.db.prepare('SELECT MAX(started_at) AS maxStartedAt FROM recovery_attempts WHERE repo = ?').get(repo)?.maxStartedAt ?? null;
+  }
+
   recordQueueEvent({ repo, eventType, issueNumber = null, statusLabel = null, reason = null, payload = null, createdAt = this.now() }) {
     this.db.prepare(`
       INSERT INTO queue_events (created_at, repo, event_type, issue_number, status_label, reason, payload_json)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `).run(createdAt, repo, eventType, asInteger(issueNumber), statusLabel, reason, json(payload));
+  }
+
+  /**
+   * The single latest quota_history row for THIS repo specifically (#53
+   * review, item 3: "make quota discovery repository-scoped"). Distinct
+   * from `latestRows('quota_history', 1)`, which is a global latest-N-rows
+   * view across every repo -- using that for quota_blocked discovery would
+   * let a different repo's more recent poll hide or fabricate this repo's
+   * own blocked/available status.
+   */
+  latestQuotaHistoryForRepo(repo) {
+    return this.db.prepare('SELECT * FROM quota_history WHERE repo = ? ORDER BY id DESC LIMIT 1').get(repo) || null;
   }
 
   recordQuotaHistory({ repo, quotaPreflight, createdAt = this.now() }) {
