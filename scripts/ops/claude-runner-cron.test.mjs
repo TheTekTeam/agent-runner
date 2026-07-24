@@ -9,9 +9,11 @@ import test from 'node:test';
 import {
   activeRunBlockForIssue,
   attemptQueuedReassignment,
+  boundedReadiness,
   buildIssueListArgs,
   buildRoutingCandidates,
   claimIssueForExecution,
+  computeReadinessByAgentId,
   claimRevisionIsCurrent,
   classifyAttemptLivenessState,
   CLAUDE_RUNNER_ENTRYPOINT,
@@ -4135,29 +4137,37 @@ test('a fresh manager packet whose approved_agent matches the (post-reassignment
 
 const READY_ISSUE_CODEX_801 = { number: 801, title: 'Codex-assigned queued issue', url: 'https://example.invalid/801', labels: [{ name: 'status:ready' }, { name: 'agent:codex-cli' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' };
 
-test('a queued issue explicitly assigned to a foundation-only (implemented:false) agent is visible to reconciliation, but never becomes an executable selection', async () => {
-  const ghRunner = issueListGhRunner([READY_ISSUE_CODEX_801]);
-  const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: false };
-  // Claude explicitly disabled here (not merely absent) so it is not itself
-  // picked up as a reassignment target -- this isolates "visible to
-  // reconciliation but unexecutable" from the separate "reconciliation finds
-  // a legitimate alternative" scenario the next test covers.
-  const noAlternativeSnapshot = testSettingsSnapshot({ claudeOverrides: { lifecycle: { enabled: true, paused: false, draining: false, disabled: true } } });
-  const selected = await selectIssue(args, withEmptyOpenPrInventory(ghRunner), {
-    settingsSnapshot: noAlternativeSnapshot,
-    readinessByAgentId: CLAUDE_READY,
+// One case per foundation-only adapter, issue #50 review's explicit list
+// ("queued agent:codex-cli, agent:grok-cli and agent:ollama"). ollama-agent's
+// label is `agent:ollama` -- not `agent:ollama-agent` -- so it exercises a
+// distinct label-to-id resolution path the other two do not.
+for (const [agentId, agentLabel, issueNumber] of [['codex-cli', 'agent:codex-cli', 801], ['grok-cli', 'agent:grok-cli', 802], ['ollama-agent', 'agent:ollama', 803]]) {
+  test(`a queued issue explicitly assigned to foundation-only (implemented:false) ${agentId} is visible to reconciliation, but never becomes an executable selection`, async () => {
+    const issue = { number: issueNumber, title: `${agentId}-assigned queued issue`, url: `https://example.invalid/${issueNumber}`, labels: [{ name: 'status:ready' }, { name: agentLabel }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' };
+    const ghRunner = issueListGhRunner([issue]);
+    const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: false };
+    // Claude explicitly disabled here (not merely absent) so it is not
+    // itself picked up as a reassignment target -- this isolates "visible
+    // to reconciliation but unexecutable" from the separate "reconciliation
+    // finds a legitimate alternative" scenario the next test covers.
+    const noAlternativeSnapshot = testSettingsSnapshot({ claudeOverrides: { lifecycle: { enabled: true, paused: false, draining: false, disabled: true } } });
+    const selected = await selectIssue(args, withEmptyOpenPrInventory(ghRunner), {
+      settingsSnapshot: noAlternativeSnapshot,
+      readinessByAgentId: CLAUDE_READY,
+    });
+    // Execution discovery only ever queried agent:claude-code-cli, so this
+    // issue was never a candidate for execution -- there is no selection.
+    assert.equal(selected.issue, null);
+    // The reconciliation scan (a separate, foundation-label-inclusive
+    // query) still saw it and recorded why no execution followed -- this
+    // agent has no settings entry in testSettingsSnapshot, so it is
+    // unqualified.
+    const reconciled = selected.skipped.find((entry) => entry.issue === issueNumber);
+    assert.ok(reconciled, `the ${agentId}-labeled issue must be visible to reconciliation`);
+    assert.equal(reconciled.agentId, agentId);
+    assert.equal(reconciled.noQualifiedAgent, true);
   });
-  // Execution discovery only ever queried agent:claude-code-cli, so this
-  // issue was never a candidate for execution -- there is no selection.
-  assert.equal(selected.issue, null);
-  // The reconciliation scan (a separate, agent:codex-cli-inclusive query)
-  // still saw it and recorded why no execution followed -- codex-cli has no
-  // settings entry in testSettingsSnapshot, so it is unqualified.
-  const reconciled = selected.skipped.find((entry) => entry.issue === 801);
-  assert.ok(reconciled, 'the foundation-labeled issue must be visible to reconciliation');
-  assert.equal(reconciled.agentId, 'codex-cli');
-  assert.equal(reconciled.noQualifiedAgent, true);
-});
+}
 
 test('a queued issue assigned to codex-cli is never selected for execution even when its own settings entry claims enabled+qualified -- implemented:false always wins, and reconciliation still finds a legitimate eligible alternative', async () => {
   const ghRunner = issueListGhRunner([READY_ISSUE_CODEX_801]);
@@ -4421,4 +4431,30 @@ test('a full selectIssue() pass with synthetic secrets in a losing agent\'s sett
   const serialized = JSON.stringify(selected.skipped);
   assert.ok(!serialized.includes('vault://'), 'a raw sessionSecretRef must never survive into a skipped decision');
   assert.ok(!serialized.includes('codex-secret-path'), 'a raw executablePath must never survive into a skipped decision');
+});
+
+test('boundedReadiness drops a raw readiness probe\'s resolved executable path and detail -- only { healthy, ready } ever survives', () => {
+  const rawReadinessWithLeakyDetail = {
+    ok: false,
+    reason: 'command-not-on-path',
+    probes: [{ probe: 'executable', ok: false, reason: 'command-not-on-path', detail: '/home/svc-account/.secret-install/codex-secret-path/bin/codex' }],
+  };
+  const bounded = boundedReadiness(rawReadinessWithLeakyDetail);
+  assert.deepEqual(bounded, { healthy: false, ready: false });
+  assert.ok(!JSON.stringify(bounded).includes('secret-install'));
+});
+
+test('computeReadinessByAgentId never threads a raw probe\'s detail/reason text through -- every agent id maps to a bounded { healthy, ready } object only', () => {
+  const readinessByAgentId = computeReadinessByAgentId({
+    computeReadiness: ({ adapter }) => ({
+      ok: adapter.agentId === 'claude-code-cli',
+      reason: adapter.agentId === 'claude-code-cli' ? null : 'not-ready',
+      probes: [{ probe: 'executable', ok: false, reason: 'command-not-on-path', detail: `/opt/synthetic-secret-token-${adapter.agentId}/bin` }],
+    }),
+    env: { PATH: '' },
+  });
+  assert.deepEqual(readinessByAgentId['claude-code-cli'], { healthy: true, ready: true });
+  assert.deepEqual(readinessByAgentId['codex-cli'], { healthy: false, ready: false });
+  const serialized = JSON.stringify(readinessByAgentId);
+  assert.ok(!serialized.includes('synthetic-secret-token'), 'a raw probe detail must never survive computeReadinessByAgentId');
 });

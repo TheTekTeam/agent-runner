@@ -426,3 +426,57 @@ test('applyPlannedReassignment reports success only when the full plan applies a
   assert.equal(result.applied, true);
   assert.equal(result.verification.ok, true);
 });
+
+// -- issue #50 review, sink hardening: mutation/read failures return fixed reason codes, never the raw exception message --
+
+test('applyPlannedReassignment never echoes a raw mutateLabels exception message -- a token, path, or provider fragment in the underlying gh error must never reach the result', () => {
+  const plan = planReassignment({
+    issue: readyIssue(),
+    currentLabels: readyIssue().labels,
+    explicitAgentId: 'claude-code-cli',
+    routingSelection: { selectedAgentId: 'ollama-agent' },
+    settingsRevisionAtPlanning: 'sha256:aaa',
+    settingsRevisionNow: 'sha256:aaa',
+    repo: 'TheTekTeam/agent-runner',
+    ...allAbsentGuards(),
+  });
+  const result = applyPlannedReassignment({
+    plan,
+    // Deliberately under the secret-scanner's 20-char threshold (this repo's
+    // own scripts/validate.sh flags any real-shaped ghp_ token, even in a
+    // test fixture) -- short enough to be obviously synthetic, still real
+    // enough in shape to prove the redaction, matching the style already
+    // used by agent-runner-supervised-canary.test.mjs.
+    mutateLabels: () => { throw new Error('gh: authentication failed for token ghp_abcdefghijklmnop against https://api.github.com/repos/x/y/issues/1'); },
+    readLiveIssue: () => ({ labels: [] }),
+  });
+  assert.equal(result.applied, false);
+  assert.equal(result.reason, 'github-mutation-failed');
+  const serialized = JSON.stringify(result);
+  assert.ok(!serialized.includes('ghp_abcdefghijklmnop'));
+  assert.ok(!serialized.includes('api.github.com'));
+  assert.deepEqual(Object.keys(result).sort(), ['applied', 'reason']);
+});
+
+test('applyPlannedReassignment never echoes a raw readLiveIssue exception message either', () => {
+  const plan = planReassignment({
+    issue: readyIssue(),
+    currentLabels: readyIssue().labels,
+    explicitAgentId: 'claude-code-cli',
+    routingSelection: { selectedAgentId: 'ollama-agent' },
+    settingsRevisionAtPlanning: 'sha256:aaa',
+    settingsRevisionNow: 'sha256:aaa',
+    repo: 'TheTekTeam/agent-runner',
+    ...allAbsentGuards(),
+  });
+  const result = applyPlannedReassignment({
+    plan,
+    mutateLabels: () => {},
+    readLiveIssue: () => { throw new Error('gh: rate limited, session=sk-live-SyntheticSecretShouldNeverLeak'); },
+  });
+  assert.equal(result.applied, false);
+  assert.equal(result.reason, 'post-mutation-read-failed');
+  const serialized = JSON.stringify(result);
+  assert.ok(!serialized.includes('sk-live-SyntheticSecretShouldNeverLeak'));
+  assert.deepEqual(Object.keys(result).sort(), ['applied', 'reason']);
+});
