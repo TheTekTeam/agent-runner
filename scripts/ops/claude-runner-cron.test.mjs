@@ -64,6 +64,7 @@ import { AGENT_ADAPTERS } from './agent-runner-agents.mjs';
 import { computeSettingsRevision, QUALIFICATION_WILDCARD as WILDCARD } from './agent-runner-agent-settings.mjs';
 import { decideRecovery, normalizeTerminalOutcome } from './claude-runner-recovery.mjs';
 import { RUNNER_STATE_TABLES, openRunnerStateStore } from './claude-runner-state.mjs';
+import { createSyntheticNotificationTransport } from './agent-runner-notifications.mjs';
 import { readRestrictedRecoveryHandle, restrictedHandleBindingDigest, restrictedRecoveryDir, writeRestrictedRecoveryHandle } from './claude-runner-recovery-adapter.mjs';
 
 const TEST_MANAGER_FINGERPRINT = `sha256:${'a'.repeat(64)}`;
@@ -4877,4 +4878,85 @@ test('computeReadinessByAgentId never threads a raw probe\'s detail/reason text 
   assert.deepEqual(readinessByAgentId['codex-cli'], { healthy: false, ready: false });
   const serialized = JSON.stringify(readinessByAgentId);
   assert.ok(!serialized.includes('synthetic-secret-token'), 'a raw probe detail must never survive computeReadinessByAgentId');
+});
+
+test('#53: main() reconciles the notification outbox using an injected synthetic transport, never a real one', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-wiring-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const store = openRunnerStateStore(stateDbPath);
+  store.recordRecoveryAttempt({
+    attemptId: 'notif-wiring-attempt', repo: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 911,
+    agent: 'claude-code-cli', model: 'claude-sonnet-5', harness: 'claude',
+    startedAt: '2026-07-24T09:00:00.000Z', finishedAt: '2026-07-24T09:05:00.000Z', outcome: 'completed', exitCode: 0,
+  });
+  store.close();
+  const { transport, deliveries } = createSyntheticNotificationTransport();
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, {
+      ghRunner: () => '',
+      notificationTransport: transport,
+    });
+    assert.equal(exitCode, 0);
+    assert.equal(deliveries.length, 1, 'main() must actually invoke reconcileNotifications on an --execute pass');
+    assert.equal(deliveries[0].eventType, 'completed');
+    const finalStore = openRunnerStateStore(stateDbPath);
+    const rows = finalStore.allRows('notification_events');
+    finalStore.close();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].delivery_status, 'resolved');
+    assert.equal(existsSync(lockPath), false, 'the serial lock must be released after a normal pass');
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53: a task-local notification transport failure releases the serial lock and never blocks or corrupts the pass', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-task-local-failure-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const store = openRunnerStateStore(stateDbPath);
+  store.recordRecoveryAttempt({
+    attemptId: 'notif-failure-attempt', repo: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 912,
+    agent: 'claude-code-cli', model: 'claude-sonnet-5', harness: 'claude',
+    startedAt: '2026-07-24T09:00:00.000Z', finishedAt: '2026-07-24T09:05:00.000Z', outcome: 'completed', exitCode: 0,
+  });
+  store.close();
+  const throwingTransport = async () => { throw new Error('synthetic notification transport explosion'); };
+  const originalLog = console.log;
+  const runPass = async () => main([
+    '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+  ], { GH_TOKEN: 'test-token' }, {
+    ghRunner: () => '',
+    notificationTransport: throwingTransport,
+  });
+  try {
+    console.log = () => {};
+    const firstExitCode = await runPass();
+    assert.equal(firstExitCode, 0, 'a notification-local transport fault must not fail the scheduler pass');
+    assert.equal(existsSync(lockPath), false, 'the serial lock must still be released even when notification delivery throws');
+
+    // The next pass (the "next eligible candidate" opportunity) must proceed
+    // normally -- proving the task-local fault never held the global slot.
+    const secondExitCode = await runPass();
+    assert.equal(secondExitCode, 0);
+    assert.equal(existsSync(lockPath), false);
+
+    const finalStore = openRunnerStateStore(stateDbPath);
+    const recoveryRows = finalStore.allRows('recovery_attempts');
+    const notificationRows = finalStore.allRows('notification_events');
+    finalStore.close();
+    assert.equal(recoveryRows.length, 1, 'the notification transport fault must never touch unrelated durable state');
+    assert.equal(recoveryRows[0].outcome, 'completed');
+    assert.equal(notificationRows.length, 1);
+    assert.equal(['pending', 'retryable-failed'].includes(notificationRows[0].delivery_status), true);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

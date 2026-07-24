@@ -10,7 +10,7 @@ import {
   serializeCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 
-export const RUNNER_STATE_SCHEMA_VERSION = 12;
+export const RUNNER_STATE_SCHEMA_VERSION = 13;
 export const DEFAULT_RUNNER_STATE_DB_NAME = 'runner-state.sqlite';
 
 const TABLES = new Set([
@@ -26,6 +26,7 @@ const TABLES = new Set([
   'attention_events',
   'runner_health_conditions',
   'routing_events',
+  'notification_events',
 ]);
 
 export const RUNNER_STATE_TABLES = Object.freeze([...TABLES]);
@@ -327,7 +328,53 @@ export class RunnerStateStore {
         payload_json TEXT NOT NULL
       );
 
+      -- Schema v13 (#53): a durable, agent-agnostic notification outbox.
+      -- Rows are derived only from already-durable normalized runner state
+      -- (recovery_attempts, attention_events, quota_history, routing_events,
+      -- runner_health_conditions) -- never from prompts, provider output,
+      -- raw logs/payloads, comments or arbitrary text. dedupe_key is UNIQUE
+      -- and scoped to the specific source occurrence (an attempt id, an
+      -- attention/routing dedupe key, a health-condition open episode, a
+      -- quota reset window) so a genuinely new transition after a prior
+      -- resolved one always gets its own row, while repeated reconciliation
+      -- passes over the same occurrence insert nothing new. delivery_status
+      -- is a small state machine: 'pending' (intent persisted, delivery not
+      -- yet attempted) -> 'delivered' or 'retryable-failed' -> ('delivered'
+      -- again, or 'exhausted' once attempt_count reaches max_attempts) ->
+      -- 'resolved' once the underlying source condition itself clears (or
+      -- immediately for one-shot event types with no further "unresolved"
+      -- concept). content_json holds only the bounded allowlisted fields a
+      -- notification may ever surface (event type, reason code, repo, issue
+      -- number, agent id, occurrence timestamp) -- it is never a passthrough
+      -- of the source row's own payload.
+      CREATE TABLE IF NOT EXISTS notification_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        project TEXT,
+        issue_number INTEGER,
+        event_type TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        agent TEXT,
+        source_table TEXT NOT NULL,
+        source_ref TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
+        delivery_status TEXT NOT NULL DEFAULT 'pending',
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        max_attempts INTEGER NOT NULL DEFAULT 5,
+        next_attempt_at TEXT,
+        last_attempt_at TEXT,
+        delivered_at TEXT,
+        resolved_at TEXT,
+        last_error TEXT,
+        content_json TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS routing_events_issue_idx ON routing_events(repo, issue_number, event_type, created_at);
+      CREATE INDEX IF NOT EXISTS notification_events_status_idx ON notification_events(repo, delivery_status);
+      CREATE INDEX IF NOT EXISTS notification_events_issue_idx ON notification_events(repo, issue_number, created_at);
       CREATE INDEX IF NOT EXISTS queue_events_issue_idx ON queue_events(issue_number, created_at);
       CREATE INDEX IF NOT EXISTS quota_history_created_idx ON quota_history(created_at);
       CREATE INDEX IF NOT EXISTS preflight_packets_issue_idx ON preflight_packets(issue_number, created_at);
@@ -449,6 +496,73 @@ export class RunnerStateStore {
    */
   pendingRoutingEvents(repo) {
     return this.db.prepare("SELECT * FROM routing_events WHERE repo = ? AND delivery_status != 'resolved' ORDER BY created_at ASC").all(repo);
+  }
+
+  /**
+   * Persist notification *intent* before any delivery is attempted (#53).
+   * `dedupeKey` is UNIQUE, so a repeated reconciliation pass over the same
+   * durable source occurrence is a safe no-op (`inserted: false`); a
+   * genuinely new occurrence (different attempt/attention/routing/health
+   * episode) always carries a different key and always inserts. Mirrors
+   * `recordRoutingEvent()`'s INSERT-OR-IGNORE-then-return-existing shape.
+   */
+  recordNotificationEvent({
+    repo, project = null, issueNumber = null, eventType, reasonCode, agent = null,
+    sourceTable, sourceRef, occurredAt, dedupeKey, content, maxAttempts = 5, createdAt = this.now(),
+  }) {
+    if (!dedupeKey) throw new Error('recordNotificationEvent requires a dedupeKey');
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO notification_events
+        (dedupe_key, created_at, updated_at, repo, project, issue_number, event_type, reason_code, agent, source_table, source_ref, occurred_at, delivery_status, attempt_count, max_attempts, content_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+    `).run(dedupeKey, createdAt, createdAt, repo, project, asInteger(issueNumber), eventType, reasonCode, agent, sourceTable, sourceRef, occurredAt, maxAttempts, json(content));
+    if (result.changes > 0) return { inserted: true, existing: null };
+    return { inserted: false, existing: this.db.prepare('SELECT * FROM notification_events WHERE dedupe_key = ?').get(dedupeKey) || null };
+  }
+
+  /** Rows never delivered, or eligible for a bounded retry -- the exact set a reconciliation pass must (re)attempt. */
+  dueNotificationEvents(repo, at = this.now()) {
+    return this.db.prepare(`SELECT * FROM notification_events WHERE repo = ?
+      AND delivery_status IN ('pending', 'retryable-failed')
+      AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+      ORDER BY created_at ASC`).all(repo, at);
+  }
+
+  /** Delivered, but not yet resolved -- rows a reconciliation pass must recheck against current source state (#53: unresolved dashboard attention must stay visible even once delivered). */
+  deliveredUnresolvedNotificationEvents(repo) {
+    return this.db.prepare(`SELECT * FROM notification_events WHERE repo = ? AND delivery_status = 'delivered' AND resolved_at IS NULL ORDER BY created_at ASC`).all(repo);
+  }
+
+  /** Advance a row to 'delivered' (and 'resolved' in the same write when the caller already knows the underlying source has nothing further to wait on -- e.g. a one-shot event type). */
+  markNotificationDelivered({ dedupeKey, deliveredAt = this.now(), resolveNow = false }) {
+    const result = this.db.prepare(`UPDATE notification_events SET
+      delivery_status = CASE WHEN ? THEN 'resolved' ELSE 'delivered' END,
+      attempt_count = attempt_count + 1, last_attempt_at = ?, delivered_at = COALESCE(delivered_at, ?),
+      resolved_at = CASE WHEN ? THEN ? ELSE resolved_at END, updated_at = ?, last_error = NULL
+      WHERE dedupe_key = ? AND delivery_status IN ('pending', 'retryable-failed')`)
+      .run(resolveNow ? 1 : 0, deliveredAt, deliveredAt, resolveNow ? 1 : 0, deliveredAt, deliveredAt, dedupeKey);
+    return result.changes === 1;
+  }
+
+  /** Bounded retry: 'retryable-failed' while attempts remain, 'exhausted' once `max_attempts` is reached. Never throws on an unknown key -- caller fails closed instead of assuming the transition happened. */
+  markNotificationDeliveryFailed({ dedupeKey, attemptedAt = this.now(), error = null, nextAttemptAt = null }) {
+    const row = this.db.prepare('SELECT attempt_count, max_attempts FROM notification_events WHERE dedupe_key = ?').get(dedupeKey);
+    if (!row) return { updated: false, exhausted: false };
+    const nextCount = row.attempt_count + 1;
+    const exhausted = nextCount >= row.max_attempts;
+    const boundedError = error == null ? null : String(error).slice(0, 300);
+    const result = this.db.prepare(`UPDATE notification_events SET
+      delivery_status = ?, attempt_count = ?, last_attempt_at = ?, next_attempt_at = ?, last_error = ?, updated_at = ?
+      WHERE dedupe_key = ? AND delivery_status IN ('pending', 'retryable-failed')`)
+      .run(exhausted ? 'exhausted' : 'retryable-failed', nextCount, attemptedAt, exhausted ? null : nextAttemptAt, boundedError, attemptedAt, dedupeKey);
+    return { updated: result.changes === 1, exhausted };
+  }
+
+  /** Mark a previously-delivered notification resolved once its underlying durable source condition has itself cleared. A no-op (false) if the row is not currently 'delivered'. */
+  resolveNotificationEvent({ dedupeKey, resolvedAt = this.now() }) {
+    const result = this.db.prepare(`UPDATE notification_events SET delivery_status = 'resolved', resolved_at = ?, updated_at = ?
+      WHERE dedupe_key = ? AND delivery_status = 'delivered'`).run(resolvedAt, resolvedAt, dedupeKey);
+    return result.changes === 1;
   }
 
   recordQueueEvent({ repo, eventType, issueNumber = null, statusLabel = null, reason = null, payload = null, createdAt = this.now() }) {

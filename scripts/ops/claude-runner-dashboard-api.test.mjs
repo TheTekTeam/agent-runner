@@ -444,3 +444,35 @@ test('dashboard API allowlists recovery_attempts/run_results/attention_events ou
     store.close();
   }
 }));
+
+test('dashboard API allowlists notification_events output and never exposes dedupe_key/source_ref/content_json/last_error (#53)', () => withTempDir('agent-runner-notifications-dashboard-allowlist-', (dir) => {
+  const dbPath = join(dir, 'state.sqlite');
+  const store = openRunnerStateStore(dbPath, { now: () => '2026-07-24T13:00:00.000Z' });
+  const SENTINEL = 'RESTRICTED-SENTINEL-53-do-not-leak';
+  try {
+    store.recordNotificationEvent({
+      repo: 'TheTekTeam/agent-runner', issueNumber: 53, eventType: 'failed_attention', reasonCode: 'attention-required',
+      sourceTable: 'attention_events', sourceRef: `${SENTINEL}-ref`, occurredAt: '2026-07-24T12:00:00.000Z',
+      dedupeKey: `${SENTINEL}-dedupe`,
+      content: { eventType: 'failed_attention', reasonCode: 'attention-required', repo: 'TheTekTeam/agent-runner', issueNumber: 53, agent: null, occurredAt: '2026-07-24T12:00:00.000Z', leaked: `${SENTINEL}-content` },
+    });
+    store.markNotificationDeliveryFailed({ dedupeKey: `${SENTINEL}-dedupe`, attemptedAt: '2026-07-24T12:05:00.000Z', error: `${SENTINEL}-error`, nextAttemptAt: '2026-07-24T12:10:00.000Z' });
+
+    const dashboard = buildRunnerDashboard(dbPath, { now: () => '2026-07-24T13:01:00.000Z' });
+    const serialized = JSON.stringify(dashboard);
+    assert.equal(serialized.includes(SENTINEL), false, `restricted sentinel leaked into dashboard output: ${serialized}`);
+
+    const notification = dashboard.latest.notifications[0];
+    assert.equal(notification.issue_number, 53);
+    assert.equal(notification.event_type, 'failed_attention');
+    assert.equal(notification.delivery_status, 'retryable-failed');
+    assert.equal(notification.attempt_count, 1);
+    assert.equal('dedupe_key' in notification, false);
+    assert.equal('source_table' in notification, false);
+    assert.equal('source_ref' in notification, false);
+    assert.equal('content_json' in notification, false);
+    assert.equal('last_error' in notification, false);
+  } finally {
+    store.close();
+  }
+}));

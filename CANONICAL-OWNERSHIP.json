@@ -254,6 +254,24 @@
       }
     },
     {
+      "path": "scripts/ops/claude-runner-dashboard-api.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-24T00:00:00.000Z",
+        "reason": "Issue #53 adds the agent-agnostic notification/outbox layer and requires exposing its bounded delivery status through the dashboard/API positive-allowlist convention, which could not be added while this file stayed byte-locked to the original ModelSpend import.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/issues/53"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-dashboard-api.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-24T00:00:00.000Z",
+        "reason": "Issue #53 adds regression coverage for the notification_events dashboard/API allowlist.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/issues/53"
+      }
+    },
+    {
       "path": "scripts/ops/install-claude-runner-systemd.sh",
       "ownership": {
         "canonicalRepository": "TheTekTeam/agent-runner",

@@ -750,3 +750,91 @@ test('a routing_events row (full serialized shape, including payload_json) never
   const serialized = JSON.stringify(row);
   assert.doesNotMatch(serialized, /executablePath|sessionSecretRef|vault:\/\/|http:\/\/|https:\/\/|Bearer\s/);
 }));
+
+test('recordNotificationEvent requires a dedupeKey', () => withStore((store) => {
+  assert.throws(() => store.recordNotificationEvent({ repo: 'TheTekTeam/agent-runner', eventType: 'completed', reasonCode: 'run-completed', sourceTable: 'recovery_attempts', sourceRef: 'x', occurredAt: '2026-07-24T10:00:00.000Z' }), /dedupeKey/);
+}));
+
+test('recordNotificationEvent is idempotent on a repeated dedupeKey (#53)', () => withStore((store) => {
+  const params = {
+    repo: 'TheTekTeam/agent-runner', issueNumber: 53, eventType: 'completed', reasonCode: 'run-completed',
+    sourceTable: 'recovery_attempts', sourceRef: 'agent-runner#53:2026-07-24T10:00:00.000Z',
+    occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey: 'completed:agent-runner#53:2026-07-24T10:00:00.000Z',
+    content: { eventType: 'completed', reasonCode: 'run-completed', repo: 'TheTekTeam/agent-runner', issueNumber: 53, agent: null, occurredAt: '2026-07-24T10:00:00.000Z' },
+  };
+  const first = store.recordNotificationEvent(params);
+  assert.equal(first.inserted, true);
+  const second = store.recordNotificationEvent(params);
+  assert.equal(second.inserted, false);
+  assert.equal(second.existing.dedupe_key, params.dedupeKey);
+  assert.equal(store.allRows('notification_events').length, 1);
+}));
+
+test('notification_events delivery state machine: pending -> retryable-failed -> exhausted, and delivered -> resolved (#53)', () => withStore((store) => {
+  const dedupeKey = 'attention:dedupe-1';
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', issueNumber: 60, eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'attention_events', sourceRef: dedupeKey, occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey,
+    content: { eventType: 'failed_attention' }, maxAttempts: 2,
+  });
+  let [row] = store.allRows('notification_events');
+  assert.equal(row.delivery_status, 'pending');
+
+  assert.equal(store.dueNotificationEvents('TheTekTeam/agent-runner').length, 1);
+  let failure = store.markNotificationDeliveryFailed({ dedupeKey, attemptedAt: '2026-07-24T10:01:00.000Z', error: 'boom', nextAttemptAt: '2026-07-24T10:02:00.000Z' });
+  assert.equal(failure.updated, true);
+  assert.equal(failure.exhausted, false);
+  row = store.allRows('notification_events')[0];
+  assert.equal(row.delivery_status, 'retryable-failed');
+  assert.equal(row.attempt_count, 1);
+
+  failure = store.markNotificationDeliveryFailed({ dedupeKey, attemptedAt: '2026-07-24T10:03:00.000Z', error: 'boom-again' });
+  assert.equal(failure.exhausted, true);
+  row = store.allRows('notification_events')[0];
+  assert.equal(row.delivery_status, 'exhausted');
+  assert.equal(store.dueNotificationEvents('TheTekTeam/agent-runner').length, 0, 'an exhausted row must never be due again');
+
+  const otherKey = 'attention:dedupe-2';
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', issueNumber: 61, eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'attention_events', sourceRef: otherKey, occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey: otherKey,
+    content: { eventType: 'failed_attention' },
+  });
+  assert.equal(store.markNotificationDelivered({ dedupeKey: otherKey, deliveredAt: '2026-07-24T10:05:00.000Z' }), true);
+  let otherRow = store.allRows('notification_events').find((r) => r.dedupe_key === otherKey);
+  assert.equal(otherRow.delivery_status, 'delivered');
+  assert.equal(otherRow.resolved_at, null);
+  assert.equal(store.deliveredUnresolvedNotificationEvents('TheTekTeam/agent-runner').length, 1);
+
+  assert.equal(store.resolveNotificationEvent({ dedupeKey: otherKey, resolvedAt: '2026-07-24T10:10:00.000Z' }), true);
+  otherRow = store.allRows('notification_events').find((r) => r.dedupe_key === otherKey);
+  assert.equal(otherRow.delivery_status, 'resolved');
+  assert.equal(otherRow.resolved_at, '2026-07-24T10:10:00.000Z');
+  assert.equal(store.deliveredUnresolvedNotificationEvents('TheTekTeam/agent-runner').length, 0);
+}));
+
+test('markNotificationDelivered can resolve a one-shot notification in the same write', () => withStore((store) => {
+  const dedupeKey = 'completed:agent-runner#70:2026-07-24T10:00:00.000Z';
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', issueNumber: 70, eventType: 'completed', reasonCode: 'run-completed',
+    sourceTable: 'recovery_attempts', sourceRef: 'agent-runner#70:2026-07-24T10:00:00.000Z', occurredAt: '2026-07-24T10:00:00.000Z',
+    dedupeKey, content: { eventType: 'completed' },
+  });
+  assert.equal(store.markNotificationDelivered({ dedupeKey, deliveredAt: '2026-07-24T10:05:00.000Z', resolveNow: true }), true);
+  const [row] = store.allRows('notification_events');
+  assert.equal(row.delivery_status, 'resolved');
+  assert.equal(row.resolved_at, '2026-07-24T10:05:00.000Z');
+  assert.equal(row.delivered_at, '2026-07-24T10:05:00.000Z');
+}));
+
+test('a notification_events row (full serialized shape, including content_json) never contains raw prompts, provider output, credentials, paths or session handles', () => withStore((store) => {
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', issueNumber: 80, eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'attention_events', sourceRef: 'attention:dedupe-80', occurredAt: '2026-07-24T10:00:00.000Z',
+    dedupeKey: 'attention:dedupe-80',
+    content: { eventType: 'failed_attention', reasonCode: 'attention-required', repo: 'TheTekTeam/agent-runner', issueNumber: 80, agent: null, occurredAt: '2026-07-24T10:00:00.000Z' },
+  });
+  const row = store.allRows('notification_events')[0];
+  const serialized = JSON.stringify(row);
+  assert.doesNotMatch(serialized, /executablePath|sessionSecretRef|vault:\/\/|http:\/\/|https:\/\/|Bearer\s|\/home\/|Authorization:/);
+}));

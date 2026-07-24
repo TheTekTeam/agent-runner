@@ -85,6 +85,7 @@ import {
   verifyPreservedWorktree,
 } from './claude-runner-recovery-adapter.mjs';
 import { redactExecutableArgs } from './lib/redact.mjs';
+import { reconcileNotifications } from './agent-runner-notifications.mjs';
 
 const DEFAULT_REPO = 'TheTekTeam/modelspend';
 const DEFAULT_LOCK = '.var/claude-runner/cron.lock';
@@ -3008,6 +3009,14 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         const reconcileRoutingEvents = dependencies.reconcilePendingRoutingEvents || reconcilePendingRoutingEvents;
         await reconcileRoutingEvents({ state, args, ghRunner });
       }
+      // #53: agent-agnostic notification outbox reconciliation. Reads only
+      // already-durable normalized state and never touches GitHub, so it is
+      // safe unconditionally (independent of multiAgentSelectorEngaged).
+      // Never throws -- a notification-local fault is recorded via
+      // state.recordTaskError and cannot corrupt queue/claim/run/routing/
+      // recovery state or delay the `finally` block's unlock() below.
+      const reconcileNotificationEvents = dependencies.reconcileNotifications || reconcileNotifications;
+      await reconcileNotificationEvents({ state, args, transport: dependencies.notificationTransport, now });
     }
 
     let recoveryClaim = null;

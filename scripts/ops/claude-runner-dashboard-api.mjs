@@ -18,6 +18,8 @@ const TABLE_TO_DASHBOARD_KEY = Object.freeze({
   // *current* truth is `operatorStatus`, derived from
   // `summary.currentHealthConditions` (#698 round 5, finding 3), not this key.
   runner_health_conditions: 'healthConditions',
+  // #53: the notification/outbox layer's bounded operator-facing status.
+  notification_events: 'notifications',
 });
 
 function isoNow() {
@@ -59,6 +61,7 @@ function baseLatest() {
     recoveryAttempts: [],
     attentionEvents: [],
     healthConditions: [],
+    notifications: [],
   };
 }
 
@@ -112,6 +115,13 @@ const TABLE_SERIALIZERS = Object.freeze({
   // the other tables' allowlist convention.
   runner_health_conditions: (row) => pickFields(row, [
     'id', 'repo', 'condition_type', 'reason', 'opened_at', 'updated_at', 'resolved_at', 'safe_next_action',
+  ]),
+  // #53 — dedupe_key, source_table, source_ref, content_json and last_error
+  // deliberately excluded: internal correlation/audit detail with no
+  // dashboard display purpose, matching the same allowlist convention.
+  notification_events: (row) => pickFields(row, [
+    'id', 'created_at', 'updated_at', 'repo', 'project', 'issue_number', 'event_type', 'reason_code', 'agent',
+    'delivery_status', 'attempt_count', 'max_attempts', 'next_attempt_at', 'last_attempt_at', 'delivered_at', 'resolved_at',
   ]),
 });
 
