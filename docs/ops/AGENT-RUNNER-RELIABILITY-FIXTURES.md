@@ -1,7 +1,7 @@
 # Agent Runner reliability fixtures
 
-Issue: `TheTekTeam/agent-runner#69`  
-Parent acceptance programme: `TheTekTeam/agent-runner#5`  
+Issue: `TheTekTeam/agent-runner#69`
+Parent acceptance programme: `TheTekTeam/agent-runner#5`
 Manager packet: `AR69-RELIABILITY-FIXTURES-2026-07-24.2`
 
 ## Purpose
