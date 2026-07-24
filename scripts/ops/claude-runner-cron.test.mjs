@@ -64,6 +64,7 @@ import { AGENT_ADAPTERS } from './agent-runner-agents.mjs';
 import { computeSettingsRevision, QUALIFICATION_WILDCARD as WILDCARD } from './agent-runner-agent-settings.mjs';
 import { decideRecovery, normalizeTerminalOutcome } from './claude-runner-recovery.mjs';
 import { RUNNER_STATE_TABLES, openRunnerStateStore } from './claude-runner-state.mjs';
+import { createSyntheticNotificationTransport, reconcileNotifications } from './agent-runner-notifications.mjs';
 import { readRestrictedRecoveryHandle, restrictedHandleBindingDigest, restrictedRecoveryDir, writeRestrictedRecoveryHandle } from './claude-runner-recovery-adapter.mjs';
 
 const TEST_MANAGER_FINGERPRINT = `sha256:${'a'.repeat(64)}`;
@@ -4877,4 +4878,447 @@ test('computeReadinessByAgentId never threads a raw probe\'s detail/reason text 
   assert.deepEqual(readinessByAgentId['codex-cli'], { healthy: false, ready: false });
   const serialized = JSON.stringify(readinessByAgentId);
   assert.ok(!serialized.includes('synthetic-secret-token'), 'a raw probe detail must never survive computeReadinessByAgentId');
+});
+
+test('#53: main() reconciles the notification outbox using an injected synthetic transport, never a real one', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-wiring-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const { transport, deliveries } = createSyntheticNotificationTransport();
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const runPass = async () => main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, { ghRunner: () => '', notificationTransport: transport });
+
+    // The very first --execute pass only activates the notification source
+    // cursors (#53 review round 2, item 4) -- it must never backfill
+    // history that predates activation, so this warm-up pass runs against
+    // an empty store before anything is seeded.
+    assert.equal(await runPass(), 0);
+    assert.equal(deliveries.length, 0, 'the activation pass must not deliver anything');
+
+    const store = openRunnerStateStore(stateDbPath);
+    store.recordRecoveryAttempt({
+      attemptId: 'notif-wiring-attempt', repo: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 911,
+      agent: 'claude-code-cli', model: 'claude-sonnet-5', harness: 'claude',
+      startedAt: '2026-07-24T09:00:00.000Z', finishedAt: '2026-07-24T09:05:00.000Z', outcome: 'completed', exitCode: 0,
+    });
+    store.close();
+
+    const exitCode = await runPass();
+    assert.equal(exitCode, 0);
+    assert.equal(deliveries.length, 1, 'main() must actually invoke reconcileNotifications on an --execute pass');
+    assert.equal(deliveries[0].eventType, 'completed');
+    const finalStore = openRunnerStateStore(stateDbPath);
+    const rows = finalStore.allRows('notification_events');
+    finalStore.close();
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].delivery_status, 'resolved');
+    assert.equal(existsSync(lockPath), false, 'the serial lock must be released after a normal pass');
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53: a task-local notification transport failure releases the serial lock and never blocks or corrupts the pass', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-task-local-failure-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const throwingTransport = async () => { throw new Error('synthetic notification transport explosion'); };
+  const originalLog = console.log;
+  const runPass = async () => main([
+    '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+  ], { GH_TOKEN: 'test-token' }, {
+    ghRunner: () => '',
+    notificationTransport: throwingTransport,
+  });
+  try {
+    console.log = () => {};
+    // Warm-up activation pass, before anything is seeded (#53 review round 2, item 4).
+    assert.equal(await runPass(), 0);
+
+    const store = openRunnerStateStore(stateDbPath);
+    store.recordRecoveryAttempt({
+      attemptId: 'notif-failure-attempt', repo: 'TheTekTeam/modelspend', project: 'modelspend', issueNumber: 912,
+      agent: 'claude-code-cli', model: 'claude-sonnet-5', harness: 'claude',
+      startedAt: '2026-07-24T09:00:00.000Z', finishedAt: '2026-07-24T09:05:00.000Z', outcome: 'completed', exitCode: 0,
+    });
+    store.close();
+
+    const firstExitCode = await runPass();
+    assert.equal(firstExitCode, 0, 'a notification-local transport fault must not fail the scheduler pass');
+    assert.equal(existsSync(lockPath), false, 'the serial lock must still be released even when notification delivery throws');
+
+    // The next pass (the "next eligible candidate" opportunity) must proceed
+    // normally -- proving the task-local fault never held the global slot.
+    const secondExitCode = await runPass();
+    assert.equal(secondExitCode, 0);
+    assert.equal(existsSync(lockPath), false);
+
+    const finalStore = openRunnerStateStore(stateDbPath);
+    const recoveryRows = finalStore.allRows('recovery_attempts');
+    const notificationRows = finalStore.allRows('notification_events');
+    finalStore.close();
+    assert.equal(recoveryRows.length, 1, 'the notification transport fault must never touch unrelated durable state');
+    assert.equal(recoveryRows[0].outcome, 'completed');
+    assert.equal(notificationRows.length, 1);
+    assert.equal(['pending', 'retryable-failed', 'in-flight'].includes(notificationRows[0].delivery_status), true);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// -- #53 manager review round 5: scheduler integration -----------------------
+//
+// The round-4 outbox itself (deferred scanner, rotating resolution cursor,
+// fail-closed source reads, SQL-bounded stale recovery) is accepted and
+// untouched. These tests cover only the round-5 defect: `main()` never
+// invoked the accepted outbox on the quota-blocked or startup systemic_pause
+// paths, so a genuinely blocked quota pass and a repeatable early-admission
+// fault (process-identity) could each return before a required notification
+// was ever created.
+
+test('#53 review round 5: main() creates and synthetically delivers a quota_blocked notification before the quota-blocked early return, deduplicates repeated blocked passes, and starts a fresh episode once quota clears and blocks again', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-quota-blocked-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const { transport, deliveries } = createSyntheticNotificationTransport();
+  const blockedQuotaRunner = () => ({ status: 1, stdout: '', stderr: 'simulated quota preflight block' });
+  const availableQuotaRunner = () => ({ status: 0, stdout: JSON.stringify({ status: 'available' }), stderr: '' });
+  const ghRunnerNeverCalled = (args) => { throw new Error(`a quota-blocked pass must never reach GitHub: ${args.join(' ')}`); };
+  const ghRunnerNoOp = () => '';
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const runPass = (quotaRunner, ghRunner) => main([
+      '--execute', '--allow-root', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, { ghRunner, quotaRunner, notificationTransport: transport });
+
+    // Pass 1: the FIRST blocked pass on a brand-new store must still create
+    // and deliver exactly one quota_blocked notification before the
+    // quota-blocked early return -- quota discovery has no activation cursor
+    // (unlike the cursor sources), so this must work from the very first pass.
+    assert.equal(await runPass(blockedQuotaRunner, ghRunnerNeverCalled), 0);
+    assert.equal(deliveries.length, 1, 'a genuinely blocked quota pass must reach reconciliation before the early return');
+    assert.equal(deliveries[0].eventType, 'quota_blocked');
+
+    let store = openRunnerStateStore(stateDbPath);
+    assert.equal(store.allRows('quota_history').length, 1, 'the current quota_history row must be durably recorded');
+    assert.equal(store.allRows('quota_history')[0].blocked, 1);
+    let quotaNotifications = store.allRows('notification_events').filter((row) => row.event_type === 'quota_blocked');
+    const quotaBlockedRuns = store.allRows('run_results').filter((row) => row.mode === 'quota-blocked');
+    store.close();
+    assert.equal(quotaNotifications.length, 1);
+    assert.equal(quotaNotifications[0].delivery_status, 'delivered');
+    // Proves "before the normal quota-blocked return" directly: the same
+    // pass that delivered the notification also reached and recorded the
+    // quota-blocked run result, not a pass that returned before either.
+    assert.equal(quotaBlockedRuns.length, 1);
+    assert.equal(quotaBlockedRuns[0].exit_code, 0);
+
+    // Passes 2-3: repeated blocked passes must deduplicate the same open episode.
+    assert.equal(await runPass(blockedQuotaRunner, ghRunnerNeverCalled), 0);
+    assert.equal(await runPass(blockedQuotaRunner, ghRunnerNeverCalled), 0);
+    assert.equal(deliveries.length, 1, 'no repeated delivery for a still-open quota-blocked episode');
+    store = openRunnerStateStore(stateDbPath);
+    quotaNotifications = store.allRows('notification_events').filter((row) => row.event_type === 'quota_blocked');
+    store.close();
+    assert.equal(quotaNotifications.length, 1, 'still exactly one open episode across three blocked passes');
+
+    // Pass 4: quota clears -- the open episode must resolve.
+    assert.equal(await runPass(availableQuotaRunner, ghRunnerNoOp), 0);
+    store = openRunnerStateStore(stateDbPath);
+    quotaNotifications = store.allRows('notification_events').filter((row) => row.event_type === 'quota_blocked');
+    store.close();
+    assert.equal(quotaNotifications.length, 1);
+    assert.equal(quotaNotifications[0].delivery_status, 'resolved', 'quota clearing must resolve the previously-delivered episode');
+
+    // Pass 5: a later block must create an independent, fresh notification --
+    // the cleared prior episode must not suppress it.
+    assert.equal(await runPass(blockedQuotaRunner, ghRunnerNeverCalled), 0);
+    assert.equal(deliveries.length, 2, 'a fresh quota-blocked episode after clearing must be independently notified');
+    store = openRunnerStateStore(stateDbPath);
+    quotaNotifications = store.allRows('notification_events').filter((row) => row.event_type === 'quota_blocked');
+    store.close();
+    assert.equal(quotaNotifications.length, 2);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53 review round 5: a systemic_pause opened by a prior pass is notified before this pass resolves it, and the next pass resolves the notification once the condition clears', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-systemic-pause-order-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const repo = 'TheTekTeam/modelspend';
+  const seedStore = openRunnerStateStore(stateDbPath);
+  seedStore.openHealthCondition({
+    repo, conditionType: 'systemic_pause', reason: 'runner_state_unavailable',
+    safeNextAction: 'Repair and verify the SQLite runner state store.', payload: { stage: 'startup' }, at: '2026-07-24T08:00:00Z',
+  });
+  seedStore.close();
+  const { transport, deliveries } = createSyntheticNotificationTransport();
+  const ghRunner = (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify([]);
+    throw new Error(`unexpected GitHub call: ${args.join(' ')}`);
+  };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const runPass = () => main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, { ghRunner, notificationTransport: transport });
+
+    assert.equal(await runPass(), 0);
+    assert.equal(deliveries.length, 1, 'the prior open systemic_pause must be notified this pass');
+    assert.equal(deliveries[0].eventType, 'systemic_pause');
+
+    const midStore = openRunnerStateStore(stateDbPath);
+    const midCondition = midStore.healthConditionForType(repo, 'systemic_pause');
+    const midNotification = midStore.allRows('notification_events').find((row) => row.event_type === 'systemic_pause');
+    midStore.close();
+    assert.ok(midCondition.resolved_at, 'the same pass must still resolve the condition once the store proves writable again');
+    assert.equal(midNotification.delivery_status, 'delivered', 'delivered before the condition it reports on was resolved, not yet resolved itself');
+
+    // Next pass observes the now-resolved health condition and resolves the notification too.
+    assert.equal(await runPass(), 0);
+    const finalStore = openRunnerStateStore(stateDbPath);
+    const finalNotification = finalStore.allRows('notification_events').find((row) => row.event_type === 'systemic_pause');
+    finalStore.close();
+    assert.equal(finalNotification.delivery_status, 'resolved');
+    assert.equal(deliveries.length, 1, 'no re-delivery once already delivered');
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53 review round 5: a repeatable process-identity failure still lets every prior systemic_pause episode be notified before the next one is opened', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-process-identity-repeat-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const repo = 'TheTekTeam/modelspend';
+  const { transport, deliveries } = createSyntheticNotificationTransport();
+  const throwingCapture = () => { throw new Error('simulated /proc capture failure'); };
+  const ghRunnerNeverCalled = (args) => { throw new Error(`a process-identity failure pass must never reach GitHub: ${args.join(' ')}`); };
+  const originalLog = console.log;
+  const originalError = console.error;
+  try {
+    console.log = () => {};
+    console.error = () => {};
+    const runPass = () => main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, { ghRunner: ghRunnerNeverCalled, notificationTransport: transport, captureProcessIdentity: throwingCapture });
+
+    // Pass 1: no prior pause exists yet -- process-identity fails and opens
+    // the first episode.
+    assert.equal(await runPass(), 1, 'process-identity capture failure must still pause the pass');
+    assert.equal(deliveries.length, 0, 'nothing was open yet on the very first failing pass');
+
+    // Pass 2: the episode pass 1 opened must be notified BEFORE it is
+    // resolved and a new one is opened by this pass's own (repeated)
+    // process-identity failure.
+    assert.equal(await runPass(), 1);
+    assert.equal(deliveries.length, 1, "pass 1's pause must be notified on pass 2, before this pass resolves and reopens it");
+    assert.equal(deliveries[0].eventType, 'systemic_pause');
+
+    // Pass 3: pass 2's reopened episode must likewise be notified -- no
+    // episode is silently skipped just because the fault keeps recurring.
+    assert.equal(await runPass(), 1);
+    assert.equal(deliveries.length, 2, "pass 2's reopened episode must also be notified on pass 3");
+
+    const store = openRunnerStateStore(stateDbPath);
+    const conditionRows = store.allRows('runner_health_conditions').filter((row) => row.condition_type === 'systemic_pause' && row.repo === repo);
+    const notificationRows = store.allRows('notification_events').filter((row) => row.event_type === 'systemic_pause');
+    store.close();
+    assert.equal(conditionRows.length, 1, 'one row per (repo, condition_type) -- each episode reuses the same row');
+    assert.equal(notificationRows.length, 2, 'two distinct episodes were each notified exactly once');
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53 review round 5: notification reconciliation runs exactly once per --execute pass, and a genuine reconciliation-time store failure systemically pauses admission before any further work', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-reconcile-budget-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  let calls = 0;
+  const failingReconcile = async ({ state: passState }) => {
+    calls += 1;
+    passState.errors.push({ stage: 'notification-store-failure', message: 'simulated durable state failure' });
+    return { discovered: 0, inserted: 0, delivered: 0, paused: 0, retried: 0, exhausted: 0, resolved: 0, staleRecovered: 0, deferred: 0 };
+  };
+  const originalLog = console.log;
+  const originalError = console.error;
+  try {
+    console.log = () => {};
+    console.error = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, {
+      ghRunner: (args) => { throw new Error(`must never reach GitHub once reconciliation reports unhealthy state: ${args.join(' ')}`); },
+      reconcileNotifications: failingReconcile,
+    });
+    assert.equal(calls, 1, 'reconciliation must run exactly once even when it fails');
+    assert.equal(exitCode, 1, 'a genuine notification-store failure must systemically pause the pass, not silently continue admission');
+    assert.equal(existsSync(lockPath), false, 'the lock is still released on the systemic-pause path');
+  } finally {
+    console.log = originalLog;
+    console.error = originalError;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53 review round 5: a normal (non-blocked, non-paused) --execute pass invokes notification reconciliation exactly once', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-reconcile-once-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  let calls = 0;
+  const countingReconcile = async (options) => { calls += 1; return reconcileNotifications(options); };
+  const ghRunner = (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify([]);
+    throw new Error(`unexpected GitHub call: ${args.join(' ')}`);
+  };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, { ghRunner, reconcileNotifications: countingReconcile });
+    assert.equal(exitCode, 0);
+    assert.equal(calls, 1, 'exactly one reconciliation budget per execute pass, with no duplicate call site remaining');
+
+    // The blocked-quota admission path is the one round 5 found broken
+    // (reconciliation was unreachable there) -- prove "at most once" holds
+    // on it too, not only on the normal path.
+    calls = 0;
+    const blockedQuotaRunner = () => ({ status: 1, stdout: '', stderr: 'simulated quota preflight block' });
+    const blockedExitCode = await main([
+      '--execute', '--allow-root', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, {
+      ghRunner: (blockedArgs) => { throw new Error(`must never reach GitHub on a blocked quota pass: ${blockedArgs.join(' ')}`); },
+      quotaRunner: blockedQuotaRunner,
+      reconcileNotifications: countingReconcile,
+    });
+    assert.equal(blockedExitCode, 0);
+    assert.equal(calls, 1, 'exactly one reconciliation budget on the blocked-quota admission path too');
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53 review round 5: a dry-run (no --execute) pass never invokes notification reconciliation, even with an open systemic_pause present', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-dry-run-non-delivery-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const repo = 'TheTekTeam/modelspend';
+  const seedStore = openRunnerStateStore(stateDbPath);
+  seedStore.openHealthCondition({
+    repo, conditionType: 'systemic_pause', reason: 'runner_state_unavailable',
+    safeNextAction: 'Repair and verify the SQLite runner state store.', payload: { stage: 'startup' }, at: '2026-07-24T08:00:00Z',
+  });
+  seedStore.close();
+  let calls = 0;
+  const countingReconcile = async () => { calls += 1; return { discovered: 0, inserted: 0, delivered: 0 }; };
+  const ghRunner = (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify([]);
+    throw new Error(`unexpected GitHub call: ${args.join(' ')}`);
+  };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, { ghRunner, reconcileNotifications: countingReconcile });
+    assert.notEqual(exitCode, undefined);
+    assert.equal(calls, 0, 'dry-run must never invoke notification reconciliation');
+    const store = openRunnerStateStore(stateDbPath);
+    const notificationRows = store.allRows('notification_events');
+    store.close();
+    assert.equal(notificationRows.length, 0, 'dry-run must never discover or persist a notification intent');
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53 review round 5: a notification transport failure on the quota-blocked admission path stays task-local, releases the lock and still records the truthful quota-blocked result', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-quota-transport-failure-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const throwingTransport = async () => { throw new Error('synthetic transport explosion on the quota path'); };
+  const blockedQuotaRunner = () => ({ status: 1, stdout: '', stderr: 'simulated quota preflight block' });
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, {
+      ghRunner: (args) => { throw new Error(`must never reach GitHub on a blocked quota pass: ${args.join(' ')}`); },
+      quotaRunner: blockedQuotaRunner,
+      notificationTransport: throwingTransport,
+    });
+    assert.equal(exitCode, 0, 'a notification-local transport fault on the quota path must not fail the pass');
+    assert.equal(existsSync(lockPath), false, 'the serial lock must be released');
+    const store = openRunnerStateStore(stateDbPath);
+    const quotaRuns = store.allRows('run_results').filter((row) => row.mode === 'quota-blocked');
+    const notificationRows = store.allRows('notification_events').filter((row) => row.event_type === 'quota_blocked');
+    store.close();
+    assert.equal(quotaRuns.length, 1);
+    assert.equal(quotaRuns[0].exit_code, 0, 'the quota-blocked result stays a clean structured stop, not a crash');
+    assert.equal(notificationRows.length, 1);
+    assert.equal(['pending', 'retryable-failed', 'in-flight'].includes(notificationRows[0].delivery_status), true, 'never falsely marked delivered/resolved when the transport threw');
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53 review round 5: a notification transport failure while notifying a still-open systemic_pause stays task-local and this pass still resolves the pause and continues', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-pause-transport-failure-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const repo = 'TheTekTeam/modelspend';
+  const seedStore = openRunnerStateStore(stateDbPath);
+  seedStore.openHealthCondition({
+    repo, conditionType: 'systemic_pause', reason: 'runner_state_unavailable',
+    safeNextAction: 'Repair and verify the SQLite runner state store.', payload: { stage: 'startup' }, at: '2026-07-24T08:00:00Z',
+  });
+  seedStore.close();
+  const throwingTransport = async () => { throw new Error('synthetic transport explosion on the systemic-pause path'); };
+  const ghRunner = (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify([]);
+    throw new Error(`unexpected GitHub call: ${args.join(' ')}`);
+  };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, { ghRunner, notificationTransport: throwingTransport });
+    assert.equal(exitCode, 0, 'a notification-local transport fault while notifying systemic_pause must not fail the pass');
+    assert.equal(existsSync(lockPath), false);
+    const store = openRunnerStateStore(stateDbPath);
+    const condition = store.healthConditionForType(repo, 'systemic_pause');
+    const notificationRows = store.allRows('notification_events').filter((row) => row.event_type === 'systemic_pause');
+    store.close();
+    assert.ok(condition.resolved_at, 'this pass must still resolve the pause once the store proves writable, independent of the notification transport fault');
+    assert.equal(notificationRows.length, 1);
+    assert.equal(['pending', 'retryable-failed', 'in-flight'].includes(notificationRows[0].delivery_status), true);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

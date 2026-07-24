@@ -750,3 +750,524 @@ test('a routing_events row (full serialized shape, including payload_json) never
   const serialized = JSON.stringify(row);
   assert.doesNotMatch(serialized, /executablePath|sessionSecretRef|vault:\/\/|http:\/\/|https:\/\/|Bearer\s/);
 }));
+
+test('latestQuotaHistoryForRepo is repository-scoped, unlike the generic global-latest-N latestRows() view (#53 round 2, item 3)', () => withStore((store) => {
+  store.recordQuotaHistory({ repo: 'TheTekTeam/modelspend', quotaPreflight: { blocked: true, status: 'exhausted' }, createdAt: '2026-07-24T09:00:00.000Z' });
+  store.recordQuotaHistory({ repo: 'TheTekTeam/agent-runner', quotaPreflight: { blocked: false, status: 'available' }, createdAt: '2026-07-24T09:30:00.000Z' });
+  assert.equal(store.latestQuotaHistoryForRepo('TheTekTeam/modelspend').blocked, 1);
+  assert.equal(store.latestQuotaHistoryForRepo('TheTekTeam/agent-runner').blocked, 0);
+  assert.equal(store.latestQuotaHistoryForRepo('TheTekTeam/nonexistent'), null);
+  // The generic global view would instead return whichever repo polled most recently, regardless of which repo is asked about.
+  assert.equal(store.latestRows('quota_history', 1)[0].repo, 'TheTekTeam/agent-runner');
+}));
+
+test('recordNotificationEvent requires a dedupeKey', () => withStore((store) => {
+  assert.throws(() => store.recordNotificationEvent({ repo: 'TheTekTeam/agent-runner', eventType: 'completed', reasonCode: 'run-completed', sourceTable: 'recovery_attempts', sourceRef: 'x', occurredAt: '2026-07-24T10:00:00.000Z' }), /dedupeKey/);
+}));
+
+test('recordNotificationEvent is idempotent on a repeated dedupeKey (#53)', () => withStore((store) => {
+  const params = {
+    repo: 'TheTekTeam/agent-runner', issueNumber: 53, eventType: 'completed', reasonCode: 'run-completed',
+    sourceTable: 'recovery_attempts', sourceRef: 'agent-runner#53:2026-07-24T10:00:00.000Z',
+    occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey: 'completed:agent-runner#53:2026-07-24T10:00:00.000Z',
+    content: { eventType: 'completed', reasonCode: 'run-completed', repo: 'TheTekTeam/agent-runner', issueNumber: 53, agent: null, occurredAt: '2026-07-24T10:00:00.000Z' },
+  };
+  const first = store.recordNotificationEvent(params);
+  assert.equal(first.inserted, true);
+  const second = store.recordNotificationEvent(params);
+  assert.equal(second.inserted, false);
+  assert.equal(second.existing.dedupe_key, params.dedupeKey);
+  assert.equal(store.allRows('notification_events').length, 1);
+}));
+
+test('notification_events delivery state machine: pending -> in-flight -> retryable-failed -> in-flight -> exhausted, and in-flight -> delivered -> resolved (#53 round 2)', () => withStore((store) => {
+  const dedupeKey = 'attention:dedupe-1';
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', issueNumber: 60, eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'attention_events', sourceRef: dedupeKey, occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey,
+    content: { eventType: 'failed_attention' }, maxAttempts: 2,
+  });
+  let [row] = store.allRows('notification_events');
+  assert.equal(row.delivery_status, 'pending');
+
+  assert.equal(store.dueNotificationEvents('TheTekTeam/agent-runner').length, 1);
+  // markNotificationDeliveryFailed only transitions from 'in-flight' -- an
+  // unclaimed row must fail closed.
+  assert.deepEqual(store.markNotificationDeliveryFailed({ dedupeKey, attemptedAt: '2026-07-24T10:00:30.000Z' }), { updated: false, exhausted: false });
+
+  assert.equal(store.claimNotificationForDelivery({ dedupeKey, owner: 'pass-1', at: '2026-07-24T10:00:30.000Z' }).claimed, true);
+  row = store.allRows('notification_events')[0];
+  assert.equal(row.delivery_status, 'in-flight');
+  assert.equal(row.in_flight_owner, 'pass-1');
+  // A claimed row is not "due" again until it leaves in-flight.
+  assert.equal(store.dueNotificationEvents('TheTekTeam/agent-runner').length, 0);
+  // A second concurrent claim attempt on an already-claimed row must fail.
+  assert.equal(store.claimNotificationForDelivery({ dedupeKey, owner: 'pass-2', at: '2026-07-24T10:00:31.000Z' }).claimed, false);
+
+  let failure = store.markNotificationDeliveryFailed({ dedupeKey, attemptedAt: '2026-07-24T10:01:00.000Z', errorCode: 'synthetic-failure-injected', nextAttemptAt: '2026-07-24T10:02:00.000Z' });
+  assert.equal(failure.updated, true);
+  assert.equal(failure.exhausted, false);
+  row = store.allRows('notification_events')[0];
+  assert.equal(row.delivery_status, 'retryable-failed');
+  assert.equal(row.attempt_count, 1);
+  assert.equal(row.in_flight_owner, null);
+
+  assert.equal(store.claimNotificationForDelivery({ dedupeKey, owner: 'pass-3', at: '2026-07-24T10:03:00.000Z' }).claimed, true);
+  failure = store.markNotificationDeliveryFailed({ dedupeKey, attemptedAt: '2026-07-24T10:03:00.000Z', errorCode: 'synthetic-failure-injected' });
+  assert.equal(failure.exhausted, true);
+  row = store.allRows('notification_events')[0];
+  assert.equal(row.delivery_status, 'exhausted');
+  assert.equal(store.dueNotificationEvents('TheTekTeam/agent-runner').length, 0, 'an exhausted row must never be due again');
+
+  const otherKey = 'attention:dedupe-2';
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', issueNumber: 61, eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'attention_events', sourceRef: otherKey, occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey: otherKey,
+    content: { eventType: 'failed_attention' },
+  });
+  // markNotificationDelivered only transitions from 'in-flight' too.
+  assert.equal(store.markNotificationDelivered({ dedupeKey: otherKey, deliveredAt: '2026-07-24T10:05:00.000Z' }), false);
+  assert.equal(store.claimNotificationForDelivery({ dedupeKey: otherKey, owner: 'pass-4', at: '2026-07-24T10:04:59.000Z' }).claimed, true);
+  assert.equal(store.markNotificationDelivered({ dedupeKey: otherKey, deliveredAt: '2026-07-24T10:05:00.000Z' }), true);
+  let otherRow = store.allRows('notification_events').find((r) => r.dedupe_key === otherKey);
+  assert.equal(otherRow.delivery_status, 'delivered');
+  assert.equal(otherRow.resolved_at, null);
+  assert.equal(otherRow.in_flight_owner, null);
+  assert.equal(store.deliveredUnresolvedNotificationEvents('TheTekTeam/agent-runner').length, 1);
+
+  assert.equal(store.resolveNotificationEvent({ dedupeKey: otherKey, resolvedAt: '2026-07-24T10:10:00.000Z' }), true);
+  otherRow = store.allRows('notification_events').find((r) => r.dedupe_key === otherKey);
+  assert.equal(otherRow.delivery_status, 'resolved');
+  assert.equal(otherRow.resolved_at, '2026-07-24T10:10:00.000Z');
+  assert.equal(store.deliveredUnresolvedNotificationEvents('TheTekTeam/agent-runner').length, 0);
+}));
+
+test('markNotificationDelivered can resolve a one-shot notification in the same write, once claimed', () => withStore((store) => {
+  const dedupeKey = 'completed:agent-runner#70:2026-07-24T10:00:00.000Z';
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', issueNumber: 70, eventType: 'completed', reasonCode: 'run-completed',
+    sourceTable: 'recovery_attempts', sourceRef: 'agent-runner#70:2026-07-24T10:00:00.000Z', occurredAt: '2026-07-24T10:00:00.000Z',
+    dedupeKey, content: { eventType: 'completed' },
+  });
+  store.claimNotificationForDelivery({ dedupeKey, owner: 'pass-1', at: '2026-07-24T10:04:59.000Z' });
+  assert.equal(store.markNotificationDelivered({ dedupeKey, deliveredAt: '2026-07-24T10:05:00.000Z', resolveNow: true }), true);
+  const [row] = store.allRows('notification_events');
+  assert.equal(row.delivery_status, 'resolved');
+  assert.equal(row.resolved_at, '2026-07-24T10:05:00.000Z');
+  assert.equal(row.delivered_at, '2026-07-24T10:05:00.000Z');
+}));
+
+test('a disabled/paused transport reverts an in-flight row to pending without consuming an attempt (#53 round 2, item 1)', () => withStore((store) => {
+  const dedupeKey = 'quota:TheTekTeam/agent-runner:2026-07-24T10:00:00.000Z';
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', eventType: 'quota_blocked', reasonCode: 'quota-or-paid-use-blocked',
+    sourceTable: 'quota_history', sourceRef: '2026-07-24T10:00:00.000Z', occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey,
+    content: { eventType: 'quota_blocked' },
+  });
+  store.claimNotificationForDelivery({ dedupeKey, owner: 'pass-1', at: '2026-07-24T10:01:00.000Z' });
+  assert.equal(store.revertNotificationInFlightToPending({ dedupeKey, at: '2026-07-24T10:01:01.000Z' }), true);
+  const [row] = store.allRows('notification_events');
+  assert.equal(row.delivery_status, 'pending');
+  assert.equal(row.attempt_count, 0);
+  assert.equal(row.last_error, null);
+  assert.equal(row.next_attempt_at, null);
+  assert.equal(row.in_flight_owner, null);
+  assert.equal(store.dueNotificationEvents('TheTekTeam/agent-runner').length, 1, 'the row must remain deliverable indefinitely while paused');
+}));
+
+test('a non-retryable delivery failure moves an in-flight row directly to exhausted in one call, regardless of max_attempts headroom (#53 round 2, item 1)', () => withStore((store) => {
+  const dedupeKey = 'routing:no-qualified-agent-dedupe';
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', issueNumber: 90, eventType: 'no_qualified_agent', reasonCode: 'no-qualified-agent',
+    sourceTable: 'routing_events', sourceRef: dedupeKey, occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey,
+    content: { eventType: 'no_qualified_agent' }, maxAttempts: 10,
+  });
+  store.claimNotificationForDelivery({ dedupeKey, owner: 'pass-1', at: '2026-07-24T10:00:00.000Z' });
+  const failure = store.markNotificationDeliveryFailed({ dedupeKey, attemptedAt: '2026-07-24T10:00:01.000Z', errorCode: 'transport-rejected-permanent', retryable: false });
+  assert.equal(failure.exhausted, true);
+  const [row] = store.allRows('notification_events');
+  assert.equal(row.delivery_status, 'exhausted');
+  assert.equal(row.attempt_count, 1, 'exactly one attempt was consumed, not the full max_attempts budget');
+}));
+
+test('reconcileStaleInFlightNotifications requeues a crash-abandoned in-flight row onto the same dedupe_key without consuming an attempt (#53 round 3, item 5)', () => withStore((store) => {
+  const dedupeKey = 'attention:stale-dedupe';
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', issueNumber: 91, eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'attention_events', sourceRef: dedupeKey, occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey,
+    content: { eventType: 'failed_attention' },
+  });
+  store.claimNotificationForDelivery({ dedupeKey, owner: 'crashed-pass', at: '2026-07-24T10:00:00.000Z' });
+
+  // Not yet stale: the claim is recent relative to the staleness boundary.
+  let result = store.reconcileStaleInFlightNotifications({ repo: 'TheTekTeam/agent-runner', staleBeforeAt: '2026-07-24T09:59:00.000Z', at: '2026-07-24T10:05:00.000Z' });
+  assert.deepEqual(result, { checked: 0, recovered: 0 });
+  assert.equal(store.allRows('notification_events')[0].delivery_status, 'in-flight');
+
+  // Stale: the claim predates the staleness boundary -- the previous process crashed mid-delivery.
+  result = store.reconcileStaleInFlightNotifications({ repo: 'TheTekTeam/agent-runner', staleBeforeAt: '2026-07-24T10:00:30.000Z', at: '2026-07-24T10:05:00.000Z' });
+  assert.deepEqual(result, { checked: 1, recovered: 1 });
+  const [row] = store.allRows('notification_events');
+  assert.equal(row.delivery_status, 'pending', 'an ambiguous stale claim requeues the row, it is not a proven delivery failure');
+  assert.equal(row.dedupe_key, dedupeKey, 'reconciliation reuses the exact same notification identity, never a new one');
+  assert.equal(row.attempt_count, 0, 'a crash while owning the row never consumes the bounded delivery-attempt budget');
+  assert.equal(row.stale_recovery_count, 1, 'stale-claim recovery is tracked separately for operator visibility');
+  assert.equal(row.last_error, 'stale-in-flight-recovered');
+  assert.equal(row.in_flight_owner, null);
+  assert.equal(store.dueNotificationEvents('TheTekTeam/agent-runner', '2026-07-24T10:05:00.000Z').length, 1);
+}));
+
+test('repeated stale claims never exhaust a notification that may never have reached a transport (#53 round 3, item 5)', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  const dedupeKey = 'attention:crash-looping';
+  store.recordNotificationEvent({
+    repo, issueNumber: 92, eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'attention_events', sourceRef: dedupeKey, occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey,
+    content: { eventType: 'failed_attention' }, maxAttempts: 2,
+  });
+  // Ten consecutive processes each claim the row and die before ever calling
+  // a transport. Under the round-2 "charge the attempt" behaviour this row
+  // would have hit max_attempts=2 and been discarded as 'exhausted' after
+  // two crashes, permanently losing an event that was never delivered once.
+  for (let pass = 1; pass <= 10; pass += 1) {
+    assert.equal(store.claimNotificationForDelivery({ dedupeKey, owner: `crashed-pass-${pass}`, at: '2026-07-24T10:00:00.000Z' }).claimed, true, `pass ${pass} must be able to claim the requeued row`);
+    const result = store.reconcileStaleInFlightNotifications({ repo, staleBeforeAt: '2026-07-24T10:00:30.000Z', at: '2026-07-24T10:05:00.000Z' });
+    assert.deepEqual(result, { checked: 1, recovered: 1 });
+  }
+  const [row] = store.allRows('notification_events');
+  assert.equal(row.delivery_status, 'pending');
+  assert.equal(row.attempt_count, 0);
+  assert.equal(row.stale_recovery_count, 10);
+  assert.equal(store.dueNotificationEvents(repo, '2026-07-24T10:05:00.000Z').length, 1, 'the event remains deliverable no matter how many processes crashed while owning it');
+}));
+
+test('resolveStatefulNotificationEvent resolves a stateful row from any pre-terminal status, and never resolves a one-shot row (#53 round 3, item 1)', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  const record = (dedupeKey, eventType, reasonCode, sourceTable) => store.recordNotificationEvent({
+    repo, issueNumber: 93, eventType, reasonCode, sourceTable, sourceRef: dedupeKey,
+    occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey, content: { eventType },
+  });
+
+  // pending -> resolved
+  record('stateful-pending', 'failed_attention', 'attention-required', 'attention_events');
+  assert.equal(store.resolveStatefulNotificationEvent({ dedupeKey: 'stateful-pending', resolvedAt: '2026-07-24T11:00:00.000Z' }), true);
+  assert.equal(store.allRows('notification_events').find((r) => r.dedupe_key === 'stateful-pending').delivery_status, 'resolved');
+
+  // exhausted -> resolved (the case that otherwise suppresses every later quota episode forever)
+  record('stateful-exhausted', 'quota_blocked', 'quota-or-paid-use-blocked', 'quota_history');
+  store.claimNotificationForDelivery({ dedupeKey: 'stateful-exhausted', owner: 'p', at: '2026-07-24T10:00:01.000Z' });
+  store.markNotificationDeliveryFailed({ dedupeKey: 'stateful-exhausted', attemptedAt: '2026-07-24T10:00:02.000Z', errorCode: 'transport-rejected-permanent', retryable: false });
+  assert.equal(store.allRows('notification_events').find((r) => r.dedupe_key === 'stateful-exhausted').delivery_status, 'exhausted');
+  assert.equal(store.openNotificationExists(repo, 'quota_blocked'), true, 'an unresolved exhausted row suppresses a new episode until it resolves');
+  assert.equal(store.resolveStatefulNotificationEvent({ dedupeKey: 'stateful-exhausted', resolvedAt: '2026-07-24T11:00:00.000Z' }), true);
+  assert.equal(store.openNotificationExists(repo, 'quota_blocked'), false, 'once resolved it must no longer suppress a later blocked episode');
+
+  // A one-shot row must never resolve through this path, at any status.
+  record('one-shot-pending', 'completed', 'run-completed', 'recovery_attempts');
+  assert.equal(store.resolveStatefulNotificationEvent({ dedupeKey: 'one-shot-pending', resolvedAt: '2026-07-24T11:00:00.000Z' }), false, 'one-shot event types are excluded in SQL, not merely by caller discipline');
+  assert.equal(store.allRows('notification_events').find((r) => r.dedupe_key === 'one-shot-pending').delivery_status, 'pending');
+
+  // An already-resolved row is a no-op, not a second resolution.
+  assert.equal(store.resolveStatefulNotificationEvent({ dedupeKey: 'stateful-pending', resolvedAt: '2026-07-24T12:00:00.000Z' }), false);
+}));
+
+test('unresolvedStatefulNotificationEvents covers every pre-terminal status, excludes one-shot rows, and bounds its batch in SQL (#53 round 3, items 1 and 7)', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  const record = (dedupeKey, eventType, reasonCode, sourceTable) => store.recordNotificationEvent({
+    repo, issueNumber: 94, eventType, reasonCode, sourceTable, sourceRef: dedupeKey,
+    occurredAt: '2026-07-24T10:00:00.000Z', dedupeKey, content: { eventType },
+  });
+  record('u-pending', 'failed_attention', 'attention-required', 'attention_events');
+  record('u-retryable', 'systemic_pause', 'systemic-pause', 'runner_health_conditions');
+  record('u-delivered', 'quota_blocked', 'quota-or-paid-use-blocked', 'quota_history');
+  record('u-one-shot', 'completed', 'run-completed', 'recovery_attempts');
+
+  store.claimNotificationForDelivery({ dedupeKey: 'u-retryable', owner: 'p', at: '2026-07-24T10:00:01.000Z' });
+  store.markNotificationDeliveryFailed({ dedupeKey: 'u-retryable', attemptedAt: '2026-07-24T10:00:02.000Z', errorCode: 'transport-timeout', nextAttemptAt: '2026-07-24T10:30:00.000Z' });
+  store.claimNotificationForDelivery({ dedupeKey: 'u-delivered', owner: 'p', at: '2026-07-24T10:00:01.000Z' });
+  store.markNotificationDelivered({ dedupeKey: 'u-delivered', deliveredAt: '2026-07-24T10:00:02.000Z' });
+
+  const keys = store.unresolvedStatefulNotificationEvents(repo, 0).map((row) => row.dedupe_key).sort();
+  assert.deepEqual(keys, ['u-delivered', 'u-pending', 'u-retryable'], 'pending, retryable-failed and delivered stateful rows are all rescanned; the one-shot row is not');
+  // The delivered-only view is strictly narrower -- the exact gap round 2 had.
+  assert.deepEqual(store.deliveredUnresolvedNotificationEvents(repo).map((row) => row.dedupe_key), ['u-delivered']);
+  assert.equal(store.unresolvedStatefulNotificationEvents(repo, 0, 2).length, 2, 'the batch bound is applied by SQL LIMIT');
+}));
+
+test('adversarial direct-store writes: project, source_table and last_error are bounded by the state-store methods themselves (#53 round 3, item 8)', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  const rawDiagnostic = 'Bearer sk-live-abcdef at /home/gp/.claude/session.json (https://provider.example/v1/messages)';
+
+  // An out-of-vocabulary source_table is rejected outright -- a caller cannot
+  // invent a source this module has no resolution path for.
+  assert.throws(() => store.recordNotificationEvent({
+    repo, eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'arbitrary_attacker_table', sourceRef: 'x', occurredAt: '2026-07-24T10:00:00.000Z',
+    dedupeKey: 'adv-source-table', content: {},
+  }), /source_table/);
+  assert.equal(store.allRows('notification_events').length, 0, 'the rejected row must not have been persisted');
+
+  // An unbounded/raw `project` is coerced to NULL rather than persisted.
+  store.recordNotificationEvent({
+    repo, project: rawDiagnostic, eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'attention_events', sourceRef: 'adv-project', occurredAt: '2026-07-24T10:00:00.000Z',
+    dedupeKey: 'adv-project', content: {},
+  });
+  let row = store.allRows('notification_events').find((r) => r.dedupe_key === 'adv-project');
+  assert.equal(row.project, null, 'a raw diagnostic string can never be persisted as a dashboard-visible project');
+
+  // A bounded, well-shaped project is still accepted.
+  store.recordNotificationEvent({
+    repo, project: 'agent-runner', eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'attention_events', sourceRef: 'adv-project-ok', occurredAt: '2026-07-24T10:00:00.000Z',
+    dedupeKey: 'adv-project-ok', content: {},
+  });
+  assert.equal(store.allRows('notification_events').find((r) => r.dedupe_key === 'adv-project-ok').project, 'agent-runner');
+
+  // A non-allowlisted last_error is mapped to the fixed sentinel, never truncated raw text.
+  store.claimNotificationForDelivery({ dedupeKey: 'adv-project', owner: 'p', at: '2026-07-24T10:00:01.000Z' });
+  store.markNotificationDeliveryFailed({ dedupeKey: 'adv-project', attemptedAt: '2026-07-24T10:00:02.000Z', errorCode: rawDiagnostic });
+  row = store.allRows('notification_events').find((r) => r.dedupe_key === 'adv-project');
+  assert.equal(row.last_error, 'invalid-error-code');
+
+  // The same closed vocabulary applies to the stale-recovery path.
+  store.claimNotificationForDelivery({ dedupeKey: 'adv-project-ok', owner: 'p', at: '2026-07-24T10:00:01.000Z' });
+  store.reconcileStaleInFlightNotifications({ repo, staleBeforeAt: '2026-07-24T10:00:30.000Z', at: '2026-07-24T10:05:00.000Z', errorCode: rawDiagnostic });
+  assert.equal(store.allRows('notification_events').find((r) => r.dedupe_key === 'adv-project-ok').last_error, 'invalid-error-code');
+
+  assert.doesNotMatch(JSON.stringify(store.allRows('notification_events')), /Bearer|sk-live|\/home\/|https:\/\//);
+}));
+
+test('recoveryAttemptsSince is cursored losslessly on rowid: two attempts sharing an exact started_at are both returned (#53 round 3, item 3)', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  const sharedStartedAt = '2026-07-24T10:00:00.000Z';
+  const attempt = (attemptId, issueNumber, startedAt) => store.recordRecoveryAttempt({
+    attemptId, repo, project: 'agent-runner', issueNumber, phase: 'run', agent: 'claude-code-cli',
+    startedAt, finishedAt: '2026-07-24T10:01:00.000Z', outcome: 'completed',
+  });
+
+  attempt(`${repo}#200:${sharedStartedAt}`, 200, sharedStartedAt);
+  const activated = store.maxRecoveryAttemptRowId(repo);
+  assert.equal(activated >= 1, true);
+  store.activateNotificationSourceCursor(repo, 'recovery_attempts', activated, '2026-07-24T10:02:00.000Z');
+  assert.deepEqual(store.recoveryAttemptsSince(repo, String(activated), 10), [], 'pre-activation history is skipped');
+
+  // Two genuinely new attempts sharing the boundary millisecond exactly. A
+  // `started_at > cursor` cursor dropped both (they are not strictly greater
+  // than the activation tail's timestamp); a rowid cursor returns both.
+  attempt(`${repo}#201:${sharedStartedAt}`, 201, sharedStartedAt);
+  attempt(`${repo}#202:${sharedStartedAt}`, 202, sharedStartedAt);
+
+  const rows = store.recoveryAttemptsSince(repo, String(activated), 10);
+  assert.deepEqual(rows.map((row) => row.issue_number), [201, 202], 'equal-timestamp attempts must never be dropped, at activation or during batch advancement');
+
+  // Normal batch advancement across the same equal timestamp: advancing past
+  // the first must still return the second, not skip it.
+  store.advanceNotificationSourceCursor(repo, 'recovery_attempts', rows[0].row_id, '2026-07-24T10:03:00.000Z');
+  const remaining = store.recoveryAttemptsSince(repo, store.getNotificationSourceCursor(repo, 'recovery_attempts'), 10);
+  assert.deepEqual(remaining.map((row) => row.issue_number), [202]);
+
+  store.advanceNotificationSourceCursor(repo, 'recovery_attempts', remaining[0].row_id, '2026-07-24T10:04:00.000Z');
+  assert.deepEqual(store.recoveryAttemptsSince(repo, store.getNotificationSourceCursor(repo, 'recovery_attempts'), 10), []);
+}));
+
+test('targeted source lookups replace per-notification full-table scans (#53 round 3, item 7)', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  store.upsertAttentionEvent({
+    dedupeKey: 'attn-target', repository: repo, project: 'agent-runner', issueNumber: 300, attemptId: 'a300', reason: 'unknown_failure',
+    agent: 'claude-code-cli', startedAt: '2026-07-24T09:00:00.000Z', finishedAt: '2026-07-24T09:01:00.000Z',
+    recoveryStatus: 'forbidden', nextAction: 'x', policyRevision: 'v1',
+  });
+  assert.equal(store.attentionEventByDedupeKey(repo, 'attn-target').issue_number, 300);
+  assert.equal(store.attentionEventByDedupeKey(repo, 'missing'), null);
+  assert.equal(store.attentionEventByDedupeKey('TheTekTeam/other', 'attn-target'), null, 'lookups are repo-scoped');
+
+  store.recordRecoveryAttempt({
+    attemptId: `${repo}#301:2026-07-24T10:00:00.000Z`, repo, project: 'agent-runner', issueNumber: 301, phase: 'run',
+    agent: 'claude-code-cli', startedAt: '2026-07-24T10:00:00.000Z', finishedAt: '2026-07-24T10:01:00.000Z',
+    outcome: 'unknown_failure', resolutionState: 'unresolved',
+  });
+  assert.equal(store.recoveryAttemptByAttemptId(repo, `${repo}#301:2026-07-24T10:00:00.000Z`).issue_number, 301);
+  assert.equal(store.recoveryAttemptByAttemptId(repo, 'nope'), null);
+
+  store.openHealthCondition({ repo, conditionType: 'systemic_pause', reason: 'state-write', openedAt: '2026-07-24T10:00:00.000Z', safeNextAction: 'inspect' });
+  store.openHealthCondition({ repo, conditionType: 'unknown_future_condition', reason: 'x', openedAt: '2026-07-24T10:00:00.000Z', safeNextAction: 'y' });
+  assert.equal(store.healthConditionForType(repo, 'systemic_pause').condition_type, 'systemic_pause');
+  assert.equal(store.healthConditionForType(repo, 'never_opened'), null);
+
+  const open = store.openHealthConditionsForTypes(repo, ['systemic_pause', 'queue_inspection_degraded']);
+  assert.deepEqual(open.map((row) => row.condition_type), ['systemic_pause'], 'only the closed, caller-supplied condition types are queried -- unknown historical rows are never loaded');
+  assert.deepEqual(store.openHealthConditionsForTypes(repo, []), [], 'an empty type set queries nothing rather than everything');
+}));
+
+test('notification_source_cursors: activation skips existing history, and only new rows are returned past the cursor (#53 round 2, item 4)', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  store.upsertAttentionEvent({
+    dedupeKey: 'attn-1', repository: repo, project: 'agent-runner', issueNumber: 100, attemptId: 'a1', reason: 'unknown_failure',
+    agent: 'claude-code-cli', startedAt: '2026-07-24T09:00:00.000Z', finishedAt: '2026-07-24T09:01:00.000Z',
+    recoveryStatus: 'forbidden', nextAction: 'x', policyRevision: 'v1',
+  });
+  assert.equal(store.getNotificationSourceCursor(repo, 'attention_events'), null);
+  const historicalMax = store.maxRowId('attention_events', repo);
+  assert.equal(historicalMax >= 1, true);
+  const activated = store.activateNotificationSourceCursor(repo, 'attention_events', historicalMax, '2026-07-24T10:00:00.000Z');
+  assert.equal(activated, String(historicalMax));
+  assert.deepEqual(store.attentionEventsSince(repo, activated, 10), [], 'pre-activation history must not be returned as new');
+
+  // Activating again must not reset an already-activated cursor.
+  assert.equal(store.activateNotificationSourceCursor(repo, 'attention_events', '0', '2026-07-24T10:05:00.000Z'), String(historicalMax));
+
+  store.upsertAttentionEvent({
+    dedupeKey: 'attn-2', repository: repo, project: 'agent-runner', issueNumber: 101, attemptId: 'a2', reason: 'unknown_failure',
+    agent: 'claude-code-cli', startedAt: '2026-07-24T10:00:00.000Z', finishedAt: '2026-07-24T10:01:00.000Z',
+    recoveryStatus: 'forbidden', nextAction: 'x', policyRevision: 'v1',
+  });
+  const sinceRows = store.attentionEventsSince(repo, activated, 10);
+  assert.equal(sinceRows.length, 1, 'only the row created after activation is returned');
+  assert.equal(sinceRows[0].dedupe_key, 'attn-2');
+
+  store.advanceNotificationSourceCursor(repo, 'attention_events', sinceRows[sinceRows.length - 1].id, '2026-07-24T10:06:00.000Z');
+  assert.equal(store.getNotificationSourceCursor(repo, 'attention_events'), String(sinceRows[0].id));
+  assert.deepEqual(store.attentionEventsSince(repo, store.getNotificationSourceCursor(repo, 'attention_events'), 10), []);
+}));
+
+test('a notification_events row (full serialized shape, including content_json) never contains raw prompts, provider output, credentials, paths or session handles', () => withStore((store) => {
+  store.recordNotificationEvent({
+    repo: 'TheTekTeam/agent-runner', issueNumber: 80, eventType: 'failed_attention', reasonCode: 'attention-required',
+    sourceTable: 'attention_events', sourceRef: 'attention:dedupe-80', occurredAt: '2026-07-24T10:00:00.000Z',
+    dedupeKey: 'attention:dedupe-80',
+    content: { eventType: 'failed_attention', reasonCode: 'attention-required', repo: 'TheTekTeam/agent-runner', issueNumber: 80, agent: null, occurredAt: '2026-07-24T10:00:00.000Z' },
+  });
+  const row = store.allRows('notification_events')[0];
+  const serialized = JSON.stringify(row);
+  assert.doesNotMatch(serialized, /executablePath|sessionSecretRef|vault:\/\/|http:\/\/|https:\/\/|Bearer\s|\/home\/|Authorization:/);
+}));
+
+// ---------------------------------------------------------------------------
+// #53 review round 4: the durable deferred-row frontier, the rotating
+// resolution cursor, and the bounded stale in-flight sweep.
+// ---------------------------------------------------------------------------
+
+function seedNotification(store, { dedupeKey, eventType = 'failed_attention', reasonCode = 'attention-required', repo = 'TheTekTeam/agent-runner', createdAt = '2026-07-24T10:00:00.000Z' }) {
+  store.recordNotificationEvent({
+    repo, eventType, reasonCode, sourceTable: 'attention_events', sourceRef: dedupeKey,
+    occurredAt: createdAt, dedupeKey, createdAt,
+    content: { eventType, reasonCode, repo, issueNumber: null, agent: null, occurredAt: createdAt },
+  });
+  return store.allRows('notification_events').find((row) => row.dedupe_key === dedupeKey);
+}
+
+test('#53 round 4: deferred source rows are durable, idempotent, rotating and individually clearable', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  assert.deepEqual(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 10), []);
+
+  assert.deepEqual(store.deferNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 7, at: '2026-07-24T10:00:00.000Z' }), { deferred: true, alreadyDeferred: false });
+  // Idempotent: re-deferring keeps the original first_deferred_at.
+  assert.deepEqual(store.deferNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 7, at: '2026-07-24T11:00:00.000Z' }), { deferred: false, alreadyDeferred: true });
+  assert.equal(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 10)[0].first_deferred_at, '2026-07-24T10:00:00.000Z');
+
+  store.deferNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 8, at: '2026-07-24T10:00:01.000Z' });
+  store.deferNotificationSourceRow({ repo, sourceTable: 'routing_events', rowKey: 9, at: '2026-07-24T10:00:02.000Z' });
+  assert.deepEqual(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 10).map((row) => row.row_key), [7, 8], 'deferred rows are scoped per source table');
+  assert.equal(store.deferredNotificationSourceRowCount(repo, 'routing_events'), 1);
+
+  // A bounded batch, least-recently-checked first: touching row 7 rotates it behind row 8.
+  assert.deepEqual(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 1).map((row) => row.row_key), [7]);
+  assert.equal(store.touchDeferredNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 7, at: '2026-07-24T12:00:00.000Z' }), true);
+  assert.deepEqual(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 1).map((row) => row.row_key), [8], 'a still-blocked row moves to the back of the rotation');
+
+  assert.equal(store.clearDeferredNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 8 }), true);
+  assert.equal(store.clearDeferredNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: 8 }), false, 'clearing an unknown identity is a no-op, never a throw');
+  assert.deepEqual(store.deferredNotificationSourceRows(repo, 'recovery_attempts', 10).map((row) => row.row_key), [7]);
+
+  // A non-integer row key can never be persisted or interpolated.
+  assert.deepEqual(store.deferNotificationSourceRow({ repo, sourceTable: 'recovery_attempts', rowKey: "1); DROP TABLE notification_events; --" }), { deferred: false });
+  assert.equal(store.deferredNotificationSourceRowCount(repo, 'recovery_attempts'), 1);
+}));
+
+test('#53 round 4: deferred source rows survive a reopen of the same database file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'modelspend-runner-state-'));
+  const dbPath = join(dir, 'state.sqlite');
+  const repo = 'TheTekTeam/agent-runner';
+  try {
+    const first = openRunnerStateStore(dbPath, { now: () => '2026-07-24T10:00:00.000Z' });
+    first.deferNotificationSourceRow({ repo, sourceTable: 'routing_events', rowKey: 42, at: '2026-07-24T10:00:00.000Z' });
+    first.advanceNotificationSourceCursor(repo, 'routing_events', 99, '2026-07-24T10:00:00.000Z');
+    first.setNotificationResolutionCursor(repo, 17, '2026-07-24T10:00:00.000Z');
+    first.close();
+
+    const reopened = openRunnerStateStore(dbPath, { now: () => '2026-07-24T11:00:00.000Z' });
+    try {
+      assert.deepEqual(reopened.deferredNotificationSourceRows(repo, 'routing_events', 10).map((row) => row.row_key), [42]);
+      assert.equal(reopened.getNotificationSourceCursor(repo, 'routing_events'), '99', 'the high-water frontier survives a reopen');
+      assert.equal(reopened.getNotificationResolutionCursor(repo), 17, 'the rotating resolution cursor survives a reopen');
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#53 round 4: targeted by-row-key lookups return only the requested rows and reject non-integer keys', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  for (let i = 0; i < 3; i += 1) {
+    store.recordRoutingEvent({
+      repo, issueNumber: 200 + i, eventType: 'reassignment', fromAgentId: 'claude-code-cli', toAgentId: 'codex-cli',
+      reason: 'explicit-agent-ineligible', settingsRevision: 'rev-1', dedupeKey: `route-${i}`, deliveryStatus: 'resolved',
+    });
+  }
+  const all = store.allRows('routing_events');
+  assert.equal(all.length, 3);
+  const wanted = [all[0].id, all[2].id];
+  assert.deepEqual(store.routingEventsByIds(repo, wanted).map((row) => row.id), wanted);
+  assert.deepEqual(store.routingEventsByIds(repo, []), []);
+  assert.deepEqual(store.routingEventsByIds(repo, ["1 OR 1=1", null, undefined]), [], 'non-integer keys are dropped, never interpolated');
+  assert.deepEqual(store.routingEventsByIds('TheTekTeam/other', wanted), [], 'lookups stay repository-scoped');
+}));
+
+test('#53 round 4: the unresolved-stateful sweep is cursored, bounded, wraps, and excludes one-shot rows in SQL', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  const rows = [];
+  for (let i = 0; i < 5; i += 1) rows.push(seedNotification(store, { dedupeKey: `stateful-${i}`, createdAt: `2026-07-24T10:0${i}:00.000Z` }));
+  seedNotification(store, { dedupeKey: 'one-shot-1', eventType: 'completed', reasonCode: 'run-completed', createdAt: '2026-07-24T10:06:00.000Z' });
+
+  const first = store.unresolvedStatefulNotificationEvents(repo, 0, 2);
+  assert.deepEqual(first.map((row) => row.dedupe_key), ['stateful-0', 'stateful-1']);
+  const second = store.unresolvedStatefulNotificationEvents(repo, first[first.length - 1].id, 2);
+  assert.deepEqual(second.map((row) => row.dedupe_key), ['stateful-2', 'stateful-3']);
+  const third = store.unresolvedStatefulNotificationEvents(repo, second[second.length - 1].id, 2);
+  assert.deepEqual(third.map((row) => row.dedupe_key), ['stateful-4'], 'a short batch means the tail was reached');
+  assert.deepEqual(store.unresolvedStatefulNotificationEvents(repo, third[0].id, 2), []);
+  // Wrapping back to 0 revisits the whole set -- the one-shot row never appears.
+  assert.deepEqual(
+    store.unresolvedStatefulNotificationEvents(repo, 0, 50).map((row) => row.event_type),
+    rows.map(() => 'failed_attention'),
+  );
+
+  assert.equal(store.getNotificationResolutionCursor(repo), 0, 'a never-swept repo starts at the beginning');
+  assert.equal(store.setNotificationResolutionCursor(repo, third[0].id, '2026-07-24T10:10:00.000Z'), third[0].id);
+  assert.equal(store.getNotificationResolutionCursor(repo), third[0].id);
+  assert.equal(store.setNotificationResolutionCursor(repo, -5, '2026-07-24T10:11:00.000Z'), 0, 'a nonsense cursor wraps to the start rather than being trusted');
+}));
+
+test('#53 round 4: stale in-flight reconciliation is bounded by a SQL LIMIT, oldest claim first', () => withStore((store) => {
+  const repo = 'TheTekTeam/agent-runner';
+  for (let i = 0; i < 5; i += 1) {
+    const row = seedNotification(store, { dedupeKey: `stale-${i}`, createdAt: `2026-07-24T10:0${i}:00.000Z` });
+    store.claimNotificationForDelivery({ dedupeKey: row.dedupe_key, owner: 'crashed', at: `2026-07-24T10:0${i}:30.000Z` });
+  }
+  assert.equal(store.allRows('notification_events').filter((row) => row.delivery_status === 'in-flight').length, 5);
+
+  const first = store.reconcileStaleInFlightNotifications({ repo, staleBeforeAt: '2026-07-24T11:00:00.000Z', at: '2026-07-24T11:00:00.000Z', limit: 2 });
+  assert.deepEqual(first, { checked: 2, recovered: 2 }, 'one pass may only touch a bounded window');
+  const recoveredKeys = store.allRows('notification_events').filter((row) => row.stale_recovery_count > 0).map((row) => row.dedupe_key).sort();
+  assert.deepEqual(recoveredKeys, ['stale-0', 'stale-1'], 'the oldest claims are recovered first');
+
+  let recovered = first.recovered;
+  for (let pass = 0; pass < 4 && recovered < 5; pass += 1) {
+    recovered += store.reconcileStaleInFlightNotifications({ repo, staleBeforeAt: '2026-07-24T11:00:00.000Z', at: '2026-07-24T11:00:00.000Z', limit: 2 }).recovered;
+  }
+  assert.equal(recovered, 5, 'repeated bounded passes drain the whole backlog');
+  assert.equal(store.allRows('notification_events').every((row) => row.attempt_count === 0), true, 'a stale claim never consumes the delivery budget');
+}));
