@@ -23,10 +23,12 @@ full repository validation are explicitly deferred to that later gate.
 
 - **`scripts/ops/agent-runner-agents.mjs`** (edited) — the `codex-cli`
   catalogue entry's `labels` now reads `['agent:codex-cli']` only (it
-  previously, incorrectly, also listed `agent:codex`). `implemented` stays
-  `false` and `command` is now the public, non-secret binary name `codex`
-  (unused while unimplemented; the live scheduler never reads it because
-  `implemented: false` short-circuits routing before this field matters).
+  previously, incorrectly, also listed `agent:codex`). `command: null` and
+  `implemented: false` are both unchanged by this issue — the catalogue
+  entry stays exactly as fail-closed/non-routable as every other
+  not-yet-implemented adapter (`ollama-agent`, `gemini-cli`, `gpt-agent`),
+  and this document does not authorise setting either field to an
+  executable value.
 - **`scripts/ops/agent-runner-agent-settings.mjs`** (edited) — adds a
   `codex-cli` entry to the shared `AGENT_SETTINGS_EXAMPLE` payload (mirrored
   byte-for-byte in `.agent-runner/agent-settings.example.json`, proven by the
@@ -165,6 +167,28 @@ unchanged afterward.
 - Nothing in this foundation logs, persists, or forwards `entry` verbatim;
   admission functions return only booleans, machine-readable reasons, and
   probe names.
+- `probeExecutable()` returns no `detail` at all on success (not the
+  configured executable path) and a fixed `codex-executable-unavailable`
+  reason on failure — never the raw `accessFn` error message, which for a
+  real filesystem error routinely embeds the path itself. `probeVersion()`'s
+  failure path matches: a fixed `codex-version-probe-failed` reason, never
+  the raw `execFileFn` error message (a real child-process spawn error
+  routinely embeds the executable path too).
+- `parseCodexResultEnvelope()` and `classifyCodexExecutionError()` read raw
+  stdout, terminal error messages, and caller-supplied process-wrapper
+  messages only to pick a bounded, machine-readable `reason`; none of that
+  raw text is ever placed into the returned `resultText` (always `''` on a
+  non-success/malformed path) or `structuredFailure` (always `null` or a
+  closed-vocabulary token — an event `type`, an OS signal name, an error
+  `code`). Only a successful `turn.completed`'s own `agent_message` item
+  text — the model's actual output, not diagnostic material — populates
+  `resultText`.
+- All of the above is proven adversarially: `agent-runner-codex-parser.test.mjs`
+  and `agent-runner-codex-adapter.test.mjs` seed malformed stdout, terminal
+  error messages, timeout/cancellation/execution-error messages, and
+  executable-probe errors with synthetic credentials, session handles,
+  prompts, and local paths, then serialize the full returned
+  result/decision and assert every synthetic value is absent.
 
 ## Known limitations
 

@@ -28,6 +28,18 @@ import { FAILURE_SCOPES, foldProbeOutcomes, probeOutcome } from './agent-runner-
  * `--version` banner. Neither ever asks Codex to run a model. All I/O
  * (`accessFn`, `execFileFn`) is injectable so tests can prove zero real
  * process access while disabled.
+ *
+ * Sink-safety contract (manager review on PR #62): `probeExecutable()`
+ * never returns the configured executable path — not on success (no
+ * `detail` at all) and not on failure (a fixed reason, never the raw
+ * `accessFn` error message, which for a real filesystem error routinely
+ * embeds the path itself). `probeVersion()`'s failure path is the same: a
+ * fixed reason, never the raw `execFileFn` error message (a real
+ * child-process spawn error routinely embeds the executable path too).
+ * `admitCodexPaidUse()`/`admitCodexDispatch()` return only booleans,
+ * machine-readable reasons, and probe names — never the raw settings
+ * `entry` a caller passed in, so a configured `sessionSecretRef` or
+ * `executablePath` can never ride along in a serialized admission decision.
  */
 export const CODEX_AGENT_ID = 'codex-cli';
 
@@ -42,17 +54,34 @@ export function resolveCodexExecutablePath(entry = {}) {
   return { ok: true, reason: null, path };
 }
 
+/**
+ * Machine-local executable path is configuration, not a fact worth
+ * surfacing on a readiness result a caller might log, dashboard, or
+ * persist: a successful probe reports no `detail` at all, and a failed one
+ * reports the same fixed, bounded reason regardless of the underlying
+ * `accessFn` error — never that error's raw `.message` (which, for a real
+ * filesystem error, routinely embeds the path itself).
+ */
 export function probeExecutable({ executablePath, accessFn = accessSync } = {}) {
   if (!executablePath) return probeOutcome({ probe: 'executable', ok: false, reason: 'codex-executable-not-configured' });
   try {
     accessFn(executablePath, fsConstants.X_OK);
-    return probeOutcome({ probe: 'executable', ok: true, detail: executablePath });
-  } catch (error) {
-    return probeOutcome({ probe: 'executable', ok: false, reason: 'codex-executable-unavailable', detail: error.message });
+    return probeOutcome({ probe: 'executable', ok: true });
+  } catch {
+    return probeOutcome({ probe: 'executable', ok: false, reason: 'codex-executable-unavailable' });
   }
 }
 
-/** Deterministic `--version` banner read. Never issues an authenticated or model-backed request. */
+/**
+ * Deterministic `--version` banner read. Never issues an authenticated or
+ * model-backed request. On success, `detail` is the version banner itself
+ * (e.g. `codex-cli 0.144.6`) — not path-bearing. On failure, the reason is
+ * fixed and `detail` is omitted entirely: `execFileFn`'s raised error can be
+ * a real child-process spawn error, which routinely embeds the executable
+ * path (`spawn <path> ENOENT`) or other diagnostic text, so its raw
+ * `.message` is never forwarded into a probe outcome a caller might log,
+ * dashboard, or persist.
+ */
 export function probeVersion({ executablePath, execFileFn } = {}) {
   if (typeof execFileFn !== 'function') {
     return probeOutcome({ probe: 'version', ok: false, reason: 'codex-version-probe-unavailable' });
@@ -61,8 +90,8 @@ export function probeVersion({ executablePath, execFileFn } = {}) {
     const stdout = String(execFileFn(executablePath, ['--version']) || '').trim();
     if (!stdout) return probeOutcome({ probe: 'version', ok: false, reason: 'codex-version-unreadable' });
     return probeOutcome({ probe: 'version', ok: true, detail: stdout });
-  } catch (error) {
-    return probeOutcome({ probe: 'version', ok: false, reason: 'codex-version-probe-failed', detail: error.message });
+  } catch {
+    return probeOutcome({ probe: 'version', ok: false, reason: 'codex-version-probe-failed' });
   }
 }
 
