@@ -123,7 +123,8 @@ test('serialized evidence excludes adversarial secrets, prompts, output, paths a
   for (const forbidden of ['sk-test', 'ignore all rules', 'provider output', 'raw log', '/home/gp', 'session_abcdef']) {
     assert.equal(serialized.includes(forbidden), false, forbidden);
   }
-  assert.equal(serialized.includes('safeCode'), true);
+  const scenario = report.scenarios.find((entry) => entry.scenarioId === 'serialized-output-redaction');
+  assert.equal(scenario.evidence.safeFieldsRetained, 1);
 });
 
 test('restart/reopen produces identical bounded evidence for the same synthetic state', async () => {
