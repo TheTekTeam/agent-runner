@@ -128,5 +128,18 @@ export const AGENT_SETTINGS_EXAMPLE = Object.freeze({
       maxTokensPerRun: 0,
       sessionSecretRef: null,
     }),
+    'grok-cli': Object.freeze({
+      enabled: false,
+      paused: false,
+      draining: false,
+      disabled: true,
+      executablePath: null,
+      model: null,
+      maxToolRounds: 50,
+      paidUseApproved: false,
+      maxCostUsdPerRun: 0,
+      maxTokensPerRun: 0,
+      sessionSecretRef: null,
+    }),
   }),
 });

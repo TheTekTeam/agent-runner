@@ -130,3 +130,28 @@ test('only agent:codex-cli identifies the codex-cli adapter', () => {
   assert.equal(resolveAgentForLabels(['agent:codex-cli']).agentId, 'codex-cli');
   assert.deepEqual(resolveAgentById('codex-cli').labels, ['agent:codex-cli']);
 });
+
+test('agent:grok-cli resolves to the grok-cli adapter, foundation-only and non-routable', () => {
+  const agent = resolveAgentForLabels(['agent:grok-cli']);
+  assert.equal(agent.agentId, 'grok-cli');
+  assert.equal(agent.command, null);
+  assert.equal(agent.implemented, false);
+  assert.deepEqual(unsupportedAgentSkip(agent, { issueNumber: 700 }), {
+    issue: 700,
+    reason: 'unsupported-agent',
+    agentId: 'grok-cli',
+    label: null,
+    detail: "Agent 'grok-cli' is registered for future use but is not implemented by this runner.",
+  });
+});
+
+test('only agent:grok-cli identifies the grok-cli adapter, and no other adapter claims that label', () => {
+  assert.equal(resolveAgentForLabels(['agent:grok-cli']).agentId, 'grok-cli');
+  assert.deepEqual(resolveAgentById('grok-cli').labels, ['agent:grok-cli']);
+});
+
+test('default label registry includes grok-cli without implementing it', () => {
+  assert.ok(allAgentLabels().includes('agent:grok-cli'));
+  assert.equal(resolveAgentById('grok-cli').implemented, false);
+  assert.equal(allAgentLabels({ includeFuture: false }).includes('agent:grok-cli'), false);
+});

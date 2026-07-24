@@ -86,6 +86,21 @@ test('computeInstanceQuota reports not-yet-qualified for a foundation-only, non-
   assert.equal(called, false);
 });
 
+test('computeInstanceQuota reports not-yet-qualified for the foundation-only grok-cli adapter, no dashboard read', () => {
+  let called = false;
+  const quota = computeInstanceQuota({ agentId: 'grok-cli', buildDashboard: () => { called = true; return {}; } });
+  assert.deepEqual(quota, { costClass: 'not-yet-qualified', paid: false, quota: null });
+  assert.equal(called, false);
+});
+
+test('computeInstanceReadiness never probes the foundation-only grok-cli adapter, since it stays implemented:false', () => {
+  let probed = false;
+  const readiness = computeInstanceReadiness({ adapter: { implemented: false, command: null }, accessFn: () => { probed = true; } });
+  assert.equal(readiness.ok, false);
+  assert.equal(readiness.reason, 'adapter-not-implemented');
+  assert.equal(probed, false);
+});
+
 test('computeInstanceQuota for claude-code-cli reuses the existing read-only dashboard quota summary, never mutates it', () => {
   let calledWith = null;
   const buildDashboard = (dbPath, options) => {

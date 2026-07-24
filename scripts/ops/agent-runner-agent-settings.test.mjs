@@ -146,6 +146,18 @@ test('the documented example settings payload itself resolves to a non-routable 
   assert.equal(settings.entry.maxTokensPerRun, 0);
 }));
 
+test('the documented example settings payload itself resolves to a non-routable grok-cli with no paid-use approval, no committed executable path or session ref, and a bounded tool-round default', () => withTempSettings(AGENT_SETTINGS_EXAMPLE, (settingsPath) => {
+  const settings = getAgentSettings({ agentId: 'grok-cli', settingsPath });
+  assert.equal(settings.routable, false);
+  assert.equal(settings.reason, 'agent-disabled');
+  assert.equal(settings.entry.paidUseApproved, false);
+  assert.equal(settings.entry.maxCostUsdPerRun, 0);
+  assert.equal(settings.entry.maxTokensPerRun, 0);
+  assert.equal(settings.entry.executablePath, null);
+  assert.equal(settings.entry.sessionSecretRef, null);
+  assert.ok(Number.isInteger(settings.entry.maxToolRounds) && settings.entry.maxToolRounds > 0);
+}));
+
 test('getAgentSettings requires an agentId', () => {
   assert.throws(() => getAgentSettings({ settingsPath: '/nonexistent' }), /agentId/);
 });
