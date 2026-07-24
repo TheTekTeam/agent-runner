@@ -9,6 +9,7 @@ import { readControlAuditEntries } from './agent-runner-control-audit.mjs';
 import {
   applyAllowlistedUpdate,
   applyLifecycleTransition,
+  buildInstanceSnapshot,
   claimEligibility,
   createInstance,
   deriveInstanceState,
@@ -160,6 +161,27 @@ test('listInstanceSnapshots exposes the whole approved catalogue, created or not
   assert.deepEqual(ids, ['claude-code-cli', 'codex-cli', 'gemini-cli', 'gpt-agent', 'ollama-agent']);
   assert.ok(snapshots.every((snapshot) => snapshot.created === false));
 }));
+
+test('buildInstanceSnapshot surfaces the real, static adapter.controls map as capabilities (issue #47 "capability classes"), never a probe filesystem path', () => {
+  const adapter = {
+    agentId: 'claude-code-cli',
+    type: 'claude',
+    command: 'claude',
+    implemented: true,
+    controls: { model: { supported: true, flag: '--model' }, worktree: { supported: false } },
+  };
+  const snapshot = buildInstanceSnapshot({
+    agentId: 'claude-code-cli',
+    adapter,
+    entry: null,
+    readiness: { ok: false, reason: 'command-not-on-path', probes: [{ probe: 'executable', detail: '/usr/local/bin/claude' }] },
+  });
+  assert.equal(snapshot.command, 'claude');
+  assert.deepEqual(snapshot.capabilities, adapter.controls);
+  // The snapshot's readiness must never carry a probe's resolved filesystem path.
+  assert.deepEqual(snapshot.readiness, { ok: false, reason: 'command-not-on-path' });
+  assert.ok(!JSON.stringify(snapshot).includes('/usr/local/bin/claude'));
+});
 
 test('getInstanceSnapshot reflects a created, updated instance', () => withTempPaths(({ settingsPath, auditPath }) => {
   createInstance({ path: settingsPath, auditPath, agentId: 'claude-code-cli', ...ACTOR });

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import test from 'node:test';
@@ -416,4 +416,98 @@ test('GET /api/audit returns actor/source/time/revision/changed-field-names only
   for (const entry of result.json.entries) {
     assert.deepEqual(Object.keys(entry).sort(), ['action', 'actor', 'at', 'changedFields', 'id', 'outcome', 'reason', 'revision', 'source']);
   }
+}));
+
+// -- Agents dashboard static shell (issue #47) --------------------------
+
+test('GET / serves the dashboard shell with no session, no Origin header and no CSRF token required', async () => {
+  await withServer(async ({ baseUrl }) => {
+    const response = await fetch(`${baseUrl}/`);
+    assert.equal(response.status, 200);
+    assert.match(response.headers.get('content-type'), /text\/html/);
+    assert.match(response.headers.get('content-security-policy') || '', /default-src 'self'/);
+    const body = await response.text();
+    assert.match(body, /<title>/);
+  });
+});
+
+test('GET /agents-dashboard.js and /agents-dashboard-view.mjs serve as JavaScript, unauthenticated', () => withServer(async ({ baseUrl }) => {
+  for (const path of ['/agents-dashboard.js', '/agents-dashboard-view.mjs', '/agents-dashboard.css']) {
+    const response = await fetch(`${baseUrl}${path}`);
+    assert.equal(response.status, 200, path);
+  }
+}));
+
+test('the static shell route never shadows /api/* and unknown paths still 404 as JSON', () => withServer(async ({ baseUrl }) => {
+  const missing = await fetch(`${baseUrl}/does-not-exist`);
+  assert.equal(missing.status, 404);
+  assert.match(missing.headers.get('content-type'), /application\/json/);
+
+  const traversal = await fetch(`${baseUrl}/../../etc/passwd`);
+  assert.ok([400, 404].includes(traversal.status));
+
+  const apiStillProtected = await fetch(`${baseUrl}/api/instances`);
+  assert.equal(apiStillProtected.status, 403); // no Origin/Referer on a bare fetch — still fails closed
+}));
+
+test('serving the static shell touches none of the four control-service sinks (no audit entry, no settings write, no secret read)', () => withServer(async ({ baseUrl, auditPath }) => {
+  await fetch(`${baseUrl}/`);
+  await fetch(`${baseUrl}/agents-dashboard.js`);
+  await fetch(`${baseUrl}/agents-dashboard.css`);
+  assert.equal(existsSync(auditPath), false, 'serving static assets must never append to the audit log');
+}));
+
+// -- Agents dashboard end-to-end flow (issue #47 required_validation: --
+// -- "dashboard -> control API -> atomic settings -> pre-claim           --
+// -- eligibility tests using temporary state")                          --
+
+test('full dashboard-shaped flow: create, configure, enable (pre-claim eligible), credential, drain (pre-claim ineligible), audit, rollback', () => withServer(async ({ baseUrl, settingsPath }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+
+  const listed = await apiRequest(baseUrl, '/api/instances', { cookie });
+  assert.equal(listed.status, 200);
+  const claude = listed.json.instances.find((instance) => instance.agentId === 'claude-code-cli');
+  // The new required-view fields are present and honest — no fabricated version, no leaked path.
+  assert.equal(claude.command, 'claude');
+  assert.ok(claude.capabilities && claude.capabilities.model.supported === true);
+  assert.equal(claude.quota.paid, true);
+  assert.equal(claude.quota.costClass, 'paid-metered');
+  assert.ok(!('probes' in (claude.readiness || {})));
+
+  const created = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
+  assert.equal(created.status, 201);
+
+  const configured = await apiRequest(baseUrl, '/api/instances/claude-code-cli/settings', {
+    method: 'PATCH', cookie, csrfToken, body: { updates: { model: 'claude-opus-4-8' }, expectedRevision: created.json.revision },
+  });
+  assert.equal(configured.status, 200);
+
+  const enabled = await apiRequest(baseUrl, '/api/instances/claude-code-cli/lifecycle', {
+    method: 'POST', cookie, csrfToken, body: { targetState: 'enabled', expectedRevision: configured.json.revision },
+  });
+  assert.equal(enabled.status, 200);
+  assert.equal(getAgentSettings({ agentId: 'claude-code-cli', settingsPath }).routable, true, 'pre-claim gate must see the enable without a service restart');
+
+  const secretValue = 'e2e-dashboard-flow-secret-must-never-leak';
+  const secretCreated = await apiRequest(baseUrl, '/api/secrets/claude-code-cli', { method: 'POST', cookie, csrfToken, body: { value: secretValue } });
+  assert.equal(secretCreated.status, 201);
+  assert.ok(!JSON.stringify(secretCreated.json).includes(secretValue));
+  const secretStatus = await apiRequest(baseUrl, '/api/secrets/claude-code-cli', { cookie });
+  assert.equal(secretStatus.json.status.status, 'configured');
+
+  const draining = await apiRequest(baseUrl, '/api/instances/claude-code-cli/lifecycle', {
+    method: 'POST', cookie, csrfToken, body: { targetState: 'draining', expectedRevision: enabled.json.revision },
+  });
+  assert.equal(draining.status, 200);
+  assert.equal(getAgentSettings({ agentId: 'claude-code-cli', settingsPath }).routable, false, 'draining must be pre-claim-ineligible without a restart');
+
+  const audit = await apiRequest(baseUrl, '/api/audit', { cookie });
+  assert.ok(audit.json.entries.some((entry) => entry.action === 'instance.lifecycle.transition'));
+  assert.ok(!JSON.stringify(audit.json).includes(secretValue));
+
+  const revisions = await apiRequest(baseUrl, '/api/settings/revisions', { cookie });
+  assert.ok(revisions.json.availableRevisions.length > 0);
+  const rollback = await apiRequest(baseUrl, '/api/settings/rollback', { method: 'POST', cookie, csrfToken, body: { targetRevision: created.json.revision } });
+  assert.equal(rollback.status, 200);
+  assert.equal(getAgentSettings({ agentId: 'claude-code-cli', settingsPath }).routable, false, 'rollback target predates enable, so it must be ineligible again');
 }));

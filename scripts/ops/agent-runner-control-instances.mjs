@@ -206,13 +206,22 @@ export function deriveInstanceState({ adapter, lifecycle, readiness = null }) {
   return 'enabled';
 }
 
+/**
+ * `command` is the already-public, non-secret catalogue runtime identifier
+ * (e.g. `claude`) — not a filesystem path. `capabilities` mirrors the
+ * frozen `adapter.controls` map (issue #47 required view: "capability
+ * classes") — static, non-secret metadata that was already public inside
+ * this module's own import; this only surfaces it on the read snapshot.
+ */
 export function buildInstanceSnapshot({ agentId, adapter, entry, readiness = null }) {
   const lifecycle = normalizeAgentLifecycle(entry);
   return {
     agentId,
     adapterId: adapter?.agentId || agentId,
     adapterType: adapter?.type || null,
+    command: adapter?.command || null,
     implemented: Boolean(adapter?.implemented),
+    capabilities: adapter?.controls || {},
     created: isPlainObject(entry),
     lifecycle,
     state: deriveInstanceState({ adapter, lifecycle, readiness }),
@@ -222,7 +231,7 @@ export function buildInstanceSnapshot({ agentId, adapter, entry, readiness = nul
     timeout: isPlainObject(entry) ? entry.timeout ?? null : null,
     maxConcurrency: isPlainObject(entry) && entry.maxConcurrency !== undefined ? entry.maxConcurrency : 1,
     policy: isPlainObject(entry) && isPlainObject(entry.policy) ? entry.policy : { requireHumanApproval: true, notes: '' },
-    readiness: readiness ? { ok: readiness.ok, reason: readiness.reason || null, probes: readiness.probes || [] } : null,
+    readiness: readiness ? { ok: readiness.ok, reason: readiness.reason || null } : null,
   };
 }
 
