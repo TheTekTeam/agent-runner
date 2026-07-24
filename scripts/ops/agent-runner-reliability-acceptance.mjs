@@ -3,6 +3,8 @@
 import { readFileSync, statSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
+import { RUNNER_STATE_SCHEMA_VERSION } from './claude-runner-state.mjs';
+
 export const INPUT_SCHEMA_VERSION = 'agent-runner-reliability-evidence/v1';
 export const REPORT_SCHEMA_VERSION = 'agent-runner-reliability-acceptance-report/v1';
 export const EXPECTED_REPOSITORY = 'TheTekTeam/agent-runner';
@@ -265,7 +267,10 @@ export function evaluateReliabilityAcceptance(input, { expectedHead, now = new D
   });
   add('state_schema_current', r.backup, () => {
     const why = recordReason(r.backup, c, { state: true });
-    const pass = !why && r.backup.schemaVersion === b.stateSchemaVersion && r.backup.backupSchemaVersion === b.stateSchemaVersion;
+    const pass = !why
+      && b.stateSchemaVersion === RUNNER_STATE_SCHEMA_VERSION
+      && r.backup.schemaVersion === RUNNER_STATE_SCHEMA_VERSION
+      && r.backup.backupSchemaVersion === RUNNER_STATE_SCHEMA_VERSION;
     return result('state_schema_current', pass, why || 'schema_mismatch', ids(r.backup));
   });
   const validation = (id, v, required) => {

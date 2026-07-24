@@ -1,9 +1,10 @@
 # Agent Runner Dell reliability acceptance gate
 
 This command is the report-only final evidence evaluator for
-`TheTekTeam/agent-runner#5`, implemented by `#68`. It accepts one bounded JSON
-evidence bundle, evaluates every required acceptance domain against one exact
-deployed Agent Runner head, and emits a deterministic JSON report.
+`TheTekTeam/agent-runner#5`, implemented by `#68` and hardened by `#74`. It
+accepts one bounded JSON evidence bundle, evaluates every required acceptance
+domain against one exact deployed Agent Runner head, and emits a deterministic
+JSON report.
 
 It does **not** gather or create operational evidence. Evidence capture,
 deployment, queue repair, supervised canary execution, timer changes and reboot
@@ -13,9 +14,12 @@ work remain separate, explicitly authorised operator actions.
 
 The evaluator is deliberately incapable of operational mutation:
 
-- it imports only Node.js file-read/stat and URL helpers;
-- it does not import `child_process`, a SQLite driver, HTTP clients or a GitHub
-  client;
+- it imports only Node.js file-read/stat and URL helpers plus the canonical,
+  side-effect-free `RUNNER_STATE_SCHEMA_VERSION` export from
+  `claude-runner-state.mjs`;
+- importing that constant does not construct `DatabaseSync`, call
+  `openRunnerStateStore()` or open a SQLite file;
+- it does not import `child_process`, HTTP/network clients or a GitHub client;
 - it does not invoke `git`, `gh`, `systemctl`, a runner, worker or provider;
 - it does not open or modify the live state database;
 - it never executes queue repair, notification delivery, deployment, timer or
@@ -69,7 +73,7 @@ exactly:
 | `expectedHead` | Exact 40-character lower-case commit SHA |
 | `deployedHead` | Must equal `expectedHead` and the CLI `--expected-head` |
 | `stateDbId` | Opaque bounded identity for the inspected live state database |
-| `stateSchemaVersion` | Expected current schema version |
+| `stateSchemaVersion` | Must equal the evaluated code's canonical `RUNNER_STATE_SCHEMA_VERSION` |
 | `windowStartedAt`, `windowEndedAt` | ISO timestamps bounding every evidence record |
 | `records` | The exact record set below |
 
@@ -85,7 +89,7 @@ The `records` object contains exactly:
 |---|---|
 | `repository` | Exact repository/head and clean deployed checkout |
 | `timer` | Pre-acceptance execution service inactive and timer disabled/inactive |
-| `backup` | Verified backup identity, source state identity and matching live/backup schema versions |
+| `backup` | Verified backup identity, source state identity and live/backup schema versions each equal to the canonical code schema |
 | `focusedValidation` | Passing totals plus `parser`, `correlation`, `stale_evidence`, `fault_injection`, `adversarial_redaction` assertions |
 | `fullValidation` | Passing totals plus `node_check`, `npm_test`, `npm_validate`, `diff_check` assertions |
 | `notification` | Delivered event through the synthetic capture transport only |
@@ -121,13 +125,31 @@ An exit code of zero without durable completed evidence returns
 manager revision/fingerprint, a non-draft publication, or mismatched dashboard
 and notification identities cannot satisfy the gate.
 
-### Backup identity
+### Backup identity and canonical schema
 
 `stateDbId` identifies the inspected live database instance. `backupStateDbId`
 records the source database identity captured by the backup evidence and must
 equal it. `backupId` identifies the distinct backup artefact and therefore must
-not equal `stateDbId`. Both recorded schema versions must match the bundle's
-expected current schema version.
+not equal `stateDbId`.
+
+The `state_schema_current` gate is bound to the evaluated code, not to agreement
+between input fields. It passes only when all three values equal the imported
+`RUNNER_STATE_SCHEMA_VERSION`:
+
+1. top-level `stateSchemaVersion`;
+2. `records.backup.schemaVersion` for the live-state capture;
+3. `records.backup.backupSchemaVersion` for the copied backup.
+
+A bundle that reports the same stale version in all three places fails with
+`schema_mismatch`. A mismatch in only one component also fails. Existing head,
+state-database identity, freshness and backup-correlation checks still apply.
+
+When the runner schema is bumped, the schema migration, the
+`RUNNER_STATE_SCHEMA_VERSION` change, acceptance fixtures/tests, evidence
+producer expectations and this documentation must be updated in the same
+reviewed change. The evaluator deliberately imports the canonical constant so
+it cannot retain a second numeric schema version that drifts from runtime code.
+Previously captured evidence must be recaptured against the new exact head.
 
 ### Redaction proof
 
