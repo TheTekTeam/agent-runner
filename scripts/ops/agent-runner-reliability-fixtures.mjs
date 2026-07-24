@@ -388,7 +388,7 @@ export function normalizeReliabilityFixtureReport(report = {}) {
     generatedAt: time(report.generatedAt),
     passed: normalizedScenarios.length === SCENARIO_IDS.length && passed === normalizedScenarios.length,
     summary: { required: SCENARIO_IDS.length, passed, failed: normalizedScenarios.length - passed },
-    sandbox: { repository: 'temporary', state: 'temporary-sqlite', externalSideEffects: false, restartReopenProven: report.restartReopenProven === true },
+    sandbox: { repository: 'temporary', state: 'temporary-sqlite', externalSideEffects: false, restartReopenProven: report.restartReopenProven === true || report.sandbox?.restartReopenProven === true },
     productionModules: [...new Set((report.productionModules || []).filter((value) => PRODUCTION_DEPENDENCY_IDS.includes(value)))],
     acceptanceRecords: normalizeRecords(report.acceptanceRecords),
     managerAuthority: { ...baseRecord(authority, true), cases: (authority.cases || []).slice(0, 8).map((entry) => ({ caseId: ['missing', 'stale', 'edited'].includes(entry.caseId) ? entry.caseId : 'missing', reasonCode: reason(entry.reasonCode), refused: entry.refused === true, workerStartDelta: count(entry.workerStartDelta), modelCallDelta: count(entry.modelCallDelta), githubMutationDelta: count(entry.githubMutationDelta) })) },
