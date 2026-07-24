@@ -1,0 +1,14 @@
+#!/usr/bin/env node
+
+// Thin executable entrypoint for the consolidated operator CLI (issue #67).
+// All behavior lives in scripts/ops/agent-runner-cli.mjs and the command
+// modules it dispatches to; this file only imports and calls main().
+
+import { main } from '../scripts/ops/agent-runner-cli.mjs';
+
+main(process.argv.slice(2), process.env)
+  .then((code) => { process.exitCode = code; })
+  .catch(() => {
+    process.stderr.write(`${JSON.stringify({ ok: false, reason: 'cli-internal-error' })}\n`);
+    process.exitCode = 1;
+  });
