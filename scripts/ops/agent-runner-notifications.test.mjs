@@ -813,3 +813,440 @@ test('NOTIFICATION_STATE_SCHEMA_VERSION is a stable positive integer', () => {
   assert.equal(Number.isInteger(NOTIFICATION_STATE_SCHEMA_VERSION), true);
   assert.equal(NOTIFICATION_STATE_SCHEMA_VERSION >= 1, true);
 });
+
+// ---------------------------------------------------------------------------
+// Manager review round 3.
+// ---------------------------------------------------------------------------
+
+// Round 3, item 1: stateful source truth is revalidated before delivery.
+
+test('round 3, item 1: a stateful source that clears while its notification is still pending resolves the row instead of delivering a stale alert', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedAttentionEvent(state, { attemptId: 'clears-while-pending' });
+    // The disabled transport leaves the discovered row pending indefinitely.
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:05:00.000Z' });
+    let [row] = notificationRows(state);
+    assert.equal(row.delivery_status, 'pending');
+    assert.equal(row.event_type, 'failed_attention');
+
+    // The operator fixes the underlying problem before a transport was ever enabled.
+    assert.equal(state.invoke('resolveAttentionForAttempt', 'clears-while-pending', '2026-07-24T10:30:00.000Z'), 1);
+
+    const { transport, deliveries, attempts } = createSyntheticNotificationTransport();
+    const summary = await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T11:00:00.000Z' });
+
+    assert.equal(attempts.length, 0, 'a cleared source must never reach the transport at all');
+    assert.equal(deliveries.length, 0);
+    assert.equal(summary.delivered, 0);
+    assert.equal(summary.resolved >= 1, true);
+    [row] = notificationRows(state);
+    assert.equal(row.delivery_status, 'resolved');
+    assert.equal(row.attempt_count, 0, 'resolving a cleared source consumes no delivery attempt');
+  });
+});
+
+test('round 3, item 1: a retryable-failed stateful row whose source clears is resolved rather than retried', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedAttentionEvent(state, { attemptId: 'clears-while-retrying' });
+    const { transport } = createSyntheticNotificationTransport({ fail: () => true, retryable: true });
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:05:00.000Z' });
+    let [row] = notificationRows(state);
+    assert.equal(row.delivery_status, 'retryable-failed');
+
+    assert.equal(state.invoke('resolveAttentionForAttempt', 'clears-while-retrying', '2026-07-24T10:30:00.000Z'), 1);
+    const second = createSyntheticNotificationTransport();
+    await reconcileNotifications({ state, args: { repo: REPO }, transport: second.transport, now: () => '2026-07-24T12:00:00.000Z' });
+
+    assert.equal(second.attempts.length, 0);
+    [row] = notificationRows(state);
+    assert.equal(row.delivery_status, 'resolved');
+  });
+});
+
+test('round 3, item 1: an exhausted quota episode whose source clears is resolved, and a later blocked episode is no longer suppressed', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedQuotaBlocked(state, { createdAt: '2026-07-24T10:00:00.000Z' });
+
+    // Burn the whole delivery budget with permanent rejections so the row exhausts.
+    const rejecting = createSyntheticNotificationTransport({ fail: () => true, retryable: false });
+    await reconcileNotifications({ state, args: { repo: REPO }, transport: rejecting.transport, now: () => '2026-07-24T10:05:00.000Z' });
+    let rows = notificationRows(state);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].delivery_status, 'exhausted');
+    assert.equal(rows[0].event_type, 'quota_blocked');
+
+    // Quota becomes available again. The exhausted row must resolve -- under
+    // round 2 it stayed unresolved forever, and openNotificationExists() then
+    // suppressed every future quota_blocked episode for this repo.
+    seedQuotaAvailable(state, { createdAt: '2026-07-24T11:00:00.000Z' });
+    await reconcileNotifications({ state, args: { repo: REPO }, transport: rejecting.transport, now: () => '2026-07-24T11:05:00.000Z' });
+    rows = notificationRows(state);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].delivery_status, 'resolved', 'a cleared exhausted quota episode must resolve');
+
+    // A genuinely new blocked episode must now be discovered and delivered.
+    seedQuotaBlocked(state, { createdAt: '2026-07-24T12:00:00.000Z' });
+    const { transport, deliveries } = createSyntheticNotificationTransport();
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T12:05:00.000Z' });
+    rows = notificationRows(state);
+    assert.equal(rows.length, 2, 'the later blocked episode must not be suppressed by the earlier exhausted one');
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0].eventType, 'quota_blocked');
+  });
+});
+
+// Round 3, item 2: a recovery-attempt-sourced failed_attention row can resolve.
+
+test('round 3, item 2: a failed_attention notification derived directly from a recovery attempt resolves once the attempt resolution_state becomes resolved', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    const attemptId = `${REPO}#405:2026-07-24T10:00:00.000Z`;
+    seedFailedAttemptWithoutAttention(state, { attemptId, issueNumber: 405, resolutionState: 'unresolved' });
+
+    const { transport, deliveries } = createSyntheticNotificationTransport();
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:05:00.000Z' });
+    let [row] = notificationRows(state);
+    assert.equal(row.event_type, 'failed_attention');
+    assert.equal(row.source_table, 'recovery_attempts');
+    assert.equal(row.source_ref, attemptId, 'the persisted reference must be the bounded, lookup-capable attempt id -- not an unparseable hash');
+    assert.equal(row.delivery_status, 'delivered');
+    assert.equal(deliveries.length, 1);
+
+    // Repeated passes while it is still unresolved must not resolve it.
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:10:00.000Z' });
+    assert.equal(notificationRows(state)[0].delivery_status, 'delivered', 'an unresolved attempt must keep its notification unresolved');
+
+    // The attempt is resolved; the notification must follow.
+    seedFailedAttemptWithoutAttention(state, { attemptId, issueNumber: 405, resolutionState: 'resolved' });
+    const summary = await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T11:00:00.000Z' });
+    assert.equal(summary.resolved >= 1, true);
+    [row] = notificationRows(state);
+    assert.equal(row.delivery_status, 'resolved');
+    assert.equal(row.resolved_at, '2026-07-24T11:00:00.000Z');
+  });
+});
+
+// Round 3, item 3: the recovery cursor is lossless.
+
+test('round 3, item 3: two recovery attempts sharing the exact same started_at are both discovered, at activation and during batch advancement', async () => {
+  await withState(async (state) => {
+    const sharedStartedAt = '2026-07-24T10:00:00.000Z';
+    // Pre-existing history sharing the same millisecond as the new rows.
+    seedCompletedAttempt(state, { attemptId: `${REPO}#500:${sharedStartedAt}`, issueNumber: 500, startedAt: sharedStartedAt });
+    await activateCursors(state);
+    assert.equal(notificationRows(state).length, 0, 'activation skips pre-existing history');
+
+    // Two genuinely new attempts, both on the activation boundary millisecond.
+    seedCompletedAttempt(state, { attemptId: `${REPO}#501:${sharedStartedAt}`, issueNumber: 501, startedAt: sharedStartedAt });
+    seedCompletedAttempt(state, { attemptId: `${REPO}#502:${sharedStartedAt}`, issueNumber: 502, startedAt: sharedStartedAt });
+
+    const { transport, deliveries } = createSyntheticNotificationTransport();
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:05:00.000Z' });
+    assert.deepEqual(
+      notificationRows(state).map((row) => row.issue_number).sort((a, b) => a - b),
+      [501, 502],
+      'an equal-timestamp attempt must never be dropped by the cursor',
+    );
+    assert.equal(deliveries.length, 2);
+
+    // A third attempt on the same millisecond, after the cursor has advanced.
+    seedCompletedAttempt(state, { attemptId: `${REPO}#503:${sharedStartedAt}`, issueNumber: 503, startedAt: sharedStartedAt });
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:10:00.000Z' });
+    assert.deepEqual(
+      notificationRows(state).map((row) => row.issue_number).sort((a, b) => a - b),
+      [501, 502, 503],
+      'normal batch advancement across an equal timestamp must also be lossless',
+    );
+  });
+});
+
+test('round 3, item 3: a bounded batch splits equal-timestamp attempts across passes without dropping any', async () => {
+  await withState(async (state) => {
+    const sharedStartedAt = '2026-07-24T10:00:00.000Z';
+    await activateCursors(state);
+    for (let i = 0; i < 5; i += 1) {
+      seedCompletedAttempt(state, { attemptId: `${REPO}#60${i}:${sharedStartedAt}`, issueNumber: 600 + i, startedAt: sharedStartedAt });
+    }
+    const { transport } = createSyntheticNotificationTransport();
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:05:00.000Z', batchSize: 2 });
+    assert.equal(notificationRows(state).length, 2);
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:06:00.000Z', batchSize: 2 });
+    assert.equal(notificationRows(state).length, 4);
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:07:00.000Z', batchSize: 2 });
+    assert.deepEqual(
+      notificationRows(state).map((row) => row.issue_number).sort((a, b) => a - b),
+      [600, 601, 602, 603, 604],
+      'every equal-timestamp attempt is eventually discovered exactly once',
+    );
+  });
+});
+
+// Round 3, item 4: no head-of-line blocking.
+
+test('round 3, item 4: an unresolved recovery attempt does not prevent a later independent attempt from being notified, and is itself notified exactly once when it becomes final', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    // A still-running attempt (no finished_at) -- its fate is not yet decided.
+    state.invoke('recordRecoveryAttempt', {
+      attemptId: `${REPO}#700:2026-07-24T10:00:00.000Z`, repo: REPO, project: 'agent-runner', issueNumber: 700,
+      agent: 'claude-code-cli', startedAt: '2026-07-24T10:00:00.000Z', finishedAt: null, outcome: null,
+    });
+    // A later, independently final attempt.
+    seedCompletedAttempt(state, { attemptId: `${REPO}#701:2026-07-24T10:01:00.000Z`, issueNumber: 701, startedAt: '2026-07-24T10:01:00.000Z' });
+
+    const { transport, deliveries } = createSyntheticNotificationTransport();
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:05:00.000Z' });
+    assert.deepEqual(
+      notificationRows(state).map((row) => row.issue_number),
+      [701],
+      'a later independent row must still create its notification intent while an earlier row is undecided',
+    );
+    assert.equal(deliveries.length, 1);
+
+    // Repeated passes must not duplicate the later row while the earlier one stays undecided.
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:06:00.000Z' });
+    assert.equal(notificationRows(state).length, 1, 're-scanning past the blocked row must be an exact no-op');
+
+    // The blocked row finally reaches a terminal state.
+    state.invoke('recordRecoveryAttempt', {
+      attemptId: `${REPO}#700:2026-07-24T10:00:00.000Z`, repo: REPO, project: 'agent-runner', issueNumber: 700,
+      agent: 'claude-code-cli', startedAt: '2026-07-24T10:00:00.000Z', finishedAt: '2026-07-24T10:20:00.000Z',
+      outcome: 'completed', exitCode: 0, recoveryEligible: false, resolutionState: 'resolved',
+    });
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:25:00.000Z' });
+    assert.deepEqual(
+      notificationRows(state).map((row) => row.issue_number).sort((a, b) => a - b),
+      [700, 701],
+      'the previously-blocked row is notified once it becomes final',
+    );
+
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:26:00.000Z' });
+    assert.equal(notificationRows(state).length, 2, 'and exactly once -- never re-notified on a later pass');
+  });
+});
+
+test('round 3, item 4: a mutation-pending routing row does not prevent a later resolved no-qualified-agent row from being notified', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedReassignment(state, { issueNumber: 710, dedupeKey: 'hol-pending-reassign', deliveryStatus: 'mutation-pending' });
+    seedNoQualifiedAgent(state, { issueNumber: 711, dedupeKey: 'hol-no-qualified', deliveryStatus: 'resolved' });
+
+    const { transport, deliveries } = createSyntheticNotificationTransport();
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:05:00.000Z' });
+    assert.deepEqual(
+      notificationRows(state).map((row) => row.event_type),
+      ['no_qualified_agent'],
+      'a permanently mutation-pending row must not hide every later routing row',
+    );
+    assert.equal(deliveries.length, 1);
+
+    // The pending mutation is finally proven applied.
+    state.invoke('updateRoutingEventDeliveryStatus', { dedupeKey: 'hol-pending-reassign', deliveryStatus: 'evidence-pending' });
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:10:00.000Z' });
+    assert.deepEqual(
+      notificationRows(state).map((row) => row.event_type).sort(),
+      ['agent_reassigned', 'no_qualified_agent'],
+    );
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:11:00.000Z' });
+    assert.equal(notificationRows(state).length, 2, 'each routing row is notified exactly once');
+  });
+});
+
+// Round 3, item 5: stale in-flight recovery never exhausts deliverability.
+
+test('round 3, item 5: repeated stale in-flight claims never consume the delivery budget or exhaust an event that may never have reached a transport', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedAttentionEvent(state, { issueNumber: 720 });
+    await reconcileNotifications({ state, args: { repo: REPO }, now: () => '2026-07-24T10:00:00.000Z' });
+    const [initial] = notificationRows(state);
+    assert.equal(initial.delivery_status, 'pending');
+
+    // Ten processes in a row claim the event and die before the transport is
+    // ever invoked. maxAttempts is 2, so the round-2 "charge the attempt"
+    // behaviour would have discarded this event as exhausted after two.
+    for (let pass = 1; pass <= 10; pass += 1) {
+      state.invoke('claimNotificationForDelivery', { dedupeKey: initial.dedupe_key, owner: `crashed-${pass}`, at: '2026-07-24T10:10:00.000Z' });
+      const summary = await reconcileNotifications({
+        state, args: { repo: REPO }, transport: createDisabledNotificationTransport(),
+        now: () => '2026-07-24T10:20:00.000Z', staleInFlightMs: 60_000, maxAttempts: 2,
+      });
+      assert.equal(summary.staleRecovered, 1, `pass ${pass} must recover the abandoned claim`);
+      assert.equal(summary.exhausted, 0, `pass ${pass} must never exhaust an unproven delivery`);
+    }
+
+    let [row] = notificationRows(state);
+    assert.equal(row.delivery_status, 'pending');
+    assert.equal(row.attempt_count, 0, 'no ambiguous stale claim ever consumed a real delivery attempt');
+    assert.equal(row.stale_recovery_count, 10, 'stale-claim recovery is tracked separately for operator visibility');
+
+    // The event is still fully deliverable, on the same idempotency key.
+    const { transport, deliveries } = createSyntheticNotificationTransport();
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T11:00:00.000Z', maxAttempts: 2 });
+    assert.equal(deliveries.length, 1);
+    assert.equal(deliveries[0].idempotencyKey, initial.dedupe_key, 'the same stable idempotency key is used across every crash and resend');
+    [row] = notificationRows(state);
+    assert.equal(row.delivery_status, 'delivered');
+  });
+});
+
+// Round 3, item 6: routing delivery status is an exact allowlist.
+
+test('round 3, item 6: a corrupt, empty or future routing delivery status never announces a reassignment and stays revisitable', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedReassignment(state, { issueNumber: 730, dedupeKey: 'malformed-status-1', deliveryStatus: 'totally-unknown-status' });
+    seedReassignment(state, { issueNumber: 731, dedupeKey: 'malformed-status-2', deliveryStatus: '' });
+    seedReassignment(state, { issueNumber: 732, dedupeKey: 'malformed-status-3', deliveryStatus: 'mutation-applied-probably' });
+    seedNoQualifiedAgent(state, { issueNumber: 733, dedupeKey: 'proven-resolved', deliveryStatus: 'resolved' });
+
+    const { transport, deliveries, attempts } = createSyntheticNotificationTransport();
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:05:00.000Z' });
+
+    assert.deepEqual(
+      notificationRows(state).map((row) => row.issue_number),
+      [733],
+      'only an exactly-allowlisted proven status may notify; unknown statuses fail closed',
+    );
+    assert.equal(attempts.length, 1);
+    assert.equal(deliveries[0].eventType, 'no_qualified_agent');
+    // A genuinely unrecognized status is surfaced as a bounded local
+    // diagnostic drawn from the closed vocabulary -- never a raw status string.
+    const unknownDiagnostics = state.taskErrors.filter((entry) => entry.stage === 'notification-source-status-unknown');
+    assert.equal(unknownDiagnostics.length >= 1, true);
+    for (const entry of unknownDiagnostics) assert.equal(entry.message, 'source-row-invalid');
+    assert.doesNotMatch(JSON.stringify(state.taskErrors), /totally-unknown-status|mutation-applied-probably/);
+
+    // Revisitable, not permanently skipped: once proven applied, it notifies.
+    state.invoke('updateRoutingEventDeliveryStatus', { dedupeKey: 'malformed-status-1', deliveryStatus: 'resolved' });
+    await reconcileNotifications({ state, args: { repo: REPO }, transport, now: () => '2026-07-24T10:10:00.000Z' });
+    assert.deepEqual(
+      notificationRows(state).map((row) => row.issue_number).sort((a, b) => a - b),
+      [730, 733],
+      'a corrupt-status row remains revisitable and notifies once its status becomes proven',
+    );
+  });
+});
+
+test('round 3, item 6: a NULL routing delivery status fails closed', async () => {
+  await withState(async (state, { stateDbPath }) => {
+    await activateCursors(state);
+    seedReassignment(state, { issueNumber: 740, dedupeKey: 'null-status', deliveryStatus: 'resolved' });
+    state.close();
+
+    // The NOT NULL column cannot be written through the state store's public
+    // methods, so force the adversarial value directly in SQLite -- exactly
+    // the "corrupt/legacy row" case the allowlist must survive.
+    const { DatabaseSync } = await import('node:sqlite');
+    const db = new DatabaseSync(stateDbPath);
+    db.exec("CREATE TABLE routing_events_rebuild AS SELECT * FROM routing_events");
+    db.exec("UPDATE routing_events_rebuild SET delivery_status = NULL WHERE dedupe_key = 'null-status'");
+    db.exec('DROP TABLE routing_events');
+    db.exec('ALTER TABLE routing_events_rebuild RENAME TO routing_events');
+    db.close();
+
+    const reopened = createStateRecorder({ stateDbPath, outputDir: '.', repo: REPO });
+    try {
+      assert.equal(reopened.invoke('allRows', 'routing_events')[0].delivery_status, null);
+      const { transport, attempts } = createSyntheticNotificationTransport();
+      await reconcileNotifications({ state: reopened, args: { repo: REPO }, transport, now: () => '2026-07-24T10:05:00.000Z' });
+      assert.equal(reopened.invoke('allRows', 'notification_events').length, 0, 'a NULL delivery status must never announce a reassignment');
+      assert.equal(attempts.length, 0);
+    } finally {
+      reopened.close();
+    }
+  });
+});
+
+// Round 3, item 7: bounded work is bounded in SQL, with targeted lookups.
+
+test('round 3, item 7: a reconciliation pass never loads whole source or outbox tables, and bounds every batch in SQL', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    for (let i = 0; i < 12; i += 1) seedAttentionEvent(state, { attemptId: `bounded-attempt-${i}`, issueNumber: 800 + i });
+    seedQuotaBlocked(state, { createdAt: '2026-07-24T10:00:00.000Z' });
+    seedSystemicPause(state, { at: '2026-07-24T10:00:00.000Z' });
+
+    // Record every state-store method a pass invokes, and the limits it passes.
+    const invoked = [];
+    const spied = {
+      ...state,
+      get healthy() { return state.healthy; },
+      get available() { return state.available; },
+      recordTaskError: (...values) => state.recordTaskError(...values),
+      invoke: (method, ...values) => { invoked.push({ method, values }); return state.invoke(method, ...values); },
+    };
+
+    const { transport } = createSyntheticNotificationTransport();
+    await reconcileNotifications({ state: spied, args: { repo: REPO }, transport, now: () => '2026-07-24T10:05:00.000Z', batchSize: 5 });
+
+    const fullTableScans = invoked.filter((call) => call.method === 'allRows');
+    assert.deepEqual(fullTableScans, [], 'no stage may load an entire table and filter/slice it in JavaScript');
+
+    // Every batched read carries an explicit SQL-side bound.
+    for (const method of ['attentionEventsSince', 'routingEventsSince', 'recoveryAttemptsSince', 'openHealthConditionsForTypes', 'dueNotificationEvents', 'unresolvedStatefulNotificationEvents']) {
+      const calls = invoked.filter((call) => call.method === method);
+      assert.equal(calls.length >= 1, true, `${method} must be used by a pass`);
+      for (const call of calls) {
+        assert.equal(Number.isInteger(call.values[call.values.length - 1]), true, `${method} must be called with an explicit SQL limit`);
+      }
+    }
+    assert.equal(invoked.filter((call) => call.method === 'attentionEventsSince')[0].values[2], 5, 'the configured batch size is the SQL limit');
+
+    // Health discovery queries only the closed condition-type set.
+    const healthCalls = invoked.filter((call) => call.method === 'openHealthConditionsForTypes');
+    assert.deepEqual(healthCalls[0].values[1].sort(), ['queue_inspection_degraded', 'systemic_pause']);
+
+    // Source-truth revalidation uses targeted single-row lookups.
+    const targeted = invoked.filter((call) => ['attentionEventByDedupeKey', 'recoveryAttemptByAttemptId', 'healthConditionForType', 'latestQuotaHistoryForRepo'].includes(call.method));
+    assert.equal(targeted.length >= 1, true, 'source resolution must use targeted lookups');
+    assert.equal(notificationRows(state).length <= 12, true);
+  });
+});
+
+// Round 3, item 8: adversarial direct-store writes cannot bypass the sink bounds.
+
+test('round 3, item 8: project, source_table and last_error are bounded by the state-store methods themselves, not only by this module', async () => {
+  await withState(async (state) => {
+    const rawDiagnostic = 'Bearer sk-live-deadbeef /home/gp/.claude/session.json https://provider.example/v1/messages';
+
+    // An unrecognized source_table is rejected by the sink itself.
+    state.invoke('recordNotificationEvent', {
+      repo: REPO, eventType: 'failed_attention', reasonCode: 'attention-required',
+      sourceTable: 'attacker_controlled_table', sourceRef: 'x', occurredAt: '2026-07-24T10:00:00.000Z',
+      dedupeKey: 'adv-1', content: {},
+    });
+    assert.equal(notificationRows(state).length, 0, 'the rejected row must never be persisted');
+
+    // A raw diagnostic can never become a dashboard-visible project.
+    state.invoke('recordNotificationEvent', {
+      repo: REPO, project: rawDiagnostic, eventType: 'failed_attention', reasonCode: 'attention-required',
+      sourceTable: 'attention_events', sourceRef: 'adv-2', occurredAt: '2026-07-24T10:00:00.000Z',
+      dedupeKey: 'adv-2', content: {},
+    });
+    assert.equal(notificationRows(state)[0].project, null);
+
+    // A raw error string can never become last_error.
+    state.invoke('claimNotificationForDelivery', { dedupeKey: 'adv-2', owner: 'p', at: '2026-07-24T10:00:01.000Z' });
+    state.invoke('markNotificationDeliveryFailed', { dedupeKey: 'adv-2', attemptedAt: '2026-07-24T10:00:02.000Z', errorCode: rawDiagnostic });
+    assert.equal(notificationRows(state)[0].last_error, 'invalid-error-code');
+
+    assert.doesNotMatch(JSON.stringify(notificationRows(state)), /Bearer|sk-live|\/home\/|https:\/\//);
+  });
+});
+
+test('round 3, item 8: every last_error this module can ever persist is a member of the closed DELIVERY_REASON_CODES set', async () => {
+  await withState(async (state) => {
+    await activateCursors(state);
+    seedAttentionEvent(state, { issueNumber: 810 });
+    // A transport returning an out-of-vocabulary reason code.
+    const rogueTransport = async () => ({ ok: false, retryable: true, reasonCode: 'Bearer sk-live-leak at /home/gp/secret' });
+    await reconcileNotifications({ state, args: { repo: REPO }, transport: rogueTransport, now: () => '2026-07-24T10:05:00.000Z' });
+    const [row] = notificationRows(state);
+    assert.equal(DELIVERY_REASON_CODES.includes(row.last_error), true, `last_error ${row.last_error} must be a closed reason code`);
+    assert.doesNotMatch(JSON.stringify(row), /Bearer|sk-live|\/home\//);
+  });
+});

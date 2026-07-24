@@ -10,8 +10,79 @@ import {
   serializeCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 
-export const RUNNER_STATE_SCHEMA_VERSION = 14;
+export const RUNNER_STATE_SCHEMA_VERSION = 15;
 export const DEFAULT_RUNNER_STATE_DB_NAME = 'runner-state.sqlite';
+
+/**
+ * Closed vocabularies enforced by the notification_events sink itself (#53
+ * review round 3, item 8). These are deliberately duplicated as SQL CHECK
+ * constraints below: the JS guards give a caller a clean, bounded coercion,
+ * and the CHECKs are the last line of defense against a future caller that
+ * bypasses them.
+ */
+export const NOTIFICATION_SOURCE_TABLES = Object.freeze([
+  'recovery_attempts',
+  'attention_events',
+  'routing_events',
+  'quota_history',
+  'runner_health_conditions',
+]);
+
+/**
+ * The only strings that may ever land in `notification_events.last_error`.
+ * A caller passing anything else gets `invalid-error-code` persisted instead
+ * of its raw text, so a raw transport reason or exception message can never
+ * reach this column through any public method (#53 review round 3, item 8).
+ */
+export const NOTIFICATION_ERROR_CODES = Object.freeze([
+  'transport-disabled',
+  'transport-timeout',
+  'transport-rejected-retryable',
+  'transport-rejected-permanent',
+  'transport-threw',
+  'stale-in-flight-recovered',
+  'state-transition-mismatch',
+  'invalid-error-code',
+]);
+
+/**
+ * Event types whose underlying condition persists after delivery and can
+ * therefore later clear on its own. Only these may be resolved through
+ * `resolveStatefulNotificationEvent()`; the one-shot types (`completed`,
+ * `agent_reassigned`, `no_qualified_agent`) describe a moment that already
+ * happened and are resolved in the same write as their delivery.
+ */
+export const NOTIFICATION_STATEFUL_EVENT_TYPES = Object.freeze([
+  'failed_attention',
+  'quota_blocked',
+  'systemic_pause',
+]);
+
+/** Statuses a stateful notification may be resolved from once its source truth has cleared (#53 review round 3, item 1). */
+const NOTIFICATION_RESOLVABLE_STATUSES = Object.freeze([
+  'pending', 'in-flight', 'retryable-failed', 'delivered', 'exhausted',
+]);
+
+// A `project` is operator-facing (it is exposed by the dashboard view), so it
+// is bounded to a short, closed identifier shape here rather than accepted as
+// free text (#53 review round 3, item 8). Anything else is stored as NULL.
+const NOTIFICATION_PROJECT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._\-\/]{0,63}$/;
+
+function boundedNotificationProject(value) {
+  return typeof value === 'string' && NOTIFICATION_PROJECT_PATTERN.test(value) ? value : null;
+}
+
+function boundedNotificationErrorCode(value) {
+  if (value == null) return null;
+  return NOTIFICATION_ERROR_CODES.includes(value) ? value : 'invalid-error-code';
+}
+
+function assertNotificationSourceTable(sourceTable) {
+  if (!NOTIFICATION_SOURCE_TABLES.includes(sourceTable)) {
+    throw new Error(`recordNotificationEvent rejected source_table ${JSON.stringify(String(sourceTable))}`);
+  }
+  return sourceTable;
+}
 
 const TABLES = new Set([
   'runner_state_schema',
@@ -118,6 +189,11 @@ function boundedLimit(limit) {
 // notification source-cursor batches (#53 round 2) get their own, larger
 // bound so a reconciliation pass can make real forward progress through a
 // backlog while still never scanning unbounded history in one call.
+/** A cursor value is only usable as a rowid/id bound if it is a non-negative integer in text form (#53 review round 3, item 3). */
+function isIntegerCursor(value) {
+  return /^\d+$/.test(String(value));
+}
+
 function boundedBatchLimit(limit, max = 200) {
   if (!Number.isInteger(limit) || limit < 1) return Math.min(50, max);
   return Math.min(limit, max);
@@ -382,7 +458,7 @@ export class RunnerStateStore {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         repo TEXT NOT NULL,
-        project TEXT,
+        project TEXT CHECK (project IS NULL OR length(project) <= 64),
         issue_number INTEGER,
         event_type TEXT NOT NULL CHECK (event_type IN (
           'completed', 'failed_attention', 'quota_blocked', 'agent_reassigned', 'no_qualified_agent', 'systemic_pause'
@@ -392,7 +468,9 @@ export class RunnerStateStore {
           'agent-disabled-reassigned', 'no-qualified-agent', 'systemic-pause', 'control-service-failure'
         )),
         agent TEXT,
-        source_table TEXT NOT NULL,
+        source_table TEXT NOT NULL CHECK (source_table IN (
+          'recovery_attempts', 'attention_events', 'routing_events', 'quota_history', 'runner_health_conditions'
+        )),
         source_ref TEXT NOT NULL,
         occurred_at TEXT NOT NULL,
         delivery_status TEXT NOT NULL DEFAULT 'pending' CHECK (delivery_status IN (
@@ -400,13 +478,22 @@ export class RunnerStateStore {
         )),
         attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
         max_attempts INTEGER NOT NULL DEFAULT 5 CHECK (max_attempts >= 1 AND max_attempts <= 20),
+        -- Stale-claim recoveries are counted separately from attempt_count on
+        -- purpose (#53 review round 3, item 5): a crash while owning the row
+        -- is not evidence a transport was ever reached, so it must never
+        -- consume the bounded delivery-attempt budget or exhaust the row.
+        stale_recovery_count INTEGER NOT NULL DEFAULT 0 CHECK (stale_recovery_count >= 0),
         in_flight_owner TEXT,
         in_flight_claimed_at TEXT,
         next_attempt_at TEXT,
         last_attempt_at TEXT,
         delivered_at TEXT,
         resolved_at TEXT,
-        last_error TEXT,
+        last_error TEXT CHECK (last_error IS NULL OR last_error IN (
+          'transport-disabled', 'transport-timeout', 'transport-rejected-retryable',
+          'transport-rejected-permanent', 'transport-threw', 'stale-in-flight-recovered',
+          'state-transition-mismatch', 'invalid-error-code'
+        )),
         content_json TEXT NOT NULL
       );
 
@@ -430,6 +517,12 @@ export class RunnerStateStore {
       CREATE INDEX IF NOT EXISTS routing_events_issue_idx ON routing_events(repo, issue_number, event_type, created_at);
       CREATE INDEX IF NOT EXISTS notification_events_status_idx ON notification_events(repo, delivery_status);
       CREATE INDEX IF NOT EXISTS notification_events_issue_idx ON notification_events(repo, issue_number, created_at);
+      -- #53 review round 3, item 7: the unresolved-stateful rescan and the
+      -- per-source targeted lookups must both be index-served, so a large
+      -- settled outbox never costs a full scan while the serial lock is held.
+      CREATE INDEX IF NOT EXISTS notification_events_unresolved_idx ON notification_events(repo, resolved_at, event_type, created_at);
+      CREATE INDEX IF NOT EXISTS notification_events_source_idx ON notification_events(repo, source_table, source_ref);
+      CREATE INDEX IF NOT EXISTS recovery_attempts_repo_attempt_idx ON recovery_attempts(repo, attempt_id);
       CREATE INDEX IF NOT EXISTS queue_events_issue_idx ON queue_events(issue_number, created_at);
       CREATE INDEX IF NOT EXISTS quota_history_created_idx ON quota_history(created_at);
       CREATE INDEX IF NOT EXISTS preflight_packets_issue_idx ON preflight_packets(issue_number, created_at);
@@ -501,6 +594,11 @@ export class RunnerStateStore {
     const routingEventColumns = new Set(this.db.prepare('PRAGMA table_info(routing_events)').all().map((column) => column.name));
     if (!routingEventColumns.has('delivery_status')) this.db.exec("ALTER TABLE routing_events ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'resolved'");
     this.db.exec('CREATE INDEX IF NOT EXISTS routing_events_delivery_status_idx ON routing_events(repo, delivery_status)');
+    // Schema v15 (#53 review round 3, item 5): stale in-flight claims are
+    // requeued rather than charged to attempt_count, and counted here so an
+    // operator can still see a row that keeps being abandoned mid-delivery.
+    const notificationColumns = new Set(this.db.prepare('PRAGMA table_info(notification_events)').all().map((column) => column.name));
+    if (!notificationColumns.has('stale_recovery_count')) this.db.exec('ALTER TABLE notification_events ADD COLUMN stale_recovery_count INTEGER NOT NULL DEFAULT 0');
     this.db.prepare('INSERT OR IGNORE INTO runner_state_schema (version, applied_at) VALUES (?, ?)').run(RUNNER_STATE_SCHEMA_VERSION, this.now());
   }
 
@@ -578,22 +676,35 @@ export class RunnerStateStore {
   }) {
     if (!dedupeKey) throw new Error('recordNotificationEvent requires a dedupeKey');
     const boundedMaxAttempts = Math.min(20, Math.max(1, Number.isInteger(maxAttempts) ? maxAttempts : 5));
+    // #53 review round 3, item 8: the sink itself -- not only its callers --
+    // constrains source_table (closed set, throws) and project (bounded
+    // identifier shape, coerced to NULL), so a future caller cannot persist
+    // raw diagnostics through this public method.
+    const boundedSourceTable = assertNotificationSourceTable(sourceTable);
+    const boundedProject = boundedNotificationProject(project);
     const result = this.db.prepare(`
       INSERT INTO notification_events
         (dedupe_key, created_at, updated_at, repo, project, issue_number, event_type, reason_code, agent, source_table, source_ref, occurred_at, delivery_status, attempt_count, max_attempts, content_json)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
       ON CONFLICT(dedupe_key) DO NOTHING
-    `).run(dedupeKey, createdAt, createdAt, repo, project, asInteger(issueNumber), eventType, reasonCode, agent, sourceTable, sourceRef, occurredAt, boundedMaxAttempts, json(content));
+    `).run(dedupeKey, createdAt, createdAt, repo, boundedProject, asInteger(issueNumber), eventType, reasonCode, agent, boundedSourceTable, sourceRef, occurredAt, boundedMaxAttempts, json(content));
     if (result.changes > 0) return { inserted: true, existing: null };
     return { inserted: false, existing: this.db.prepare('SELECT * FROM notification_events WHERE dedupe_key = ?').get(dedupeKey) || null };
   }
 
-  /** Rows never delivered, or eligible for a bounded retry -- the exact set a reconciliation pass must (re)attempt. Excludes 'in-flight': those are claimed by a specific pass/owner already. */
-  dueNotificationEvents(repo, at = this.now()) {
+  /**
+   * Rows never delivered, or eligible for a bounded retry -- the exact set a
+   * reconciliation pass must (re)attempt. Excludes 'in-flight': those are
+   * claimed by a specific pass/owner already. The batch bound is applied as a
+   * SQL `LIMIT`, never by loading every due row and slicing in JavaScript
+   * (#53 review round 3, item 7), so a large backlog cannot cost unbounded
+   * query/memory work while the serial scheduler lock is held.
+   */
+  dueNotificationEvents(repo, at = this.now(), limit) {
     return this.db.prepare(`SELECT * FROM notification_events WHERE repo = ?
       AND delivery_status IN ('pending', 'retryable-failed')
       AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
-      ORDER BY created_at ASC`).all(repo, at);
+      ORDER BY created_at ASC LIMIT ?`).all(repo, at, boundedBatchLimit(limit));
   }
 
   /**
@@ -627,9 +738,34 @@ export class RunnerStateStore {
     return result.changes === 1;
   }
 
-  /** Delivered, but not yet resolved -- rows a reconciliation pass must recheck against current source state (#53: unresolved dashboard attention must stay visible even once delivered). */
-  deliveredUnresolvedNotificationEvents(repo) {
-    return this.db.prepare(`SELECT * FROM notification_events WHERE repo = ? AND delivery_status = 'delivered' AND resolved_at IS NULL ORDER BY created_at ASC`).all(repo);
+  /** Delivered, but not yet resolved -- the narrow post-delivery view. Superseded for reconciliation by `unresolvedStatefulNotificationEvents()`, which also covers rows whose source cleared before they were ever delivered. */
+  deliveredUnresolvedNotificationEvents(repo, limit) {
+    return this.db.prepare(`SELECT * FROM notification_events WHERE repo = ? AND delivery_status = 'delivered' AND resolved_at IS NULL
+      ORDER BY created_at ASC LIMIT ?`).all(repo, boundedBatchLimit(limit));
+  }
+
+  /**
+   * Every unresolved *stateful* notification for a repo, whatever delivery
+   * stage it reached (#53 review round 3, item 1). A stateful condition can
+   * clear at any point in the delivery lifecycle -- including before the
+   * first successful delivery -- so restricting this rescan to `delivered`
+   * rows (as the round-2 implementation did) let a `pending`, `retryable-
+   * failed` or `exhausted` row survive as a stale alert, and left an
+   * exhausted quota episode permanently unresolved, which in turn made
+   * `openNotificationExists()` suppress every future quota_blocked episode
+   * for that repo forever.
+   *
+   * 'in-flight' is deliberately excluded: those rows are owned by a live
+   * pass, which revalidates source truth itself immediately before calling a
+   * transport. Bounded by a SQL `LIMIT` and filtered to the closed stateful
+   * event-type set in SQL, never in JavaScript (item 7).
+   */
+  unresolvedStatefulNotificationEvents(repo, limit) {
+    return this.db.prepare(`SELECT * FROM notification_events WHERE repo = ?
+      AND resolved_at IS NULL
+      AND delivery_status IN ('pending', 'retryable-failed', 'delivered', 'exhausted')
+      AND event_type IN ('failed_attention', 'quota_blocked', 'systemic_pause')
+      ORDER BY created_at ASC LIMIT ?`).all(repo, boundedBatchLimit(limit));
   }
 
   /**
@@ -681,7 +817,13 @@ export class RunnerStateStore {
     if (!row) return { updated: false, exhausted: false };
     const nextCount = row.attempt_count + 1;
     const exhausted = !retryable || nextCount >= row.max_attempts;
-    const boundedError = errorCode == null ? null : String(errorCode).slice(0, 80);
+    // #53 review round 3, item 8: the closed `last_error` vocabulary is
+    // enforced here, in the state-store method itself -- not only by the
+    // notification module that normally calls it. Truncating an arbitrary
+    // string to 80 characters (the round-2 behaviour) still persisted raw
+    // diagnostics; anything outside NOTIFICATION_ERROR_CODES now becomes the
+    // fixed `invalid-error-code` sentinel instead.
+    const boundedError = boundedNotificationErrorCode(errorCode);
     const result = this.db.prepare(`UPDATE notification_events SET
       delivery_status = ?, attempt_count = ?, last_attempt_at = ?, next_attempt_at = ?, last_error = ?,
       in_flight_owner = NULL, in_flight_claimed_at = NULL, updated_at = ?
@@ -698,27 +840,61 @@ export class RunnerStateStore {
   }
 
   /**
+   * Resolve a *stateful* notification from any pre-terminal delivery status
+   * once its underlying source truth has cleared (#53 review round 3, item
+   * 1) -- including a row that was never successfully delivered at all, so a
+   * stale alert is retired instead of being delivered later, and an
+   * exhausted quota episode stops suppressing the next genuine one.
+   *
+   * The one-shot event types are excluded *in SQL*, not merely by caller
+   * discipline: `completed` / `agent_reassigned` / `no_qualified_agent`
+   * describe a moment that already happened, have no source condition that
+   * can "clear", and are resolved in the same write as their delivery. A
+   * caller passing one gets `false`, never a silent early resolution.
+   */
+  resolveStatefulNotificationEvent({ dedupeKey, resolvedAt = this.now() }) {
+    const result = this.db.prepare(`UPDATE notification_events SET
+      delivery_status = 'resolved', resolved_at = ?, updated_at = ?,
+      in_flight_owner = NULL, in_flight_claimed_at = NULL, next_attempt_at = NULL
+      WHERE dedupe_key = ?
+      AND delivery_status IN ('pending', 'in-flight', 'retryable-failed', 'delivered', 'exhausted')
+      AND event_type IN ('failed_attention', 'quota_blocked', 'systemic_pause')`)
+      .run(resolvedAt, resolvedAt, dedupeKey);
+    return result.changes === 1;
+  }
+
+  /**
    * Rows still 'in-flight' after `staleBeforeAt` were claimed by a process
    * that never came back -- a crash between the claim and the terminal
    * write, not a live delivery attempt. Reconciled back onto the SAME row
    * (same dedupe_key/idempotency key), never a new notification identity
    * (#53 review, item 2): the external side effect may already have
    * happened, so a real transport's provider-side idempotency is what
-   * collapses the eventual resend, not this reconciliation step. Bounded by
-   * the same max_attempts as any other failure.
+   * collapses the eventual resend, not this reconciliation step.
+   *
+   * The claim is *requeued*, not charged (#53 review round 3, item 5). An
+   * ambiguous stale claim is not equivalent to a proven transport rejection
+   * or timeout -- the process may well have crashed before the transport was
+   * ever reached -- so `attempt_count` is left untouched and the row returns
+   * to 'pending' and immediately due. Charging it, as the round-2
+   * implementation did, meant a process crash-looping before its first
+   * transport call could silently walk an undelivered event all the way to
+   * 'exhausted' and discard it forever. Stale recoveries are instead counted
+   * in their own `stale_recovery_count` column so a repeatedly-abandoned row
+   * is still visible to an operator without becoming undeliverable.
    */
   reconcileStaleInFlightNotifications({ repo, staleBeforeAt, at = this.now(), errorCode = 'stale-in-flight-recovered' }) {
-    const stale = this.db.prepare(`SELECT dedupe_key, attempt_count, max_attempts FROM notification_events
+    const boundedError = boundedNotificationErrorCode(errorCode);
+    const stale = this.db.prepare(`SELECT dedupe_key FROM notification_events
       WHERE repo = ? AND delivery_status = 'in-flight' AND in_flight_claimed_at < ?`).all(repo, staleBeforeAt);
     let recovered = 0;
     for (const row of stale) {
-      const nextCount = row.attempt_count + 1;
-      const exhausted = nextCount >= row.max_attempts;
       const result = this.db.prepare(`UPDATE notification_events SET
-        delivery_status = ?, attempt_count = ?, last_attempt_at = ?, next_attempt_at = ?, last_error = ?,
+        delivery_status = 'pending', stale_recovery_count = stale_recovery_count + 1,
+        next_attempt_at = NULL, last_error = ?,
         in_flight_owner = NULL, in_flight_claimed_at = NULL, updated_at = ?
         WHERE dedupe_key = ? AND delivery_status = 'in-flight' AND in_flight_claimed_at < ?`)
-        .run(exhausted ? 'exhausted' : 'retryable-failed', nextCount, at, exhausted ? null : at, errorCode, at, row.dedupe_key, staleBeforeAt);
+        .run(boundedError, at, row.dedupe_key, staleBeforeAt);
       if (result.changes === 1) recovered += 1;
     }
     return { checked: stale.length, recovered };
@@ -755,35 +931,38 @@ export class RunnerStateStore {
 
   /** Bounded batch of attention_events rows strictly newer than `cursorValue` (an id, as text), oldest first. `cursorValue = null` returns none -- the caller must activate the cursor first. */
   attentionEventsSince(repo, cursorValue, limit) {
-    if (cursorValue == null) return [];
+    if (cursorValue == null || !isIntegerCursor(cursorValue)) return [];
     return this.db.prepare('SELECT * FROM attention_events WHERE repo = ? AND id > ? ORDER BY id ASC LIMIT ?').all(repo, Number(cursorValue), boundedBatchLimit(limit));
   }
 
   /** Bounded batch of routing_events rows strictly newer than `cursorValue` (an id, as text), oldest first. */
   routingEventsSince(repo, cursorValue, limit) {
-    if (cursorValue == null) return [];
+    if (cursorValue == null || !isIntegerCursor(cursorValue)) return [];
     return this.db.prepare('SELECT * FROM routing_events WHERE repo = ? AND id > ? ORDER BY id ASC LIMIT ?').all(repo, Number(cursorValue), boundedBatchLimit(limit));
   }
 
   /**
-   * Bounded batch of recovery_attempts rows strictly newer than
-   * `cursorValue` (a `started_at` timestamp, as text), oldest first. Strict
-   * `>` (not `>=`): the cursor is always set to a row this pass already
-   * fully finished processing (either at activation, past the pre-existing
-   * tail, or past the last row a prior batch actually reached), so `>=`
-   * would re-fetch that exact boundary row every following pass -- wasting
-   * a batch slot every time, and, at activation specifically, causing the
-   * tail row (deliberately meant to be skipped as pre-existing history) to
-   * be freshly evaluated and wrongly notified on the very next real pass.
-   * The accepted tradeoff is a genuinely-new row sharing the exact same
-   * millisecond `started_at` as the boundary row being missed -- not
-   * realistic for real wall-clock attempt timestamps. This table has no
-   * integer id to cursor on instead (its primary key is the text
-   * attempt_id).
+   * Bounded batch of recovery_attempts rows strictly past `cursorValue`,
+   * oldest first, cursored on the table's own SQLite `rowid`.
+   *
+   * The round-2 implementation cursored on `started_at > ?` and explicitly
+   * accepted dropping a genuinely-new row that shared the boundary
+   * millisecond. That is a data-loss tradeoff reliability code may not make
+   * (#53 review round 3, item 3): attempt timestamps are generated by this
+   * runner, not by wall-clock chance, so two attempts sharing an exact
+   * `started_at` is entirely reachable -- and the dropped row would never be
+   * notified at all. `rowid` is strictly monotonic per insert, unique, and
+   * unaffected by the in-place UPDATEs `recordRecoveryAttempt()` performs on
+   * an existing attempt_id, so it is lossless for both normal batch
+   * advancement and initial activation.
+   *
+   * `recovery_attempts` declares `attempt_id TEXT PRIMARY KEY`, so it is an
+   * ordinary rowid table and this alias is stable across the row's lifetime.
    */
   recoveryAttemptsSince(repo, cursorValue, limit) {
-    if (cursorValue == null) return [];
-    return this.db.prepare('SELECT * FROM recovery_attempts WHERE repo = ? AND started_at > ? ORDER BY started_at ASC LIMIT ?').all(repo, cursorValue, boundedBatchLimit(limit));
+    if (cursorValue == null || !isIntegerCursor(cursorValue)) return [];
+    return this.db.prepare('SELECT rowid AS row_id, * FROM recovery_attempts WHERE repo = ? AND rowid > ? ORDER BY rowid ASC LIMIT ?')
+      .all(repo, Number(cursorValue), boundedBatchLimit(limit));
   }
 
   /** The current tail (max id) of a table for a repo -- used only to activate a fresh cursor past all pre-existing history. */
@@ -792,9 +971,48 @@ export class RunnerStateStore {
     return this.db.prepare(`SELECT MAX(id) AS maxId FROM ${table} WHERE repo = ?`).get(repo)?.maxId ?? 0;
   }
 
-  /** The current tail (max started_at) of recovery_attempts for a repo -- used only to activate a fresh cursor past all pre-existing history. */
-  maxRecoveryAttemptStartedAt(repo) {
-    return this.db.prepare('SELECT MAX(started_at) AS maxStartedAt FROM recovery_attempts WHERE repo = ?').get(repo)?.maxStartedAt ?? null;
+  /** The current tail (max rowid) of recovery_attempts for a repo -- used only to activate a fresh cursor past all pre-existing history (#53 review round 3, item 3). */
+  maxRecoveryAttemptRowId(repo) {
+    return this.db.prepare('SELECT MAX(rowid) AS maxRowId FROM recovery_attempts WHERE repo = ?').get(repo)?.maxRowId ?? 0;
+  }
+
+  /**
+   * A single recovery attempt by its own durable identity, scoped to a repo
+   * (#53 review round 3, items 2 and 7). Used by notification source-truth
+   * revalidation instead of scanning `allRows('recovery_attempts')` per
+   * notification.
+   */
+  recoveryAttemptByAttemptId(repo, attemptId) {
+    if (!attemptId) return null;
+    return this.db.prepare('SELECT * FROM recovery_attempts WHERE repo = ? AND attempt_id = ?').get(repo, attemptId) || null;
+  }
+
+  /** A single attention_events row by its own durable dedupe_key, scoped to a repo -- a targeted lookup replacing a per-notification full-table scan (#53 review round 3, item 7). */
+  attentionEventByDedupeKey(repo, dedupeKey) {
+    if (!dedupeKey) return null;
+    return this.db.prepare('SELECT * FROM attention_events WHERE repo = ? AND dedupe_key = ?').get(repo, dedupeKey) || null;
+  }
+
+  /** A single runner_health_conditions row by its (repo, condition_type) unique key -- a targeted lookup, never a full-table scan (#53 review round 3, item 7). */
+  healthConditionForType(repo, conditionType) {
+    if (!conditionType) return null;
+    return this.db.prepare('SELECT * FROM runner_health_conditions WHERE repo = ? AND condition_type = ?').get(repo, conditionType) || null;
+  }
+
+  /**
+   * Currently-open health conditions restricted to a closed, caller-supplied
+   * set of condition types (#53 review round 3, item 7): notification
+   * discovery must never load every historical or unknown health row and
+   * filter afterwards in JavaScript. `conditionTypes` is bound as SQL
+   * parameters, never interpolated.
+   */
+  openHealthConditionsForTypes(repo, conditionTypes, limit) {
+    const types = (Array.isArray(conditionTypes) ? conditionTypes : []).filter((type) => typeof type === 'string' && type.length > 0);
+    if (types.length === 0) return [];
+    const placeholders = types.map(() => '?').join(', ');
+    return this.db.prepare(`SELECT * FROM runner_health_conditions
+      WHERE repo = ? AND resolved_at IS NULL AND condition_type IN (${placeholders})
+      ORDER BY opened_at ASC LIMIT ?`).all(repo, ...types, boundedBatchLimit(limit));
   }
 
   recordQueueEvent({ repo, eventType, issueNumber = null, statusLabel = null, reason = null, payload = null, createdAt = this.now() }) {

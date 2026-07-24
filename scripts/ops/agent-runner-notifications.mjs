@@ -21,19 +21,23 @@
  *
  * DELIVERY GUARANTEE: at-least-once, with `dedupe_key` doubling as a stable
  * idempotency key handed to the transport across every retry and restart.
- * This is NOT exactly-once -- a crash between a transport call succeeding
- * and the corresponding SQLite write landing will cause exactly one resend
- * on the next reconciliation pass, using the identical idempotency key.
- * Collapsing that resend into a no-op is the transport/provider's
- * responsibility (idempotent delivery keyed on `idempotencyKey`), not a
- * property this module can prove on its own.
+ * This is NOT exactly-once, and it is NOT "exactly one resend": repeated
+ * crashes or timeouts between a transport call and the corresponding SQLite
+ * write may cause ONE OR MORE duplicate delivery attempts, always carrying
+ * the same `idempotencyKey`. Each crash-abandoned claim is requeued rather
+ * than charged against the bounded delivery-attempt budget, so the number of
+ * duplicates is bounded by how often the process dies mid-delivery, not by
+ * any count this module can promise. Collapsing those duplicates into a
+ * single external side effect is the transport/provider's responsibility
+ * (idempotent delivery keyed on `idempotencyKey`), not a property this
+ * module can prove on its own.
  */
 
 import { createHash } from 'node:crypto';
 
 import { TERMINAL_OUTCOMES } from './claude-runner-recovery.mjs';
 
-export const NOTIFICATION_STATE_SCHEMA_VERSION = 2;
+export const NOTIFICATION_STATE_SCHEMA_VERSION = 3;
 
 export const NOTIFICATION_EVENT_TYPES = Object.freeze([
   'completed',
@@ -86,6 +90,23 @@ const HEALTH_CONDITION_REASON_CODES = Object.freeze({
 });
 
 const ONE_SHOT_EVENT_TYPES = new Set(['completed', 'agent_reassigned', 'no_qualified_agent']);
+
+/** The stateful complement of ONE_SHOT_EVENT_TYPES -- the event types whose source condition persists after delivery and can later clear on its own. */
+const STATEFUL_EVENT_TYPES = new Set(NOTIFICATION_EVENT_TYPES.filter((eventType) => !ONE_SHOT_EVENT_TYPES.has(eventType)));
+
+/**
+ * The exact `routing_events.delivery_status` values that prove the GitHub
+ * label mutation behind a reassignment / no-qualified-agent decision was
+ * actually applied, per the #50 routing contract (#53 review round 3, item
+ * 6). This is a positive allowlist, not a `!== 'mutation-pending'`
+ * exclusion: a corrupt, NULL, legacy or future status must fail closed and
+ * stay revisitable, never announce a reassignment that may never have
+ * happened.
+ */
+const ROUTING_PROVEN_DELIVERY_STATUSES = new Set(['evidence-pending', 'resolved']);
+
+/** Statuses #50 is known to write. Anything outside this set is genuinely corrupt/unrecognized and worth a bounded local diagnostic; `mutation-pending` is simply not-yet-decided. */
+const ROUTING_KNOWN_DELIVERY_STATUSES = new Set(['mutation-pending', 'evidence-pending', 'resolved']);
 
 const DEFAULT_MAX_ATTEMPTS = 5;
 const DEFAULT_RETRY_BACKOFF_MS = 5 * 60_000;
@@ -219,10 +240,22 @@ function failedTaskCandidate(row) {
   if (row.attention_dedupe_key) return null; // deferred to the attention_events candidate -- no double notify
   const resolved = row.resolution_state === 'resolved';
   if (resolved) return null; // already-resolved historical failure -- do not notify (#53 review, item 3)
+  // The persisted source_ref is the bare `attempt_id` (#53 review round 3,
+  // item 2). Round 2 stored `failed:${attempt_id}`, whose shape matched none
+  // of boundedSourceRef()'s recognized patterns and was therefore replaced by
+  // an opaque sha256 hash -- while the resolver still expected to parse a
+  // `failed:` prefix out of it, so these rows could never resolve at all. The
+  // bare attempt_id is itself a bounded, closed-shape, non-sensitive
+  // identifier (repo/issue/timestamp, all already columns on this row) that
+  // survives boundedSourceRef() intact and supports a targeted lookup. The
+  // `failed:` discriminator stays on the dedupe key alone, which is where it
+  // was actually needed: to keep this row distinct from the same attempt's
+  // `completed` notification. `source_table` already distinguishes the two
+  // recovery-attempt-sourced shapes from the attention_events-sourced one.
   return candidate({
     eventType: 'failed_attention', reasonCode: 'attention-required', repo: row.repo, project: row.project,
     issueNumber: row.issue_number, agent: row.agent, occurredAt: row.finished_at || row.started_at,
-    sourceTable: 'recovery_attempts', rawSourceRef: `failed:${row.attempt_id}`, dedupeKeyMaterial: `failed:${row.attempt_id}`, sourceResolved: false,
+    sourceTable: 'recovery_attempts', rawSourceRef: row.attempt_id, dedupeKeyMaterial: `failed:${row.attempt_id}`, sourceResolved: false,
   });
 }
 
@@ -259,19 +292,25 @@ function attentionCandidates(row) {
 }
 
 /**
- * Only a routing event whose GitHub mutation is proven applied (`evidence-
- * pending` or `resolved`, per the existing #50 routing_events delivery-state
- * contract) may announce a reassignment or no-qualified-agent outcome
- * (#53 review, item 3). A `mutation-pending` row means the label mutation
- * has not been verified applied yet -- notifying from it would announce a
- * reassignment that may never actually happen. `mutation-pending` rows are
- * updated in place by the existing #50 reconciliation flow as the mutation
- * is verified, so this blocks cursor advance rather than permanently
- * skipping -- otherwise a reassignment proven applied one pass later would
- * never be notified at all.
+ * Only a routing event whose GitHub mutation is proven applied may announce
+ * a reassignment or no-qualified-agent outcome (#53 review round 3, item 6).
+ * Proof is an exact allowlist match against `ROUTING_PROVEN_DELIVERY_
+ * STATUSES` -- every other value, including `mutation-pending`, NULL, and
+ * any corrupt/legacy/future status, fails closed: no notification is ever
+ * created from it.
+ *
+ * Such a row is marked `blocked` rather than skipped, because #50 updates
+ * these rows in place as the mutation is verified -- a reassignment proven
+ * applied one pass later must still be notified. Since round 3 (item 4), a
+ * blocked row only holds its own cursor position; it no longer stops later
+ * independent rows in the same batch from persisting their intents, so a
+ * permanently-corrupt status cannot stall the whole source.
  */
-function routingCandidates(row) {
-  if (row.delivery_status === 'mutation-pending') return { items: [], blocked: true };
+function routingCandidates(row, { onUnknownStatus } = {}) {
+  if (!ROUTING_PROVEN_DELIVERY_STATUSES.has(row.delivery_status)) {
+    if (!ROUTING_KNOWN_DELIVERY_STATUSES.has(row.delivery_status)) onUnknownStatus?.();
+    return { items: [], blocked: true };
+  }
   if (row.event_type !== 'reassignment' && row.event_type !== 'no-qualified-agent') return { items: [], blocked: false };
   const isReassignment = row.event_type === 'reassignment';
   const built = candidate({
@@ -360,16 +399,26 @@ const CURSOR_SOURCES = Object.freeze([
     fetchSince: (state, repo, cursor, limit) => state.invoke('routingEventsSince', repo, cursor, limit) || [],
     tailValue: (state, repo) => state.invoke('maxRowId', 'routing_events', repo),
     rowCursorValue: (row) => row.id,
-    buildCandidates: routingCandidates,
+    buildCandidates: (row, context) => routingCandidates(row, context),
   },
   {
+    // Cursored on SQLite `rowid`, not `started_at` (#53 review round 3, item
+    // 3): a timestamp cursor silently dropped any genuinely-new attempt that
+    // shared the boundary millisecond. `rowid` is unique and strictly
+    // increasing per insert, and is unaffected by the in-place UPDATEs
+    // `recordRecoveryAttempt()` performs on an existing attempt_id.
     table: 'recovery_attempts',
     fetchSince: (state, repo, cursor, limit) => state.invoke('recoveryAttemptsSince', repo, cursor, limit) || [],
-    tailValue: (state, repo) => state.invoke('maxRecoveryAttemptStartedAt', repo),
-    rowCursorValue: (row) => row.started_at,
+    tailValue: (state, repo) => state.invoke('maxRecoveryAttemptRowId', repo),
+    rowCursorValue: (row) => row.row_id,
     buildCandidates: recoveryAttemptCandidates,
   },
 ]);
+
+/** Every cursor source is now keyed on a monotonic integer (id or rowid); a stored cursor of any other shape predates that and must be re-activated rather than trusted (#53 review round 3, item 3). */
+function isUsableCursor(value) {
+  return /^\d+$/.test(String(value));
+}
 
 function persistCandidate(state, item, maxAttempts) {
   return state.invoke('recordNotificationEvent', {
@@ -389,29 +438,52 @@ function persistCandidate(state, item, maxAttempts) {
  * failure (#53 review, item 8).
  */
 function scanCursorSource({ state, repo, source, batchSize, maxAttempts }) {
-  let cursor = state.invoke('getNotificationSourceCursor', repo, source.table);
+  const cursor = state.invoke('getNotificationSourceCursor', repo, source.table);
   if (cursor === null) {
     const tail = source.tailValue(state, repo);
     state.invoke('activateNotificationSourceCursor', repo, source.table, tail ?? 0);
     return { inserted: 0, activated: true };
   }
+  if (!isUsableCursor(cursor)) {
+    // A stored cursor in a shape this source no longer understands (the
+    // pre-round-3 `started_at` recovery cursor). Re-activate past the current
+    // tail rather than re-scanning history: activation semantics are exactly
+    // "skip everything that already exists", which is the safe reading of an
+    // uninterpretable cursor (#53 review round 3, item 3).
+    state.invoke('advanceNotificationSourceCursor', repo, source.table, source.tailValue(state, repo) ?? 0);
+    return { inserted: 0, activated: true };
+  }
   const rows = source.fetchSince(state, repo, cursor, batchSize);
   let inserted = 0;
   let lastProcessed = cursor;
+  // The cursor may only advance across a contiguous run of rows whose fate is
+  // final. `blockedAt` records where that run ended -- but scanning does NOT
+  // stop there (#53 review round 3, item 4). A stale running recovery attempt
+  // or a permanently mutation-pending routing row used to break the loop,
+  // which meant every later row in that source table was invisible for as
+  // long as the blocked row stayed undecided -- head-of-line blocking on an
+  // outbox whose whole job is to not lose events. Later rows are now still
+  // processed and still persist their outbox intents; only the durable cursor
+  // stays parked before the blocked row, so that row is re-evaluated fresh on
+  // every later pass and its eventual in-place update is never missed. The
+  // rows past it are simply re-scanned then, and `dedupe_key` makes
+  // re-persisting them an exact no-op.
+  let blockedAt = null;
   for (const row of rows) {
     let result = { items: [], blocked: false };
     try {
-      const built = source.buildCandidates(row);
+      const built = source.buildCandidates(row, {
+        onUnknownStatus: () => state.recordTaskError('notification-source-status-unknown', new Error('source-row-invalid')),
+      });
       result = Array.isArray(built) ? { items: built, blocked: false } : (built || { items: [], blocked: false });
     } catch (error) {
       state.recordTaskError('notification-source-row-invalid', new Error('source-row-invalid'));
       result = { items: [], blocked: false };
     }
-    // A row whose fate is not yet final (still running, might still self-
-    // heal, or a mutation not yet proven applied) blocks the cursor here --
-    // it is re-evaluated fresh on the next pass instead of ever advancing
-    // past it, so a later in-place update to this same row is never missed.
-    if (result.blocked) break;
+    if (result.blocked) {
+      if (blockedAt === null) blockedAt = source.rowCursorValue(row);
+      continue;
+    }
     let rowOk = true;
     for (const item of result.items) {
       const recorded = persistCandidate(state, item, maxAttempts);
@@ -419,10 +491,12 @@ function scanCursorSource({ state, repo, source, batchSize, maxAttempts }) {
       if (recorded.inserted) inserted += 1;
     }
     if (!rowOk || !state.healthy) break;
-    lastProcessed = source.rowCursorValue(row);
+    // Only extend the durable cursor while no earlier row in this batch is
+    // still awaiting a final fate.
+    if (blockedAt === null) lastProcessed = source.rowCursorValue(row);
   }
   if (lastProcessed !== cursor) state.invoke('advanceNotificationSourceCursor', repo, source.table, lastProcessed);
-  return { inserted, activated: false };
+  return { inserted, activated: false, blockedAt };
 }
 
 /**
@@ -482,16 +556,35 @@ function boundedDeliveryReasonCode(reasonCode) {
   return DELIVERY_REASON_CODES.includes(reasonCode) ? reasonCode : 'transport-rejected-retryable';
 }
 
+/**
+ * Whether a stateful notification's underlying source condition has already
+ * cleared. Every branch uses a targeted, indexed, single-row lookup keyed on
+ * the notification's own persisted `source_ref` -- never an
+ * `allRows(<table>)` full scan repeated per notification (#53 review round
+ * 3, item 7).
+ *
+ * Unparseable/unrecognized `source_ref` shapes fail CLOSED (return `false`,
+ * "not proven cleared"). A reference this module cannot interpret is not
+ * evidence a condition ended, and an attention or systemic-pause alert that
+ * stays visible is strictly safer than one silently retired. The only
+ * event type where a permanently-unresolved row would suppress future
+ * notifications is `quota_blocked`, and its branch does not parse
+ * `source_ref` at all -- it re-reads live quota truth for the repo.
+ */
 function isSourceResolvedNow({ row, state }) {
   if (ONE_SHOT_EVENT_TYPES.has(row.event_type)) return true;
   if (row.event_type === 'failed_attention') {
     if (row.source_table === 'attention_events') {
-      const match = (state.invoke('allRows', 'attention_events') || []).find((item) => item.repo === row.repo && boundedSourceRef(item.dedupe_key) === row.source_ref);
+      // source_ref is the attention row's own sha256 dedupe_key, kept intact
+      // by boundedSourceRef() -- a direct unique-key lookup.
+      const match = state.invoke('attentionEventByDedupeKey', row.repo, row.source_ref);
       return Boolean(match?.resolved_at);
     }
-    // sourceTable === 'recovery_attempts' (the failed_attention-without-attention-row path).
-    const attemptId = row.source_ref.startsWith('failed:') ? row.source_ref.slice('failed:'.length) : null;
-    const match = attemptId && (state.invoke('allRows', 'recovery_attempts') || []).find((item) => item.repo === row.repo && item.attempt_id === attemptId);
+    // source_table === 'recovery_attempts': the failed_attention-derived-
+    // directly-from-an-attempt path. source_ref is the bare attempt_id
+    // (#53 review round 3, item 2), so this is a direct primary-key lookup.
+    if (!ATTEMPT_ID_SOURCE_REF_PATTERN.test(row.source_ref)) return false;
+    const match = state.invoke('recoveryAttemptByAttemptId', row.repo, row.source_ref);
     return Boolean(match && match.resolution_state === 'resolved');
   }
   if (row.event_type === 'systemic_pause') {
@@ -502,10 +595,10 @@ function isSourceResolvedNow({ row, state }) {
     // the live row has moved on to a strictly newer opened_at, which can
     // only mean this row's own episode has already ended.
     const parsed = /^([a-z_]+):(.+)$/.exec(row.source_ref);
-    if (!parsed) return true; // hashed/unrecognized source_ref from a pre-fix row -- fail open to resolved rather than stuck forever
+    if (!parsed) return false; // uninterpretable reference -- fail closed, keep the alert visible
     const [, conditionType, openedAt] = parsed;
-    const live = (state.invoke('allRows', 'runner_health_conditions') || []).find((item) => item.repo === row.repo && item.condition_type === conditionType);
-    if (!live) return true;
+    const live = state.invoke('healthConditionForType', row.repo, conditionType);
+    if (!live) return true; // the condition row itself is gone -- nothing left open
     if (live.opened_at === openedAt) return Boolean(live.resolved_at);
     return live.opened_at > openedAt; // a strictly newer episode has started -- ours has ended
   }
@@ -527,12 +620,15 @@ function isSourceResolvedNow({ row, state }) {
  *    -- upserted in place per condition type, so it cannot use the cursor
  *    mechanism; bounded because at most one row exists per known type.
  * 4. Repository-scoped, occurrence-specific quota discovery+persistence.
- * 5. Claim-then-deliver a bounded batch of due rows, each against a bounded
- *    delivery timeout, within a bounded total pass duration -- so a hung,
- *    rejected or throwing transport can never hold the caller's serial
- *    execution lock open or starve the next eligible engineering issue
- *    (#53 review, item 5).
- * 6. Recheck already-`delivered` stateful rows for source resolution.
+ * 5. Claim-then-revalidate-then-deliver a bounded batch of due rows, each
+ *    against a bounded delivery timeout, within a bounded total pass
+ *    duration -- so a hung, rejected or throwing transport can never hold
+ *    the caller's serial execution lock open or starve the next eligible
+ *    engineering issue (#53 review, item 5). A stateful row whose source
+ *    condition has cleared since discovery is resolved in place instead of
+ *    delivered (#53 review round 3, item 1).
+ * 6. Recheck every unresolved stateful row -- pending, retryable-failed,
+ *    delivered or exhausted -- for source resolution.
  *
  * Never throws: every per-row/per-stage failure is caught and recorded via
  * `state.recordTaskError()` using only a fixed reason code (never a raw
@@ -581,11 +677,13 @@ export async function reconcileNotifications({
   }
 
   // Step 3: runner_health_conditions -- scanned directly every pass, not
-  // via cursor (see the CURSOR_SOURCES comment above for why). Bounded: at
-  // most one row per known condition type.
+  // via cursor (see the CURSOR_SOURCES comment above for why). Bounded in
+  // SQL to the closed set of condition types this module can notify about,
+  // still open, with a LIMIT -- never "load every historical/unknown health
+  // row and filter in JavaScript" (#53 review round 3, item 7).
   if (state.healthy) {
     try {
-      const healthRows = (state.invoke('allRows', 'runner_health_conditions') || []).filter((row) => row.repo === repo);
+      const healthRows = state.invoke('openHealthConditionsForTypes', repo, Object.keys(HEALTH_CONDITION_REASON_CODES), boundedBatchSize) || [];
       for (const row of healthRows) {
         for (const item of healthConditionCandidates(row)) {
           const recorded = persistCandidate(state, item, boundedMaxAttempts);
@@ -615,12 +713,37 @@ export async function reconcileNotifications({
 
   // Step 5: claim-then-deliver a bounded batch, each within a bounded
   // timeout, within a bounded total pass duration.
-  const due = (state.invoke('dueNotificationEvents', repo, now()) || []).slice(0, boundedBatchSize);
+  // Bounded by SQL LIMIT, not by loading every due row and slicing here
+  // (#53 review round 3, item 7).
+  const due = state.invoke('dueNotificationEvents', repo, now(), boundedBatchSize) || [];
   for (const row of due) {
     if (passDeadlineExceeded()) break;
     const owner = `pass:${now()}`;
     const claim = state.invoke('claimNotificationForDelivery', { dedupeKey: row.dedupe_key, owner, at: now() });
     if (!claim?.claimed) continue; // already claimed/moved by another pass -- never double-claim
+
+    // Revalidate stateful source truth immediately before the transport call
+    // (#53 review round 3, item 1). A condition can clear between discovery
+    // and delivery -- or across the many passes a paused/retrying row waits
+    // through -- and delivering then would announce a stale alert for
+    // something already fixed. Resolve it in place instead, without
+    // delivering and without consuming an attempt. One-shot event types
+    // never take this path: they describe a moment that already happened and
+    // have no source condition that can clear.
+    if (STATEFUL_EVENT_TYPES.has(row.event_type)) {
+      let clearedNow = false;
+      try {
+        clearedNow = isSourceResolvedNow({ row, state });
+      } catch (error) {
+        state.recordTaskError('notification-resolution-check-failed', new Error('source-row-invalid'));
+      }
+      if (clearedNow) {
+        const resolved = state.invoke('resolveStatefulNotificationEvent', { dedupeKey: row.dedupe_key, resolvedAt: now() });
+        if (resolved) summary.resolved += 1;
+        else state.recordTaskError('notification-state-transition-mismatch', new Error('state-transition-mismatch'));
+        continue;
+      }
+    }
 
     const content = rebuildValidatedContent(row);
     if (!content) {
@@ -674,9 +797,16 @@ export async function reconcileNotifications({
 
   if (!state.healthy || passDeadlineExceeded()) return summary;
 
-  // Step 6: recheck already-delivered stateful rows for source resolution.
-  const deliveredUnresolved = state.invoke('deliveredUnresolvedNotificationEvents', repo) || [];
-  for (const row of deliveredUnresolved) {
+  // Step 6: recheck EVERY unresolved stateful row for source resolution --
+  // whatever delivery stage it reached (#53 review round 3, item 1). Round 2
+  // rechecked only `delivered` rows, so a still-pending, retrying or
+  // exhausted row whose source had already cleared stayed unresolved: it
+  // could later be delivered as a stale alert, and an exhausted quota row
+  // kept `openNotificationExists()` suppressing every subsequent
+  // quota_blocked episode for that repo forever. Bounded by SQL LIMIT and
+  // filtered to the stateful event types in SQL (item 7).
+  const unresolved = state.invoke('unresolvedStatefulNotificationEvents', repo, boundedBatchSize) || [];
+  for (const row of unresolved) {
     if (passDeadlineExceeded()) break;
     let resolvedNow = false;
     try {
@@ -686,7 +816,7 @@ export async function reconcileNotifications({
       continue;
     }
     if (resolvedNow) {
-      const resolved = state.invoke('resolveNotificationEvent', { dedupeKey: row.dedupe_key, resolvedAt: now() });
+      const resolved = state.invoke('resolveStatefulNotificationEvent', { dedupeKey: row.dedupe_key, resolvedAt: now() });
       if (resolved) summary.resolved += 1;
       else state.recordTaskError('notification-state-transition-mismatch', new Error('state-transition-mismatch'));
     }

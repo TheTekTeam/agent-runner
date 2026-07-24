@@ -119,9 +119,15 @@ const TABLE_SERIALIZERS = Object.freeze({
   // #53 — dedupe_key, source_table, source_ref, content_json and last_error
   // deliberately excluded: internal correlation/audit detail with no
   // dashboard display purpose, matching the same allowlist convention.
+  // `stale_recovery_count` is included deliberately (#53 review round 3,
+  // item 5): stale-claim recoveries no longer consume attempt_count, so this
+  // is the only operator-visible signal that a row keeps being abandoned
+  // mid-delivery. It is a bounded non-negative integer, like attempt_count.
+  // `project` is a bounded identifier enforced by the state store itself.
   notification_events: (row) => pickFields(row, [
     'id', 'created_at', 'updated_at', 'repo', 'project', 'issue_number', 'event_type', 'reason_code', 'agent',
-    'delivery_status', 'attempt_count', 'max_attempts', 'next_attempt_at', 'last_attempt_at', 'delivered_at', 'resolved_at',
+    'delivery_status', 'attempt_count', 'max_attempts', 'stale_recovery_count',
+    'next_attempt_at', 'last_attempt_at', 'delivered_at', 'resolved_at',
   ]),
 });
 
