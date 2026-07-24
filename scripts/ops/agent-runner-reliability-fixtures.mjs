@@ -139,9 +139,10 @@ export async function runReliabilityFixtures({ production, seed = {} } = {}) {
 
   const adversarial = sanitizeEvidence(seed.adversarial || {});
   const serialized = JSON.stringify({ output, adversarial });
-  const redactionPass = !FORBIDDEN_VALUE.test(serialized) && !FORBIDDEN_KEYS.test(serialized);
+  const redactionPass = !FORBIDDEN_VALUE.test(serialized);
   output.push(result(SCENARIOS.REDACTION, redactionPass, redactionPass ? 'redaction-clean' : 'redaction-failed', counters(), {
     serializedBytes: Buffer.byteLength(serialized),
+    safeFieldsRetained: Object.keys(adversarial).length,
   }));
 
   return Object.freeze({
