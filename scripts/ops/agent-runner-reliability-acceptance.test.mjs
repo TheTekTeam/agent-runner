@@ -1,5 +1,10 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import {
   GATE_IDS,
@@ -7,12 +12,15 @@ import {
   evaluateReliabilityAcceptance,
   runReliabilityAcceptanceCli,
 } from './agent-runner-reliability-acceptance.mjs';
+import { RUNNER_STATE_SCHEMA_VERSION } from './claude-runner-state.mjs';
 
 const HEAD = '36adcedee9341bedeab0db668f4408268ac466d2';
 const OTHER = 'cccccccccccccccccccccccccccccccccccccccc';
 const COMMIT = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const NOW = '2026-07-24T20:00:00.000Z';
 const DB = 'state-db-main-001';
+const HERE = dirname(fileURLToPath(import.meta.url));
+const ACCEPTANCE_MODULE = join(HERE, 'agent-runner-reliability-acceptance.mjs');
 const base = (evidenceId, capturedAt = '2026-07-24T19:10:00.000Z') => ({ evidenceId, capturedAt, head: HEAD });
 const state = (id, at) => ({ ...base(id, at), stateDbId: DB });
 const attempt = (id, at) => ({ ...state(id, at), issueNumber: 901, attemptId: 'attempt-901-a' });
@@ -24,12 +32,12 @@ function bundle() {
     schemaVersion: 'agent-runner-reliability-evidence/v1',
     acceptanceId: 'dell-acceptance-20260724-a',
     repository: 'TheTekTeam/agent-runner', issueNumber: 5,
-    expectedHead: HEAD, deployedHead: HEAD, stateDbId: DB, stateSchemaVersion: 16,
+    expectedHead: HEAD, deployedHead: HEAD, stateDbId: DB, stateSchemaVersion: RUNNER_STATE_SCHEMA_VERSION,
     windowStartedAt: '2026-07-24T19:00:00.000Z', windowEndedAt: '2026-07-24T19:59:00.000Z',
     records: {
       repository: { ...base('repo-1', '2026-07-24T19:01:00.000Z'), repository: 'TheTekTeam/agent-runner', clean: true },
       timer: { ...base('timer-1', '2026-07-24T19:02:00.000Z'), phase: 'preacceptance', serviceState: 'inactive', timerEnabled: false, timerActive: false },
-      backup: { ...state('backup-1', '2026-07-24T19:03:00.000Z'), backupId: 'backup-copy-1', backupStateDbId: DB, schemaVersion: 16, backupSchemaVersion: 16, consistent: true },
+      backup: { ...state('backup-1', '2026-07-24T19:03:00.000Z'), backupId: 'backup-copy-1', backupStateDbId: DB, schemaVersion: RUNNER_STATE_SCHEMA_VERSION, backupSchemaVersion: RUNNER_STATE_SCHEMA_VERSION, consistent: true },
       focusedValidation: { ...base('focused-1', '2026-07-24T19:04:00.000Z'), status: 'passed', total: 35, passed: 35, failed: 0, skipped: 0, assertions: ['parser', 'correlation', 'stale_evidence', 'fault_injection', 'adversarial_redaction'] },
       fullValidation: { ...base('full-1', '2026-07-24T19:05:00.000Z'), status: 'passed', total: 1300, passed: 1298, failed: 0, skipped: 2, assertions: ['node_check', 'npm_test', 'npm_validate', 'diff_check'] },
       notification: { ...state('notification-1', '2026-07-24T19:06:00.000Z'), issueNumber: 900, attemptId: 'smoke-a', synthetic: true, transport: 'synthetic-capture', eventType: 'completed', deliveryStatus: 'delivered', notificationEventId: 'event-1' },
@@ -66,7 +74,7 @@ function bundle() {
 const evaluate = (value = bundle(), options = {}) => evaluateReliabilityAcceptance(value, { expectedHead: HEAD, now: NOW, maxAgeSeconds: 3600, ...options });
 const gate = (report, id) => report.gates.find((item) => item.id === id);
 
-test('complete evidence passes all gates in closed order and schema', () => {
+ test('complete canonical evidence passes all gates in closed order and schema', () => {
   const report = evaluate();
   assert.equal(report.schemaVersion, REPORT_SCHEMA_VERSION);
   assert.equal(report.mode, 'report-only');
@@ -74,6 +82,62 @@ test('complete evidence passes all gates in closed order and schema', () => {
   assert.deepEqual(report.gates.map((item) => item.id), GATE_IDS);
   assert.deepEqual(report.summary, { required: 20, passed: 20, failed: 0 });
   report.gates.forEach((item) => assert.deepEqual(Object.keys(item), ['id', 'passed', 'reasonCode', 'evidenceIds', 'safeNextAction']));
+});
+
+test('canonical schema values pass state_schema_current', () => {
+  const value = bundle();
+  assert.equal(value.stateSchemaVersion, RUNNER_STATE_SCHEMA_VERSION);
+  assert.equal(value.records.backup.schemaVersion, RUNNER_STATE_SCHEMA_VERSION);
+  assert.equal(value.records.backup.backupSchemaVersion, RUNNER_STATE_SCHEMA_VERSION);
+  assert.equal(gate(evaluate(value), 'state_schema_current').passed, true);
+});
+
+test('self-consistent stale top-level, live and backup schema values fail', () => {
+  const value = bundle();
+  const stale = RUNNER_STATE_SCHEMA_VERSION - 1;
+  value.stateSchemaVersion = stale;
+  value.records.backup.schemaVersion = stale;
+  value.records.backup.backupSchemaVersion = stale;
+  assert.deepEqual(gate(evaluate(value), 'state_schema_current'), {
+    id: 'state_schema_current', passed: false, reasonCode: 'schema_mismatch',
+    evidenceIds: ['backup-1'], safeNextAction: 'Migrate the copied state through the authorised process, then recapture schema evidence.',
+  });
+});
+
+for (const [name, mutate] of [
+  ['top-level', (value, stale) => { value.stateSchemaVersion = stale; }],
+  ['live', (value, stale) => { value.records.backup.schemaVersion = stale; }],
+  ['backup', (value, stale) => { value.records.backup.backupSchemaVersion = stale; }],
+]) test(`one stale ${name} schema component fails`, () => {
+  const value = bundle();
+  mutate(value, RUNNER_STATE_SCHEMA_VERSION - 1);
+  assert.equal(gate(evaluate(value), 'state_schema_current').reasonCode, 'schema_mismatch');
+});
+
+test('importing the evaluator is side-effect free and grants no operational capability', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-runner-acceptance-import-'));
+  try {
+    execFileSync(process.execPath, [
+      '--input-type=module',
+      '--eval',
+      `await import(${JSON.stringify(pathToFileURL(ACCEPTANCE_MODULE).href)});`,
+    ], { cwd: root, stdio: 'pipe' });
+    assert.deepEqual(readdirSync(root), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+
+  const source = readFileSync(ACCEPTANCE_MODULE, 'utf8');
+  const imports = source.split('\n').filter((line) => line.startsWith('import '));
+  assert.deepEqual(imports, [
+    "import { readFileSync, statSync } from 'node:fs';",
+    "import { pathToFileURL } from 'node:url';",
+    "import { RUNNER_STATE_SCHEMA_VERSION } from './claude-runner-state.mjs';",
+  ]);
+  assert.doesNotMatch(source, /node:(?:child_process|http|https|net|tls|sqlite)/);
+  assert.doesNotMatch(source, /\b(?:DatabaseSync|openRunnerStateStore|fetch|exec|execFile|spawn|systemctl)\s*\(/);
+  assert.doesNotMatch(source, /\b(?:writeFile|appendFile|mkdir|rm|rename|unlink|chmod)(?:Sync)?\s*\(/);
+  assert.doesNotMatch(source, /from ['"][^'"]*(?:github|octokit|provider)[^'"]*['"]/i);
 });
 
 test('identical input and time produce deterministic output', () => assert.deepEqual(evaluate(), evaluate()));
@@ -108,7 +172,7 @@ const cases = [
   ['timer enabled', 'timer_preacceptance_disabled', 'timer_not_disabled', (v) => { v.records.timer.timerEnabled = true; }],
   ['service active', 'timer_preacceptance_disabled', 'service_state_invalid', (v) => { v.records.timer.serviceState = 'active'; }],
   ['backup identity', 'state_backup_recorded', 'backup_identity_mismatch', (v) => { v.records.backup.backupStateDbId = 'other-db'; }],
-  ['schema mismatch', 'state_schema_current', 'schema_mismatch', (v) => { v.records.backup.backupSchemaVersion = 15; }],
+  ['schema mismatch', 'state_schema_current', 'schema_mismatch', (v) => { v.records.backup.backupSchemaVersion = RUNNER_STATE_SCHEMA_VERSION - 1; }],
   ['focused assertion missing', 'focused_validation_passed', 'validation_failed', (v) => { v.records.focusedValidation.assertions.pop(); }],
   ['full assertion missing', 'full_validation_passed', 'validation_failed', (v) => { v.records.fullValidation.assertions = ['node_check']; }],
   ['notification pending', 'synthetic_notification_smoke_passed', 'notification_unproven', (v) => { v.records.notification.deliveryStatus = 'pending'; }],
