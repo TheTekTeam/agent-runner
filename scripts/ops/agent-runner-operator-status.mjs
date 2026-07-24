@@ -1,34 +1,45 @@
 #!/usr/bin/env node
 
 // Read-only bounded operator status (issue #67, required by #5 finding
-// F10/replacement contract item 9). Reuses claude-runner-dashboard-api.mjs's
-// buildRunnerDashboard() for health/activity/metrics/notification state
-// (already positive-allowlisted internally -- see TABLE_SERIALIZERS in that
-// module) and agent-runner-operator-doctor.mjs's unitState() for
-// service/timer state. Only a narrow, explicitly allowlisted subset of the
-// dashboard's fields is ever forwarded; `latest.queueEvents`,
-// `latest.quota`, `latest.preflights`, `latest.selections`, `latest.claims`,
-// `dashboard.error`, `dashboard.diagnostics` and `dbPath` are deliberately
-// never read here (see review notes) because they are not field-allowlisted
-// upstream or embed local paths/raw error text.
+// F10/replacement contract item 9).
+//
+// State inspection reuses agent-runner-operator-doctor.mjs's
+// readOnlyRunnerStateSnapshot() -- a genuinely read-only bounded SQLite
+// projection (see that module's header for why buildRunnerDashboard()/
+// summarizeRunnerState()/openRunnerStateStore() are not used: their
+// writable RunnerStateStore constructor creates directories, opens SQLite
+// writable, and runs the full migration path). The derived operator-facing
+// shape (activity/metrics/operatorStatus) still reuses the exact canonical,
+// already-reviewed PURE functions from claude-runner-dashboard-api.mjs
+// (buildRunnerActivity, buildRunnerMetrics, buildRunnerOperatorStatus) --
+// those functions only transform already-fetched plain JS data and never
+// touch the database themselves, so calling them with data fetched
+// read-only is genuine reuse of canonical derivation logic, not a
+// reimplementation of it.
+//
+// Only a narrow, explicitly allowlisted subset of fields is ever forwarded
+// in the final report; the raw `queueEvents`/`quota`/`selections`/`claims`
+// projections fetched to compute activity/metrics/operatorStatus are used
+// only as inputs to those pure functions and are never themselves included
+// in output.
 //
 // The admission circuit-breaker's persisted state is read directly with a
-// bounded raw SQL query, opened `readOnly: true`, instead of going through
-// AdmissionCircuitBreaker -- that class's constructor unconditionally
-// creates the database file and its tables (mkdirSync + CREATE TABLE IF NOT
-// EXISTS) and its check() method can DELETE a stale machine_profile row.
-// Neither behavior belongs in a command whose entire contract is read-only.
+// bounded raw SQL query through the same read-only/immutable SQLite path,
+// instead of going through AdmissionCircuitBreaker -- that class's
+// constructor unconditionally creates the database file and its tables
+// (mkdirSync + CREATE TABLE IF NOT EXISTS) and its check() method can
+// DELETE a stale machine_profile row. Neither behavior belongs in a
+// command whose entire contract is read-only.
 
 import { existsSync } from 'node:fs';
-import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 
-import { unitState } from './agent-runner-operator-doctor.mjs';
+import { openReadOnly, readOnlyRunnerStateSnapshot, unitState } from './agent-runner-operator-doctor.mjs';
 import { CANDIDATE_PAUSED_EXIT_CODE } from './agent-runner-candidate-admission.mjs';
 import { defaultCircuitDbPath, effectiveConfigurationFingerprint } from './agent-runner-circuit-breaker.mjs';
 import { loadAgentRunnerConfig, projectIdentity } from './agent-runner-config.mjs';
 import { defaultRunnerStateDbPath } from './claude-runner-state.mjs';
-import { buildRunnerDashboard } from './claude-runner-dashboard-api.mjs';
+import { buildRunnerActivity, buildRunnerMetrics, buildRunnerOperatorStatus } from './claude-runner-dashboard-api.mjs';
 
 export const STATUS_SCHEMA_VERSION = 'agent-runner-operator-status/v1';
 export const USAGE_ERROR_EXIT_CODE = 2;
@@ -61,7 +72,7 @@ export function readCircuitState(env = process.env) {
   if (!existsSync(dbPath)) return { blocked: false, exists: false };
   let db;
   try {
-    db = new DatabaseSync(dbPath, { readOnly: true });
+    db = openReadOnly(dbPath);
     const row = db.prepare('SELECT * FROM admission_circuit ORDER BY tripped_at LIMIT 1').get();
     if (!row) return { blocked: false, exists: true };
     return {
@@ -99,40 +110,65 @@ function boundedNotification(latestNotifications = []) {
   return { countsByDeliveryStatus: byStatus, recent: latestNotifications };
 }
 
-export function buildOperatorStatus(config, env = process.env, { now = isoNow } = {}) {
-  const dbPath = env.CLAUDE_RUNNER_STATE_DB || config.stateDbPath || defaultRunnerStateDbPath(config.outputDir || '.var/claude-runner');
-  const dashboard = buildRunnerDashboard(dbPath, { now, historyLimit: 10, strict: false, config });
-  const circuit = readCircuitState(env);
+export function requiredUnitsInstalled(service, timer) {
+  return service?.status === 'installed' && timer?.status === 'installed';
+}
 
-  return {
+export function buildOperatorStatus(config, env = process.env, { now = isoNow, spawn } = {}) {
+  const dbPath = env.CLAUDE_RUNNER_STATE_DB || config.stateDbPath || defaultRunnerStateDbPath(config.outputDir || '.var/claude-runner');
+  const snapshot = readOnlyRunnerStateSnapshot(dbPath, { historyLimit: 10, includeLatest: true });
+  const circuit = readCircuitState(env);
+  const service = unitState(config.systemd.serviceName, spawn);
+  const timer = unitState(config.systemd.timerName, spawn);
+  const base = {
     schemaVersion: STATUS_SCHEMA_VERSION,
     generatedAt: now(),
     project: projectIdentity(config),
-    ok: dashboard.ok,
-    status: dashboard.status,
-    schemaVersionState: dashboard.schemaVersion,
-    service: unitState(config.systemd.serviceName),
-    timer: unitState(config.systemd.timerName),
+    service,
+    timer,
     circuit,
-    operatorStatus: dashboard.operatorStatus,
-    health: dashboard.currentHealthConditions,
-    currentTask: dashboard.activity,
-    queue: dashboard.metrics.queue,
-    attention: boundedAttention(dashboard.latest.attentionEvents),
-    notification: boundedNotification(dashboard.latest.notifications),
     issueMutation: false,
     stateMutation: false,
+  };
+
+  if (!snapshot.ok) {
+    return {
+      ...base,
+      ok: false,
+      status: snapshot.status,
+      reason: snapshot.reason,
+      safeNextAction: snapshot.safeNextAction,
+      schemaVersionState: null,
+    };
+  }
+
+  const activity = buildRunnerActivity(snapshot.latest);
+  const metrics = buildRunnerMetrics({ latest: snapshot.latest });
+  const operatorStatus = buildRunnerOperatorStatus(snapshot.latest, activity, snapshot.currentHealthConditions);
+
+  return {
+    ...base,
+    ok: true,
+    status: snapshot.status,
+    schemaVersionState: snapshot.schemaVersion,
+    operatorStatus,
+    health: snapshot.currentHealthConditions,
+    currentTask: activity,
+    queue: metrics.queue,
+    attention: boundedAttention(snapshot.latest.attentionEvents),
+    notification: boundedNotification(snapshot.latest.notifications),
   };
 }
 
 export function exitCodeForStatus(report) {
-  if (report.status === 'error' || report.status === 'invalid-path') return SYSTEMIC_ERROR_EXIT_CODE;
+  if (!report.ok) return SYSTEMIC_ERROR_EXIT_CODE;
+  if (!requiredUnitsInstalled(report.service, report.timer)) return SYSTEMIC_ERROR_EXIT_CODE;
   if (report.operatorStatus?.code === 'global_systemic_pause') return SYSTEMIC_ERROR_EXIT_CODE;
   if (report.circuit?.blocked) return CANDIDATE_PAUSED_EXIT_CODE;
   return 0;
 }
 
-export function run(argv = [], env = process.env, io = { stdout: process.stdout, stderr: process.stderr }) {
+export function run(argv = [], env = process.env, io = { stdout: process.stdout, stderr: process.stderr }, dependencies = {}) {
   let args;
   try {
     args = parseStatusArgs(argv, env);
@@ -150,7 +186,7 @@ export function run(argv = [], env = process.env, io = { stdout: process.stdout,
   }
   let report;
   try {
-    report = buildOperatorStatus(args.config, env);
+    report = buildOperatorStatus(args.config, env, dependencies);
   } catch {
     io.stdout.write(`${JSON.stringify({ ok: false, reason: 'status-internal-error' }, null, 2)}\n`);
     return SYSTEMIC_ERROR_EXIT_CODE;
