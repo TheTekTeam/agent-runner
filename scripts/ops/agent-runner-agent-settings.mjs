@@ -200,15 +200,20 @@ export const AGENT_SETTINGS_EXAMPLE = Object.freeze({
   }),
 });
 
-// Sink hardening (issue #50 review): qualification identifiers read from a
-// machine-local settings file are bounded to a closed, safe token grammar
-// before they can ever reach a decision, log, SQLite row, or GitHub comment.
-// A qualification value that fails this grammar is dropped, never coerced
-// or truncated into something that still looks plausible.
+// Sink hardening (issue #50 review): every qualification/classification
+// identifier -- whether read from a machine-local settings file or from an
+// issue's own label/field text -- is bounded to this one closed, safe token
+// grammar before it can ever reach a decision, log, SQLite row, or GitHub
+// comment. A value that fails this grammar is dropped, never coerced or
+// truncated into something that still looks plausible. This is the single
+// shared normalizer `agent-runner-qualification.mjs#classifyIssueTaskRisk()`
+// also uses for issue task/risk/model/harness classification, so settings
+// qualification and issue classification can never drift onto two different
+// bounds.
 const QUALIFICATION_TOKEN_MAX_LENGTH = 64;
 const QUALIFICATION_TOKEN_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
-function isSafeQualificationToken(value) {
+export function isSafeQualificationToken(value) {
   return value === WILDCARD || (
     typeof value === 'string'
     && value.length > 0
@@ -217,19 +222,32 @@ function isSafeQualificationToken(value) {
   );
 }
 
+/**
+ * Normalize one caller-supplied value against the shared safe-token
+ * grammar: trims a string and returns it unchanged when it passes, or
+ * `null` when it is missing, not a string, or fails the grammar (too long,
+ * empty, control characters, unsafe punctuation) -- never a truncated or
+ * coerced approximation of the original value.
+ */
+export function normalizeSafeToken(value, { allowWildcard = false } = {}) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().toLowerCase();
+  if (!allowWildcard && trimmed === WILDCARD) return null;
+  return isSafeQualificationToken(trimmed) ? trimmed : null;
+}
+
 function normalizeBoundedTokenList(value, fallback) {
   if (!Array.isArray(value)) return fallback;
   const cleaned = value
-    .map((item) => (typeof item === 'string' ? item.trim() : String(item ?? '')))
-    .filter(isSafeQualificationToken);
+    .map((item) => normalizeSafeToken(typeof item === 'string' ? item : String(item ?? ''), { allowWildcard: true }))
+    .filter(Boolean);
   return Object.freeze(cleaned.length ? cleaned : []);
 }
 
 function normalizeBoundedHarnessValue(value, fallback) {
   if (value === null) return null;
   if (typeof value !== 'string') return fallback;
-  const trimmed = value.trim();
-  return isSafeQualificationToken(trimmed) ? trimmed : fallback;
+  return normalizeSafeToken(value, { allowWildcard: true }) || fallback;
 }
 
 /**

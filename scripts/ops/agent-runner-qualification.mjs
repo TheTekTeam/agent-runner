@@ -12,8 +12,8 @@
 // inputs. Missing qualification (an empty list, no wildcard) always means
 // unqualified; it is never coerced into a permissive default.
 
-import { QUALIFICATION_WILDCARD as WILDCARD } from './agent-runner-agent-settings.mjs';
-import { findFieldValue, labelNames, normaliseToken } from './issue-metadata.mjs';
+import { normalizeSafeToken, QUALIFICATION_WILDCARD as WILDCARD } from './agent-runner-agent-settings.mjs';
+import { findFieldValue, labelNames } from './issue-metadata.mjs';
 
 export const OLLAMA_AGENT_ID = 'ollama-agent';
 export const LOW_RISK_CLASS = 'low';
@@ -31,35 +31,55 @@ const CLASSIFICATION_FIELDS = Object.freeze({
   harness: Object.freeze({ names: Object.freeze(['Harness']), labelPrefix: 'harness:' }),
 });
 
-function labelValueForPrefix(issue, prefix) {
-  const label = labelNames(issue).find((name) => name.startsWith(prefix));
-  return label ? (label.slice(prefix.length).trim() || null) : null;
+/** Every raw label suffix for a given `prefix:` -- not just the first one, so a caller can detect multiple distinct values instead of silently picking one. */
+function labelValuesForPrefix(issue, prefix) {
+  return labelNames(issue)
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => name.slice(prefix.length).trim())
+    .filter(Boolean);
 }
 
 /**
- * One field's classification: a project-field value and a label value that
- * actively disagree resolve to `null` (never guessed toward either side);
- * otherwise whichever of the two is present wins, and absence of both is
- * `null` (unclassified) -- never a guessed permissive default. The raw
- * field/label values that disagreed are intentionally not returned here --
- * only a boolean conflict flag -- so no issue-authored text can reach a
- * decision, log, SQLite row, or comment (issue #50 review, sink hardening).
+ * One field's classification against the shared bounded safe-token grammar
+ * (`agent-runner-agent-settings.mjs#normalizeSafeToken()` -- the exact same
+ * normalizer settings qualification values go through, issue #50 review:
+ * "reuse one bounded safe-token normalizer for both"). Three closed
+ * outcomes, never a raw value:
+ *  - a single explicit, in-grammar value (from a field, a label, or both
+ *    agreeing) wins;
+ *  - two or more *distinct* normalized label values for the same field is a
+ *    conflict (`'multiple-labels'`) -- never "first label wins";
+ *  - a field/label value that is present but fails the safe-token grammar
+ *    (too long, wrong charset, control characters) is dropped to `null`
+ *    with `'invalid-value'`, distinct from a genuine field/label
+ *    disagreement (`'field-label-mismatch'`).
+ * The raw field/label text itself never appears in the return value --
+ * only a bounded value and a fixed-vocabulary conflict key.
  */
 function classifyOneField(issue, { names, labelPrefix }) {
   const field = findFieldValue(issue, names);
-  const fieldValue = field ? (String(field.value || '').trim() || null) : null;
-  const labelValue = labelValueForPrefix(issue, labelPrefix);
-  if (fieldValue && labelValue && normaliseToken(fieldValue) !== normaliseToken(labelValue)) {
-    return { value: null, conflict: true };
-  }
-  return { value: fieldValue || labelValue || null, conflict: false };
+  const rawFieldValue = field ? String(field.value || '').trim() : '';
+  const fieldValue = rawFieldValue ? normalizeSafeToken(rawFieldValue) : null;
+  if (rawFieldValue && !fieldValue) return { value: null, conflict: 'invalid-value' };
+
+  const rawLabelSuffixes = labelValuesForPrefix(issue, labelPrefix);
+  const normalizedLabelValues = [...new Set(rawLabelSuffixes.map((raw) => normalizeSafeToken(raw)).filter(Boolean))];
+  if (rawLabelSuffixes.length > 0 && normalizedLabelValues.length === 0) return { value: null, conflict: 'invalid-value' };
+  if (normalizedLabelValues.length > 1) return { value: null, conflict: 'multiple-labels' };
+  const labelValue = normalizedLabelValues[0] || null;
+
+  if (fieldValue && labelValue && fieldValue !== labelValue) return { value: null, conflict: 'field-label-mismatch' };
+  return { value: fieldValue || labelValue || null, conflict: null };
 }
 
 /**
  * Conservative task/risk/model/harness classification for the issue #50
  * selector. Missing metadata classifies as `null` (unclassified); a
- * project-field/label disagreement also classifies as `null` rather than
- * silently picking a side.
+ * project-field/label disagreement, multiple distinct labels for one field,
+ * or an out-of-grammar value all classify as `null` rather than silently
+ * picking a side or a guessed permissive default. `conflicts` carries only
+ * a bounded `{ key, reason }` pair per affected field -- `reason` is always
+ * one of `'field-label-mismatch'`, `'multiple-labels'`, `'invalid-value'`.
  */
 export function classifyIssueTaskRisk(issue) {
   const taskClass = classifyOneField(issue, CLASSIFICATION_FIELDS.taskClass);
@@ -67,10 +87,10 @@ export function classifyIssueTaskRisk(issue) {
   const model = classifyOneField(issue, CLASSIFICATION_FIELDS.model);
   const harness = classifyOneField(issue, CLASSIFICATION_FIELDS.harness);
   const conflicts = [];
-  if (taskClass.conflict) conflicts.push({ key: 'taskClass' });
-  if (riskClass.conflict) conflicts.push({ key: 'riskClass' });
-  if (model.conflict) conflicts.push({ key: 'model' });
-  if (harness.conflict) conflicts.push({ key: 'harness' });
+  if (taskClass.conflict) conflicts.push({ key: 'taskClass', reason: taskClass.conflict });
+  if (riskClass.conflict) conflicts.push({ key: 'riskClass', reason: riskClass.conflict });
+  if (model.conflict) conflicts.push({ key: 'model', reason: model.conflict });
+  if (harness.conflict) conflicts.push({ key: 'harness', reason: harness.conflict });
   return { taskClass: taskClass.value, riskClass: riskClass.value, model: model.value, harness: harness.value, conflicts };
 }
 

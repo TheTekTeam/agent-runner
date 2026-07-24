@@ -41,7 +41,9 @@ import {
   probeProcessIdentity,
   preflightAlreadyClaimed,
   quotaPreflightArgs,
+  reconcilePendingRoutingEvents,
   reconcileSchedulerAttempts,
+  recordNoQualifiedAgentEvidence,
   resolveManagerTimelineAuthority,
   restoreIssueAfterSuccessfulRecovery,
   runChildWithWatchdog,
@@ -3653,27 +3655,32 @@ test('listOpenPullRequests requests open PRs with the fields findLinkedOpenPullR
   assert.equal(prs[0].state, 'open');
 });
 
-test('selectIssue skips a future configured agent label with structured unsupported-agent diagnostic', async () => {
+test('selectIssue round 3: a configured agentLabels entry for a not-yet-implemented adapter is never queried by execution discovery at all -- misconfiguring acceptedAgentLabels cannot move a foundation label into the execution scan', async () => {
   const calls = [];
   const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:codex-cli'], includeInProgress: false, requireManagerPreflight: true, execute: false, autoPreflightMode: false };
   const result = await selectIssue(args, (ghArgs) => {
     calls.push(ghArgs);
     if (ghArgs[0] === 'pr' && ghArgs[1] === 'list') return JSON.stringify([]);
     if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
-      return JSON.stringify([{ number: 655, title: 'Future agent', body: 'Body', updatedAt: '2026-01-01T00:00:00Z', labels: [{ name: 'status:ready' }, { name: 'agent:codex-cli' }] }]);
+      throw new Error('execution discovery must never query a not-yet-implemented adapter label, even when an operator misconfigures it into acceptedAgentLabels');
     }
     throw new Error(`unexpected gh call: ${ghArgs.join(' ')}`);
   });
   assert.equal(result.issue, null);
-  assert.deepEqual(result.skipped, [{
-    issue: 655,
-    reason: 'unsupported-agent',
-    agentId: 'codex-cli',
-    label: null,
-    detail: "Agent 'codex-cli' is registered for future use but is not implemented by this runner.",
-    statusLabel: 'status:ready',
-  }]);
-  assert.equal(calls.length, 2);
+  assert.deepEqual(result.skipped, []);
+  assert.equal(calls.length, 1, 'only the repo-wide open-PR inventory call -- zero issue-list queries for the misconfigured foundation-only label');
+});
+
+test('selectIssue round 3: the same misconfigured acceptedAgentLabels entry becomes visible via reconciliation once the multi-agent selector is engaged, independent of args.agentLabels', async () => {
+  const ghRunner = issueListGhRunner([{ number: 655, title: 'Future agent', url: 'https://example.invalid/655', labels: [{ name: 'status:ready' }, { name: 'agent:codex-cli' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-01-01T00:00:00Z' }]);
+  const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:codex-cli'], includeInProgress: false, requireManagerPreflight: true, execute: false };
+  const noAlternativeSnapshot = testSettingsSnapshot({ claudeOverrides: { lifecycle: { enabled: true, paused: false, draining: false, disabled: true } } });
+  const result = await selectIssue(args, withEmptyOpenPrInventory(ghRunner), { settingsSnapshot: noAlternativeSnapshot, readinessByAgentId: CLAUDE_READY });
+  assert.equal(result.issue, null);
+  const reconciled = result.skipped.find((entry) => entry.issue === 655);
+  assert.ok(reconciled, 'reconciliation discovery is independent of args.agentLabels -- it always covers every foundation-only catalogue label');
+  assert.equal(reconciled.agentId, 'codex-cli');
+  assert.equal(reconciled.noQualifiedAgent, true);
 });
 
 for (const failure of [
@@ -4041,7 +4048,7 @@ test('main() aborts a claim with exit code 1 and performs no GitHub status mutat
     const exitCode = await main([
       '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', join(dir, 'cron.lock'), '--agent-labels', 'agent:claude-code-cli',
-    ], { GH_TOKEN: 'test-token' }, {
+    ], { GH_TOKEN: 'test-token', AGENT_RUNNER_ENABLE_MULTIAGENT_ROUTING: 'true' }, {
       ghRunner,
       snapshotAgentSettings: snapshotAgentSettingsSpy,
       computeInstanceReadiness: () => ({ ok: true, reason: null, probes: [] }),
@@ -4094,7 +4101,7 @@ test('main() records deduplicated no-qualified-agent evidence and posts exactly 
   const runOnce = () => main([
     '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
     '--state-db', stateDbPath, '--lock-path', join(dir, 'cron.lock'), '--agent-labels', 'agent:claude-code-cli',
-  ], { GH_TOKEN: 'test-token' }, {
+  ], { GH_TOKEN: 'test-token', AGENT_RUNNER_ENABLE_MULTIAGENT_ROUTING: 'true' }, {
     ghRunner,
     snapshotAgentSettings: snapshotAgentSettingsSpy,
     computeInstanceReadiness: () => ({ ok: true, reason: null, probes: [] }),
@@ -4196,6 +4203,62 @@ test('a queued issue assigned to codex-cli is never selected for execution even 
   assert.ok(codexDecision.reasons.includes('not-implemented'));
 });
 
+test('selectIssue round 3: configured acceptedAgentLabels explicitly listing every foundation label (codex-cli, grok-cli, ollama) still routes each one to reconciliation, never to execution', async () => {
+  const issues = [
+    { number: 811, title: 'codex', url: 'https://example.invalid/811', labels: [{ name: 'status:ready' }, { name: 'agent:codex-cli' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' },
+    { number: 812, title: 'grok', url: 'https://example.invalid/812', labels: [{ name: 'status:ready' }, { name: 'agent:grok-cli' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' },
+    { number: 813, title: 'ollama', url: 'https://example.invalid/813', labels: [{ name: 'status:ready' }, { name: 'agent:ollama' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' },
+  ];
+  const ghRunner = issueListGhRunner(issues);
+  // The operator explicitly configured every foundation label as "accepted"
+  // alongside Claude -- exactly the misconfiguration the review calls out.
+  const args = {
+    repo: 'TheTekTeam/modelspend', limit: 10,
+    agentLabels: ['agent:claude-code-cli', 'agent:codex-cli', 'agent:grok-cli', 'agent:ollama'],
+    includeInProgress: true, requireManagerPreflight: true, execute: false,
+  };
+  const noAlternativeSnapshot = testSettingsSnapshot({ claudeOverrides: { lifecycle: { enabled: true, paused: false, draining: false, disabled: true } } });
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(ghRunner), {
+    settingsSnapshot: noAlternativeSnapshot,
+    readinessByAgentId: CLAUDE_READY,
+  });
+  assert.equal(selected.issue, null);
+  for (const [issueNumber, agentId] of [[811, 'codex-cli'], [812, 'grok-cli'], [813, 'ollama-agent']]) {
+    const reconciled = selected.skipped.find((entry) => entry.issue === issueNumber);
+    assert.ok(reconciled, `issue #${issueNumber} (${agentId}) must still be visible to reconciliation despite the misconfigured acceptedAgentLabels`);
+    assert.equal(reconciled.agentId, agentId);
+    assert.notEqual(reconciled.reason, 'unsupported-agent', 'must never fall through to the legacy unsupported-agent skip -- that would mean it silently reached execution discovery');
+  }
+});
+
+test('selectIssue round 3: an issue carrying two distinct supported local agent labels is ambiguous -- fails closed with bounded routing-attention evidence, never executes, never silently picks one', async () => {
+  const ambiguousIssue = { number: 821, title: 'Double-labeled', url: 'https://example.invalid/821', labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }, { name: 'agent:codex-cli' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' };
+  const ghRunner = issueListGhRunner([ambiguousIssue]);
+  const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: false };
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(ghRunner), {
+    settingsSnapshot: testSettingsSnapshot({}),
+    readinessByAgentId: CLAUDE_READY,
+  });
+  assert.equal(selected.issue, null, 'an ambiguously-labeled issue must never execute, even though claude-code-cli alone would otherwise be eligible');
+  assert.equal(selected.skipped.length, 1, 'flagged exactly once, not once per scan it appears in');
+  const entry = selected.skipped[0];
+  assert.equal(entry.issue, 821);
+  assert.equal(entry.reason, 'ambiguous-agent-labels');
+  assert.equal(entry.ambiguousAgentLabels, true);
+  assert.deepEqual(entry.supportedAgentLabels, ['agent:claude-code-cli', 'agent:codex-cli']);
+});
+
+test('selectIssue round 3: two labels for the SAME adapter (agent:claude and agent:claude-code-cli) are not ambiguous', async () => {
+  const issue = { number: 822, title: 'Two aliases, one adapter', url: 'https://example.invalid/822', labels: [{ name: 'status:ready' }, { name: 'agent:claude' }, { name: 'agent:claude-code-cli' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' };
+  const ghRunner = issueListGhRunner([issue]);
+  const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: false };
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(ghRunner), {
+    settingsSnapshot: testSettingsSnapshot({}),
+    readinessByAgentId: CLAUDE_READY,
+  });
+  assert.equal(selected.skipped.some((entry) => entry.ambiguousAgentLabels), false);
+});
+
 // -- Issue #50 review, requirement 2: missing/malformed settings create no selection, attempt, claim, marker, mutation, or launch --
 
 test('main() with a present-but-malformed settings document engages the selector and produces zero selection/claim/mutation, even for an otherwise-eligible Claude issue', async () => {
@@ -4222,11 +4285,11 @@ test('main() with a present-but-malformed settings document engages the selector
     const exitCode = await main([
       '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
       '--state-db', stateDbPath, '--lock-path', join(dir, 'cron.lock'), '--agent-labels', 'agent:claude-code-cli',
-    ], { GH_TOKEN: 'test-token' }, {
+    ], { GH_TOKEN: 'test-token', AGENT_RUNNER_ENABLE_MULTIAGENT_ROUTING: 'true' }, {
       ghRunner,
-      // fileFound: true (a document is present) but parseError set -- the
-      // selector is engaged (it is not a "no document at all" scenario) and
-      // must fail closed uniformly, including for claude-code-cli.
+      // fileFound: true (a document is present) but parseError set -- with
+      // the gate enabled, the selector engages regardless, and must fail
+      // closed uniformly, including for claude-code-cli.
       snapshotAgentSettings: () => ({ revision: 'sha256:' + '9'.repeat(64), fileFound: true, parseError: 'agent-settings-malformed-json', agents: {} }),
       computeInstanceReadiness: () => ({ ok: true, reason: null, probes: [] }),
     });
@@ -4246,19 +4309,132 @@ test('main() with a present-but-malformed settings document engages the selector
   }
 });
 
+// -- Issue #50 review round 3, requirement 1: the explicit AGENT_RUNNER_ENABLE_MULTIAGENT_ROUTING gate --
+
+test('main() with the multi-agent routing gate disabled (default) preserves the legacy Claude path and performs zero multi-agent reconciliation, even with no settings file at all', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-gate-disabled-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const comments = [{ ...canonicalPreflightComment(1, 'TEST.1', 'Bounded task.'), createdAt: '2026-07-24T09:00:00Z' }];
+  const editCalls = [];
+  const ghRunner = (ghArgs) => {
+    if (ghArgs[0] === 'pr' && ghArgs[1] === 'list') return JSON.stringify([]);
+    if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
+      const labelIndexes = ghArgs.reduce((acc, value, index) => (value === '--label' ? [...acc, index] : acc), []);
+      const statusLabel = ghArgs[labelIndexes[0] + 1];
+      const agentLabel = ghArgs[labelIndexes[1] + 1];
+      if (statusLabel !== 'status:ready' || agentLabel !== 'agent:claude-code-cli') return JSON.stringify([]);
+      return JSON.stringify([READY_ISSUE_701]);
+    }
+    if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') return JSON.stringify({ comments });
+    if (ghArgs[0] === 'issue' && ghArgs[1] === 'edit') { editCalls.push(ghArgs); return ''; }
+    if (ghArgs[0] === 'issue' && ghArgs[1] === 'comment') return '';
+    throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
+  };
+  let snapshotCalls = 0;
+  try {
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
+      '--state-db', stateDbPath, '--lock-path', join(dir, 'cron.lock'), '--agent-labels', 'agent:claude-code-cli',
+    ], { GH_TOKEN: 'test-token' }, {
+      ghRunner,
+      // No settings document exists at all -- with the gate left at its
+      // default (false/absent), this must never be consulted; the legacy
+      // Claude path claims the ready issue exactly as it did before #50.
+      snapshotAgentSettings: () => { snapshotCalls += 1; return { revision: 'sha256:' + '0'.repeat(64), fileFound: false, parseError: null, agents: {} }; },
+      computeInstanceReadiness: () => { throw new Error('readiness must never be probed when the multi-agent routing gate is disabled'); },
+      runChild: async () => ({ status: 0, signal: null, stdout: JSON.stringify({ logPath: 'child.json', executionPhase: 'implementation', costAdmission: { allowed: true }, sourcePreflightCommentId: '1' }), stderr: '', error: null }),
+    });
+    assert.equal(exitCode, 0);
+    assert.equal(editCalls.length, 1, 'the legacy Claude claim path still flips status:ready -> status:in-progress');
+    assert.ok(snapshotCalls >= 1, 'the settings snapshot is still read (e.g. for the agent-local Claude quota check) but never gates selection/claim while the routing gate is disabled');
+    const state = openRunnerStateStore(stateDbPath);
+    assert.equal(state.allRows('claims').length, 1, 'a real claim was created -- the legacy path was not blocked');
+    assert.equal(state.allRows('routing_events').length, 0, 'zero multi-agent reconciliation evidence with the gate disabled');
+    state.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('main() with the multi-agent routing gate enabled and no settings file at all still fails closed -- zero selection, attempt, claim, mutation, marker or launch', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-gate-enabled-missing-settings-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const comments = [{ ...canonicalPreflightComment(1, 'TEST.1', 'Bounded task.'), createdAt: '2026-07-24T09:00:00Z' }];
+  const ghCalls = [];
+  const ghRunner = (ghArgs) => {
+    ghCalls.push(ghArgs);
+    if (ghArgs[0] === 'pr' && ghArgs[1] === 'list') return JSON.stringify([]);
+    if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
+      const labelIndexes = ghArgs.reduce((acc, value, index) => (value === '--label' ? [...acc, index] : acc), []);
+      const statusLabel = ghArgs[labelIndexes[0] + 1];
+      const agentLabel = ghArgs[labelIndexes[1] + 1];
+      if (statusLabel !== 'status:ready' || agentLabel !== 'agent:claude-code-cli') return JSON.stringify([]);
+      return JSON.stringify([READY_ISSUE_701]);
+    }
+    if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') return JSON.stringify({ comments });
+    if (ghArgs[0] === 'issue' && ghArgs[1] === 'edit') throw new Error('a missing settings document with the gate enabled must never produce a label mutation');
+    if (ghArgs[0] === 'issue' && ghArgs[1] === 'comment') return '';
+    throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
+  };
+  try {
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
+      '--state-db', stateDbPath, '--lock-path', join(dir, 'cron.lock'), '--agent-labels', 'agent:claude-code-cli',
+    ], { GH_TOKEN: 'test-token', AGENT_RUNNER_ENABLE_MULTIAGENT_ROUTING: 'true' }, {
+      ghRunner,
+      snapshotAgentSettings: () => ({ revision: 'sha256:' + '0'.repeat(64), fileFound: false, parseError: null, agents: {} }),
+      computeInstanceReadiness: () => ({ ok: true, reason: null, probes: [] }),
+    });
+    assert.equal(exitCode, 0, 'no eligible candidate is a clean idle pass, not an error');
+    assert.equal(ghCalls.some((call) => call[0] === 'issue' && call[1] === 'edit'), false);
+    const state = openRunnerStateStore(stateDbPath);
+    assert.equal(state.allRows('claims').length, 0);
+    assert.equal(state.allRows('recovery_attempts').length, 0);
+    state.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // -- Issue #50 review, requirement 6/9: attemptQueuedReassignment's evidence-based guards and durability --
 
-function fakeReassignmentState({ attemptRows = [], recordRoutingEventResult = { inserted: true }, healthy = true } = {}) {
+/**
+ * A minimal in-memory `routing_events` simulator -- real enough
+ * INSERT-OR-IGNORE-by-dedupe-key plus delivery-status UPDATE semantics for
+ * attemptQueuedReassignment()'s pending/evidence-pending/resolved state
+ * machine to be exercised faithfully, without a real SQLite store.
+ * `updateRoutingEventDeliveryStatusResult` lets a test simulate a durable
+ * write fault on just that one transition.
+ */
+function fakeReassignmentState({
+  attemptRows = [], healthy = true, updateRoutingEventDeliveryStatusResult = undefined,
+} = {}) {
   const taskErrors = [];
+  const rows = new Map();
   return {
     get healthy() { return healthy; },
-    invoke(method) {
+    invoke(method, ...callArgs) {
       if (method === 'allRows') return attemptRows;
-      if (method === 'recordRoutingEvent') return recordRoutingEventResult;
+      if (method === 'recordRoutingEvent') {
+        const [{ dedupeKey, deliveryStatus = 'resolved', ...rest }] = callArgs;
+        if (rows.has(dedupeKey)) return { inserted: false, existing: rows.get(dedupeKey) };
+        const row = { dedupe_key: dedupeKey, delivery_status: deliveryStatus, ...rest };
+        rows.set(dedupeKey, row);
+        return { inserted: true, existing: null };
+      }
+      if (method === 'updateRoutingEventDeliveryStatus') {
+        if (updateRoutingEventDeliveryStatusResult !== undefined) return updateRoutingEventDeliveryStatusResult;
+        const [{ dedupeKey, deliveryStatus }] = callArgs;
+        const row = rows.get(dedupeKey);
+        if (!row) return { updated: false };
+        row.delivery_status = deliveryStatus;
+        return { updated: true };
+      }
       return null;
     },
     recordTaskError(stage, error) { taskErrors.push({ stage, message: String(error?.message || error) }); },
     taskErrors,
+    rows,
   };
 }
 
@@ -4374,12 +4550,36 @@ test('attemptQueuedReassignment treats a fully resolved terminal attempt as clea
   assert.equal(editCalls.length, 1);
 }));
 
-test('attemptQueuedReassignment reports not-applied when the label mutation succeeds but the routing event cannot be durably recorded, and never re-posts stale evidence', () => withCleanLocalRepo(async (localRepoPath) => {
-  const { ghRunner, editCalls } = reassignmentGhRunner(503, ['status:ready', 'agent:claude-code-cli'], { allowComment: false });
+test('attemptQueuedReassignment: a pending-state write failure before mutation means GitHub is never mutated', () => withCleanLocalRepo(async (localRepoPath) => {
+  const { ghRunner, editCalls } = reassignmentGhRunner(502, ['status:ready', 'agent:claude-code-cli']);
+  const settingsSnapshot = { revision: 'sha256:' + '5'.repeat(64) };
+  const state = fakeReassignmentState({ attemptRows: [] });
+  // Force the very first durable write (the pending intent, before any
+  // mutation) to fail, by making recordRoutingEvent itself unavailable.
+  state.invoke = (method) => (method === 'recordRoutingEvent' ? null : (method === 'allRows' ? [] : null));
+  const candidateSkip = {
+    issue: 502, agentId: 'claude-code-cli',
+    labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }],
+    routingResult: { selectedAgentId: 'ollama-agent' },
+  };
+  const result = await attemptQueuedReassignment({
+    args: { repo: 'TheTekTeam/modelspend', project: { localRepoPath } },
+    state, ghRunner, candidateSkip, settingsSnapshot,
+    snapshotSettings: () => settingsSnapshot,
+    env: {},
+  });
+  assert.equal(result.applied, false);
+  assert.equal(result.reason, 'pending-state-write-failed');
+  assert.equal(editCalls.length, 0, 'a pending-state write failure must mean GitHub is never mutated');
+}));
+
+test('attemptQueuedReassignment reports not-applied when the label mutation succeeds but the post-mutation state transition cannot be durably recorded, and never re-posts stale evidence', () => withCleanLocalRepo(async (localRepoPath) => {
+  const { ghRunner, editCalls, commentCalls } = reassignmentGhRunner(503, ['status:ready', 'agent:claude-code-cli']);
   const settingsSnapshot = { revision: 'sha256:' + '3'.repeat(64) };
   // Simulates a durable-store fault on this exact write: the label mutation
-  // still lands on GitHub, but the routing-event insert itself fails.
-  const state = fakeReassignmentState({ attemptRows: [], recordRoutingEventResult: null });
+  // succeeds and verifies, but the transition from 'mutation-pending' to
+  // 'evidence-pending' cannot be durably recorded.
+  const state = fakeReassignmentState({ attemptRows: [], updateRoutingEventDeliveryStatusResult: { updated: false } });
   const candidateSkip = {
     issue: 503, agentId: 'claude-code-cli',
     labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }],
@@ -4391,11 +4591,197 @@ test('attemptQueuedReassignment reports not-applied when the label mutation succ
     snapshotSettings: () => settingsSnapshot,
     env: {},
   });
-  assert.equal(result.applied, false, 'a state-write fault after a real label mutation must never be reported as a completed reassignment');
+  assert.equal(result.applied, false, 'a state-transition fault after a real label mutation must never be reported as a completed reassignment');
   assert.equal(result.reason, 'applied-but-not-durably-recorded');
   assert.equal(editCalls.length, 1, 'the label mutation itself still happened exactly once -- this proves the fault, it does not retry it');
-  assert.ok(state.taskErrors.some((entry) => entry.stage === 'reassignment-routing-event-persistence-failed'));
+  assert.equal(commentCalls.length, 0, 'evidence is never posted before the durable transition succeeds');
+  assert.ok(state.taskErrors.some((entry) => entry.stage === 'reassignment-state-transition-failed'));
 }));
+
+// -- Issue #50 review round 3, requirement 4: crash-safe pending/delivery reconciliation, real SQLite store --
+
+test('reconcilePendingRoutingEvents: a mutation-pending row whose live labels already match the persisted plan self-heals to evidence-pending without re-mutating', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-routing-reconcile-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  try {
+    const store = openRunnerStateStore(stateDbPath);
+    const dedupeKey = 'TheTekTeam/modelspend:701:reassignment:claude-code-cli:ollama-agent:sha256:aaa';
+    store.recordRoutingEvent({
+      repo: 'TheTekTeam/modelspend', issueNumber: 701, eventType: 'reassignment',
+      fromAgentId: 'claude-code-cli', toAgentId: 'ollama-agent', reason: 'explicit-agent-ineligible',
+      settingsRevision: 'sha256:aaa', dedupeKey, deliveryStatus: 'mutation-pending',
+      payload: { labelMutation: { removeLabels: ['agent:claude-code-cli'], addLabels: ['agent:ollama'], expectedFinalLabels: ['agent:ollama', 'status:ready'], replacementAgentLabel: 'agent:ollama' } },
+    });
+    store.close();
+
+    const editCalls = [];
+    const ghRunner = (ghArgs) => {
+      if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
+        // The mutation already landed on GitHub before the crash -- live
+        // labels already match the persisted plan.
+        return JSON.stringify({ number: 701, state: 'OPEN', labels: [{ name: 'status:ready' }, { name: 'agent:ollama' }], comments: [] });
+      }
+      if (ghArgs[0] === 'issue' && ghArgs[1] === 'edit') { editCalls.push(ghArgs); return ''; }
+      throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
+    };
+    // A fresh state handle -- simulating a restarted process re-opening the
+    // same durable store after the crash.
+    const state = createStateRecorder({ stateDbPath, outputDir: dir, repo: 'TheTekTeam/modelspend' });
+    const result = await reconcilePendingRoutingEvents({ state, args: { repo: 'TheTekTeam/modelspend' }, ghRunner });
+    state.close();
+
+    assert.equal(editCalls.length, 0, 'self-healing must never re-mutate GitHub');
+    assert.equal(result.checked, 1);
+
+    const verify = openRunnerStateStore(stateDbPath);
+    const row = verify.allRows('routing_events').find((r) => r.dedupe_key === dedupeKey);
+    assert.equal(row.delivery_status, 'evidence-pending', 'the row self-healed past mutation-pending without a re-mutation');
+    verify.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('reconcilePendingRoutingEvents: a mutation-pending row whose live labels do NOT yet reflect the plan is left untouched -- no premature transition, no mutation attempted here', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-routing-reconcile-unapplied-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  try {
+    const store = openRunnerStateStore(stateDbPath);
+    const dedupeKey = 'TheTekTeam/modelspend:701:reassignment:claude-code-cli:ollama-agent:sha256:aaa';
+    store.recordRoutingEvent({
+      repo: 'TheTekTeam/modelspend', issueNumber: 701, eventType: 'reassignment',
+      fromAgentId: 'claude-code-cli', toAgentId: 'ollama-agent', reason: 'explicit-agent-ineligible',
+      settingsRevision: 'sha256:aaa', dedupeKey, deliveryStatus: 'mutation-pending',
+      payload: { labelMutation: { removeLabels: ['agent:claude-code-cli'], addLabels: ['agent:ollama'], expectedFinalLabels: ['agent:ollama', 'status:ready'], replacementAgentLabel: 'agent:ollama' } },
+    });
+    store.close();
+
+    const editCalls = [];
+    const ghRunner = (ghArgs) => {
+      if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
+        // The crash happened before the mutation ever ran.
+        return JSON.stringify({ number: 701, state: 'OPEN', labels: [{ name: 'status:ready' }, { name: 'agent:claude-code-cli' }], comments: [] });
+      }
+      if (ghArgs[0] === 'issue' && ghArgs[1] === 'edit') { editCalls.push(ghArgs); return ''; }
+      throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
+    };
+    const state = createStateRecorder({ stateDbPath, outputDir: dir, repo: 'TheTekTeam/modelspend' });
+    await reconcilePendingRoutingEvents({ state, args: { repo: 'TheTekTeam/modelspend' }, ghRunner });
+    state.close();
+
+    assert.equal(editCalls.length, 0, 'reconciliation itself never mutates -- a fresh selectIssue()/attemptQueuedReassignment() pass owns retrying the mutation');
+    const verify = openRunnerStateStore(stateDbPath);
+    const row = verify.allRows('routing_events').find((r) => r.dedupe_key === dedupeKey);
+    assert.equal(row.delivery_status, 'mutation-pending', 'left untouched -- not yet applied');
+    verify.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('reconcilePendingRoutingEvents: an evidence-pending reassignment row retries ONLY the comment on the next pass, never a second mutation, and reaches resolved', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-routing-reconcile-evidence-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  try {
+    const store = openRunnerStateStore(stateDbPath);
+    const dedupeKey = 'TheTekTeam/modelspend:701:reassignment:claude-code-cli:ollama-agent:sha256:aaa';
+    store.recordRoutingEvent({
+      repo: 'TheTekTeam/modelspend', issueNumber: 701, eventType: 'reassignment',
+      fromAgentId: 'claude-code-cli', toAgentId: 'ollama-agent', reason: 'explicit-agent-ineligible',
+      settingsRevision: 'sha256:aaa', dedupeKey, deliveryStatus: 'evidence-pending',
+      payload: {},
+    });
+    store.close();
+
+    const editCalls = [];
+    const commentCalls = [];
+    const ghRunner = (ghArgs) => {
+      if (ghArgs[0] === 'issue' && ghArgs[1] === 'edit') { editCalls.push(ghArgs); return ''; }
+      if (ghArgs[0] === 'issue' && ghArgs[1] === 'comment') { commentCalls.push(ghArgs); return ''; }
+      throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
+    };
+    const state = createStateRecorder({ stateDbPath, outputDir: dir, repo: 'TheTekTeam/modelspend' });
+    const result = await reconcilePendingRoutingEvents({ state, args: { repo: 'TheTekTeam/modelspend' }, ghRunner });
+    state.close();
+
+    assert.equal(editCalls.length, 0, 'never a second label mutation');
+    assert.equal(commentCalls.length, 1);
+    assert.ok(commentCalls[0][commentCalls[0].indexOf('--body') + 1].includes('agent-runner:routing-attention:v1'));
+    assert.equal(result.resolved, 1);
+    const verify = openRunnerStateStore(stateDbPath);
+    assert.equal(verify.allRows('routing_events').find((r) => r.dedupe_key === dedupeKey).delivery_status, 'resolved');
+    verify.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('reconcilePendingRoutingEvents: a failed comment retry leaves the row evidence-pending for a later pass, and never marks it resolved', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-routing-reconcile-retry-fail-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  try {
+    const store = openRunnerStateStore(stateDbPath);
+    const dedupeKey = 'TheTekTeam/modelspend:701:no-qualified-agent:sha256:aaa';
+    store.recordRoutingEvent({
+      repo: 'TheTekTeam/modelspend', issueNumber: 701, eventType: 'no-qualified-agent',
+      reason: 'no-qualified-agent', settingsRevision: 'sha256:aaa', dedupeKey, deliveryStatus: 'evidence-pending',
+      payload: { eligibilityReasons: [] },
+    });
+    store.close();
+
+    const ghRunner = (ghArgs) => {
+      if (ghArgs[0] === 'issue' && ghArgs[1] === 'comment') throw new Error('gh api rate limited');
+      throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
+    };
+    const state = createStateRecorder({ stateDbPath, outputDir: dir, repo: 'TheTekTeam/modelspend' });
+    const result = await reconcilePendingRoutingEvents({ state, args: { repo: 'TheTekTeam/modelspend' }, ghRunner });
+    state.close();
+
+    assert.equal(result.resolved, 0);
+    assert.ok(state.taskErrors.some((entry) => entry.stage === 'routing-event-evidence-delivery-retry-failed'));
+    const verify = openRunnerStateStore(stateDbPath);
+    assert.equal(verify.allRows('routing_events').find((r) => r.dedupe_key === dedupeKey).delivery_status, 'evidence-pending', 'a failed retry stays evidence-pending, never silently resolved');
+    verify.close();
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('recordNoQualifiedAgentEvidence: a comment delivery failure on the first pass is retried and succeeds on a later call, posting exactly once', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-no-qualified-retry-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  try {
+    let allowComment = false;
+    let commentPosts = 0;
+    const ghRunner = (ghArgs) => {
+      if (ghArgs[0] === 'issue' && ghArgs[1] === 'comment') {
+        if (!allowComment) throw new Error('gh api rate limited');
+        commentPosts += 1;
+        return '';
+      }
+      throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
+    };
+    const state = createStateRecorder({ stateDbPath, outputDir: dir, repo: 'TheTekTeam/modelspend' });
+    const settingsSnapshot = { revision: 'sha256:' + 'b'.repeat(64) };
+    const candidateSkip = { issue: 701, eligibilityReasons: ['no-settings-entry'] };
+
+    const first = recordNoQualifiedAgentEvidence({ args: { repo: 'TheTekTeam/modelspend' }, state, ghRunner, candidateSkip, settingsSnapshot });
+    assert.equal(first.inserted, true);
+    assert.equal(commentPosts, 0, 'the first delivery attempt failed');
+
+    allowComment = true;
+    const second = recordNoQualifiedAgentEvidence({ args: { repo: 'TheTekTeam/modelspend' }, state, ghRunner, candidateSkip, settingsSnapshot });
+    assert.equal(second.inserted, false, 'the durable row already exists -- this is a retry, not a fresh event');
+    assert.equal(commentPosts, 1, 'delivery is retried on the existing pending row and now succeeds');
+
+    const third = recordNoQualifiedAgentEvidence({ args: { repo: 'TheTekTeam/modelspend' }, state, ghRunner, candidateSkip, settingsSnapshot });
+    assert.equal(commentPosts, 1, 'once resolved, a later pass never re-delivers');
+    state.close();
+    void third;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 // -- Issue #50 review, requirement 8: no synthetic secret/prompt/path/endpoint/session text survives a full serialized pass --
 
@@ -4431,6 +4817,40 @@ test('a full selectIssue() pass with synthetic secrets in a losing agent\'s sett
   const serialized = JSON.stringify(selected.skipped);
   assert.ok(!serialized.includes('vault://'), 'a raw sessionSecretRef must never survive into a skipped decision');
   assert.ok(!serialized.includes('codex-secret-path'), 'a raw executablePath must never survive into a skipped decision');
+});
+
+test('a reassignment-candidate skip entry\'s labels field carries only bounded label names, never a raw GH label object with a secret-bearing description', async () => {
+  // A codex-cli-labeled queued issue (reconciliation path) with Claude
+  // still eligible as the real, implemented alternative -- the one
+  // reachable way to produce a genuine reassignment-candidate outcome
+  // against the real catalogue (every non-Claude adapter stays
+  // implemented:false, so Claude is the only possible "winner").
+  const issueWithSecretLabelDescriptions = {
+    number: 902, title: 'Ready issue', url: 'https://example.invalid/902',
+    labels: [
+      { id: 1, name: 'status:ready', description: 'sk-ant-shorttoken12', color: '00ff00' },
+      { id: 2, name: 'agent:codex-cli', description: 'vault://another-secret-in-a-label-description', color: '0000ff' },
+      { id: 3, name: 'task:code', description: null },
+      { id: 4, name: 'risk:low', description: null },
+    ],
+    updatedAt: '2026-07-08T10:00:00Z',
+  };
+  const ghRunner = issueListGhRunner([issueWithSecretLabelDescriptions]);
+  const snapshot = testSettingsSnapshot({});
+  const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:claude-code-cli'], includeInProgress: true, requireManagerPreflight: true, execute: false };
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(ghRunner), {
+    settingsSnapshot: snapshot,
+    readinessByAgentId: CLAUDE_READY,
+  });
+  const reconciled = selected.skipped.find((entry) => entry.issue === 902);
+  assert.ok(reconciled, 'the codex-cli-labeled issue must be visible to reconciliation');
+  assert.equal(reconciled.reassignmentCandidate, true);
+  assert.equal(reconciled.routingResult.selectedAgentId, 'claude-code-cli');
+  assert.deepEqual(reconciled.labels, ['status:ready', 'agent:codex-cli', 'task:code', 'risk:low'], 'bounded label names only, in order, never the raw label objects');
+  const serialized = JSON.stringify(selected.skipped);
+  assert.ok(!serialized.includes('sk-ant-shorttoken12'), 'a raw label description must never survive into a skipped decision');
+  assert.ok(!serialized.includes('vault://'));
+  assert.ok(!serialized.includes('"color"'), 'no raw label object field (color, id, description) survives at all');
 });
 
 test('boundedReadiness drops a raw readiness probe\'s resolved executable path and detail -- only { healthy, ready } ever survives', () => {

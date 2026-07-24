@@ -11,9 +11,11 @@ import {
   computeSettingsRevision,
   getAgentSettings,
   isAgentRoutable,
+  isSafeQualificationToken,
   normalizeAgentLifecycle,
   normalizeAgentPaidUsePolicy,
   normalizeAgentQualification,
+  normalizeSafeToken,
   QUALIFICATION_WILDCARD,
   resolveAgentSettingsPath,
   SAFE_DEFAULT_AGENT_LIFECYCLE,
@@ -310,6 +312,39 @@ test('normalizeAgentQualification drops a qualification token that fails the bou
     qualification: { taskClasses: ['code', tooLong, 'unsafe token; DROP TABLE'], riskClasses: [], models: [], harness: null },
   });
   assert.deepEqual(qual.taskClasses, ['code']);
+});
+
+// -- issue #50 review round 3: the shared normalizeSafeToken() grammar itself --
+
+test('normalizeSafeToken case-folds a mixed-case in-grammar value deterministically', () => {
+  assert.equal(normalizeSafeToken('Code'), 'code');
+  assert.equal(normalizeSafeToken('  Docs-V2  '), 'docs-v2');
+});
+
+test('normalizeSafeToken rejects non-strings, empty/whitespace-only values, and values over the length bound', () => {
+  assert.equal(normalizeSafeToken(null), null);
+  assert.equal(normalizeSafeToken(undefined), null);
+  assert.equal(normalizeSafeToken(42), null);
+  assert.equal(normalizeSafeToken('   '), null);
+  assert.equal(normalizeSafeToken('a'.repeat(65)), null);
+  assert.equal(normalizeSafeToken('a'.repeat(64)), 'a'.repeat(64));
+});
+
+test('normalizeSafeToken rejects unsafe punctuation/control-character shapes (paths, URLs, injected text)', () => {
+  assert.equal(normalizeSafeToken('/usr/local/bin/codex'), null);
+  assert.equal(normalizeSafeToken('vault://very-secret'), null);
+  assert.equal(normalizeSafeToken('unsafe token; DROP TABLE'), null);
+  assert.equal(normalizeSafeToken('low/medium'), null);
+});
+
+test('normalizeSafeToken only returns the wildcard when explicitly allowed', () => {
+  assert.equal(normalizeSafeToken('*'), null);
+  assert.equal(normalizeSafeToken('*', { allowWildcard: true }), '*');
+});
+
+test('isSafeQualificationToken agrees with normalizeSafeToken\'s grammar for the wildcard itself', () => {
+  assert.equal(isSafeQualificationToken('*'), true);
+  assert.equal(isSafeQualificationToken(''), false);
 });
 
 test('normalizeAgentPaidUsePolicy requires a strictly positive cost or token cap to report hasPositiveCap', () => {

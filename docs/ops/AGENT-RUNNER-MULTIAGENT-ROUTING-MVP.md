@@ -37,24 +37,36 @@ inside `snapshotAgentSettings()`/`normalizeAgentQualification()`: an absent
 or malformed `claude-code-cli` entry is fully non-routable and unqualified,
 identically to `codex-cli`/`grok-cli`/`ollama-agent`.
 
-Instead, "today's Claude just works" behaviour is preserved by a distinct
-**selector-engagement** boundary in `claude-runner-cron.mjs#main()`, not by
-a permissive default inside the settings module: the multi-agent selector
-(and every strict check it brings — explicit settings, explicit task/risk
-classification, proven readiness) is engaged for a pass **only when
-`snapshotAgentSettings()` reports `fileFound: true`** — i.e. a real
-machine-local settings document actually exists on disk. When no document
-exists at all, `settingsSnapshot` is not passed into `selectIssue()`/the
-pre-attempt revision check, and Claude's pre-issue-#50 legacy execution path
-(which has never read this file) runs completely unaffected — this is what
-keeps every real, currently-unlabeled-for-classification production Claude
-deployment working unchanged today. A document that is *present but
-malformed* (`fileFound: true`, `parseError` set) is a different case: the
-selector *is* engaged, and its uniform fail-closed defaults make every
-agent — including Claude — unqualified until the document is fixed. This
-engagement boundary is this correction round's own interpretation of an
-inherent tension in the review comment (see "Known limitations" below for
-the reviewer to confirm or correct).
+**Selector engagement is one explicit machine-local flag, never inferred
+from settings-file presence.** `AGENT_RUNNER_ENABLE_MULTIAGENT_ROUTING`
+(default `false`) is the single boundary `claude-runner-cron.mjs#main()`
+reads into `args.multiAgentRoutingEnabled`. This directly replaces an
+earlier draft of this issue that inferred engagement from
+`snapshotAgentSettings().fileFound === true` — flagged by review as unsafe
+because deleting or losing the settings file would then silently restore
+the permissive legacy path even after multi-agent routing had genuinely
+been in use.
+
+- **Gate `false` (default):** `settingsSnapshot` is not threaded into
+  `selectIssue()`/the pre-attempt revision check at all, no reconciliation
+  scan runs, and Claude's pre-issue-#50 legacy execution path (which has
+  never read the settings file) runs completely unaffected — regardless of
+  whether a settings document exists, is missing, or is malformed. This is
+  what keeps every real production Claude deployment working unchanged
+  until an operator explicitly opts in.
+- **Gate `true`:** the selector engages unconditionally, including when the
+  settings document is missing, unreadable, malformed, or non-object. There
+  is no secondary fallback once the gate is on — `snapshotAgentSettings()`'s
+  uniform fail-closed defaults (no agent id, Claude included, has a
+  permissive absent-entry default) then make every candidate unqualified
+  until a valid document is in place, so "engaged with bad/missing
+  settings" fails closed all the way through selection, reconciliation,
+  attempt creation, claim, GitHub mutation, and worker launch.
+
+This flag is a code/test boundary only in this PR — it does not enable the
+execution timer, alter concurrency, or authorise live routing to any
+adapter by itself; every adapter other than `claude-code-cli` still stays
+`implemented: false` in the committed catalogue regardless of this flag.
 
 `settingsRevisionUnchanged(atSelection, fresh)` requires `fileFound: true`
 on **both** snapshots (two "file not found" reads never count as
@@ -91,12 +103,36 @@ entry still cannot route a `medium`-risk issue to Ollama.
 `scripts/ops/agent-runner-qualification.mjs#classifyIssueTaskRisk()` reads
 explicit `task:`/`risk:`/`model:`/`harness:` labels and matching
 project-field names, built only from `issue-metadata.mjs`'s already-exported
-generic primitives (`findFieldValue`, `labelNames`, `normaliseToken`) —
-`issue-metadata.mjs` itself needed no functional change and stays
-byte-identical to its locked migration import. Missing metadata classifies
-as `null` (unclassified) rather than a guessed permissive class, and a
-project-field value that disagrees with the label value also classifies as
-`null` — a conflict is never silently resolved to either side.
+generic primitives (`findFieldValue`, `labelNames`) — `issue-metadata.mjs`
+itself needed no functional change and stays byte-identical to its locked
+migration import. Missing metadata classifies as `null` (unclassified)
+rather than a guessed permissive class.
+
+**Settings qualification and issue classification share one bounded
+safe-token normalizer.** `agent-runner-agent-settings.mjs#normalizeSafeToken()`
+(also used to bound `qualification.taskClasses`/`riskClasses`/`models`/`harness`
+read from a settings file) is the same function `classifyOneField()` runs
+every field/label value through: it trims, lowercase-folds, and accepts
+only `^[a-z0-9][a-z0-9._-]{0,63}$`. Three closed, bounded outcomes, never a
+raw value:
+
+- a single explicit, in-grammar value (from a field, a label, or both
+  agreeing) wins;
+- **two or more *distinct* normalized label values for the same field is a
+  conflict** (`reason: 'multiple-labels'`) — the previous
+  `labelValueForPrefix()` silently took the first matching label; it no
+  longer does;
+- a field/label value that is present but fails the grammar (too long,
+  wrong charset, control characters, secret-shaped) is dropped to `null`
+  with `reason: 'invalid-value'`, distinct from a genuine field/label
+  disagreement (`reason: 'field-label-mismatch'`).
+
+`classification.conflicts` is therefore always `{ key, reason }` pairs from
+this fixed three-value vocabulary — never the raw field value, label value,
+or label object. A GitHub label's `description`/`color`/`id` fields are
+never read at all; only `.name` is ever inspected, by
+`agent-runner-qualification.mjs`, by `claude-runner-cron.mjs`'s ambiguity
+check, and by every skip payload's bounded `labels` field.
 
 ## Deterministic serial selector
 
@@ -200,49 +236,60 @@ a bare `false` literal. `hasConflictingBranchOrWorktree` continues to reuse
 `hasLinkedOpenPullRequest`/`hasHandoffInProgress` continue to reuse
 `findLinkedOpenPullRequests()`/a handoff-heading comment scan respectively.
 
-**A reassignment is only ever reported durably `applied: true` when both
-the post-mutation label verification and the durable `recordRoutingEvent()`
-write succeed.** If the GitHub label mutation lands but the routing-event
-insert cannot be proven (`recorded?.inserted !== true` — a state-write
-fault), `attemptQueuedReassignment()` returns `applied: false` with the
-distinct reason `applied-but-not-durably-recorded` and never posts the
-evidence comment. It also never re-attempts the label mutation on a later
-pass: the issue's live label already reflects the replacement agent, so a
-later reconciliation pass no longer classifies it as a reassignment
-candidate for the agent it was just moved away from — the label itself is
-the reconciliation checkpoint, not a second durable flag.
+**A reassignment is only ever reported durably `applied: true` after both
+the post-mutation label verification and a durable state transition
+succeed** — see "Durable evidence" below for the full crash-safe
+pending/delivery state machine `attemptQueuedReassignment()` now drives a
+durable `routing_events` row through, and for how a state-write fault at
+any step reconciles safely on a later pass without ever repeating a
+mutation that already landed.
 
 ## The dual scan: execution discovery vs. status:ready reconciliation
 
-Two independent candidate scans run inside `selectIssue()` when the
-multi-agent selector is engaged:
+Two independent, **structurally fixed** candidate scans run inside
+`selectIssue()` when the multi-agent selector is engaged — neither is
+computed as "the other minus configured labels":
 
-1. **Execution discovery** (unchanged in scope) queries only
-   `args.agentLabels` — implemented-agent labels by default
-   (`agent:claude-code-cli`) — and is the only scan that can ever produce an
-   executable selection. It still rejects a resolved-but-unimplemented
-   agent early, but the generic selector now runs on every remaining
-   candidate before that legacy checkpoint is reached for anything the
-   agent-label query itself returned.
-2. **Reconciliation** is a second, `status:ready`-only query over every
-   remaining catalogue-supported label, including foundation-only,
-   not-yet-implemented adapters (`agent:codex-cli`, `agent:grok-cli`,
-   `agent:ollama`, …) — built as `allAgentLabels({ includeFuture: true })`
-   minus whatever execution discovery already queried. `agent:codex`
-   (Codex Web/manual) has no catalogue entry at all and is therefore never
-   part of either scan. A reconciliation candidate runs through the exact
-   same `selectAgentForIssue()` the execution scan uses, but only ever
-   produces a `reassignment-candidate` or `no-qualified-agent` skip entry —
-   it is foundation-only by construction (that is precisely why its label
-   was excluded from execution discovery's query), so it can never itself
-   become an executable selection. This is how a queued issue explicitly
-   assigned to `codex-cli`/`grok-cli`/`ollama-agent` becomes visible to
-   reassignment/no-qualified-agent evidence without ever becoming
-   executable while its catalogue entry stays `implemented: false`.
+1. **Execution discovery** queries the *intersection* of whatever an
+   operator configured in `args.agentLabels`/`acceptedAgentLabels` with the
+   catalogue's `implemented: true` adapter labels
+   (`IMPLEMENTED_AGENT_LABELS`). A misconfigured `acceptedAgentLabels` that
+   happens to include `agent:codex-cli`/`agent:grok-cli`/`agent:ollama` can
+   therefore never route those issues into execution discovery's GH
+   query — an earlier draft of this issue computed reconciliation as "all
+   labels minus configured labels," which meant a misconfigured
+   `acceptedAgentLabels` entry moved a foundation label *into* execution
+   discovery and *out of* reconciliation, where the legacy
+   `!agent.implemented` check silently skipped it with no evidence. It
+   still rejects a resolved-but-unimplemented agent early as a defensive
+   backstop, but that branch is unreachable in practice now that its input
+   is constructed this way.
+2. **Reconciliation** queries every catalogue label whose adapter is
+   `implemented: false` (`FOUNDATION_ONLY_AGENT_LABELS`), full stop —
+   independent of `args.agentLabels` entirely, so an operator cannot
+   configure a foundation-only label out of reconciliation by listing it as
+   "accepted." `agent:codex` (Codex Web/manual) has no catalogue entry at
+   all and is therefore never part of either scan. A reconciliation
+   candidate runs through the exact same `selectAgentForIssue()` the
+   execution scan uses, but only ever produces a `reassignment-candidate`
+   or `no-qualified-agent` skip entry — it is foundation-only by
+   construction, so it can never itself become an executable selection.
 
 Both scans share one `evaluateAgentEligibility()`/`selectAgentForIssue()`
 pass, so a Claude-labeled issue can never receive two disagreeing verdicts
 from the two scans.
+
+**An issue carrying more than one distinct supported local agent label is
+ambiguous and fails closed.** `skipIfAmbiguous()` checks every candidate
+from both scans (before either resolves an agent for it) against the full
+catalogue label set; two or more *distinct agent ids* represented (not
+merely two labels — `agent:claude` plus `agent:claude-code-cli` is one
+adapter, not ambiguous) produces a `reason: 'ambiguous-agent-labels'` skip
+entry with a bounded `supportedAgentLabels` list (catalogue label names
+only), and — when the selector is engaged —
+`recordAmbiguousAgentLabelsEvidence()` posts one deduplicated,
+delivery-tracked routing-attention comment. The issue is flagged exactly
+once even if it would otherwise appear in both scans, and never executes.
 
 ## Manager authority after reassignment
 
@@ -267,25 +314,70 @@ actually resolved.
 When a queued issue's explicit agent is ineligible and no alternative is
 eligible either, `recordNoQualifiedAgentEvidence()` records one
 deduplicated `routing_events` row (`event_type: 'no-qualified-agent'`,
-keyed by `(repo, issue, settings revision)`) and posts the evidence comment
-only the first time that row is actually inserted — proven by test across
-two full reconciliation passes. No worker is launched, no manager packet is
+keyed by `(repo, issue, settings revision)`) starting in `'evidence-pending'`
+and attempts delivery immediately; a delivery failure leaves the row
+`'evidence-pending'` for retry rather than being silently dropped (see
+"Durable evidence" below). No worker is launched, no manager packet is
 consumed, and no claim is created.
 
-## Durable evidence: `routing_events`
+## Durable evidence: `routing_events` and crash-safe pending/delivery reconciliation
 
 `scripts/ops/claude-runner-state.mjs` adds a `routing_events` table
-(schema v11) with a `UNIQUE` `dedupe_key` — `recordRoutingEvent()` is an
-`INSERT OR IGNORE` and reports whether the row was actually new, which is
-the gate every GitHub comment above is posted behind. `payload_json` is
+(schema v12) with a `UNIQUE` `dedupe_key` and a `delivery_status` column —
+`recordRoutingEvent()` is an `INSERT OR IGNORE`; on a dedupe collision it
+now also returns the `existing` row so a caller can distinguish "already
+fully resolved" from "still pending, safe to resume." `payload_json` is
 caller-bounded and never receives raw settings, credentials, paths,
 endpoints, prompts, or provider text.
+
+**`delivery_status` is a small durable state machine** —
+`'mutation-pending'` → `'evidence-pending'` → `'resolved'` — that makes
+every GitHub mutation and every evidence comment resumable after a crash,
+without ever repeating a mutation that already landed:
+
+1. **Before any label mutation**, `attemptQueuedReassignment()` persists a
+   bounded intent row (`deliveryStatus: 'mutation-pending'`) keyed by the
+   same deterministic `reassignmentDedupeKey()` as before. If this write
+   fails, GitHub is never mutated — there is nothing to reconcile because
+   nothing happened. A collision against an existing row this exact call
+   didn't just insert only proceeds to mutate when that row is *itself*
+   still `'mutation-pending'` (a prior crash before the mutation ran); any
+   other state means an earlier pass already applied or is delivering
+   evidence, and this call returns without touching GitHub again.
+2. **After the label mutation is verified**, the same row transitions to
+   `'evidence-pending'`. If that transition cannot be durably recorded, the
+   function returns `applied: false, reason: 'applied-but-not-durably-recorded'`
+   and posts no comment — the mutation already happened, but this pass
+   cannot prove it durably, so it reports honestly rather than silently
+   "complete."
+3. **`reassignment complete` is reported (`applied: true`) as soon as step 2
+   succeeds** — comment delivery is tracked and retried separately below,
+   and never flips `applied` back to `false` on its own.
+4. **`recordNoQualifiedAgentEvidence()`/`recordAmbiguousAgentLabelsEvidence()`**
+   never mutate GitHub, so their rows start life directly in
+   `'evidence-pending'`; a prior comment-delivery failure leaves the row
+   there, and a later call (dedupe-collision) retries delivery instead of
+   silently never trying again — the fixed bug this round's review named
+   explicitly (the previous design's `INSERT OR IGNORE` gate meant a
+   failed first comment could never be retried, because the dedupe row
+   already existed).
+5. **`reconcilePendingRoutingEvents()`** runs once per execute pass (when
+   the selector is engaged), before fresh selection: for every
+   non-`'resolved'` row, a `'mutation-pending'` row is self-healed to
+   `'evidence-pending'` by re-reading the live issue's labels and verifying
+   them against the row's own persisted `labelMutation` plan (via
+   `verifyLabelMutation()`) — **never by re-running the mutation**; if live
+   labels don't yet match, the row is left untouched (a fresh
+   `selectIssue()` reconciliation scan naturally re-flags the issue as a
+   candidate on its own, since its live label is unchanged, and
+   `attemptQueuedReassignment()` picks up the same dedupe key from there).
+   An `'evidence-pending'` row only ever retries the comment.
 
 ## Code map
 
 | File | Change |
 | --- | --- |
-| `scripts/ops/agent-runner-agent-settings.mjs` | `snapshotAgentSettings()`, `settingsRevisionUnchanged()`, per-agent qualification/paid-use normalization, Claude's permissive absent-entry default |
+| `scripts/ops/agent-runner-agent-settings.mjs` | `snapshotAgentSettings()`, `settingsRevisionUnchanged()` (now requires `fileFound: true` on both sides), per-agent qualification/paid-use normalization with no Claude-specific fallback, shared `normalizeSafeToken()`/`isSafeQualificationToken()` |
 | `scripts/ops/agent-runner-agent-settings.test.mjs` | snapshot/revision/qualification/paid-use coverage |
 | `.agent-runner/agent-settings.example.json` | adds `qualification` blocks and `automaticRoutingApproved: false` to codex-cli/grok-cli/ollama-agent |
 | `scripts/ops/issue-metadata.mjs` | unchanged — this migration-locked file needed no functional edit; `classifyIssueTaskRisk()` is built entirely from its existing exported primitives (see below) |
@@ -294,21 +386,20 @@ endpoints, prompts, or provider text.
 | `scripts/ops/agent-runner-qualification.test.mjs` | new — includes classification and conflict-handling coverage |
 | `scripts/ops/agent-runner-routing.mjs` | new — deterministic serial selector |
 | `scripts/ops/agent-runner-routing.test.mjs` | new |
-| `scripts/ops/agent-runner-reassignment.mjs` | new — queued-only precondition proof, label mutation plan/verify, evidence bodies |
+| `scripts/ops/agent-runner-reassignment.mjs` | queued-only precondition proof, label mutation plan/verify, evidence bodies (reassignment, no-qualified-agent, ambiguous-agent-labels), fixed mutation/read failure reason codes (never a raw exception message) |
 | `scripts/ops/agent-runner-reassignment.test.mjs` | new |
 | `scripts/ops/agent-runner-manager-authority.mjs` | `managerAuthorityApprovesAgent()` |
 | `scripts/ops/agent-runner-manager-authority.test.mjs` | coverage for the new comparator |
 | `scripts/ops/claude-runner-selection.mjs` | unchanged — already exposes `managerAuthority.approvedAgent`; no functional edit needed |
 | `scripts/ops/claude-runner-selection.test.mjs` | new — regression-proofs the `approvedAgent` contract `claude-runner-cron.mjs` now depends on |
-| `scripts/ops/claude-runner-cron.mjs` | selector-engagement boundary, status:ready reconciliation scan, readiness wiring (`computeReadinessByAgentId()`/`boundedReadiness()`), pre-attempt (not just pre-claim) settings-revision re-check, evidence-based reassignment guards, durability-gated reassignment reporting, per-candidate eligibility/qualification/approved-agent checks in `selectIssue()` |
-| `scripts/ops/claude-runner-cron.test.mjs` | selector/reconciliation/reassignment/no-qualified-agent/settings-revision/redaction coverage, all pre-existing tests still passing |
-| `scripts/ops/claude-runner-state.mjs` | `routing_events` table (schema v11), `recordRoutingEvent()`, `hasRoutingEvent()` |
-| `scripts/ops/claude-runner-state.test.mjs` | dedup/idempotency coverage |
+| `scripts/ops/claude-runner-cron.mjs` | explicit `AGENT_RUNNER_ENABLE_MULTIAGENT_ROUTING` gate, structurally independent execution/reconciliation label sets, ambiguous-agent-label detection and evidence, readiness wiring (`computeReadinessByAgentId()`/`boundedReadiness()`), pre-attempt (not just pre-claim) settings-revision re-check, evidence-based reassignment guards, crash-safe pending/delivery reassignment and evidence reporting (`reconcilePendingRoutingEvents()`), per-candidate eligibility/qualification/approved-agent checks in `selectIssue()` |
+| `scripts/ops/claude-runner-cron.test.mjs` | gate/selector/reconciliation/ambiguous-label/reassignment/no-qualified-agent/settings-revision/crash-safety/redaction coverage, all pre-existing tests still passing |
+| `scripts/ops/claude-runner-state.mjs` | `routing_events` table (schema v12), `delivery_status` column + `updateRoutingEventDeliveryStatus()`/`pendingRoutingEvents()`, `recordRoutingEvent()` now returns the colliding `existing` row, `hasRoutingEvent()` |
+| `scripts/ops/claude-runner-state.test.mjs` | dedup/idempotency/delivery-status-transition coverage |
 | `scripts/ops/agent-runner-control-readiness.mjs` | unchanged — `computeInstanceReadiness()` is now actually called, per pass, from `claude-runner-cron.mjs`; no functional edit to this module was needed |
 
 ## Known limitations and deferred gates
 
-- **The multi-agent selector's engagement boundary (settings-file presence) is this correction round's interpretation of the review comment, not an explicitly re-confirmed instruction — please confirm or correct it.** The review's own wording contains a tension: "a missing … settings document must be unusable for selection, reassignment and claim" reads as fully fail-closed even on absence, while "preserve old behaviour only when the multi-agent selector is not engaged" implies an absent file is exactly the *not engaged* case. This round adopted the latter reading — `snapshotAgentSettings().fileFound === true` gates engagement — because the alternative (treating a missing file as fail-closed too) would make every real production Claude issue newly non-executable the moment this branch deploys, since no production deployment has ever needed a `claude-code-cli` settings entry, explicit `task:`/`risk:` labels, or a settings file at all. If the intended reading is stricter, the fix is narrow: change the `multiAgentSelectorEngaged` computation in `main()`.
-- **The "alternative agent selected" and "reassignment applied" code paths are structurally unreachable against the real, committed catalogue** (every non-Claude adapter stays `implemented: false`) in live production dispatch — they are exercised through dependency-injected pure-function tests (`agent-runner-routing.test.mjs`, `agent-runner-reassignment.test.mjs`) and through `attemptQueuedReassignment()`/`selectIssue()` called directly with an injected `routingResult`/settings snapshot (`claude-runner-cron.test.mjs`), not a live `main()` run against a real second implemented adapter. Making the production catalogue injectable for that purpose remains out of this issue's scope.
-- Supervised per-adapter canaries, live routing enablement, concurrency, and the recurring execution timer remain gated on the later `#41` MVP integration milestone, unchanged by this issue.
-- **`scripts/ops/issue-metadata.mjs` was deliberately left byte-identical to its `MIGRATION-MANIFEST.json` `"locked"` import.** An earlier draft added `taskClass`/`riskClass`/`model`/`harness` fields directly to that module, which broke `agent-runner-manifest-provenance.test.mjs`'s hash check. Rather than editing `MIGRATION-MANIFEST.json`/`CANONICAL-OWNERSHIP.json` (both outside this issue's code map), the classification logic was relocated into `agent-runner-qualification.mjs#classifyIssueTaskRisk()`, built entirely from `issue-metadata.mjs`'s pre-existing exports (`findFieldValue`, `labelNames`, `normaliseToken`). No non-code-map file was modified.
+- **The "alternative agent selected" and "reassignment applied" code paths are structurally unreachable against the real, committed catalogue** (every non-Claude adapter stays `implemented: false`) in live production dispatch — they are exercised through dependency-injected pure-function tests (`agent-runner-routing.test.mjs`, `agent-runner-reassignment.test.mjs`) and through `attemptQueuedReassignment()`/`selectIssue()`/`reconcilePendingRoutingEvents()` called directly with an injected `routingResult`/settings snapshot/real SQLite store (`claude-runner-cron.test.mjs`), not a live `main()` run against a real second implemented adapter. Making the production catalogue injectable for that purpose remains out of this issue's scope.
+- Supervised per-adapter canaries, live routing enablement, concurrency, and the recurring execution timer remain gated on the later `#41` MVP integration milestone, unchanged by this issue. `AGENT_RUNNER_ENABLE_MULTIAGENT_ROUTING` is a code/test boundary only; nothing in this repository sets it in a deployed environment.
+- **`scripts/ops/issue-metadata.mjs` was deliberately left byte-identical to its `MIGRATION-MANIFEST.json` `"locked"` import.** An earlier draft added `taskClass`/`riskClass`/`model`/`harness` fields directly to that module, which broke `agent-runner-manifest-provenance.test.mjs`'s hash check. Rather than editing `MIGRATION-MANIFEST.json`/`CANONICAL-OWNERSHIP.json` (both outside this issue's code map), the classification logic was relocated into `agent-runner-qualification.mjs#classifyIssueTaskRisk()`, built entirely from `issue-metadata.mjs`'s pre-existing exports (`findFieldValue`, `labelNames`). No non-code-map file was modified.

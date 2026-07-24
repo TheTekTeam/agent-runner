@@ -136,6 +136,10 @@ export function noQualifiedAgentDedupeKey({ repo, issueNumber, settingsRevision 
   return `${repo}:${issueNumber}:no-qualified-agent:${settingsRevision}`;
 }
 
+export function ambiguousAgentLabelsDedupeKey({ repo, issueNumber, settingsRevision }) {
+  return `${repo}:${issueNumber}:ambiguous-agent-labels:${settingsRevision}`;
+}
+
 /**
  * The reassignment evidence comment is a sanitized, non-authority marker --
  * distinct from `MANAGER_PREFLIGHT_MARKER` and never matching the manager
@@ -171,6 +175,25 @@ export function buildNoQualifiedAgentEvidenceCommentBody({ issueNumber, reason =
     `Settings revision: ${settingsRevision}`,
     '',
     'No enabled, implemented, and qualified agent is currently eligible for this queued issue. No worker was launched, no manager packet was consumed, and no claim was created.',
+  ].join('\n');
+}
+
+/**
+ * `supportedAgentLabels` is always the bounded, catalogue-derived label
+ * *names* the issue actually carries (e.g. `agent:claude-code-cli`,
+ * `agent:codex-cli`) -- never a raw label object or description.
+ */
+export function buildAmbiguousAgentLabelsEvidenceCommentBody({ issueNumber, supportedAgentLabels = [], settingsRevision }) {
+  return [
+    ROUTING_ATTENTION_MARKER,
+    '',
+    '## Routing attention — ambiguous agent labels',
+    '',
+    `Issue: #${issueNumber}`,
+    `Supported agent labels present: ${supportedAgentLabels.join(', ') || 'none'}`,
+    `Settings revision: ${settingsRevision}`,
+    '',
+    'This issue carries more than one supported local agent label, resolving to more than one distinct agent. No agent was selected, no worker was launched, no manager packet was consumed, and no claim was created. Remove every supported agent label except the one intended before this issue can be routed.',
   ].join('\n');
 }
 

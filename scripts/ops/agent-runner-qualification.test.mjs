@@ -204,7 +204,7 @@ test('classifyIssueTaskRisk conflict evidence carries only a bounded key, never 
   };
   const classification = classifyIssueTaskRisk(issue);
   assert.equal(classification.taskClass, null);
-  assert.deepEqual(classification.conflicts, [{ key: 'taskClass' }]);
+  assert.deepEqual(classification.conflicts, [{ key: 'taskClass', reason: 'field-label-mismatch' }]);
   const serialized = JSON.stringify(classification);
   assert.ok(!serialized.includes('SECRET'), 'raw label value must never appear in serialized classification');
   assert.ok(!serialized.includes('sk-live'), 'raw field value must never appear in serialized classification');
@@ -222,4 +222,55 @@ test('classifyIssueTaskRisk never inspects issue title/body prose', () => {
   const classification = classifyIssueTaskRisk(issue);
   assert.equal(classification.taskClass, null);
   assert.equal(classification.riskClass, null);
+});
+
+// -- issue #50 review round 3: shared safe-token normalizer + multi-label ambiguity --
+
+test('classifyIssueTaskRisk normalizes a mixed-case, in-grammar label value deterministically (case-folded, not rejected)', () => {
+  const classification = classifyIssueTaskRisk({ labels: [{ name: 'task:Code' }] });
+  assert.equal(classification.taskClass, 'code');
+  assert.equal(classification.conflicts.length, 0);
+});
+
+test('classifyIssueTaskRisk treats two distinct task: labels on the same issue as a conflict, not "first label wins"', () => {
+  const issue = { labels: [{ name: 'task:code' }, { name: 'task:docs' }] };
+  const classification = classifyIssueTaskRisk(issue);
+  assert.equal(classification.taskClass, null);
+  assert.deepEqual(classification.conflicts, [{ key: 'taskClass', reason: 'multiple-labels' }]);
+});
+
+test('classifyIssueTaskRisk treats two copies of the exact same task: label as agreeing (not a conflict)', () => {
+  const issue = { labels: [{ name: 'task:code' }, { name: 'task:code' }] };
+  const classification = classifyIssueTaskRisk(issue);
+  assert.equal(classification.taskClass, 'code');
+  assert.equal(classification.conflicts.length, 0);
+});
+
+test('classifyIssueTaskRisk drops an out-of-grammar field value (too long) to null with the fixed invalid-value key -- never a raw value', () => {
+  const issue = { fields: { Risk: 'x'.repeat(200) } };
+  const classification = classifyIssueTaskRisk(issue);
+  assert.equal(classification.riskClass, null);
+  assert.deepEqual(classification.conflicts, [{ key: 'riskClass', reason: 'invalid-value' }]);
+});
+
+test('classifyIssueTaskRisk drops an out-of-grammar label value (secret-shaped, contains "/") to null with invalid-value, never echoing it', () => {
+  const issue = { labels: [{ name: 'risk:low/medium' }] };
+  const classification = classifyIssueTaskRisk(issue);
+  assert.equal(classification.riskClass, null);
+  assert.deepEqual(classification.conflicts, [{ key: 'riskClass', reason: 'invalid-value' }]);
+});
+
+test('classifyIssueTaskRisk never reads a label object\'s description field, even when it is secret-bearing -- only .name is ever inspected', () => {
+  const issue = {
+    labels: [
+      { name: 'task:code', description: 'sk-ant-shorttoken12', color: 'ff0000', id: 123 },
+      { name: 'risk:low', description: 'vault://another-secret-in-a-description' },
+    ],
+  };
+  const classification = classifyIssueTaskRisk(issue);
+  assert.equal(classification.taskClass, 'code');
+  assert.equal(classification.riskClass, 'low');
+  const serialized = JSON.stringify(classification);
+  assert.ok(!serialized.includes('sk-ant-shorttoken12'), 'a label description must never survive into classification, even when the label itself resolves cleanly');
+  assert.ok(!serialized.includes('vault://'));
 });
