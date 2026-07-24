@@ -2,6 +2,7 @@ import { constants as fsConstants, accessSync } from 'node:fs';
 
 import { getAgentSettings } from './agent-runner-agent-settings.mjs';
 import { FAILURE_SCOPES, foldProbeOutcomes, probeOutcome } from './agent-runner-adapter-contract.mjs';
+import { GROK_MAX_TOOL_ROUNDS_CEILING } from './agent-runner-grok-command.mjs';
 
 /**
  * Foundation-only Grok CLI adapter (issue #49).
@@ -33,12 +34,30 @@ import { FAILURE_SCOPES, foldProbeOutcomes, probeOutcome } from './agent-runner-
  * one version this foundation's contract was actually captured against
  * (`1.1.7`) rather than accepting any non-empty banner.
  *
+ * Before any of those process-touching probes, `admitGrokExecutionOptions()`
+ * runs first — immediately after the settings lifecycle gate and strictly
+ * before `executable`/`version`/`help-surface` — and validates the
+ * machine-local execution options a future dispatch would use: a bounded
+ * `timeout` (`1_000`..`3_600_000` ms, the same integer-millisecond contract
+ * `agent-runner-control-instances.mjs`'s `validateTimeoutValue()` already
+ * uses for every other adapter), a bounded `maxToolRounds`
+ * (`1`..`GROK_MAX_TOOL_ROUNDS_CEILING`), and a `model` that is either
+ * absent/null or a bounded, option-injection-safe identifier. The installed
+ * Grok CLI has no `--timeout` flag of its own (see `grok --help` above), so
+ * `timeout` here is a caller-enforced process deadline this foundation
+ * establishes and validates for a future live executor to honour — not a
+ * CLI argument `buildGrokCommandArgs()` emits. An invalid option fails
+ * closed with a fixed reason and calls neither `accessFn` nor `execFileFn`;
+ * the executable/version/help-surface probes never run.
+ *
  * Every probe is deterministic and non-generative: `executable` is a pure
  * local filesystem check, `version`/`help-surface` run the configured
- * binary's `--version`/`--help` banners. None of them ever asks Grok to run
- * a model, log in, or make a network/provider request. All I/O (`accessFn`,
- * `execFileFn`) is injectable so tests can prove zero real process access
- * while disabled.
+ * binary's `--version`/`--help` banners, and `admitGrokExecutionOptions()`
+ * only reads the machine-local settings entry already in memory. None of
+ * them ever asks Grok to run a model, log in, or make a network/provider
+ * request. All I/O (`accessFn`, `execFileFn`) is injectable so tests can
+ * prove zero real process access while disabled or while options are
+ * invalid.
  *
  * Sink-safety contract (mirrors the Codex foundation's manager-reviewed
  * contract from PR #62): `probeExecutable()` never returns the configured
@@ -47,12 +66,40 @@ import { FAILURE_SCOPES, foldProbeOutcomes, probeOutcome } from './agent-runner-
  * filesystem error routinely embeds the path itself). `probeVersion()`'s and
  * `probeHelpSurface()`'s failure paths are the same: a fixed reason, never
  * the raw `execFileFn` error message or raw help/version banner text.
- * `admitGrokPaidUse()`/`admitGrokDispatch()` return only booleans,
- * machine-readable reasons, and probe names — never the raw settings
- * `entry` a caller passed in, so a configured `sessionSecretRef` or
- * `executablePath` can never ride along in a serialized admission decision.
+ * `admitGrokPaidUse()`/`admitGrokExecutionOptions()`/`admitGrokDispatch()`
+ * return only booleans, machine-readable reasons, and probe names — never
+ * the raw settings `entry` a caller passed in, so a configured
+ * `sessionSecretRef`, `executablePath`, or `model` can never ride along in a
+ * serialized admission decision.
  */
 export const GROK_AGENT_ID = 'grok-cli';
+
+/**
+ * Bounded, caller-enforced process-deadline range for a future live
+ * executor. Matches the repository's existing generic timeout contract
+ * (`agent-runner-control-instances.mjs`'s `validateTimeoutValue()`) exactly,
+ * so a `timeout` configured for `grok-cli` through the control API's shared
+ * `ALLOWED_UPDATE_FIELDS.timeout` and the value this admission probe
+ * enforces can never disagree.
+ */
+export const GROK_TIMEOUT_MIN_MS = 1_000;
+export const GROK_TIMEOUT_MAX_MS = 3_600_000;
+
+/**
+ * A positive allowlist, not a denylist: a valid model identifier must start
+ * with an alphanumeric character and otherwise contain only
+ * alphanumerics/`_`/`.`/`/`/`:`/`-`, up to `GROK_MODEL_MAX_LENGTH`
+ * characters total. This is the exact same shape (and the same `128`-
+ * character bound) as `agent-runner-control-instances.mjs`'s own
+ * `MODEL_PATTERN`, reused deliberately rather than reinvented: a positive
+ * allowlist can't be bypassed by a character class its author forgot to
+ * deny, which a denylist can. It structurally satisfies every one of the
+ * governing packet's three requirements — a match can never start with `-`
+ * (option injection), never contain whitespace or a control character, and
+ * never exceed the length bound — without listing any of them individually.
+ */
+export const GROK_MODEL_MAX_LENGTH = 128;
+const GROK_MODEL_PATTERN = new RegExp(`^[A-Za-z0-9][A-Za-z0-9_./:-]{0,${GROK_MODEL_MAX_LENGTH - 1}}$`);
 
 /**
  * The one version this foundation's flag surface was actually captured
@@ -158,6 +205,61 @@ export function probeHelpSurface({ executablePath, execFileFn } = {}) {
   }
 }
 
+/**
+ * Pure, synchronous bounds check — no I/O, no defaulting: a missing/`null`
+ * `timeout` is invalid, exactly like an out-of-range one, since a future
+ * live executor needs an explicit deadline, not an implicit "no timeout."
+ */
+export function probeTimeout({ timeout } = {}) {
+  const number = Number(timeout);
+  if (!Number.isInteger(number) || number < GROK_TIMEOUT_MIN_MS || number > GROK_TIMEOUT_MAX_MS) {
+    return probeOutcome({ probe: 'timeout', ok: false, reason: 'grok-timeout-out-of-range' });
+  }
+  return probeOutcome({ probe: 'timeout', ok: true });
+}
+
+/** Pure, synchronous bounds check — no I/O. Mirrors `buildGrokCommandArgs()`'s own bound so admission and construction can never disagree. */
+export function probeMaxToolRounds({ maxToolRounds } = {}) {
+  const number = Number(maxToolRounds);
+  if (!Number.isInteger(number) || number < 1 || number > GROK_MAX_TOOL_ROUNDS_CEILING) {
+    return probeOutcome({ probe: 'max-tool-rounds', ok: false, reason: 'grok-max-tool-rounds-invalid' });
+  }
+  return probeOutcome({ probe: 'max-tool-rounds', ok: true });
+}
+
+/**
+ * Pure, synchronous shape check — no I/O. Absent/`null`/whitespace-only is
+ * valid (mirrors `buildGrokCommandArgs()`'s own "omit unless configured"
+ * handling); a configured value must match `GROK_MODEL_PATTERN`.
+ */
+export function probeModel({ model } = {}) {
+  if (model === undefined || model === null) return probeOutcome({ probe: 'model', ok: true });
+  const raw = String(model);
+  if (!raw.trim()) return probeOutcome({ probe: 'model', ok: true });
+  if (!GROK_MODEL_PATTERN.test(raw)) {
+    return probeOutcome({ probe: 'model', ok: false, reason: 'grok-model-invalid' });
+  }
+  return probeOutcome({ probe: 'model', ok: true });
+}
+
+/**
+ * The pre-I/O execution-options admission gate. Runs entirely against the
+ * settings `entry` already in memory — no `accessFn`, no `execFileFn`, no
+ * network, no command construction. Each sub-probe is independently
+ * mandatory; `foldProbeOutcomes` reports the first that fails.
+ */
+export function admitGrokExecutionOptions({ entry = {} } = {}) {
+  const resolvedEntry = isPlainObject(entry) ? entry : {};
+  const outcomes = [
+    probeTimeout({ timeout: resolvedEntry.timeout }),
+    probeMaxToolRounds({ maxToolRounds: resolvedEntry.maxToolRounds }),
+    probeModel({ model: resolvedEntry.model }),
+  ];
+  return { ...foldProbeOutcomes(outcomes, {
+    safeNextAction: `Set a timeout between ${GROK_TIMEOUT_MIN_MS} and ${GROK_TIMEOUT_MAX_MS} ms, a maxToolRounds between 1 and ${GROK_MAX_TOOL_ROUNDS_CEILING}, and either omit model or set a bounded, option-safe identifier before any future invocation.`,
+  }), probes: outcomes };
+}
+
 function normalizeLabels(labels = []) {
   return (Array.isArray(labels) ? labels : [])
     .map((value) => String(value?.name || value || '').trim())
@@ -195,11 +297,13 @@ export function admitGrokPaidUse({ entry = {}, labels = [] } = {}) {
 }
 
 /**
- * Settings gate, then executable/version/help-surface probes, then the
- * paid-use gate — in strict sequence, never `Promise.all`, stopping at the
- * first failure. Returns `probes: []` and calls no injected I/O function at
- * all when the agent is not routable, which is itself the zero-process/
- * zero-model-call proof for the disabled-by-default path.
+ * Settings gate, then the pre-I/O execution-options gate, then
+ * executable/version/help-surface probes, then the paid-use gate — in
+ * strict sequence, never `Promise.all`, stopping at the first failure.
+ * Returns `probes: []` and calls no injected I/O function at all when the
+ * agent is not routable or when an execution option is invalid, which is
+ * itself the zero-process/zero-model-call proof for both the
+ * disabled-by-default path and the invalid-configuration path.
  */
 export function admitGrokDispatch({
   env = process.env,
@@ -222,6 +326,12 @@ export function admitGrokDispatch({
   }
 
   const entry = isPlainObject(resolvedSettings.entry) ? resolvedSettings.entry : {};
+
+  const optionsDecision = admitGrokExecutionOptions({ entry });
+  if (!optionsDecision.allowed) {
+    return { ...optionsDecision, probes: optionsDecision.probes };
+  }
+
   const executable = resolveGrokExecutablePath(entry);
   const outcomes = [];
 
@@ -239,11 +349,11 @@ export function admitGrokDispatch({
 
   const readinessDecision = foldProbeOutcomes(outcomes);
   if (!readinessDecision.allowed) {
-    return { ...readinessDecision, probes: outcomes };
+    return { ...readinessDecision, probes: [...optionsDecision.probes, ...outcomes] };
   }
 
   const paidUseDecision = admitGrokPaidUse({ entry, labels });
-  return { ...paidUseDecision, probes: [...outcomes, ...paidUseDecision.probes] };
+  return { ...paidUseDecision, probes: [...optionsDecision.probes, ...outcomes, ...paidUseDecision.probes] };
 }
 
 export { classifyGrokExecutionError, grokUsageEnvelope, parseGrokResultEnvelope } from './agent-runner-grok-parser.mjs';

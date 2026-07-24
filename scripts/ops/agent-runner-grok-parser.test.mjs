@@ -187,39 +187,69 @@ test('a success payload whose message field contains synthetic secrets still sur
 
 // --- timeout / cancellation (process-level, not from stdout) -----------------
 
-test('timeout is classified distinctly from an ordinary execution error', () => {
+test('timeout is classified distinctly from an ordinary execution error, with a fixed structuredFailure token regardless of the injected signal', () => {
   const result = classifyGrokExecutionError({ timedOut: true, signal: 'SIGTERM' });
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'grok-timeout');
   assert.equal(result.failureScope, FAILURE_SCOPES.TASK_ATTEMPT);
   assert.equal(result.resultText, '');
+  assert.equal(result.structuredFailure, 'grok-timeout');
 });
 
-test('cancellation is classified distinctly from timeout and ordinary error', () => {
+test('cancellation is classified distinctly from timeout and ordinary error, with a fixed structuredFailure token regardless of the injected signal', () => {
   const result = classifyGrokExecutionError({ cancelled: true, signal: 'SIGINT' });
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'grok-cancelled');
   assert.equal(result.resultText, '');
+  assert.equal(result.structuredFailure, 'grok-cancelled');
 });
 
-test('an execution error that is neither timed out nor cancelled is classified generically', () => {
+test('an execution error that is neither timed out nor cancelled is classified generically, with a fixed structuredFailure token regardless of the injected code', () => {
   const result = classifyGrokExecutionError({ code: 'ENOENT', message: 'spawn grok ENOENT' });
   assert.equal(result.reason, 'grok-execution-error');
-  assert.equal(result.structuredFailure, 'ENOENT');
+  assert.equal(result.structuredFailure, 'grok-execution-error');
   assert.equal(result.resultText, '');
 });
 
-// --- adversarial: caller-supplied process-wrapper messages carrying secrets -
+// --- adversarial: caller-supplied process-wrapper message/signal/code carrying secrets -
+//
+// PR #63 manager review: earlier revisions forwarded `signal || code`
+// verbatim into `structuredFailure`. These tests place every synthetic
+// secret/session-handle/prompt/path/diagnostic into ALL THREE of `message`,
+// `signal`, and `code` simultaneously (not just `message`), serialize the
+// complete normalized result, and prove every synthetic value is absent AND
+// that `structuredFailure` is exactly the fixed token -- never the injected
+// signal/code themselves.
 
-for (const [label, options] of [
-  ['timeout with a secret-bearing message', { timedOut: true, signal: 'SIGTERM', message: `killed after timeout, cwd=${SYNTHETIC_SECRETS[3]} token=${SYNTHETIC_SECRETS[0]}` }],
-  ['cancellation with a secret-bearing message', { cancelled: true, signal: 'SIGINT', message: `cancelled by user, session=${SYNTHETIC_SECRETS[1]}` }],
-  ['generic execution error with a secret-bearing message', { code: 'ENOENT', message: `spawn ${SYNTHETIC_SECRETS[3]} ENOENT, auth=${SYNTHETIC_SECRETS[2]}` }],
+for (const [label, options, expectedToken] of [
+  [
+    'timeout with secrets in message, signal, and code',
+    { timedOut: true, message: `killed after timeout, cwd=${SYNTHETIC_SECRETS[3]} token=${SYNTHETIC_SECRETS[0]}`, signal: SYNTHETIC_SECRETS[1], code: SYNTHETIC_SECRETS[2] },
+    'grok-timeout',
+  ],
+  [
+    'cancellation with secrets in message, signal, and code',
+    { cancelled: true, message: `cancelled by user, session=${SYNTHETIC_SECRETS[1]}`, signal: SYNTHETIC_SECRETS[3], code: SYNTHETIC_SECRETS[4] },
+    'grok-cancelled',
+  ],
+  [
+    'generic execution error with secrets in message, signal, and code',
+    { message: `spawn ${SYNTHETIC_SECRETS[3]} ENOENT, auth=${SYNTHETIC_SECRETS[2]}`, signal: SYNTHETIC_SECRETS[0], code: SYNTHETIC_SECRETS[1] },
+    'grok-execution-error',
+  ],
 ]) {
-  test(`classifyGrokExecutionError never echoes the caller-supplied message: ${label}`, () => {
+  test(`classifyGrokExecutionError never echoes message, signal, or code, and structuredFailure is exactly the fixed token: ${label}`, () => {
     const result = classifyGrokExecutionError(options);
     assert.equal(result.resultText, '');
+    assert.equal(result.structuredFailure, expectedToken);
+    // The injected signal/code values are themselves synthetic secrets, so
+    // assertNoLeak() (which checks the whole SYNTHETIC_SECRETS list against
+    // the full serialized result) already proves they are absent; this
+    // extra check pins the exact, closed-vocabulary value.
     assertNoLeak(result, label);
+    const serialized = JSON.stringify(result);
+    assert.equal(serialized.includes(options.signal), false, `${label}: raw signal leaked`);
+    assert.equal(serialized.includes(options.code), false, `${label}: raw code leaked`);
   });
 }
 

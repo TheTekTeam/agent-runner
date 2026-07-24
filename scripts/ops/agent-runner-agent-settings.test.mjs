@@ -146,7 +146,7 @@ test('the documented example settings payload itself resolves to a non-routable 
   assert.equal(settings.entry.maxTokensPerRun, 0);
 }));
 
-test('the documented example settings payload itself resolves to a non-routable grok-cli with no paid-use approval, no committed executable path or session ref, and a bounded tool-round default', () => withTempSettings(AGENT_SETTINGS_EXAMPLE, (settingsPath) => {
+test('the documented example settings payload itself resolves to a non-routable grok-cli with no paid-use approval, no committed executable path or session ref, and bounded timeout/tool-round defaults', () => withTempSettings(AGENT_SETTINGS_EXAMPLE, (settingsPath) => {
   const settings = getAgentSettings({ agentId: 'grok-cli', settingsPath });
   assert.equal(settings.routable, false);
   assert.equal(settings.reason, 'agent-disabled');
@@ -156,6 +156,8 @@ test('the documented example settings payload itself resolves to a non-routable 
   assert.equal(settings.entry.executablePath, null);
   assert.equal(settings.entry.sessionSecretRef, null);
   assert.ok(Number.isInteger(settings.entry.maxToolRounds) && settings.entry.maxToolRounds > 0);
+  assert.ok(Number.isInteger(settings.entry.timeout));
+  assert.ok(settings.entry.timeout >= 1000 && settings.entry.timeout <= 3_600_000, 'the committed example timeout must fall within the repository-wide 1_000..3_600_000 ms bound');
 }));
 
 test('getAgentSettings requires an agentId', () => {

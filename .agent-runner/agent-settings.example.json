@@ -33,6 +33,7 @@
       "disabled": true,
       "executablePath": null,
       "model": null,
+      "timeout": 300000,
       "maxToolRounds": 50,
       "paidUseApproved": false,
       "maxCostUsdPerRun": 0,

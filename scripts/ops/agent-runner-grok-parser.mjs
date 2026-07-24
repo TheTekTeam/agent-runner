@@ -23,17 +23,22 @@ import { FAILURE_SCOPES, normalizedAdapterResult } from './agent-runner-adapter-
  * `docs/ops/AGENT-RUNNER-GROK-ADAPTER-FOUNDATION.md`. Every function here is
  * a pure parser: none of them spawn a process or make a network/model call.
  *
- * Sink-safety contract (mirrors the Codex foundation's manager-reviewed
- * contract from PR #62): raw stdout, provider error text, prompt content,
- * session/credential material, and arbitrary process-wrapper messages are
- * classification *inputs* only — they are read to pick a bounded,
- * machine-readable `reason`/enum value and are never themselves placed into
- * the returned `normalizedAdapterResult` (`resultText`, `structuredFailure`,
- * or any other field). Every non-success path below returns
- * `resultText: ''` and either `structuredFailure: null` or a bounded,
- * closed-vocabulary token (`grok-invalid-output`, an OS signal name, an
- * error `code`) — never a raw, unbounded string a malformed/adversarial
- * payload could fill with secrets. `agent-runner-grok-adapter.test.mjs` and
+ * Sink-safety contract (tightened per PR #63 manager review, mirroring the
+ * Codex foundation's manager-reviewed contract from PR #62): raw stdout,
+ * provider error text, prompt content, session/credential material, and
+ * arbitrary caller-supplied process-wrapper `message`/`signal`/`code` values
+ * are classification *inputs* only — they are read (or, for
+ * `classifyGrokExecutionError()`'s `message`/`signal`/`code`, not read at
+ * all; only the `cancelled`/`timedOut` booleans select the branch) to pick a
+ * bounded, machine-readable `reason`/enum value and are never themselves
+ * placed into the returned `normalizedAdapterResult` (`resultText`,
+ * `structuredFailure`, or any other field). Every non-success path below
+ * returns `resultText: ''` and either `structuredFailure: null` or one of a
+ * small, fixed, finite set of closed-vocabulary tokens
+ * (`'grok-invalid-output'`, `'grok-cancelled'`, `'grok-timeout'`,
+ * `'grok-execution-error'`) — never an OS signal name, an error `code`, or
+ * any other raw, unbounded string a malformed/adversarial payload or
+ * process wrapper could fill with secrets. `agent-runner-grok-adapter.test.mjs` and
  * this module's own test file prove this by serializing full results seeded
  * with synthetic credentials/session handles/local paths/prompts and
  * asserting their absence.
@@ -154,19 +159,27 @@ export function parseGrokResultEnvelope(stdout = '', { agentId = 'grok-cli' } = 
  * Classify a process-level execution outcome (timeout/cancellation) that
  * never produced parseable Grok output. No child-process spawning lives in
  * this foundation-only module — callers normalize their own process
- * wrapper's outcome into this shape. `message` is an arbitrary,
- * caller-supplied string (a raised error's `.message`, which can embed a
- * full command line, a path, or provider diagnostic text) and is discarded
- * entirely rather than echoed; only `signal`/`code` — short, closed-
- * vocabulary OS-level tokens (`SIGTERM`, `ENOENT`, ...) — ever reach
- * `structuredFailure`.
+ * wrapper's outcome into this shape.
+ *
+ * Branch selection is driven entirely by the boolean `cancelled`/`timedOut`
+ * flags. `message`, `signal`, and `code` are accepted only for call-site
+ * shape compatibility with a future live process wrapper and are otherwise
+ * inert: none of the three is read, and none is ever placed into the
+ * returned result. Earlier revisions of this function forwarded
+ * `signal || code` into `structuredFailure` verbatim; a caller could place a
+ * credential, session handle, path, prompt, or unrestricted diagnostic in
+ * either field and have it survive into a normalized result. There is now
+ * no code path through which any of `message`/`signal`/`code` can reach the
+ * return value: `structuredFailure` is always one of the fixed, finite
+ * tokens `'grok-cancelled'`, `'grok-timeout'`, or `'grok-execution-error'`
+ * (matching `reason`), regardless of what the caller passes.
  */
 export function classifyGrokExecutionError({ timedOut = false, cancelled = false, signal = null, code = null, message = '' } = {}) {
   if (cancelled) {
-    return normalizedAdapterResult({ ok: false, reason: 'grok-cancelled', failureScope: FAILURE_SCOPES.TASK_ATTEMPT, resultText: '', structuredFailure: signal || code || null, usage: grokUsageEnvelope({}) });
+    return normalizedAdapterResult({ ok: false, reason: 'grok-cancelled', failureScope: FAILURE_SCOPES.TASK_ATTEMPT, resultText: '', structuredFailure: 'grok-cancelled', usage: grokUsageEnvelope({}) });
   }
   if (timedOut) {
-    return normalizedAdapterResult({ ok: false, reason: 'grok-timeout', failureScope: FAILURE_SCOPES.TASK_ATTEMPT, resultText: '', structuredFailure: signal || code || null, usage: grokUsageEnvelope({}) });
+    return normalizedAdapterResult({ ok: false, reason: 'grok-timeout', failureScope: FAILURE_SCOPES.TASK_ATTEMPT, resultText: '', structuredFailure: 'grok-timeout', usage: grokUsageEnvelope({}) });
   }
-  return normalizedAdapterResult({ ok: false, reason: 'grok-execution-error', failureScope: FAILURE_SCOPES.TASK_ATTEMPT, resultText: '', structuredFailure: code || signal || null, usage: grokUsageEnvelope({}) });
+  return normalizedAdapterResult({ ok: false, reason: 'grok-execution-error', failureScope: FAILURE_SCOPES.TASK_ATTEMPT, resultText: '', structuredFailure: 'grok-execution-error', usage: grokUsageEnvelope({}) });
 }

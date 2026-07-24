@@ -7,14 +7,22 @@ import test from 'node:test';
 
 import { FAILURE_SCOPES } from './agent-runner-adapter-contract.mjs';
 import { AGENT_ADAPTERS, resolveAgentForLabels } from './agent-runner-agents.mjs';
+import { GROK_MAX_TOOL_ROUNDS_CEILING } from './agent-runner-grok-command.mjs';
 import {
   admitGrokDispatch,
+  admitGrokExecutionOptions,
   admitGrokPaidUse,
   buildGrokCommandArgs,
   GROK_AGENT_ID,
+  GROK_MODEL_MAX_LENGTH,
   GROK_SUPPORTED_VERSIONS,
+  GROK_TIMEOUT_MAX_MS,
+  GROK_TIMEOUT_MIN_MS,
   probeExecutable,
   probeHelpSurface,
+  probeMaxToolRounds,
+  probeModel,
+  probeTimeout,
   probeVersion,
   resolveGrokExecutablePath,
 } from './agent-runner-grok-adapter.mjs';
@@ -81,6 +89,11 @@ const NOT_ROUTABLE_SETTINGS = { agentId: GROK_AGENT_ID, routable: false, reason:
 const PAID_USE_APPROVED = { paidUseApproved: true, maxCostUsdPerRun: 2.5 };
 const CLI_LABELS = [{ name: 'agent:grok-cli' }];
 
+// A minimal valid execution-options block, merged into `fakeSettings()`
+// entries for tests that intend to exercise the executable/version/
+// help-surface/paid-use probes beyond the pre-I/O options gate.
+const VALID_EXECUTION_OPTIONS = { timeout: 60000, maxToolRounds: 50 };
+
 function execFileFnFor({ version = REFERENCE_VERSION, help = REFERENCE_HELP_TEXT } = {}) {
   return (path, args) => {
     if (args[0] === '--version') return version;
@@ -143,19 +156,182 @@ test('no other label resolves to grok-cli, and no adapter besides grok-cli claim
   assert.deepEqual(AGENT_ADAPTERS['grok-cli'].labels, ['agent:grok-cli']);
 });
 
+// --- 2b. Execution-options admission gate: pre-I/O, runs before executable/version/help ---
+
+test('probeTimeout accepts the exact boundary values and rejects just outside them', () => {
+  assert.equal(probeTimeout({ timeout: GROK_TIMEOUT_MIN_MS }).ok, true);
+  assert.equal(probeTimeout({ timeout: GROK_TIMEOUT_MAX_MS }).ok, true);
+  assert.equal(probeTimeout({ timeout: GROK_TIMEOUT_MIN_MS - 1 }).ok, false);
+  assert.equal(probeTimeout({ timeout: GROK_TIMEOUT_MAX_MS + 1 }).ok, false);
+});
+
+test('probeTimeout fails closed for non-integer, missing, null, and non-numeric values', () => {
+  for (const bad of [undefined, null, '', 'not-a-number', 1500.5, NaN, {}, []]) {
+    const outcome = probeTimeout({ timeout: bad });
+    assert.equal(outcome.ok, false, `timeout=${JSON.stringify(bad)} should be rejected`);
+    assert.equal(outcome.reason, 'grok-timeout-out-of-range');
+  }
+});
+
+test('probeMaxToolRounds accepts the exact boundary values and rejects just outside them', () => {
+  assert.equal(probeMaxToolRounds({ maxToolRounds: 1 }).ok, true);
+  assert.equal(probeMaxToolRounds({ maxToolRounds: GROK_MAX_TOOL_ROUNDS_CEILING }).ok, true);
+  assert.equal(probeMaxToolRounds({ maxToolRounds: 0 }).ok, false);
+  assert.equal(probeMaxToolRounds({ maxToolRounds: GROK_MAX_TOOL_ROUNDS_CEILING + 1 }).ok, false);
+});
+
+test('probeMaxToolRounds fails closed for non-integer, negative, missing, and null values', () => {
+  for (const bad of [undefined, null, -1, 12.5, NaN, '', 'fifty']) {
+    const outcome = probeMaxToolRounds({ maxToolRounds: bad });
+    assert.equal(outcome.ok, false, `maxToolRounds=${JSON.stringify(bad)} should be rejected`);
+    assert.equal(outcome.reason, 'grok-max-tool-rounds-invalid');
+  }
+});
+
+test('probeModel treats absent, null, empty, and whitespace-only as valid (not configured)', () => {
+  assert.equal(probeModel({}).ok, true);
+  assert.equal(probeModel({ model: null }).ok, true);
+  assert.equal(probeModel({ model: undefined }).ok, true);
+  assert.equal(probeModel({ model: '' }).ok, true);
+  assert.equal(probeModel({ model: '   ' }).ok, true);
+});
+
+test('probeModel accepts a normal bounded identifier and the exact max-length boundary', () => {
+  assert.equal(probeModel({ model: 'grok-4-fast' }).ok, true);
+  assert.equal(probeModel({ model: 'x'.repeat(GROK_MODEL_MAX_LENGTH) }).ok, true);
+});
+
+test('probeModel rejects a model that could be interpreted as another CLI option (leading -)', () => {
+  const outcome = probeModel({ model: '--allow-net' });
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.reason, 'grok-model-invalid');
+});
+
+test('probeModel rejects whitespace and control characters anywhere in the value', () => {
+  assert.equal(probeModel({ model: 'grok 4' }).ok, false);
+  assert.equal(probeModel({ model: 'grok\t4' }).ok, false);
+  assert.equal(probeModel({ model: 'grok\n4' }).ok, false);
+  assert.equal(probeModel({ model: 'grok\x074' }).ok, false);
+  assert.equal(probeModel({ model: 'grok\x7f4' }).ok, false);
+});
+
+test('probeModel rejects a value longer than GROK_MODEL_MAX_LENGTH', () => {
+  const outcome = probeModel({ model: 'x'.repeat(GROK_MODEL_MAX_LENGTH + 1) });
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.reason, 'grok-model-invalid');
+});
+
+test('admitGrokExecutionOptions folds all three sub-probes and reports the first failure', () => {
+  const timeoutFails = admitGrokExecutionOptions({ entry: { timeout: 1, maxToolRounds: 50, model: null } });
+  assert.equal(timeoutFails.allowed, false);
+  assert.equal(timeoutFails.failedProbe, 'timeout');
+  assert.equal(timeoutFails.probes.length, 3);
+
+  const toolRoundsFails = admitGrokExecutionOptions({ entry: { timeout: 60000, maxToolRounds: 0, model: null } });
+  assert.equal(toolRoundsFails.allowed, false);
+  assert.equal(toolRoundsFails.failedProbe, 'max-tool-rounds');
+
+  const modelFails = admitGrokExecutionOptions({ entry: { timeout: 60000, maxToolRounds: 50, model: '-x' } });
+  assert.equal(modelFails.allowed, false);
+  assert.equal(modelFails.failedProbe, 'model');
+
+  const allPass = admitGrokExecutionOptions({ entry: { timeout: 60000, maxToolRounds: 50, model: 'grok-4' } });
+  assert.equal(allPass.allowed, true);
+  assert.equal(allPass.probes.length, 3);
+});
+
+test('admitGrokExecutionOptions treats a non-object entry the same as an empty one -- everything fails closed on the missing timeout/maxToolRounds', () => {
+  const decision = admitGrokExecutionOptions({ entry: null });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.failedProbe, 'timeout');
+});
+
+// The core ordering/no-I/O requirement: an invalid timeout, maxToolRounds,
+// or model must short-circuit admitGrokDispatch BEFORE executable/version/
+// help-surface run, calling neither accessFn nor execFileFn, and before any
+// command is constructed (admitGrokDispatch never calls
+// buildGrokCommandArgs at all -- there is no code path for it to do so).
+
+test('an invalid timeout short-circuits admitGrokDispatch before executable/version/help, even with a fully valid executable path', () => withTempRoot((dir) => {
+  const execPath = writeFakeExecutable(dir);
+  const decision = admitGrokDispatch({
+    settings: fakeSettings({ executablePath: execPath, timeout: 500, maxToolRounds: 50, ...PAID_USE_APPROVED }),
+    labels: CLI_LABELS,
+    accessFn: neverCalled('accessFn'),
+    execFileFn: neverCalled('execFileFn'),
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.failedProbe, 'timeout');
+  assert.equal(decision.reason, 'grok-timeout-out-of-range');
+  assert.equal(decision.probes.length, 3);
+}));
+
+test('an invalid maxToolRounds short-circuits admitGrokDispatch before executable/version/help, even with a fully valid executable path', () => withTempRoot((dir) => {
+  const execPath = writeFakeExecutable(dir);
+  const decision = admitGrokDispatch({
+    settings: fakeSettings({ executablePath: execPath, timeout: 60000, maxToolRounds: GROK_MAX_TOOL_ROUNDS_CEILING + 1, ...PAID_USE_APPROVED }),
+    labels: CLI_LABELS,
+    accessFn: neverCalled('accessFn'),
+    execFileFn: neverCalled('execFileFn'),
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.failedProbe, 'max-tool-rounds');
+  assert.equal(decision.reason, 'grok-max-tool-rounds-invalid');
+  assert.equal(decision.probes.length, 3);
+}));
+
+test('an invalid model short-circuits admitGrokDispatch before executable/version/help, even with a fully valid executable path', () => withTempRoot((dir) => {
+  const execPath = writeFakeExecutable(dir);
+  const decision = admitGrokDispatch({
+    settings: fakeSettings({ executablePath: execPath, ...VALID_EXECUTION_OPTIONS, model: '--allow-net', ...PAID_USE_APPROVED }),
+    labels: CLI_LABELS,
+    accessFn: neverCalled('accessFn'),
+    execFileFn: neverCalled('execFileFn'),
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.failedProbe, 'model');
+  assert.equal(decision.reason, 'grok-model-invalid');
+  assert.equal(decision.probes.length, 3);
+}));
+
+test('a missing timeout (not yet configured) short-circuits admitGrokDispatch the same as an out-of-range one, calling no injected I/O function', () => withTempRoot((dir) => {
+  const execPath = writeFakeExecutable(dir);
+  const decision = admitGrokDispatch({
+    settings: fakeSettings({ executablePath: execPath, maxToolRounds: 50, ...PAID_USE_APPROVED }),
+    labels: CLI_LABELS,
+    accessFn: neverCalled('accessFn'),
+    execFileFn: neverCalled('execFileFn'),
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.failedProbe, 'timeout');
+}));
+
+test('the options-gate-blocked decision constructs no command: it has no argv/command-shaped field at all', () => withTempRoot((dir) => {
+  const execPath = writeFakeExecutable(dir);
+  const decision = admitGrokDispatch({
+    settings: fakeSettings({ executablePath: execPath, timeout: 500, maxToolRounds: 50, ...PAID_USE_APPROVED }),
+    labels: CLI_LABELS,
+    accessFn: neverCalled('accessFn'),
+    execFileFn: neverCalled('execFileFn'),
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal('argv' in decision, false);
+  assert.equal('command' in decision, false);
+}));
+
 // --- 3. Unavailable executable -----------------------------------------------
 
 test('unavailable executable: real temp-repo filesystem check fails closed and short-circuits later probes', () => withTempRoot((dir) => {
   const missingPath = join(dir, 'does-not-exist', 'grok');
   const decision = admitGrokDispatch({
-    settings: fakeSettings({ executablePath: missingPath, ...PAID_USE_APPROVED }),
+    settings: fakeSettings({ executablePath: missingPath, ...VALID_EXECUTION_OPTIONS, ...PAID_USE_APPROVED }),
     labels: CLI_LABELS,
     execFileFn: neverCalled('execFileFn'),
   });
   assert.equal(decision.allowed, false);
   assert.equal(decision.failedProbe, 'executable');
   assert.equal(decision.reason, 'grok-executable-unavailable');
-  assert.equal(decision.probes.length, 1);
+  assert.equal(decision.probes.length, 4);
 }));
 
 test('resolveGrokExecutablePath never falls back to a PATH search', () => {
@@ -260,7 +436,7 @@ test('a failed help-surface probe never echoes the raw help text or the raw exec
 test('adversarial: executable passes but execFileFn throws a secret-bearing error -- the serialized admitGrokDispatch decision is clean', () => withTempRoot((dir) => {
   const execPath = writeFakeExecutable(dir);
   const decision = admitGrokDispatch({
-    settings: fakeSettings({ executablePath: execPath, ...PAID_USE_APPROVED }),
+    settings: fakeSettings({ executablePath: execPath, ...VALID_EXECUTION_OPTIONS, ...PAID_USE_APPROVED }),
     labels: CLI_LABELS,
     execFileFn: () => { throw new Error(`spawn ${execPath} ENOENT, session=${SYNTHETIC_SECRETS[1]}, key=${SYNTHETIC_SECRETS[0]}`); },
   });
@@ -273,13 +449,13 @@ test('adversarial: executable passes but execFileFn throws a secret-bearing erro
 test('admission fails at help-surface when executable/version pass but the help text has drifted', () => withTempRoot((dir) => {
   const execPath = writeFakeExecutable(dir);
   const decision = admitGrokDispatch({
-    settings: fakeSettings({ executablePath: execPath, ...PAID_USE_APPROVED }),
+    settings: fakeSettings({ executablePath: execPath, ...VALID_EXECUTION_OPTIONS, ...PAID_USE_APPROVED }),
     labels: CLI_LABELS,
     execFileFn: execFileFnFor({ help: REFERENCE_HELP_TEXT.replace('-p, --prompt', '') }),
   });
   assert.equal(decision.allowed, false);
   assert.equal(decision.failedProbe, 'help-surface');
-  assert.equal(decision.probes.length, 3);
+  assert.equal(decision.probes.length, 6);
 }));
 
 // --- 4. Paid-use admission gate: all three parts independently mandatory ----
@@ -323,27 +499,27 @@ test('paid-use gate allows only when all three parts are simultaneously satisfie
   assert.ok(decision.probes.every((probe) => probe.ok));
 });
 
-test('full admission fails at the paid-use gate when executable/version/help-surface pass but approval is missing', () => withTempRoot((dir) => {
+test('full admission fails at the paid-use gate when options/executable/version/help-surface pass but approval is missing', () => withTempRoot((dir) => {
   const execPath = writeFakeExecutable(dir);
   const decision = admitGrokDispatch({
-    settings: fakeSettings({ executablePath: execPath, maxCostUsdPerRun: 5 }),
+    settings: fakeSettings({ executablePath: execPath, ...VALID_EXECUTION_OPTIONS, maxCostUsdPerRun: 5 }),
     labels: CLI_LABELS,
     execFileFn: execFileFnFor(),
   });
   assert.equal(decision.allowed, false);
   assert.equal(decision.failedProbe, 'paid-use-approval');
-  assert.equal(decision.probes.length, 6);
+  assert.equal(decision.probes.length, 9);
 }));
 
-test('full admission succeeds end-to-end when settings, executable, version, help-surface, and all three paid-use conditions pass', () => withTempRoot((dir) => {
+test('full admission succeeds end-to-end when settings, options, executable, version, help-surface, and all three paid-use conditions pass', () => withTempRoot((dir) => {
   const execPath = writeFakeExecutable(dir);
   const decision = admitGrokDispatch({
-    settings: fakeSettings({ executablePath: execPath, ...PAID_USE_APPROVED }),
+    settings: fakeSettings({ executablePath: execPath, ...VALID_EXECUTION_OPTIONS, ...PAID_USE_APPROVED }),
     labels: CLI_LABELS,
     execFileFn: execFileFnFor(),
   });
   assert.equal(decision.allowed, true);
-  assert.equal(decision.probes.length, 6);
+  assert.equal(decision.probes.length, 9);
   assert.ok(decision.probes.every((probe) => probe.ok));
 }));
 
@@ -371,7 +547,7 @@ test('command construction and admission against an isolated worktree never muta
 
     const execPath = writeFakeExecutable(dir);
     const decision = admitGrokDispatch({
-      settings: fakeSettings({ executablePath: execPath, ...PAID_USE_APPROVED }),
+      settings: fakeSettings({ executablePath: execPath, ...VALID_EXECUTION_OPTIONS, ...PAID_USE_APPROVED }),
       labels: CLI_LABELS,
       execFileFn: execFileFnFor(),
     });
@@ -424,11 +600,16 @@ test('admission decisions never surface the raw entry object, only booleans/prob
 
 test('adversarial: a fully serialized admitGrokDispatch success decision carries none of the configured secrets/paths', () => withTempRoot((dir) => {
   const execPath = writeFakeExecutable(dir);
+  // SYNTHETIC_SECRETS[0] has no whitespace/control characters and no
+  // leading '-', so it is a validly-shaped model per probeModel() -- this
+  // proves that a secret-*looking* but structurally valid model still never
+  // leaks, not merely that an invalid one gets rejected before it could.
   const secretBearingEntry = {
     executablePath: execPath,
+    ...VALID_EXECUTION_OPTIONS,
     ...PAID_USE_APPROVED,
     sessionSecretRef: `secretref:${SYNTHETIC_SECRETS[1]}`,
-    model: SYNTHETIC_SECRETS[4],
+    model: SYNTHETIC_SECRETS[0],
   };
   const decision = admitGrokDispatch({
     settings: fakeSettings(secretBearingEntry),
@@ -445,6 +626,7 @@ test('adversarial: a fully serialized admitGrokDispatch failure decision carries
   const decision = admitGrokDispatch({
     settings: fakeSettings({
       executablePath: secretBearingPath,
+      ...VALID_EXECUTION_OPTIONS,
       sessionSecretRef: `secretref:${SYNTHETIC_SECRETS[1]}`,
     }),
     labels: CLI_LABELS,
@@ -453,6 +635,27 @@ test('adversarial: a fully serialized admitGrokDispatch failure decision carries
   });
   assert.equal(decision.allowed, false);
   assertNoLeak(decision, 'failed admitGrokDispatch decision');
+});
+
+test('adversarial: a fully serialized admitGrokDispatch decision blocked at the options gate by a secret-bearing invalid model carries none of the configured secrets/paths, and calls neither accessFn nor execFileFn', () => {
+  const secretBearingEntry = {
+    executablePath: `/home/attacker/${SYNTHETIC_SECRETS[3]}`,
+    ...VALID_EXECUTION_OPTIONS,
+    ...PAID_USE_APPROVED,
+    sessionSecretRef: `secretref:${SYNTHETIC_SECRETS[1]}`,
+    // Contains whitespace -> structurally invalid, rejected by probeModel()
+    // before any process probe runs.
+    model: SYNTHETIC_SECRETS[4],
+  };
+  const decision = admitGrokDispatch({
+    settings: fakeSettings(secretBearingEntry),
+    labels: CLI_LABELS,
+    accessFn: neverCalled('accessFn'),
+    execFileFn: neverCalled('execFileFn'),
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.failedProbe, 'model');
+  assertNoLeak(decision, 'options-gate-blocked admitGrokDispatch decision with a secret-bearing invalid model');
 });
 
 test('adversarial: the not-routable (disabled) admission decision carries no configured secret even when settings.entry is secret-bearing', () => {
@@ -476,7 +679,7 @@ test('no probe or admission function ever invokes a Batch API, remote-control, w
     return execFileFnFor()(path, args);
   };
   admitGrokDispatch({
-    settings: fakeSettings({ executablePath: execPath, ...PAID_USE_APPROVED }),
+    settings: fakeSettings({ executablePath: execPath, ...VALID_EXECUTION_OPTIONS, ...PAID_USE_APPROVED }),
     labels: CLI_LABELS,
     execFileFn: observingExecFileFn,
   });

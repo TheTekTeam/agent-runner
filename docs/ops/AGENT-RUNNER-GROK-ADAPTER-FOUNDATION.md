@@ -27,31 +27,36 @@ full repository validation are explicitly deferred to that later gate.
   catalogue entry: `command: null`, `implemented: false`,
   `labels: ['agent:grok-cli']`. No other adapter's labels changed.
 - **`scripts/ops/agent-runner-agent-settings.mjs`** (edited) — adds a
-  `grok-cli` entry to the shared `AGENT_SETTINGS_EXAMPLE` payload (mirrored
-  byte-for-byte in `.agent-runner/agent-settings.example.json`, proven by the
-  existing parity test). The generic fail-closed lifecycle loader itself is
-  unchanged.
+  `grok-cli` entry (including a bounded `timeout`, `1_000`..`3_600_000` ms)
+  to the shared `AGENT_SETTINGS_EXAMPLE` payload (mirrored byte-for-byte in
+  `.agent-runner/agent-settings.example.json`, proven by the existing parity
+  test). The generic fail-closed lifecycle loader itself is unchanged.
 - **`scripts/ops/agent-runner-grok-command.mjs`** (new) — bounded,
   Grok-native argv construction: explicit working directory, model only when
   configured, structured `--format json` output, a fixed always-on
   `--sandbox`, and a bounded `--max-tool-rounds`. No shell-string
-  construction; this function only returns an array.
+  construction; this function only returns an array. No `timeout` argument —
+  the CLI has no such flag (see below).
 - **`scripts/ops/agent-runner-grok-parser.mjs`** (new) — a bounded parser
   for a single-JSON-object `grok -p ... --format json` stdout capture,
   classifying success, no-op, task failure, authentication failure, and
   quota/rate-limit failure, plus a process-level
   `classifyGrokExecutionError()` for timeout/cancellation/generic execution
-  errors that never produced parseable output.
+  errors that never produced parseable output — `structuredFailure` is
+  always one of three fixed tokens, never a caller-supplied `signal`/`code`.
 - **`scripts/ops/agent-runner-grok-adapter.mjs`** (new) — orchestration: the
-  shared enabled/paused/draining/disabled settings gate, three deterministic
-  no-cost probes (`executable`, `version`, `help-surface`), and the
-  three-part paid-use admission gate (`admitGrokPaidUse`).
+  shared enabled/paused/draining/disabled settings gate, a pre-I/O
+  execution-options admission gate (`admitGrokExecutionOptions`, validating
+  `timeout`/`maxToolRounds`/`model`), three deterministic no-cost probes
+  (`executable`, `version`, `help-surface`), and the three-part paid-use
+  admission gate (`admitGrokPaidUse`).
 - Focused test files for all three new modules, plus label-resolution
   assertions added to `agent-runner-agents.test.mjs`, an example-payload
-  routability assertion added to `agent-runner-agent-settings.test.mjs`, a
-  `not-yet-qualified` cost-class assertion added to
-  `agent-runner-control-readiness.test.mjs`, and catalogue/sink-safety
-  assertions added to `agent-runner-control-instances.test.mjs`.
+  routability assertion (including the bounded `timeout`) added to
+  `agent-runner-agent-settings.test.mjs`, a `not-yet-qualified` cost-class
+  assertion added to `agent-runner-control-readiness.test.mjs`, and
+  catalogue/sink-safety assertions added to
+  `agent-runner-control-instances.test.mjs`.
 
 ## Captured qualification evidence (local, no-cost, non-authenticated)
 
@@ -156,6 +161,7 @@ Excluded, with no parameter and therefore no code path in
       "disabled": true,
       "executablePath": null,
       "model": null,
+      "timeout": 300000,
       "maxToolRounds": 50,
       "paidUseApproved": false,
       "maxCostUsdPerRun": 0,
@@ -168,14 +174,101 @@ Excluded, with no parameter and therefore no code path in
 
 `isAgentRoutable()`/`getAgentSettings().routable` requires **all** of
 `enabled: true`, `disabled: false`, `paused: false`, `draining: false`,
-exactly as issues #40 and #48 established. `maxToolRounds` defaults to `50`
-in the example payload — a conservative, bounded choice well under the
-installed CLI's own documented `--max-tool-rounds` default of `400`
-(`GROK_MAX_TOOL_ROUNDS_CEILING` in `agent-runner-grok-command.mjs`); the
-example value is not itself load-bearing for safety, since the adapter stays
-disabled regardless. `sessionSecretRef` is reserved for a future opaque
-`secretref:<id>` (issue #45) pointing at a Grok CLI credential; this
-foundation never reads or resolves it.
+exactly as issues #40 and #48 established.
+
+`timeout` is a **caller-enforced process deadline for a future live
+executor, not a CLI argument** — `grok --help` (captured above) has no
+`--timeout`/`-t` flag of any kind, so nothing in `buildGrokCommandArgs()`
+ever emits one. This foundation establishes and validates the *bound* a
+future executor must honour, using the repository's existing generic
+timeout contract exactly:
+`agent-runner-control-instances.mjs`'s `validateTimeoutValue()` already
+requires an **integer number of milliseconds from `1_000` through
+`3_600_000`** for every other adapter's `timeout` field (reachable through
+the control API's shared `ALLOWED_UPDATE_FIELDS.timeout`); `GROK_TIMEOUT_MIN_MS`/
+`GROK_TIMEOUT_MAX_MS` in `agent-runner-grok-adapter.mjs` mirror that same
+range so the two can never disagree. The committed example value,
+`300000` (5 minutes), is a **conservative, disabled-by-default choice**: it
+comfortably covers a bounded `maxToolRounds: 50` run without approaching
+the CLI's own unrelated `--max-tool-rounds` default of `400`, and — like
+`maxToolRounds` — is not itself load-bearing for safety, since the adapter
+stays disabled regardless of this value.
+
+`maxToolRounds` defaults to `50` in the example payload — a conservative,
+bounded choice well under the installed CLI's own documented
+`--max-tool-rounds` default of `400` (`GROK_MAX_TOOL_ROUNDS_CEILING` in
+`agent-runner-grok-command.mjs`).
+
+`sessionSecretRef` is reserved for a future opaque `secretref:<id>` (issue
+#45) pointing at a Grok CLI credential; this foundation never reads or
+resolves it.
+
+## The pre-I/O execution-options admission gate
+
+`admitGrokExecutionOptions({ entry })` is a **pure, synchronous function —
+no `accessFn`, no `execFileFn`, no network, no command construction** — that
+validates the settings `entry` already in memory before any process-touching
+probe runs. It requires **all** of:
+
+1. **A bounded `timeout`** — an integer from `GROK_TIMEOUT_MIN_MS` (`1_000`)
+   through `GROK_TIMEOUT_MAX_MS` (`3_600_000`), inclusive. Missing/`null`/
+   non-integer/out-of-range all fail closed with the same fixed reason
+   (`grok-timeout-out-of-range`) — an unset timeout is not treated as "no
+   limit."
+2. **A bounded `maxToolRounds`** — an integer from `1` through
+   `GROK_MAX_TOOL_ROUNDS_CEILING` (`400`), inclusive
+   (`grok-max-tool-rounds-invalid` otherwise).
+3. **A safe `model`** — absent/`null`/whitespace-only is valid (mirrors
+   `buildGrokCommandArgs()`'s own "omit unless configured" handling); a
+   configured value must match `GROK_MODEL_PATTERN`
+   (`^[A-Za-z0-9][A-Za-z0-9_./:-]{0,127}$`) — the exact same positive
+   allowlist shape, and the same `128`-character bound, as
+   `agent-runner-control-instances.mjs`'s own `MODEL_PATTERN` — otherwise
+   `grok-model-invalid`. A positive allowlist rather than a denylist: no
+   match can ever start with `-` (option injection), contain whitespace or a
+   control character, or exceed the length bound, without those needing to
+   be enumerated individually.
+
+Any one missing/invalid part fails the whole gate closed with a fixed,
+machine-readable reason, and — because this probe touches nothing but the
+in-memory `entry` — calling it (or reaching it through `admitGrokDispatch()`)
+invokes neither `accessFn` nor `execFileFn` and constructs no command:
+`admitGrokDispatch()` never calls `buildGrokCommandArgs()` at all, so there
+is no code path through which an invalid configuration could reach command
+construction.
+
+## Admission probes (all non-model, all injectable for tests)
+
+`admitGrokDispatch()` runs, in strict sequence:
+
+1. The shared settings lifecycle gate (calling no injected I/O function at
+   all when not routable — itself the zero-model-call/zero-mutation proof
+   for the disabled path).
+2. **The execution-options gate above** (`admitGrokExecutionOptions()`) —
+   runs immediately after the lifecycle gate and strictly before any of the
+   three probes below. An invalid `timeout`/`maxToolRounds`/`model` fails
+   closed here, before `executable`/`version`/`help-surface` ever run and
+   before `accessFn`/`execFileFn` are called even once.
+3. **executable** — `accessSync(path, X_OK)` against the explicit
+   `executablePath`. No `PATH` search, no default binary name.
+4. **version** — the configured executable's `--version` banner, checked
+   against the fixed `GROK_SUPPORTED_VERSIONS` allowlist (currently just
+   `['1.1.7']`, the version this foundation's contract was captured
+   against). A version outside the allowlist fails closed as
+   `grok-unsupported-version` rather than being accepted on the strength of
+   merely being non-empty.
+5. **help-surface** — the configured executable's `--help` banner, checked
+   for every flag `buildGrokCommandArgs()` depends on
+   (`-d, --directory`, `-m, --model`, `--format`, `--sandbox`,
+   `--max-tool-rounds`, `-p, --prompt`). A future CLI upgrade that removes
+   or renames any of these fails closed as `grok-help-drift` instead of
+   silently constructing an argv the installed binary no longer understands.
+6. The three-part paid-use gate below (`admitGrokPaidUse()`).
+
+A failing probe short-circuits later ones (proven in
+`agent-runner-grok-adapter.test.mjs`) — on a full success, `probes` carries
+all `3 + 3 + 3 = 9` sub-probe outcomes (execution-options, then
+executable/version/help-surface, then the paid-use gate's own three).
 
 ## The three-part paid-use admission gate
 
@@ -192,32 +285,6 @@ Any one missing part fails the whole gate closed, and the failing probe
 name (`paid-use-approval` / `per-run-ceiling` / `cli-label`) is always
 reported, never silently combined. This is a foundation-level policy check
 only — it makes no network, filesystem-write, or process call.
-
-## Admission probes (all non-model, all injectable for tests)
-
-`admitGrokDispatch()` runs, in strict sequence:
-
-1. The shared settings lifecycle gate (calling no injected I/O function at
-   all when not routable — itself the zero-model-call/zero-mutation proof
-   for the disabled path).
-2. **executable** — `accessSync(path, X_OK)` against the explicit
-   `executablePath`. No `PATH` search, no default binary name.
-3. **version** — the configured executable's `--version` banner, checked
-   against the fixed `GROK_SUPPORTED_VERSIONS` allowlist (currently just
-   `['1.1.7']`, the version this foundation's contract was captured
-   against). A version outside the allowlist fails closed as
-   `grok-unsupported-version` rather than being accepted on the strength of
-   merely being non-empty.
-4. **help-surface** — the configured executable's `--help` banner, checked
-   for every flag `buildGrokCommandArgs()` depends on
-   (`-d, --directory`, `-m, --model`, `--format`, `--sandbox`,
-   `--max-tool-rounds`, `-p, --prompt`). A future CLI upgrade that removes
-   or renames any of these fails closed as `grok-help-drift` instead of
-   silently constructing an argv the installed binary no longer understands.
-5. The three-part paid-use gate above.
-
-A failing probe short-circuits later ones (proven in
-`agent-runner-grok-adapter.test.mjs`).
 
 ## Isolated worktrees and no shared-checkout mutation
 
@@ -247,21 +314,44 @@ afterward.
   real filesystem error routinely embeds the path itself. `probeVersion()`'s
   and `probeHelpSurface()`'s failure paths match: a fixed reason, never the
   raw `execFileFn` error message or raw banner text.
-- `parseGrokResultEnvelope()` and `classifyGrokExecutionError()` read raw
-  stdout, terminal error messages, and caller-supplied process-wrapper
-  messages only to pick a bounded, machine-readable `reason`; none of that
-  raw text is ever placed into the returned `resultText` (always `''` on a
-  non-success/malformed path) or `structuredFailure` (always `null` or a
-  closed-vocabulary token — `grok-invalid-output`, `grok-run-failed`, an OS
-  signal name, an error `code`). Only a `status: 'success'` payload's own
-  `message` field — the assumed model output field, exercised only by mocked
-  test fixtures in this issue — populates `resultText`.
+- `admitGrokExecutionOptions()` never returns the raw `entry` it validated —
+  not even the configured `model`, `timeout`, or `maxToolRounds` value —
+  only booleans, fixed reasons (`grok-timeout-out-of-range`,
+  `grok-max-tool-rounds-invalid`, `grok-model-invalid`), and probe names.
+- `parseGrokResultEnvelope()` reads raw stdout and terminal error messages
+  only to pick a bounded, machine-readable `reason`; none of that raw text
+  is ever placed into the returned `resultText` (always `''` on a
+  non-success/malformed path) or `structuredFailure` (always `null` or one
+  of the fixed tokens `'grok-invalid-output'`/`'grok-run-failed'`). Only a
+  `status: 'success'` payload's own `message` field — the assumed model
+  output field, exercised only by mocked test fixtures in this issue —
+  populates `resultText`.
+- `classifyGrokExecutionError()` **discards `message`, `signal`, and `code`
+  entirely** — branch selection is driven only by the boolean
+  `cancelled`/`timedOut` flags, and `structuredFailure` is always exactly
+  one of three fixed, finite tokens: `'grok-cancelled'`, `'grok-timeout'`,
+  or `'grok-execution-error'` (matching `reason`). An earlier revision of
+  this function forwarded `signal || code` into `structuredFailure`
+  verbatim, which a caller could have used to smuggle a credential, session
+  handle, path, or prompt into a normalized result through either field —
+  this was corrected per PR #63 manager review before merge; no such code
+  path exists in this module.
 - All of the above is proven adversarially:
   `agent-runner-grok-parser.test.mjs` and `agent-runner-grok-adapter.test.mjs`
-  seed malformed stdout, terminal error messages, timeout/cancellation/
-  execution-error messages, and executable-probe errors with synthetic
-  credentials, session handles, prompts, and local paths, then serialize the
-  full returned result/decision and assert every synthetic value is absent.
+  seed malformed stdout, terminal error messages, and executable/version/
+  help-surface probe errors with synthetic credentials, session handles,
+  prompts, and local paths, then serialize the full returned result/decision
+  and assert every synthetic value is absent.
+  `agent-runner-grok-parser.test.mjs` additionally places every synthetic
+  secret into **all three** of `classifyGrokExecutionError()`'s `message`,
+  `signal`, and `code` simultaneously, across all three branches
+  (cancelled/timeout/generic), and asserts both that no synthetic value
+  survives and that `structuredFailure` is exactly the fixed token.
+  `agent-runner-grok-adapter.test.mjs` proves the execution-options gate
+  itself: invalid `timeout`/`maxToolRounds`/`model` (including a
+  secret-bearing invalid `model`) each short-circuit `admitGrokDispatch()`
+  before `executable`/`version`/`help-surface` run, calling neither
+  `accessFn` nor `execFileFn`.
 
 ## Allowed and forbidden task classes
 
@@ -304,6 +394,12 @@ currently be dispatched against. For the future live-enablement gate in
   contract was captured against (`1.1.7`). Any CLI upgrade requires this
   foundation to be re-verified and the allowlist updated — by design, not an
   oversight.
+- `admitGrokExecutionOptions()` establishes and validates the bound a
+  `timeout` must fall within; it does not itself start, watch, or kill any
+  process, since this foundation adds no live executor. Enforcing that bound
+  against a real `grok` invocation (a process-level deadline/kill) is
+  deferred to the live-enablement gate in `#41`, alongside the rest of live
+  dispatch.
 - No scheduler, dashboard, or cron wiring reads any of these new modules
   yet. Live routing, `agent:grok-cli` label activation, and timer changes
   are explicitly out of scope for this issue.
