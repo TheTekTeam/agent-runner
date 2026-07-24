@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -87,6 +87,47 @@ test('updateInstanceSettings rejects any field outside the positive allowlist, i
       InstanceUpdateRejectedError,
     );
   }
+}));
+
+test('updateInstanceSettings rejects Codex-specific credential/paid-use fields outside the positive allowlist', () => withTempPaths(({ settingsPath, auditPath }) => {
+  createInstance({ path: settingsPath, auditPath, agentId: 'codex-cli', ...ACTOR });
+  for (const field of ['sessionSecretRef', 'executablePath', 'paidUseApproved', 'maxCostUsdPerRun', 'maxTokensPerRun']) {
+    assert.throws(
+      () => updateInstanceSettings({ path: settingsPath, auditPath, agentId: 'codex-cli', updates: { [field]: 'x' }, ...ACTOR }),
+      InstanceUpdateRejectedError,
+    );
+  }
+}));
+
+test('a codex-cli entry carrying a sessionSecretRef never surfaces it in a built or listed snapshot', () => {
+  const adapter = { agentId: 'codex-cli', type: 'codex', command: null, implemented: false, controls: {} };
+  const entry = {
+    enabled: false, paused: false, draining: false, disabled: true,
+    executablePath: '/usr/local/bin/codex',
+    sessionSecretRef: 'secretref:codex-session-token',
+    paidUseApproved: false,
+  };
+  const snapshot = buildInstanceSnapshot({ agentId: 'codex-cli', adapter, entry });
+  const serialized = JSON.stringify(snapshot);
+  assert.equal(serialized.includes('secretref:'), false);
+  assert.equal(serialized.includes('codex-session-token'), false);
+  assert.equal(serialized.includes('/usr/local/bin/codex'), false);
+});
+
+test('listInstanceSnapshots never surfaces a sessionSecretRef present in the on-disk settings file', () => withTempPaths(({ settingsPath, auditPath }) => {
+  createInstance({ path: settingsPath, auditPath, agentId: 'codex-cli', ...ACTOR });
+  // Simulate a hand-edited machine-local settings file carrying adapter-specific
+  // fields the control API's positive allowlist can never write (proven above).
+  const doc = JSON.parse(readFileSync(settingsPath, 'utf8'));
+  doc.agents['codex-cli'].sessionSecretRef = 'secretref:codex-session-token';
+  doc.agents['codex-cli'].executablePath = '/usr/local/bin/codex';
+  writeFileSync(settingsPath, JSON.stringify(doc, null, 2));
+
+  const snapshots = listInstanceSnapshots({ path: settingsPath });
+  const serialized = JSON.stringify(snapshots);
+  assert.equal(serialized.includes('secretref:'), false);
+  assert.equal(serialized.includes('codex-session-token'), false);
+  assert.equal(serialized.includes('/usr/local/bin/codex'), false);
 }));
 
 test('validateMaxConcurrencyValue only ever accepts 1 — no multi-worker concurrency has a writable path', () => {

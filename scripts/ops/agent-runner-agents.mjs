@@ -39,7 +39,10 @@ export const AGENT_ADAPTERS = Object.freeze({
       outputFormat: Object.freeze({ supported: true, flag: '--output-format', default: 'json' }),
     }),
   }),
-  'codex-cli': Object.freeze({ agentId: 'codex-cli', type: 'codex', command: null, implemented: false, labels: Object.freeze(['agent:codex', 'agent:codex-cli']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
+  // `agent:codex` intentionally has no adapter entry anywhere in this
+  // catalogue: it identifies Codex Web/manual work and must never resolve to
+  // a local process. Only `agent:codex-cli` identifies this adapter.
+  'codex-cli': Object.freeze({ agentId: 'codex-cli', type: 'codex', command: null, implemented: false, labels: Object.freeze(['agent:codex-cli']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
   'gpt-agent': Object.freeze({ agentId: 'gpt-agent', type: 'gpt', command: null, implemented: false, labels: Object.freeze(['agent:gpt', 'agent:openai']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
   'gemini-cli': Object.freeze({ agentId: 'gemini-cli', type: 'gemini', command: null, implemented: false, labels: Object.freeze(['agent:gemini', 'agent:gemini-cli']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
   'ollama-agent': Object.freeze({ agentId: 'ollama-agent', type: 'ollama', command: null, implemented: false, labels: Object.freeze(['agent:ollama']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),

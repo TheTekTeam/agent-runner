@@ -10,6 +10,21 @@
       "endpointAllowlistHosts": [],
       "installedModelAllowlist": [],
       "minFreeMemoryBytes": 2147483648
+    },
+    "codex-cli": {
+      "enabled": false,
+      "paused": false,
+      "draining": false,
+      "disabled": true,
+      "executablePath": null,
+      "sandboxMode": "workspace-write",
+      "approvalMode": "on-request",
+      "model": null,
+      "reasoningEffort": null,
+      "paidUseApproved": false,
+      "maxCostUsdPerRun": 0,
+      "maxTokensPerRun": 0,
+      "sessionSecretRef": null
     }
   }
 }

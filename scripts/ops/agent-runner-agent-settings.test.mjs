@@ -137,6 +137,15 @@ test('the documented example settings payload itself resolves to a non-routable 
   assert.equal(settings.reason, 'agent-disabled');
 }));
 
+test('the documented example settings payload itself resolves to a non-routable codex-cli with no paid-use approval', () => withTempSettings(AGENT_SETTINGS_EXAMPLE, (settingsPath) => {
+  const settings = getAgentSettings({ agentId: 'codex-cli', settingsPath });
+  assert.equal(settings.routable, false);
+  assert.equal(settings.reason, 'agent-disabled');
+  assert.equal(settings.entry.paidUseApproved, false);
+  assert.equal(settings.entry.maxCostUsdPerRun, 0);
+  assert.equal(settings.entry.maxTokensPerRun, 0);
+}));
+
 test('getAgentSettings requires an agentId', () => {
   assert.throws(() => getAgentSettings({ settingsPath: '/nonexistent' }), /agentId/);
 });

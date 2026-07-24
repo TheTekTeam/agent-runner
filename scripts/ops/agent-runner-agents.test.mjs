@@ -119,3 +119,14 @@ test('default label registry includes Claude and future agents without implement
   assert.ok(allAgentLabels().includes('agent:codex-cli'));
   assert.deepEqual(allAgentLabels({ includeFuture: false }), ['agent:claude', 'agent:claude-code-cli']);
 });
+
+test('agent:codex is Codex Web/manual and is not one of codex-cli\'s labels, nor any other adapter\'s', () => {
+  assert.equal(resolveAgentById('codex-cli').labels.includes('agent:codex'), false);
+  assert.equal(allAgentLabels().includes('agent:codex'), false);
+  assert.equal(resolveAgentForLabels(['agent:codex']), null);
+});
+
+test('only agent:codex-cli identifies the codex-cli adapter', () => {
+  assert.equal(resolveAgentForLabels(['agent:codex-cli']).agentId, 'codex-cli');
+  assert.deepEqual(resolveAgentById('codex-cli').labels, ['agent:codex-cli']);
+});
