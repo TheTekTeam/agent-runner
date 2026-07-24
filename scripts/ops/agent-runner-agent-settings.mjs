@@ -128,5 +128,26 @@ export const AGENT_SETTINGS_EXAMPLE = Object.freeze({
       maxTokensPerRun: 0,
       sessionSecretRef: null,
     }),
+    'grok-cli': Object.freeze({
+      enabled: false,
+      paused: false,
+      draining: false,
+      disabled: true,
+      executablePath: null,
+      model: null,
+      // Bounded, caller-enforced process deadline for a future live
+      // executor (the installed Grok CLI has no --timeout flag of its own).
+      // Integer milliseconds, 1_000..3_600_000 -- the same range
+      // agent-runner-control-instances.mjs's validateTimeoutValue() already
+      // enforces for every other adapter. 300_000 (5 minutes) is a
+      // conservative example given maxToolRounds:50 below, well under the
+      // installed CLI's own --max-tool-rounds default of 400.
+      timeout: 300000,
+      maxToolRounds: 50,
+      paidUseApproved: false,
+      maxCostUsdPerRun: 0,
+      maxTokensPerRun: 0,
+      sessionSecretRef: null,
+    }),
   }),
 });

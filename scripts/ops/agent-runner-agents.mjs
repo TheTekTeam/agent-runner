@@ -43,6 +43,10 @@ export const AGENT_ADAPTERS = Object.freeze({
   // catalogue: it identifies Codex Web/manual work and must never resolve to
   // a local process. Only `agent:codex-cli` identifies this adapter.
   'codex-cli': Object.freeze({ agentId: 'codex-cli', type: 'codex', command: null, implemented: false, labels: Object.freeze(['agent:codex-cli']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
+  // Foundation-only (issue #49): command stays null and implemented stays
+  // false so no live dispatch can route to Grok under this issue. Only
+  // agent:grok-cli identifies this adapter.
+  'grok-cli': Object.freeze({ agentId: 'grok-cli', type: 'grok', command: null, implemented: false, labels: Object.freeze(['agent:grok-cli']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
   'gpt-agent': Object.freeze({ agentId: 'gpt-agent', type: 'gpt', command: null, implemented: false, labels: Object.freeze(['agent:gpt', 'agent:openai']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
   'gemini-cli': Object.freeze({ agentId: 'gemini-cli', type: 'gemini', command: null, implemented: false, labels: Object.freeze(['agent:gemini', 'agent:gemini-cli']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
   'ollama-agent': Object.freeze({ agentId: 'ollama-agent', type: 'ollama', command: null, implemented: false, labels: Object.freeze(['agent:ollama']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),

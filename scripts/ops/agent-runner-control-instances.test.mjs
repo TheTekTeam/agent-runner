@@ -130,6 +130,45 @@ test('listInstanceSnapshots never surfaces a sessionSecretRef present in the on-
   assert.equal(serialized.includes('/usr/local/bin/codex'), false);
 }));
 
+test('updateInstanceSettings rejects Grok-specific credential/paid-use fields outside the positive allowlist', () => withTempPaths(({ settingsPath, auditPath }) => {
+  createInstance({ path: settingsPath, auditPath, agentId: 'grok-cli', ...ACTOR });
+  for (const field of ['sessionSecretRef', 'executablePath', 'paidUseApproved', 'maxCostUsdPerRun', 'maxTokensPerRun', 'maxToolRounds']) {
+    assert.throws(
+      () => updateInstanceSettings({ path: settingsPath, auditPath, agentId: 'grok-cli', updates: { [field]: 'x' }, ...ACTOR }),
+      InstanceUpdateRejectedError,
+    );
+  }
+}));
+
+test('a grok-cli entry carrying a sessionSecretRef never surfaces it in a built or listed snapshot', () => {
+  const adapter = { agentId: 'grok-cli', type: 'grok', command: null, implemented: false, controls: {} };
+  const entry = {
+    enabled: false, paused: false, draining: false, disabled: true,
+    executablePath: '/usr/local/bin/grok',
+    sessionSecretRef: 'secretref:grok-session-token',
+    paidUseApproved: false,
+  };
+  const snapshot = buildInstanceSnapshot({ agentId: 'grok-cli', adapter, entry });
+  const serialized = JSON.stringify(snapshot);
+  assert.equal(serialized.includes('secretref:'), false);
+  assert.equal(serialized.includes('grok-session-token'), false);
+  assert.equal(serialized.includes('/usr/local/bin/grok'), false);
+});
+
+test('listInstanceSnapshots never surfaces a grok-cli sessionSecretRef present in the on-disk settings file', () => withTempPaths(({ settingsPath, auditPath }) => {
+  createInstance({ path: settingsPath, auditPath, agentId: 'grok-cli', ...ACTOR });
+  const doc = JSON.parse(readFileSync(settingsPath, 'utf8'));
+  doc.agents['grok-cli'].sessionSecretRef = 'secretref:grok-session-token';
+  doc.agents['grok-cli'].executablePath = '/usr/local/bin/grok';
+  writeFileSync(settingsPath, JSON.stringify(doc, null, 2));
+
+  const snapshots = listInstanceSnapshots({ path: settingsPath });
+  const serialized = JSON.stringify(snapshots);
+  assert.equal(serialized.includes('secretref:'), false);
+  assert.equal(serialized.includes('grok-session-token'), false);
+  assert.equal(serialized.includes('/usr/local/bin/grok'), false);
+}));
+
 test('validateMaxConcurrencyValue only ever accepts 1 — no multi-worker concurrency has a writable path', () => {
   assert.equal(validateMaxConcurrencyValue(1).ok, true);
   assert.equal(validateMaxConcurrencyValue(null).ok, true);
@@ -199,7 +238,7 @@ test('deriveInstanceState reports unavailable only for a routable, implemented a
 test('listInstanceSnapshots exposes the whole approved catalogue, created or not', () => withTempPaths(({ settingsPath }) => {
   const snapshots = listInstanceSnapshots({ path: settingsPath });
   const ids = snapshots.map((snapshot) => snapshot.agentId).sort();
-  assert.deepEqual(ids, ['claude-code-cli', 'codex-cli', 'gemini-cli', 'gpt-agent', 'ollama-agent']);
+  assert.deepEqual(ids, ['claude-code-cli', 'codex-cli', 'gemini-cli', 'gpt-agent', 'grok-cli', 'ollama-agent']);
   assert.ok(snapshots.every((snapshot) => snapshot.created === false));
 }));
 

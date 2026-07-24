@@ -155,7 +155,7 @@ test('GET /api/instances lists the whole approved catalogue with capacity-1 load
   const result = await apiRequest(baseUrl, '/api/instances', { cookie });
   assert.equal(result.status, 200);
   const ids = result.json.instances.map((instance) => instance.agentId).sort();
-  assert.deepEqual(ids, ['claude-code-cli', 'codex-cli', 'gemini-cli', 'gpt-agent', 'ollama-agent']);
+  assert.deepEqual(ids, ['claude-code-cli', 'codex-cli', 'gemini-cli', 'gpt-agent', 'grok-cli', 'ollama-agent']);
   assert.ok(result.json.instances.every((instance) => instance.load.capacity === 1));
   assert.ok(result.json.instances.every((instance) => instance.created === false));
 }));
