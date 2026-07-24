@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
+import { fileURLToPath } from 'node:url';
 
 import { FAILURE_SCOPES } from './agent-runner-admission.mjs';
 import {
@@ -194,6 +198,53 @@ test('CLI arguments accept an exact head and deterministic timestamp', () => {
     help: false,
   });
   assert.throws(() => parseReliabilityFixtureArgs(['--unknown'], {}), /unknown fixture argument/);
+});
+
+test('CLI serialization preserves restart/reopen proof on the real executable path', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-runner-reliability-cli-'));
+  const outputPath = join(root, 'report.json');
+
+  try {
+    const executable = fileURLToPath(
+      new URL('./agent-runner-reliability-fixtures.mjs', import.meta.url),
+    );
+    const result = spawnSync(process.execPath, [
+      executable,
+      '--head', HEAD,
+      '--now', NOW,
+      '--output', outputPath,
+    ], { encoding: 'utf8' });
+
+    assert.equal(result.error, undefined);
+    assert.equal(result.signal, null);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout, '');
+
+    const value = JSON.parse(readFileSync(outputPath, 'utf8'));
+
+    assert.equal(value.head, HEAD);
+    assert.equal(value.passed, true);
+    assert.deepEqual(value.summary, {
+      required: SCENARIO_IDS.length,
+      passed: SCENARIO_IDS.length,
+      failed: 0,
+    });
+    assert.equal(value.sandbox.restartReopenProven, true);
+    assert.deepEqual(value.externalSideEffects, {
+      githubCalls: 0,
+      networkCalls: 0,
+      providerCalls: 0,
+      subprocessCalls: 0,
+      systemdCalls: 0,
+      deployedStateWrites: 0,
+      syntheticWorkerStarts: 1,
+    });
+    assert.equal(value.acceptanceRecords.redaction.leakCount, 0);
+    assert.equal(value.acceptanceRecords.redaction.serialized, true);
+    assert.equal(JSON.stringify(value).length < 32_000, true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('fixture executable has no subprocess, network, systemd or GitHub client capability', () => {
