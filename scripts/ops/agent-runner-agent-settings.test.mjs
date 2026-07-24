@@ -7,12 +7,23 @@ import test from 'node:test';
 
 import {
   AGENT_SETTINGS_EXAMPLE,
+  CLAUDE_AGENT_ID,
+  computeSettingsRevision,
   getAgentSettings,
   isAgentRoutable,
+  isSafeQualificationToken,
   normalizeAgentLifecycle,
+  normalizeAgentPaidUsePolicy,
+  normalizeAgentQualification,
+  normalizeSafeToken,
+  QUALIFICATION_WILDCARD,
   resolveAgentSettingsPath,
   SAFE_DEFAULT_AGENT_LIFECYCLE,
+  settingsRevisionUnchanged,
+  snapshotAgentSettings,
 } from './agent-runner-agent-settings.mjs';
+
+const CATALOGUE_AGENT_IDS = ['claude-code-cli', 'codex-cli', 'grok-cli', 'ollama-agent'];
 
 function withTempSettings(payload, fn) {
   const dir = mkdtempSync(join(tmpdir(), 'agent-runner-agent-settings-'));
@@ -168,4 +179,198 @@ test('the committed .agent-runner/agent-settings.example.json matches AGENT_SETT
   const repoRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
   const onDisk = JSON.parse(readFileSync(join(repoRoot, '.agent-runner', 'agent-settings.example.json'), 'utf8'));
   assert.deepEqual(onDisk, AGENT_SETTINGS_EXAMPLE);
+});
+
+// -- Issue #50: atomic whole-file settings snapshot + immutable revision --
+
+test('computeSettingsRevision is a deterministic sha256 digest over the exact bytes given', () => {
+  const revision = computeSettingsRevision('{"agents":{}}');
+  assert.equal(revision, computeSettingsRevision('{"agents":{}}'));
+  assert.notEqual(revision, computeSettingsRevision('{"agents":{}} '));
+  assert.match(revision, /^sha256:[a-f0-9]{64}$/);
+});
+
+test('snapshotAgentSettings on a missing file reads zero times, reports fileFound false, and still returns a stable revision', () => withTempSettings(undefined, (settingsPath) => {
+  let readCalls = 0;
+  const snapshot = snapshotAgentSettings({
+    settingsPath,
+    fileExists: () => false,
+    readFile: () => { readCalls += 1; throw new Error('must not read a file that does not exist'); },
+    agentIds: CATALOGUE_AGENT_IDS,
+  });
+  assert.equal(readCalls, 0);
+  assert.equal(snapshot.fileFound, false);
+  assert.equal(snapshot.parseError, null);
+  assert.match(snapshot.revision, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(snapshot.revision, computeSettingsRevision(''));
+}));
+
+test('snapshotAgentSettings reads the settings file exactly once and derives the revision from those exact bytes', () => withTempSettings(AGENT_SETTINGS_EXAMPLE, (settingsPath) => {
+  let readCalls = 0;
+  const raw = readFileSync(settingsPath, 'utf8');
+  const snapshot = snapshotAgentSettings({
+    settingsPath,
+    readFile: (...args) => { readCalls += 1; return readFileSync(...args); },
+    agentIds: CATALOGUE_AGENT_IDS,
+  });
+  assert.equal(readCalls, 1);
+  assert.equal(snapshot.fileFound, true);
+  assert.equal(snapshot.parseError, null);
+  assert.equal(snapshot.revision, computeSettingsRevision(raw));
+}));
+
+test('snapshotAgentSettings fails closed with a bounded parseError on malformed JSON, and still exposes a revision over the bytes read -- every agent id, including claude-code-cli, is non-routable', () => withTempSettings('{not json', (settingsPath) => {
+  const snapshot = snapshotAgentSettings({ settingsPath, agentIds: CATALOGUE_AGENT_IDS });
+  assert.equal(snapshot.parseError, 'agent-settings-malformed-json');
+  assert.match(snapshot.revision, /^sha256:[a-f0-9]{64}$/);
+  for (const agentId of CATALOGUE_AGENT_IDS) assert.equal(snapshot.agents[agentId].routable, false, `${agentId} must fail closed on a malformed settings document`);
+}));
+
+test('snapshotAgentSettings fails closed when the document is valid JSON but not an object', () => withTempSettings('[1,2,3]', (settingsPath) => {
+  const snapshot = snapshotAgentSettings({ settingsPath, agentIds: CATALOGUE_AGENT_IDS });
+  assert.equal(snapshot.parseError, 'agent-settings-not-an-object');
+}));
+
+test('snapshotAgentSettings fails closed for every agent id, including claude-code-cli, with no entry at all -- the multi-agent selector path has no implicit enabled/wildcard Claude fallback', () => withTempSettings(undefined, (settingsPath) => {
+  const snapshot = snapshotAgentSettings({ settingsPath, agentIds: CATALOGUE_AGENT_IDS });
+  for (const agentId of CATALOGUE_AGENT_IDS) {
+    assert.equal(snapshot.agents[agentId].routable, false, `${agentId} must stay non-routable with no entry`);
+    assert.equal(snapshot.agents[agentId].lifecycle.disabled, true);
+  }
+}));
+
+test('snapshotAgentSettings fails closed for claude-code-cli the same way when the document is present but its agents block is empty', () => withTempSettings({ agents: {} }, (settingsPath) => {
+  const snapshot = snapshotAgentSettings({ settingsPath, agentIds: CATALOGUE_AGENT_IDS });
+  assert.equal(snapshot.agents['claude-code-cli'].routable, false);
+  assert.equal(snapshot.agents['claude-code-cli'].lifecycle.disabled, true);
+}));
+
+test('snapshotAgentSettings honours an explicit disabled claude-code-cli entry', () => withTempSettings({ agents: { 'claude-code-cli': { enabled: false, disabled: true } } }, (settingsPath) => {
+  const snapshot = snapshotAgentSettings({ settingsPath, agentIds: CATALOGUE_AGENT_IDS });
+  assert.equal(snapshot.agents['claude-code-cli'].routable, false);
+  assert.equal(snapshot.agents['claude-code-cli'].lifecycle.disabled, true);
+}));
+
+test('snapshotAgentSettings honours an explicit paused claude-code-cli entry', () => withTempSettings({ agents: { 'claude-code-cli': { enabled: true, disabled: false, paused: true } } }, (settingsPath) => {
+  const snapshot = snapshotAgentSettings({ settingsPath, agentIds: CATALOGUE_AGENT_IDS });
+  assert.equal(snapshot.agents['claude-code-cli'].routable, false);
+  assert.equal(snapshot.agents['claude-code-cli'].lifecycle.paused, true);
+}));
+
+test('snapshotAgentSettings honours an explicit draining claude-code-cli entry', () => withTempSettings({ agents: { 'claude-code-cli': { enabled: true, disabled: false, draining: true } } }, (settingsPath) => {
+  const snapshot = snapshotAgentSettings({ settingsPath, agentIds: CATALOGUE_AGENT_IDS });
+  assert.equal(snapshot.agents['claude-code-cli'].routable, false);
+  assert.equal(snapshot.agents['claude-code-cli'].lifecycle.draining, true);
+}));
+
+test('snapshotAgentSettings never copies raw secret-shaped fields into the sanitized view', () => withTempSettings({
+  agents: {
+    'codex-cli': {
+      enabled: true, disabled: false, executablePath: '/usr/local/bin/codex-secret-path', sessionSecretRef: 'vault://very-secret', endpoint: 'https://leak.example/token=abc',
+    },
+  },
+}, (settingsPath) => {
+  const snapshot = snapshotAgentSettings({ settingsPath, agentIds: CATALOGUE_AGENT_IDS });
+  const serialized = JSON.stringify(snapshot);
+  assert.doesNotMatch(serialized, /executablePath|sessionSecretRef|vault:\/\/|leak\.example|codex-secret-path/);
+}));
+
+test('normalizeAgentQualification defaults claude-code-cli to fully unqualified when no entry or qualification block is present, exactly like every other agent id -- no implicit wildcard fallback', () => {
+  const qual = normalizeAgentQualification(CLAUDE_AGENT_ID, null);
+  assert.deepEqual(qual.taskClasses, []);
+  assert.deepEqual(qual.riskClasses, []);
+  assert.deepEqual(qual.models, []);
+  assert.equal(qual.harness, null);
+});
+
+test('normalizeAgentQualification defaults every other agent id to fully unqualified when no entry or qualification block is present', () => {
+  for (const agentId of ['codex-cli', 'grok-cli', 'ollama-agent']) {
+    const qual = normalizeAgentQualification(agentId, null);
+    assert.deepEqual(qual.taskClasses, []);
+    assert.deepEqual(qual.riskClasses, []);
+    assert.deepEqual(qual.models, []);
+    assert.equal(qual.harness, null);
+  }
+});
+
+test('normalizeAgentQualification reads an explicit bounded qualification block', () => {
+  const qual = normalizeAgentQualification('ollama-agent', { qualification: { taskClasses: ['docs'], riskClasses: ['low'], models: ['llama3'], harness: 'ollama-cli' } });
+  assert.deepEqual(qual.taskClasses, ['docs']);
+  assert.deepEqual(qual.riskClasses, ['low']);
+  assert.deepEqual(qual.models, ['llama3']);
+  assert.equal(qual.harness, 'ollama-cli');
+});
+
+test('normalizeAgentQualification falls back per-field to the fully-unqualified default when a qualification sub-field is malformed', () => {
+  const qual = normalizeAgentQualification(CLAUDE_AGENT_ID, { qualification: { taskClasses: 'not-an-array' } });
+  assert.deepEqual(qual.taskClasses, []);
+});
+
+test('normalizeAgentQualification drops a qualification token that fails the bounded safe-token grammar (too long, or containing unsafe characters)', () => {
+  const tooLong = 'a'.repeat(65);
+  const qual = normalizeAgentQualification('codex-cli', {
+    qualification: { taskClasses: ['code', tooLong, 'unsafe token; DROP TABLE'], riskClasses: [], models: [], harness: null },
+  });
+  assert.deepEqual(qual.taskClasses, ['code']);
+});
+
+// -- issue #50 review round 3: the shared normalizeSafeToken() grammar itself --
+
+test('normalizeSafeToken case-folds a mixed-case in-grammar value deterministically', () => {
+  assert.equal(normalizeSafeToken('Code'), 'code');
+  assert.equal(normalizeSafeToken('  Docs-V2  '), 'docs-v2');
+});
+
+test('normalizeSafeToken rejects non-strings, empty/whitespace-only values, and values over the length bound', () => {
+  assert.equal(normalizeSafeToken(null), null);
+  assert.equal(normalizeSafeToken(undefined), null);
+  assert.equal(normalizeSafeToken(42), null);
+  assert.equal(normalizeSafeToken('   '), null);
+  assert.equal(normalizeSafeToken('a'.repeat(65)), null);
+  assert.equal(normalizeSafeToken('a'.repeat(64)), 'a'.repeat(64));
+});
+
+test('normalizeSafeToken rejects unsafe punctuation/control-character shapes (paths, URLs, injected text)', () => {
+  assert.equal(normalizeSafeToken('/usr/local/bin/codex'), null);
+  assert.equal(normalizeSafeToken('vault://very-secret'), null);
+  assert.equal(normalizeSafeToken('unsafe token; DROP TABLE'), null);
+  assert.equal(normalizeSafeToken('low/medium'), null);
+});
+
+test('normalizeSafeToken only returns the wildcard when explicitly allowed', () => {
+  assert.equal(normalizeSafeToken('*'), null);
+  assert.equal(normalizeSafeToken('*', { allowWildcard: true }), '*');
+});
+
+test('isSafeQualificationToken agrees with normalizeSafeToken\'s grammar for the wildcard itself', () => {
+  assert.equal(isSafeQualificationToken('*'), true);
+  assert.equal(isSafeQualificationToken(''), false);
+});
+
+test('normalizeAgentPaidUsePolicy requires a strictly positive cost or token cap to report hasPositiveCap', () => {
+  assert.equal(normalizeAgentPaidUsePolicy({ maxCostUsdPerRun: 0, maxTokensPerRun: 0 }).hasPositiveCap, false);
+  assert.equal(normalizeAgentPaidUsePolicy({ maxCostUsdPerRun: 5, maxTokensPerRun: 0 }).hasPositiveCap, true);
+  assert.equal(normalizeAgentPaidUsePolicy({ maxCostUsdPerRun: 0, maxTokensPerRun: 1000 }).hasPositiveCap, true);
+});
+
+test('normalizeAgentPaidUsePolicy only reports approval booleans on an exact `=== true`', () => {
+  assert.equal(normalizeAgentPaidUsePolicy({ paidUseApproved: 'yes', automaticRoutingApproved: 1 }).paidUseApproved, false);
+  assert.equal(normalizeAgentPaidUsePolicy({ paidUseApproved: true, automaticRoutingApproved: true }).automaticRoutingApproved, true);
+});
+
+test('settingsRevisionUnchanged requires an exact revision match, fileFound true on both sides, and no parse error on either snapshot', () => {
+  const a = { revision: 'sha256:aaa', fileFound: true, parseError: null };
+  const b = { revision: 'sha256:aaa', fileFound: true, parseError: null };
+  const c = { revision: 'sha256:bbb', fileFound: true, parseError: null };
+  assert.equal(settingsRevisionUnchanged(a, b), true);
+  assert.equal(settingsRevisionUnchanged(a, c), false);
+  assert.equal(settingsRevisionUnchanged(a, { revision: 'sha256:aaa', fileFound: true, parseError: 'agent-settings-malformed-json' }), false);
+  assert.equal(settingsRevisionUnchanged(null, b), false);
+  assert.equal(settingsRevisionUnchanged(a, null), false);
+});
+
+test('settingsRevisionUnchanged: two "file not found" snapshots never count as unchanged, even though they share the same synthetic revision over empty bytes', () => {
+  const missing1 = { revision: 'sha256:' + '0'.repeat(64), fileFound: false, parseError: null };
+  const missing2 = { revision: 'sha256:' + '0'.repeat(64), fileFound: false, parseError: null };
+  assert.equal(settingsRevisionUnchanged(missing1, missing2), false, 'fileFound must be true on both sides, not merely equal revisions');
 });

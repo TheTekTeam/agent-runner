@@ -201,3 +201,17 @@ export function managerAuthorityMatches(left, right) {
   const rightKey = typeof right === 'string' ? right : right?.authorityKey;
   return Boolean(leftKey && rightKey && leftKey === rightKey);
 }
+
+/**
+ * Issue #50, requirement 9: after a reassignment, the runner must never
+ * create/edit/refresh/revoke manager authority itself -- selection can only
+ * become executable again once a normal ChatGPT manager session or approved
+ * scheduled task posts a fresh packet whose `approved_agent` names the
+ * replacement agent. This is the single comparison point: any mismatch (or
+ * a missing authority/agentId) fails closed.
+ */
+export function managerAuthorityApprovesAgent(authority, agentId) {
+  const approvedAgent = String(authority?.approvedAgent || '').trim();
+  const candidate = String(agentId || '').trim();
+  return Boolean(approvedAgent && candidate && approvedAgent === candidate);
+}

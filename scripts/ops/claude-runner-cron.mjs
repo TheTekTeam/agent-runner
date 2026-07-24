@@ -8,11 +8,31 @@ import { fileURLToPath } from 'node:url';
 
 import { loadAgentRunnerConfig, stripConfigArgs } from './agent-runner-config.mjs';
 import {
+  AGENT_ADAPTERS,
   agentRunMetadata,
   allAgentLabels,
   resolveAgentForLabels,
   unsupportedAgentSkip,
 } from './agent-runner-agents.mjs';
+import {
+  CLAUDE_AGENT_ID,
+  settingsRevisionUnchanged,
+  snapshotAgentSettings,
+} from './agent-runner-agent-settings.mjs';
+import { classifyIssueTaskRisk } from './agent-runner-qualification.mjs';
+import { selectAgentForIssue } from './agent-runner-routing.mjs';
+import { computeInstanceReadiness } from './agent-runner-control-readiness.mjs';
+import {
+  ambiguousAgentLabelsDedupeKey,
+  applyPlannedReassignment,
+  buildAmbiguousAgentLabelsEvidenceCommentBody,
+  buildNoQualifiedAgentEvidenceCommentBody,
+  buildReassignmentEvidenceCommentBody,
+  noQualifiedAgentDedupeKey,
+  planReassignment,
+  reassignmentDedupeKey,
+  verifyLabelMutation,
+} from './agent-runner-reassignment.mjs';
 
 import {
   RUNNER_STARTED_HEADING,
@@ -35,7 +55,7 @@ import {
   sameCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 import { findLinkedOpenPullRequests } from './claude-runner-review-followup.mjs';
-import { managerAuthorityKeyIsCurrent } from './agent-runner-manager-authority.mjs';
+import { managerAuthorityApprovesAgent, managerAuthorityKeyIsCurrent } from './agent-runner-manager-authority.mjs';
 import { defaultRunnerStateDbPath, openRunnerStateStore } from './claude-runner-state.mjs';
 import {
   RECOVERY_POLICY_REVISION,
@@ -76,6 +96,12 @@ const DEFAULT_OUTPUT = '.var/claude-runner';
 // checkout's own vendored copy instead of this canonical implementation.
 export const CLAUDE_RUNNER_ENTRYPOINT = fileURLToPath(new URL('./claude-runner.mjs', import.meta.url));
 const DEFAULT_AGENT_LABELS = allAgentLabels({ includeFuture: false });
+// Issue #50 review round 3: the fixed, catalogue-derived label partition
+// execution discovery and reconciliation discovery each read from --
+// neither one is computed from the other or from `args.agentLabels`.
+const IMPLEMENTED_AGENT_LABELS = allAgentLabels({ includeFuture: false });
+const FOUNDATION_ONLY_AGENT_LABELS = allAgentLabels({ includeFuture: true })
+  .filter((label) => !IMPLEMENTED_AGENT_LABELS.includes(label));
 const DEFAULT_LIMIT = 100;
 const DEFAULT_WATCHDOG_INTERVAL_MS = 10 * 60_000;
 const DEFAULT_STALLED_PASS_LIMIT = 2;
@@ -192,6 +218,16 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
     // there; it must not spread by being committed or copied between
     // machines.
     nativeResumeEnabled: truthy(env.CLAUDE_RUNNER_ENABLE_NATIVE_RESUME),
+    // Issue #50 review round 3: the multi-agent selector's engagement is a
+    // single explicit, env-only, machine-local enable gate -- never inferred
+    // from whether a settings file happens to exist. Default false
+    // preserves the legacy Claude execution path (and performs zero
+    // multi-agent reconciliation) on every deployment that has not
+    // explicitly opted in, regardless of whether a settings document is
+    // present, missing, unreadable, or malformed. This flag is only a
+    // code/test boundary in this PR -- the execution timer stays disabled
+    // and this does not enable live routing to any adapter by itself.
+    multiAgentRoutingEnabled: truthy(env.AGENT_RUNNER_ENABLE_MULTIAGENT_ROUTING),
     limit: Number.parseInt(env.CLAUDE_RUNNER_CRON_LIMIT || String(config.runner?.candidateLimit || DEFAULT_LIMIT), 10),
     watchdogIntervalMs: Number.parseInt(env.CLAUDE_RUNNER_WATCHDOG_INTERVAL_MS || String(config.runner?.watchdogIntervalMs || DEFAULT_WATCHDOG_INTERVAL_MS), 10),
     stalledPassLimit: Number.parseInt(env.CLAUDE_RUNNER_STALLED_PASS_LIMIT || String(config.runner?.stalledPassLimit || DEFAULT_STALLED_PASS_LIMIT), 10),
@@ -1874,16 +1910,106 @@ export function runQuotaPreflight(args, env = process.env, runner = spawnSync) {
   };
 }
 
-export async function selectIssue(args, ghRunner = gh, { state = null, processProbe = probeProcessIdentity } = {}) {
+/**
+ * Cheap, catalogue-level pre-check (issue #50, "Claude quota is agent-local"):
+ * is there *any* implemented, routable agent other than Claude at all? Real
+ * deployments today have zero implemented alternatives (Codex CLI/Grok
+ * CLI/Ollama all stay `implemented:false`), so this is always false in
+ * production and the quota-blocked global idle below is unchanged. Only
+ * once a real alternative adapter is implemented and enabled does this
+ * unlock the per-issue path where Claude alone is excluded by its own
+ * quota block instead of idling the whole queue.
+ */
+export function hasImplementedRoutableAlternative(settingsSnapshot) {
+  return Object.values(AGENT_ADAPTERS).some((adapter) => (
+    adapter.agentId !== CLAUDE_AGENT_ID
+    && adapter.implemented
+    && settingsSnapshot?.agents?.[adapter.agentId]?.routable
+  ));
+}
+
+/**
+ * Deterministic, catalogue-ordered candidate list for the serial selector --
+ * no weighting or randomness. `readinessByAgentId` carries only the bounded
+ * `{ healthy, ready }` view `boundedReadiness()` produces below -- never the
+ * raw `computeInstanceReadiness()` result, whose `probes[].detail` can carry
+ * a resolved executable path.
+ */
+export function buildRoutingCandidates(settingsSnapshot, claudeResourceState = null, readinessByAgentId = {}) {
+  return Object.values(AGENT_ADAPTERS).map((adapter) => ({
+    agentId: adapter.agentId,
+    adapter,
+    settingsEntry: settingsSnapshot?.agents?.[adapter.agentId] || null,
+    resourceState: adapter.agentId === CLAUDE_AGENT_ID ? claudeResourceState : null,
+    readiness: readinessByAgentId?.[adapter.agentId] || null,
+  }));
+}
+
+/**
+ * Bound a raw `computeInstanceReadiness()` result down to exactly the two
+ * booleans + fixed reason code `evaluateAgentEligibility()` is allowed to
+ * see (issue #50 review, requirement 5). `probes`/`detail` -- which can
+ * carry a resolved executable path -- are intentionally dropped here and
+ * never threaded any further.
+ */
+export function boundedReadiness(rawReadiness) {
+  if (!rawReadiness || typeof rawReadiness !== 'object') return null;
+  return Object.freeze({ healthy: rawReadiness.ok === true, ready: rawReadiness.ok === true });
+}
+
+/** Deterministic, catalogue-ordered `{ agentId: boundedReadiness }` map -- one no-cost, zero-process-spawn probe per adapter. */
+export function computeReadinessByAgentId({ computeReadiness = computeInstanceReadiness, env = process.env } = {}) {
+  const entries = Object.values(AGENT_ADAPTERS).map((adapter) => [
+    adapter.agentId,
+    boundedReadiness(computeReadiness({ adapter, pathEnv: env.PATH })),
+  ]);
+  return Object.freeze(Object.fromEntries(entries));
+}
+
+export async function selectIssue(args, ghRunner = gh, {
+  state = null,
+  processProbe = probeProcessIdentity,
+  settingsSnapshot = null,
+  claudeResourceState = null,
+  classifyIssue = classifyIssueTaskRisk,
+  readinessByAgentId = {},
+} = {}) {
   const skipped = [];
   let candidates;
+  let reconciliationCandidates = [];
   try {
     // Retain the repo-wide open-PR inventory as part of queue inspection.
     // Selection no longer uses PR state to generate manager packets, but a
     // failed PR inventory still means the queue was not fully inspected and
     // must surface as queue_inspection_degraded rather than idle.
     listOpenPullRequests(args.repo, ghRunner);
-    candidates = listCandidateIssues(args.repo, args.limit, args.agentLabels, args.includeInProgress, ghRunner);
+    // Issue #50 review round 3: execution discovery and reconciliation
+    // discovery are now structurally independent label sets, not one
+    // configured list minus the other. Execution discovery is the
+    // intersection of whatever an operator configured in `args.agentLabels`
+    // with the catalogue's *implemented* adapter labels -- so a
+    // misconfigured `acceptedAgentLabels` that happens to include
+    // `agent:codex-cli`/`agent:grok-cli`/`agent:ollama` can never route
+    // those issues into execution discovery (they would previously have
+    // been silently skipped there as "unsupported agent" instead of
+    // reaching reconciliation at all). Reconciliation discovery is every
+    // catalogue label whose adapter is `implemented: false`, full stop --
+    // it does not subtract or otherwise depend on `args.agentLabels`, so an
+    // operator cannot accidentally configure a foundation-only label out of
+    // reconciliation by listing it as "accepted".
+    const executionAgentLabels = args.agentLabels.filter((label) => IMPLEMENTED_AGENT_LABELS.includes(label));
+    candidates = executionAgentLabels.length
+      ? listCandidateIssues(args.repo, args.limit, executionAgentLabels, args.includeInProgress, ghRunner)
+      : [];
+    // A distinct status:ready-only reconciliation scan over every
+    // foundation-only (not-yet-implemented) catalogue label, so a queued
+    // issue explicitly assigned to e.g. codex-cli/grok-cli/ollama-agent is
+    // visible to reassignment/no-qualified-agent evidence below even though
+    // it can never be executed. Only runs when the multi-agent selector is
+    // engaged for this pass (settingsSnapshot supplied).
+    if (settingsSnapshot && FOUNDATION_ONLY_AGENT_LABELS.length) {
+      reconciliationCandidates = listCandidateIssues(args.repo, args.limit, FOUNDATION_ONLY_AGENT_LABELS, false, ghRunner);
+    }
     // #698 round 5, finding 3: a successful repo-wide scan is exactly the
     // condition that clears `queue_inspection_degraded` — resolve it here,
     // not merely by letting newer queue events push a stale event out of a
@@ -1923,12 +2049,104 @@ export async function selectIssue(args, ghRunner = gh, { state = null, processPr
     return { issue: null, selection: null, command: null, currentPreflight: null, managerAuthority: null, skipped, blocked: null, queueInspectionDegraded: true };
   }
 
+  // Issue #50 review round 3: multiple supported local agent labels on one
+  // issue are ambiguous -- resolving to "whichever label matched first"
+  // (the pre-existing `resolveAgentForLabels()` behaviour) is exactly the
+  // silent-pick this review forbids. Checked once, ahead of both scans
+  // below, against a shared set so an issue that happens to appear in both
+  // `candidates` and `reconciliationCandidates` (one implemented label plus
+  // one foundation label) is flagged exactly once and never processed by
+  // either loop as a normal candidate.
+  const flaggedAmbiguousIssueNumbers = new Set();
+  const ALL_SUPPORTED_AGENT_LABELS = allAgentLabels({ includeFuture: true });
+  function supportedAgentLabelsOnIssue(issue) {
+    const present = new Set(issueLabels(issue));
+    return ALL_SUPPORTED_AGENT_LABELS.filter((label) => present.has(label));
+  }
+  function skipIfAmbiguous(issue) {
+    const supportedAgentLabels = supportedAgentLabelsOnIssue(issue);
+    // Two labels for the *same* adapter (e.g. both `agent:claude` and
+    // `agent:claude-code-cli`) are not ambiguous -- only two or more
+    // *distinct* agent ids present on one issue are.
+    const distinctAgentIds = new Set(supportedAgentLabels.map((label) => resolveAgentForLabels([label])?.agentId).filter(Boolean));
+    if (distinctAgentIds.size <= 1) return false;
+    if (!flaggedAmbiguousIssueNumbers.has(issue.number)) {
+      flaggedAmbiguousIssueNumbers.add(issue.number);
+      skipped.push({
+        issue: issue.number,
+        statusLabel: issue.statusLabel,
+        reason: 'ambiguous-agent-labels',
+        ambiguousAgentLabels: true,
+        // Bounded, catalogue-derived label *names* only (never a raw label
+        // object or description) -- see supportedAgentLabelsOnIssue().
+        supportedAgentLabels,
+      });
+    }
+    return true;
+  }
+
+  // Issue #50 review, requirement 1/2: reconciliation candidates are
+  // foundation-only by construction (their labels were deliberately
+  // excluded from execution discovery's query because their catalogue
+  // adapter is not implemented). The generic selector runs on them here,
+  // before any implemented-agent check, since they must never reach
+  // execution regardless of the outcome -- only a reassignment-candidate or
+  // no-qualified-agent skip entry is ever produced for them. Only
+  // status:ready issues are reconciled; an in-progress foundation-labeled
+  // issue is already anomalous and is left for operator attention rather
+  // than acted on here.
+  const reconciledIssueNumbers = new Set();
+  for (const issue of reconciliationCandidates) {
+    if (issue.statusLabel !== STATUS_READY || reconciledIssueNumbers.has(issue.number)) continue;
+    reconciledIssueNumbers.add(issue.number);
+    const conflictSkip = metadataConflictSkip(issue);
+    if (conflictSkip) {
+      skipped.push(conflictSkip);
+      continue;
+    }
+    if (skipIfAmbiguous(issue)) continue;
+    const agent = resolveAgentForLabels([...(issue.labels || []), issue.agentLabel]);
+    const classification = classifyIssue(issue);
+    const routingResult = selectAgentForIssue({
+      explicitAgentId: agent?.agentId || null,
+      candidates: buildRoutingCandidates(settingsSnapshot, claudeResourceState, readinessByAgentId),
+      classification,
+      globalSlotAvailable: true,
+    });
+    if (routingResult.selectedAgentId && routingResult.selectedAgentId !== agent?.agentId) {
+      skipped.push({
+        issue: issue.number,
+        statusLabel: issue.statusLabel,
+        reason: 'reassignment-candidate',
+        agentId: agent?.agentId || null,
+        reassignmentCandidate: true,
+        routingResult,
+        labels: issueLabels(issue),
+      });
+    } else if (!routingResult.selectedAgentId) {
+      skipped.push({
+        issue: issue.number,
+        statusLabel: issue.statusLabel,
+        reason: 'no-qualified-agent',
+        agentId: agent?.agentId || null,
+        noQualifiedAgent: true,
+      });
+    }
+    // A foundation-only (not-yet-implemented) agent can never itself be
+    // `routingResult.selectedAgentId === agent.agentId` here -- it is never
+    // eligible -- so no third branch is reachable.
+  }
+
   for (const issue of candidates) {
     const conflictSkip = metadataConflictSkip(issue);
     if (conflictSkip) {
       skipped.push(conflictSkip);
       continue;
     }
+    // An issue also visible to reconciliation (it carries a foundation
+    // label too) must not execute in this same pass -- see
+    // skipIfAmbiguous() above, shared across both scans.
+    if (skipIfAmbiguous(issue)) continue;
 
     const agent = resolveAgentForLabels([...(issue.labels || []), issue.agentLabel]);
     if (!agent?.implemented) {
@@ -1937,6 +2155,55 @@ export async function selectIssue(args, ghRunner = gh, { state = null, processPr
         statusLabel: issue.statusLabel,
       });
       continue;
+    }
+
+    // Issue #50 serial selector: only evaluated when a caller opts in by
+    // supplying `settingsSnapshot` (real dispatch always does; the many
+    // pre-existing unit tests that call selectIssue() directly do not, and
+    // are therefore completely unaffected by this block). Retains an
+    // eligible explicit assignment; otherwise routes to a qualified
+    // alternative or records why none exists, without guessing, weighting,
+    // or randomness -- see agent-runner-routing.mjs for the eligibility
+    // rules themselves.
+    if (settingsSnapshot) {
+      const classification = classifyIssue(issue);
+      const routingResult = selectAgentForIssue({
+        explicitAgentId: agent.agentId,
+        candidates: buildRoutingCandidates(settingsSnapshot, claudeResourceState, readinessByAgentId),
+        classification,
+        globalSlotAvailable: true,
+      });
+      if (routingResult.selectedAgentId !== agent.agentId) {
+        const explicitDecision = routingResult.decisions.find((decision) => decision.agentId === agent.agentId);
+        const isQueuedReady = issue.statusLabel === STATUS_READY;
+        if (routingResult.selectedAgentId && isQueuedReady) {
+          // A qualified alternative exists for this queued, unclaimed issue
+          // -- a reassignment *candidate*, not yet a mutation. main() proves
+          // the full queued-only precondition set (lease/PR/recovery/
+          // workspace/branch/settings-revision/live-label stability) before
+          // any label mutation is attempted.
+          skipped.push({
+            issue: issue.number,
+            statusLabel: issue.statusLabel,
+            reason: 'reassignment-candidate',
+            agentId: agent.agentId,
+            eligibilityReasons: explicitDecision?.reasons || [],
+            reassignmentCandidate: true,
+            routingResult,
+            labels: issueLabels(issue),
+          });
+        } else {
+          skipped.push({
+            issue: issue.number,
+            statusLabel: issue.statusLabel,
+            reason: routingResult.selectedAgentId ? 'agent-not-eligible' : 'no-qualified-agent',
+            agentId: agent.agentId,
+            eligibilityReasons: explicitDecision?.reasons || [],
+            ...(isQueuedReady && !routingResult.selectedAgentId ? { noQualifiedAgent: true } : {}),
+          });
+        }
+        continue;
+      }
     }
 
     // A transient GitHub read failure for one candidate must not crash the
@@ -1973,6 +2240,26 @@ export async function selectIssue(args, ghRunner = gh, { state = null, processPr
         statusLabel: issue.statusLabel,
         reason: selection.reason,
         ...(conflicts.length ? { metadataConflicts: conflicts } : {}),
+      });
+      continue;
+    }
+
+    // Issue #50, requirement 9: an existing packet whose approved_agent
+    // does not name the agent this pass actually resolved for the issue
+    // fails closed here, before any claim, status mutation, runner-start
+    // comment, or worker launch. This only ever fires when settingsSnapshot
+    // opted this pass into the new selector; existing callers are
+    // unaffected. In real dispatch every packet's approved_agent already
+    // matches the sole implemented adapter it names, so this is inert
+    // unless a reassignment (or a hand-authored packet) names a different
+    // agent than the one this pass would actually select.
+    if (settingsSnapshot && !managerAuthorityApprovesAgent(selection.managerAuthority, agent.agentId)) {
+      skipped.push({
+        issue: issue.number,
+        statusLabel: issue.statusLabel,
+        reason: 'manager-authority-approved-agent-mismatch',
+        agentId: agent.agentId,
+        approvedAgent: selection.managerAuthority?.approvedAgent || null,
       });
       continue;
     }
@@ -2316,6 +2603,286 @@ export async function reconcilePendingRecoveryTransitions({ state, args, ghRunne
   return { checked: pending.length, converged, skipped };
 }
 
+/**
+ * Queued-only reassignment (issue #50, requirement 7-9). Every precondition
+ * is proven fresh, right now, against real GitHub/SQLite state -- never
+ * against the stale signals gathered during selectIssue()'s scan. Any
+ * blocker (including a settings-revision or live-label change since
+ * planning) fails closed with no mutation and no durable write at all --
+ * silence, not a comment, is the correct behaviour for legitimately
+ * ambiguous/active work, and it also means repeated reconciliation passes
+ * over a currently-blocked candidate never spam duplicate evidence.
+ */
+export async function attemptQueuedReassignment({ args, state, ghRunner, candidateSkip, settingsSnapshot, snapshotSettings, env }) {
+  const issueNumber = candidateSkip.issue;
+  let liveIssue;
+  let openPullRequests;
+  try {
+    liveIssue = readRecoveryIssue(args.repo, issueNumber, ghRunner);
+    openPullRequests = listOpenPullRequests(args.repo, ghRunner);
+  } catch (error) {
+    state.recordTaskError('reassignment-precondition-read-failed', error);
+    return { applied: false, reason: 'precondition-read-failed' };
+  }
+  if (!state.healthy) return { applied: false, reason: 'state-unhealthy' };
+
+  const freshSettingsSnapshot = snapshotSettings({ env, agentIds: Object.keys(AGENT_ADAPTERS) });
+  const hasHandoff = /^## (?:Manager|Agent) handoff\s*$/im.test((liveIssue.comments || []).map((comment) => comment?.body || '').join('\n'));
+  const linkedOpenPrs = findLinkedOpenPullRequests({ issueNumber, pullRequests: openPullRequests });
+  const branchConflicts = localRecoveryConflicts(issueNumber, args.project?.localRepoPath, null);
+  // Every recovery_attempts row ever written for this exact issue -- not
+  // only the currently-active ones (issue #50 review, requirement 6): a
+  // terminal attempt just as often leaves preserved recovery artefacts
+  // (branch/worktree/checkpoint/session) behind as a still-active one does.
+  // `resolution_state = 'resolved'` is the one durable marker that an
+  // attempt's recovery/workspace state was actually verified clean
+  // (`markResolved()` in claude-runner-state.mjs); any other value --
+  // including a missing/unrecognized one -- fails closed as unresolved.
+  const attemptsForIssue = (state.invoke('allRows', 'recovery_attempts') || [])
+    .filter((row) => row.repo === args.repo && row.issue_number === issueNumber);
+  if (!state.healthy) return { applied: false, reason: 'state-unhealthy' };
+  const activeRows = attemptsForIssue.filter((row) => !row.finished_at && !row.outcome);
+  const unresolvedRows = attemptsForIssue.filter((row) => row.resolution_state !== 'resolved');
+
+  const plan = planReassignment({
+    issue: { number: issueNumber, statusLabel: liveIssue.statusLabel },
+    currentLabels: liveIssue.labels,
+    explicitAgentId: candidateSkip.agentId,
+    routingSelection: candidateSkip.routingResult,
+    settingsRevisionAtPlanning: settingsSnapshot.revision,
+    settingsRevisionNow: freshSettingsSnapshot.revision,
+    liveLabelsAtPlanning: candidateSkip.labels || [],
+    liveLabelsNow: liveIssue.labels,
+    repo: args.repo,
+    hasActiveLease: activeRows.length === 0 ? false : true,
+    hasUnfinishedAttempt: activeRows.length === 0 ? false : true,
+    hasInProgressOwnership: liveIssue.statusLabel === STATUS_IN_PROGRESS,
+    hasLinkedOpenPullRequest: linkedOpenPrs.length === 0 ? false : true,
+    hasReviewOrRecoveryState: unresolvedRows.length === 0 ? false : true,
+    hasHandoffInProgress: hasHandoff,
+    hasConflictingBranchOrWorktree: (branchConflicts.noConflictingBranch && branchConflicts.noConflictingWorktree) ? false : true,
+    // Preserved recovery artefacts (branch/worktree availability) on an
+    // unresolved attempt row -- real durable evidence, not an assumption.
+    hasUnresolvedWorkspaceOwnership: unresolvedRows.some((row) => row.worktree_available !== 0 || row.branch_available !== 0),
+  });
+
+  if (!plan.allowed) return { applied: false, reason: 'blocked', blockers: plan.blockers };
+
+  // Issue #50 review round 3: a bounded reassignment *intent* is persisted
+  // durably BEFORE any GitHub mutation. If this write fails, GitHub is
+  // never mutated -- there is nothing to reconcile because nothing
+  // happened. `plan.dedupeKey` is deterministic over
+  // (repo, issue, fromAgentId, toAgentId, settingsRevision), so a dedupe
+  // collision here means either (a) a prior pass already durably completed
+  // this exact reassignment (delivery_status 'resolved'), or (b) a prior
+  // pass's intent row is still 'mutation-pending' (a crash before the
+  // mutation ran, or before this pass's own write) -- case (b) is exactly
+  // when it is safe, and necessary, to proceed and (re)attempt the
+  // mutation; case (a) must never mutate again.
+  const pendingRecord = state.invoke('recordRoutingEvent', {
+    repo: args.repo,
+    issueNumber,
+    eventType: 'reassignment',
+    fromAgentId: candidateSkip.agentId,
+    toAgentId: plan.replacementAgentId,
+    reason: 'explicit-agent-ineligible',
+    settingsRevision: freshSettingsSnapshot.revision,
+    dedupeKey: plan.dedupeKey,
+    payload: { labelMutation: plan.labelMutation },
+    deliveryStatus: 'mutation-pending',
+  });
+  if (!pendingRecord) {
+    state.recordTaskError('reassignment-pending-write-failed', new Error('routing-event pending write returned no result'));
+    return { applied: false, reason: 'pending-state-write-failed' };
+  }
+  if (!pendingRecord.inserted && pendingRecord.existing?.delivery_status !== 'mutation-pending') {
+    // Already applied/resolved (or evidence-pending) by an earlier pass or
+    // the crash-reconciliation sweep -- never mutate again for the same
+    // dedupe key.
+    return { applied: pendingRecord.existing?.delivery_status !== undefined, reason: 'already-recorded', replacementAgentId: plan.replacementAgentId };
+  }
+
+  const result = applyPlannedReassignment({
+    plan,
+    mutateLabels: ({ removeLabels, addLabels }) => {
+      const editArgs = ['issue', 'edit', String(issueNumber), '--repo', args.repo];
+      for (const label of removeLabels) editArgs.push('--remove-label', label);
+      for (const label of addLabels) editArgs.push('--add-label', label);
+      ghRunner(editArgs);
+    },
+    readLiveIssue: () => readRecoveryIssue(args.repo, issueNumber, ghRunner),
+  });
+
+  if (!result.applied) {
+    // The row stays 'mutation-pending' -- a transient mutation/verification
+    // failure is safe to retry on a later pass (a fresh precondition check
+    // will run again from the top); this is not a crash-consistency
+    // problem, just an ordinary failure.
+    state.recordTaskError('reassignment-mutation-failed', new Error(result.reason || 'unknown'));
+    return { applied: false, reason: result.reason || 'unknown', replacementAgentId: plan.replacementAgentId };
+  }
+
+  // Issue #50 review, requirement 9: report reassignment complete only
+  // after verified labels AND a durable applied state -- comment delivery
+  // is tracked and retried separately below, and its outcome never flips
+  // `applied` back to false.
+  const transitioned = state.invoke('updateRoutingEventDeliveryStatus', { dedupeKey: plan.dedupeKey, deliveryStatus: 'evidence-pending' });
+  if (!transitioned?.updated) {
+    state.recordTaskError('reassignment-state-transition-failed', new Error('could not durably transition to evidence-pending after a verified label mutation'));
+    return { applied: false, reason: 'applied-but-not-durably-recorded', replacementAgentId: plan.replacementAgentId };
+  }
+
+  let evidenceDelivered = false;
+  try {
+    ghRunner(['issue', 'comment', String(issueNumber), '--repo', args.repo, '--body', plan.evidenceCommentBody]);
+    state.invoke('updateRoutingEventDeliveryStatus', { dedupeKey: plan.dedupeKey, deliveryStatus: 'resolved' });
+    evidenceDelivered = true;
+  } catch (error) {
+    // Left 'evidence-pending' -- reconcilePendingRoutingEvents() retries
+    // delivery only, on a later pass, never re-mutating.
+    state.recordTaskError('reassignment-evidence-comment-failed', error);
+  }
+
+  return { applied: true, reason: null, replacementAgentId: plan.replacementAgentId, evidenceDelivered };
+}
+
+/**
+ * No-qualified-agent evidence (issue #50, requirement 10): visible,
+ * deduplicated, sanitized, and worker-free. Launches nothing, consumes no
+ * manager packet, creates no claim, and never touches active work. This
+ * event type never mutates GitHub, so its durable row starts life directly
+ * in `evidence-pending` -- dedup on `(repo, issue, settings revision)`
+ * means a genuinely new condition inserts exactly one row, but a prior
+ * *comment delivery failure* leaves that same row `evidence-pending` so a
+ * later reconciliation pass retries delivery instead of silently never
+ * trying again (issue #50 review round 3).
+ */
+export function recordNoQualifiedAgentEvidence({ args, state, ghRunner, candidateSkip, settingsSnapshot }) {
+  const dedupeKey = noQualifiedAgentDedupeKey({ repo: args.repo, issueNumber: candidateSkip.issue, settingsRevision: settingsSnapshot.revision });
+  const recorded = state.invoke('recordRoutingEvent', {
+    repo: args.repo,
+    issueNumber: candidateSkip.issue,
+    eventType: 'no-qualified-agent',
+    reason: 'no-qualified-agent',
+    settingsRevision: settingsSnapshot.revision,
+    dedupeKey,
+    payload: { eligibilityReasons: candidateSkip.eligibilityReasons || [] },
+    deliveryStatus: 'evidence-pending',
+  });
+  if (!recorded) return recorded;
+  if (!recorded.inserted && recorded.existing?.delivery_status === 'resolved') return recorded;
+  const body = buildNoQualifiedAgentEvidenceCommentBody({ issueNumber: candidateSkip.issue, settingsRevision: settingsSnapshot.revision });
+  try {
+    ghRunner(['issue', 'comment', String(candidateSkip.issue), '--repo', args.repo, '--body', body]);
+    state.invoke('updateRoutingEventDeliveryStatus', { dedupeKey, deliveryStatus: 'resolved' });
+  } catch (error) {
+    state.recordTaskError('no-qualified-agent-comment-failed', error);
+  }
+  return recorded;
+}
+
+/**
+ * Ambiguous-agent-labels evidence (issue #50 review round 3): an issue
+ * carrying more than one distinct supported local agent label is never
+ * routed to any of them -- this records why, with the same
+ * dedupe/evidence-pending-retry semantics as no-qualified-agent evidence.
+ */
+export function recordAmbiguousAgentLabelsEvidence({ args, state, ghRunner, candidateSkip, settingsSnapshot }) {
+  const dedupeKey = ambiguousAgentLabelsDedupeKey({ repo: args.repo, issueNumber: candidateSkip.issue, settingsRevision: settingsSnapshot.revision });
+  const recorded = state.invoke('recordRoutingEvent', {
+    repo: args.repo,
+    issueNumber: candidateSkip.issue,
+    eventType: 'ambiguous-agent-labels',
+    reason: 'ambiguous-agent-labels',
+    settingsRevision: settingsSnapshot.revision,
+    dedupeKey,
+    payload: { supportedAgentLabels: candidateSkip.supportedAgentLabels || [] },
+    deliveryStatus: 'evidence-pending',
+  });
+  if (!recorded) return recorded;
+  if (!recorded.inserted && recorded.existing?.delivery_status === 'resolved') return recorded;
+  const body = buildAmbiguousAgentLabelsEvidenceCommentBody({
+    issueNumber: candidateSkip.issue, supportedAgentLabels: candidateSkip.supportedAgentLabels || [], settingsRevision: settingsSnapshot.revision,
+  });
+  try {
+    ghRunner(['issue', 'comment', String(candidateSkip.issue), '--repo', args.repo, '--body', body]);
+    state.invoke('updateRoutingEventDeliveryStatus', { dedupeKey, deliveryStatus: 'resolved' });
+  } catch (error) {
+    state.recordTaskError('ambiguous-agent-labels-comment-failed', error);
+  }
+  return recorded;
+}
+
+/**
+ * Crash-safe reconciliation for the `routing_events` pending/delivery state
+ * machine (issue #50 review round 3). Runs once per execute pass, before
+ * fresh selection: a `'mutation-pending'` row is self-healed to
+ * `'evidence-pending'` by re-reading the live issue's labels and verifying
+ * they already match the persisted plan -- never by re-running the
+ * mutation. A `'evidence-pending'` row (mutation done, or never applicable)
+ * only ever retries the evidence comment. Any row this pass cannot safely
+ * resolve is simply left as-is for the next pass.
+ */
+export async function reconcilePendingRoutingEvents({ state, args, ghRunner }) {
+  if (!state.healthy) return { checked: 0, resolved: 0 };
+  const pending = state.invoke('pendingRoutingEvents', args.repo) || [];
+  let resolved = 0;
+  for (const row of pending) {
+    if (!row.issue_number) continue;
+    if (row.delivery_status === 'mutation-pending') {
+      let payload;
+      try { payload = JSON.parse(row.payload_json || '{}'); } catch { payload = {}; }
+      const labelMutation = payload?.labelMutation;
+      if (!labelMutation?.expectedFinalLabels || !labelMutation?.replacementAgentLabel) continue;
+      let liveIssue;
+      try {
+        liveIssue = readRecoveryIssue(args.repo, row.issue_number, ghRunner);
+      } catch (error) {
+        state.recordTaskError('routing-event-reconcile-read-failed', error);
+        continue;
+      }
+      const verification = verifyLabelMutation({
+        liveLabelsAfter: liveIssue.labels || [],
+        expectedFinalLabels: labelMutation.expectedFinalLabels,
+        replacementAgentLabel: labelMutation.replacementAgentLabel,
+      });
+      if (verification.ok) {
+        // The mutation already landed on GitHub (a crash happened between
+        // the gh CLI call succeeding and this row's own transition) --
+        // self-heal the durable record without mutating again.
+        state.invoke('updateRoutingEventDeliveryStatus', { dedupeKey: row.dedupe_key, deliveryStatus: 'evidence-pending' });
+      }
+      // Not yet applied: leave 'mutation-pending'. A fresh selectIssue()
+      // reconciliation scan will re-flag this issue as a candidate (its
+      // live label is unchanged) and attemptQueuedReassignment() will pick
+      // up this exact dedupe key and retry the mutation from a fresh
+      // precondition check.
+      continue;
+    }
+    if (row.delivery_status === 'evidence-pending') {
+      const body = row.event_type === 'no-qualified-agent'
+        ? buildNoQualifiedAgentEvidenceCommentBody({ issueNumber: row.issue_number, settingsRevision: row.settings_revision })
+        : row.event_type === 'ambiguous-agent-labels'
+          ? buildAmbiguousAgentLabelsEvidenceCommentBody({
+            issueNumber: row.issue_number,
+            supportedAgentLabels: (() => { try { return JSON.parse(row.payload_json || '{}')?.supportedAgentLabels || []; } catch { return []; } })(),
+            settingsRevision: row.settings_revision,
+          })
+          : buildReassignmentEvidenceCommentBody({
+            issueNumber: row.issue_number, fromAgentId: row.from_agent_id, toAgentId: row.to_agent_id, reason: row.reason, settingsRevision: row.settings_revision,
+          });
+      try {
+        ghRunner(['issue', 'comment', String(row.issue_number), '--repo', args.repo, '--body', body]);
+        state.invoke('updateRoutingEventDeliveryStatus', { dedupeKey: row.dedupe_key, deliveryStatus: 'resolved' });
+        resolved += 1;
+      } catch (error) {
+        state.recordTaskError('routing-event-evidence-delivery-retry-failed', error);
+      }
+    }
+  }
+  return { checked: pending.length, resolved };
+}
+
 export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
   const now = dependencies.now || (() => new Date().toISOString());
   const ghRunner = dependencies.ghRunner || gh;
@@ -2353,7 +2920,47 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     if (!state.record('recordQuotaHistory', { repo: args.repo, quotaPreflight })) {
       return emitSystemicStatePause(args, state, 'quota-history', { now, logger: dependencies.logger }).exitCode;
     }
-    if (quotaPreflight.blocked) {
+
+    // Issue #50: one atomic machine-local settings snapshot for this whole
+    // pass. Retained through selection and re-read (with an exact-revision
+    // match required) immediately before any reassignment mutation or
+    // execution claim below. Read unconditionally (cheap, local, no
+    // process spawn) so `hasImplementedRoutableAlternative()` below and any
+    // later reconciliation pass always have a fresh value to hand -- but see
+    // `multiAgentSelectorEngaged` immediately below for what actually gates
+    // whether it is *used*.
+    const snapshotSettings = dependencies.snapshotAgentSettings || snapshotAgentSettings;
+    const settingsSnapshot = snapshotSettings({ env, agentIds: Object.keys(AGENT_ADAPTERS) });
+    // Issue #50 review round 3: engagement is decided by exactly one
+    // explicit, machine-local flag -- never inferred from whether a
+    // settings file happens to exist. `args.multiAgentRoutingEnabled` is
+    // `false` by default: the pre-issue-#50 legacy Claude execution path
+    // (which never reads this file) runs exactly as it always has, and zero
+    // multi-agent reconciliation happens, regardless of `settingsSnapshot`.
+    // When the flag is `true`, the selector is engaged unconditionally --
+    // including when the settings document is missing, unreadable,
+    // malformed, or non-object. `snapshotAgentSettings()`'s uniform
+    // fail-closed defaults (no agent id, Claude included, has an implicit
+    // permissive fallback) then make every candidate unqualified until a
+    // valid document is in place, so "engaged with bad/missing settings"
+    // fails closed all the way through selection, reconciliation, attempt
+    // creation, claim, GitHub mutation, and worker launch -- never a
+    // silent fall-back to the legacy path.
+    const multiAgentSelectorEngaged = args.multiAgentRoutingEnabled === true;
+    const computeReadiness = dependencies.computeInstanceReadiness || computeInstanceReadiness;
+    const readinessByAgentId = multiAgentSelectorEngaged
+      ? computeReadinessByAgentId({ computeReadiness, env })
+      : {};
+
+    if (quotaPreflight.blocked && !hasImplementedRoutableAlternative(settingsSnapshot)) {
+      // Claude is the only implemented agent in every real deployment
+      // today, so a Claude quota block is structurally a full-queue block
+      // and this idle is unchanged from before issue #50. Once a real
+      // alternative adapter is implemented, enabled, and qualified, this
+      // condition is false and the pass instead falls through to per-issue
+      // selection below, where Claude alone is excluded by its own quota
+      // block (requirement 6) while an independently eligible alternative
+      // is still assessed.
       const payload = {
         dryRun: !args.execute,
         quotaBlocked: true,
@@ -2371,6 +2978,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       console.log(JSON.stringify({ ...payload, quotaPreflight: { ...quotaPreflight, stdout: '<see log>', stderr: '<see log>' }, logPath }, null, 2));
       return 0;
     }
+    const claudeResourceState = quotaPreflight.blocked ? { blocked: true, reason: 'claude-quota-blocked' } : null;
 
     if (args.execute) {
       // Crash-safe convergence for a prior pass's incomplete GitHub status
@@ -2388,6 +2996,18 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
           currentQuotaPreflight: quotaPreflight,
         },
       });
+      // Issue #50 review round 3: crash-safe pending/delivery reconciliation
+      // for routing evidence -- re-reads live labels for any
+      // 'mutation-pending' row and retries delivery for any
+      // 'evidence-pending' row, never repeating an already-applied
+      // mutation. Only meaningful once the multi-agent selector has ever
+      // been engaged (no pending rows exist otherwise), but running it
+      // unconditionally when engaged is cheap and self-limiting (an empty
+      // `pendingRoutingEvents()` result is a no-op).
+      if (multiAgentSelectorEngaged) {
+        const reconcileRoutingEvents = dependencies.reconcilePendingRoutingEvents || reconcilePendingRoutingEvents;
+        await reconcileRoutingEvents({ state, args, ghRunner });
+      }
     }
 
     let recoveryClaim = null;
@@ -2483,7 +3103,13 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       issue: recoveryPreLaunch.issue,
       selection: { mode: 'recovery', command: null, preflight: null }, command: null, currentPreflight: null,
       skipped: [], blocked: null, managerAuthority: null,
-    } : await selectIssue(args, ghRunner, { state, processProbe: dependencies.processProbe || probeProcessIdentity });
+    } : await selectIssue(args, ghRunner, {
+      state,
+      processProbe: dependencies.processProbe || probeProcessIdentity,
+      settingsSnapshot: multiAgentSelectorEngaged ? settingsSnapshot : null,
+      claudeResourceState,
+      readinessByAgentId,
+    });
     const selectedSourceCommentIdentity = selected.command?.sourceCommentIdentity || null;
     const selectedPreflightCommentIdentity = selected.currentPreflight
       ? normalizeCommentIdentity(selected.currentPreflight, { context: 'scheduler-manager-preflight', required: true })
@@ -2520,6 +3146,27 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       return emitSystemicStatePause(args, state, 'selection-persistence', { now, logger: dependencies.logger }).exitCode;
     }
     if (!selected.issue) {
+      // Issue #50, requirements 7 and 10: at most one queued-only
+      // reassignment or no-qualified-agent evidence write per pass, mirroring
+      // the single global execution slot -- this is bookkeeping around an
+      // empty pass, never itself a claim or a worker launch. Both branches
+      // are execute-only: a dry-run pass proves and reports selection state
+      // without mutating GitHub, exactly like every other mutation below.
+      if (args.execute && state.healthy) {
+        const reassignmentCandidate = selected.skipped.find((entry) => entry.reassignmentCandidate);
+        const noQualifiedCandidate = !reassignmentCandidate && selected.skipped.find((entry) => entry.noQualifiedAgent);
+        const ambiguousCandidate = !reassignmentCandidate && !noQualifiedCandidate && selected.skipped.find((entry) => entry.ambiguousAgentLabels);
+        if (reassignmentCandidate) {
+          await attemptQueuedReassignment({
+            args, state, ghRunner, candidateSkip: reassignmentCandidate, settingsSnapshot,
+            snapshotSettings: dependencies.snapshotAgentSettings || snapshotAgentSettings, env,
+          });
+        } else if (noQualifiedCandidate) {
+          recordNoQualifiedAgentEvidence({ args, state, ghRunner, candidateSkip: noQualifiedCandidate, settingsSnapshot });
+        } else if (ambiguousCandidate && multiAgentSelectorEngaged) {
+          recordAmbiguousAgentLabelsEvidence({ args, state, ghRunner, candidateSkip: ambiguousCandidate, settingsSnapshot });
+        }
+      }
       const logPath = writeLog(args.outputDir, plan);
       if (!state.record('recordRunResult', { repo: args.repo, mode: 'no-selection', exitCode: 0, logPath, payload: plan })) {
         return emitSystemicStatePause(args, state, 'no-selection-result', { now, logger: dependencies.logger }).exitCode;
@@ -2604,6 +3251,43 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     const freshImplementationDispatch = Boolean(dispatchIdentity?.ok)
       && dispatchIdentity.executionAuthorization.phase === EXECUTION_PHASE_IMPLEMENTATION
       && dispatchIdentity.executionAuthorization.allowed === true;
+
+    // Issue #50 review, requirement 7: this settings-revision check must run
+    // before any new attempt/ownership row, claim, GitHub mutation,
+    // runner-start marker, or worker launch -- not merely before the
+    // execution claim itself. It is deliberately positioned here, ahead of
+    // the dispatch-authority-rejection check and `recordRecoveryAttempt`
+    // below, mirroring the same "zero attempts, zero claims, zero
+    // mutations on rejection" pattern the dispatch-authority check already
+    // demonstrates. A settings change between selection and this point now
+    // creates zero attempt rows, not just zero claims. Only enforced when
+    // the multi-agent selector was actually engaged this pass (a
+    // machine-local settings document was present at selection); when it
+    // was not, Claude's eligibility never depended on this file and the
+    // pre-issue-#50 legacy execution path is unaffected.
+    if (!recoveryClaim && args.claimOnExecute && multiAgentSelectorEngaged) {
+      if (!state.healthy) return emitSystemicStatePause(args, state, 'pre-attempt-settings-revision-read', { now, logger: dependencies.logger }).exitCode;
+      const preAttemptSettingsSnapshot = (dependencies.snapshotAgentSettings || snapshotAgentSettings)({ env, agentIds: Object.keys(AGENT_ADAPTERS) });
+      if (!settingsRevisionUnchanged(settingsSnapshot, preAttemptSettingsSnapshot)) {
+        const finishedAt = now();
+        const payload = {
+          dryRun: false,
+          settingsRevisionChanged: true,
+          selectedIssue: selected.issue.number,
+          stateDbPath: args.stateDbPath,
+          statePersistenceErrors: state.errors,
+        };
+        const logPath = writeLog(args.outputDir, payload);
+        state.record('recordQueueEvent', {
+          repo: args.repo, eventType: 'settings-revision-changed-before-claim', issueNumber: selected.issue.number, reason: 'settings-revision-changed',
+        });
+        if (!state.record('recordRunResult', { repo: args.repo, issueNumber: selected.issue.number, mode: 'settings-revision-changed', exitCode: 1, logPath, payload, startedAt, finishedAt })) {
+          return emitSystemicStatePause(args, state, 'settings-revision-changed-result', { now, logger: dependencies.logger }).exitCode;
+        }
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return 1;
+      }
+    }
 
     // Dispatch authority -- the resolved repository, checkout, branch, base
     // commit, manager revision and fingerprint (#56) -- is verified before
@@ -2751,6 +3435,9 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     let claim = null;
     if (args.execute && args.claimOnExecute && !recoveryClaim) {
       if (!state.ensureWritable('pre-issue-mutation-write-probe')) return emitSystemicStatePause(args, state, 'pre-issue-mutation', { now, logger: dependencies.logger }).exitCode;
+
+      // The settings-revision recheck (issue #50, requirement 7) now runs
+      // earlier, before any attempt/ownership row was created -- see above.
       claim = claimIssueForExecution(args, selected.issue, selected.selection, ghRunner);
       if (!state.record('recordClaim', { repo: args.repo, issueNumber: selected.issue.number, claim })) {
         return emitSystemicStatePause(args, state, 'claim-persistence', { now, logger: dependencies.logger }).exitCode;

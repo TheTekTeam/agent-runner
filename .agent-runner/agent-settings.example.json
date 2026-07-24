@@ -9,7 +9,13 @@
       "endpoint": "http://127.0.0.1:11434",
       "endpointAllowlistHosts": [],
       "installedModelAllowlist": [],
-      "minFreeMemoryBytes": 2147483648
+      "minFreeMemoryBytes": 2147483648,
+      "qualification": {
+        "taskClasses": ["docs"],
+        "riskClasses": ["low"],
+        "models": [],
+        "harness": null
+      }
     },
     "codex-cli": {
       "enabled": false,
@@ -22,9 +28,16 @@
       "model": null,
       "reasoningEffort": null,
       "paidUseApproved": false,
+      "automaticRoutingApproved": false,
       "maxCostUsdPerRun": 0,
       "maxTokensPerRun": 0,
-      "sessionSecretRef": null
+      "sessionSecretRef": null,
+      "qualification": {
+        "taskClasses": [],
+        "riskClasses": [],
+        "models": [],
+        "harness": null
+      }
     },
     "grok-cli": {
       "enabled": false,
@@ -36,9 +49,16 @@
       "timeout": 300000,
       "maxToolRounds": 50,
       "paidUseApproved": false,
+      "automaticRoutingApproved": false,
       "maxCostUsdPerRun": 0,
       "maxTokensPerRun": 0,
-      "sessionSecretRef": null
+      "sessionSecretRef": null,
+      "qualification": {
+        "taskClasses": [],
+        "riskClasses": [],
+        "models": [],
+        "harness": null
+      }
     }
   }
 }

@@ -10,7 +10,7 @@ import {
   serializeCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
 
-export const RUNNER_STATE_SCHEMA_VERSION = 10;
+export const RUNNER_STATE_SCHEMA_VERSION = 12;
 export const DEFAULT_RUNNER_STATE_DB_NAME = 'runner-state.sqlite';
 
 const TABLES = new Set([
@@ -25,6 +25,7 @@ const TABLES = new Set([
   'recovery_revalidations',
   'attention_events',
   'runner_health_conditions',
+  'routing_events',
 ]);
 
 export const RUNNER_STATE_TABLES = Object.freeze([...TABLES]);
@@ -295,6 +296,38 @@ export class RunnerStateStore {
         UNIQUE(repo, condition_type)
       );
 
+      -- Schema v11 (#50): durable, deduplicated evidence for the serial
+      -- multi-agent selector -- queued reassignment planning/application and
+      -- the no-qualified-agent outcome. dedupe_key is UNIQUE so repeated
+      -- reconciliation passes over the same unresolved condition insert
+      -- exactly one row (and the caller can gate a duplicate GitHub comment
+      -- on whether this insert actually happened). payload_json is bounded
+      -- server-side by the caller -- this table never receives raw settings,
+      -- credentials, paths, endpoints, prompts, or provider responses.
+      -- Schema v12 (#50 review round 3): delivery_status turns this table
+      -- into a small durable state machine -- 'mutation-pending' (intent
+      -- recorded, GitHub not yet mutated), 'evidence-pending' (mutation
+      -- verified or not applicable, evidence comment not yet delivered), and
+      -- 'resolved' (comment delivered, or the event type never mutates
+      -- GitHub at all). A crash between any two of these steps leaves a row
+      -- a later reconciliation pass can find and safely resume from -- by
+      -- re-reading live GitHub state, never by blindly repeating a mutation.
+      CREATE TABLE IF NOT EXISTS routing_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        issue_number INTEGER,
+        event_type TEXT NOT NULL,
+        from_agent_id TEXT,
+        to_agent_id TEXT,
+        reason TEXT,
+        settings_revision TEXT,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        delivery_status TEXT NOT NULL DEFAULT 'resolved',
+        payload_json TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS routing_events_issue_idx ON routing_events(repo, issue_number, event_type, created_at);
       CREATE INDEX IF NOT EXISTS queue_events_issue_idx ON queue_events(issue_number, created_at);
       CREATE INDEX IF NOT EXISTS quota_history_created_idx ON quota_history(created_at);
       CREATE INDEX IF NOT EXISTS preflight_packets_issue_idx ON preflight_packets(issue_number, created_at);
@@ -363,7 +396,59 @@ export class RunnerStateStore {
     if (!attemptColumns.has('retry_attempt')) this.db.exec('ALTER TABLE recovery_attempts ADD COLUMN retry_attempt INTEGER NOT NULL DEFAULT 0');
     if (!attemptColumns.has('retry_cap')) this.db.exec('ALTER TABLE recovery_attempts ADD COLUMN retry_cap INTEGER');
     if (!attemptColumns.has('retry_reason')) this.db.exec('ALTER TABLE recovery_attempts ADD COLUMN retry_reason TEXT');
+    const routingEventColumns = new Set(this.db.prepare('PRAGMA table_info(routing_events)').all().map((column) => column.name));
+    if (!routingEventColumns.has('delivery_status')) this.db.exec("ALTER TABLE routing_events ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'resolved'");
+    this.db.exec('CREATE INDEX IF NOT EXISTS routing_events_delivery_status_idx ON routing_events(repo, delivery_status)');
     this.db.prepare('INSERT OR IGNORE INTO runner_state_schema (version, applied_at) VALUES (?, ?)').run(RUNNER_STATE_SCHEMA_VERSION, this.now());
+  }
+
+  /**
+   * Idempotent (issue #50): a `dedupe_key` collision is silently ignored,
+   * and the return value's `inserted` flag tells the caller whether this
+   * was a genuinely new event. On a collision, `existing` carries the
+   * already-persisted row (in particular its `delivery_status`) so a caller
+   * can distinguish "already fully resolved, do nothing" from "still
+   * pending, safe to resume" without a second query (issue #50 review round
+   * 3: crash-safe pending/delivery reconciliation).
+   */
+  recordRoutingEvent({
+    repo, issueNumber = null, eventType, fromAgentId = null, toAgentId = null, reason = null,
+    settingsRevision = null, dedupeKey, payload = null, deliveryStatus = 'resolved', createdAt = this.now(),
+  }) {
+    if (!dedupeKey) throw new Error('recordRoutingEvent requires a dedupeKey');
+    const result = this.db.prepare(`
+      INSERT OR IGNORE INTO routing_events (created_at, repo, issue_number, event_type, from_agent_id, to_agent_id, reason, settings_revision, dedupe_key, delivery_status, payload_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(createdAt, repo, asInteger(issueNumber), eventType, fromAgentId, toAgentId, reason, settingsRevision, dedupeKey, deliveryStatus, json(payload));
+    if (result.changes > 0) return { inserted: true, existing: null };
+    return { inserted: false, existing: this.db.prepare('SELECT * FROM routing_events WHERE dedupe_key = ?').get(dedupeKey) || null };
+  }
+
+  hasRoutingEvent({ dedupeKey }) {
+    return Boolean(this.db.prepare('SELECT 1 FROM routing_events WHERE dedupe_key = ?').get(dedupeKey));
+  }
+
+  /**
+   * Advance a durable routing-event row's delivery state -- the only
+   * mutation this table's crash-safe reconciliation flow ever performs
+   * beyond the initial insert. Returns `{ updated: false }` rather than
+   * throwing when the dedupe key is unknown, so a caller can fail closed
+   * (never assume the transition happened) instead of crashing the pass.
+   */
+  updateRoutingEventDeliveryStatus({ dedupeKey, deliveryStatus }) {
+    if (!dedupeKey || !deliveryStatus) throw new Error('updateRoutingEventDeliveryStatus requires dedupeKey and deliveryStatus');
+    const result = this.db.prepare('UPDATE routing_events SET delivery_status = ? WHERE dedupe_key = ?').run(deliveryStatus, dedupeKey);
+    return { updated: result.changes > 0 };
+  }
+
+  /**
+   * Every not-yet-`resolved` routing-event row for a repo, oldest first --
+   * the exact set a restart/reopen reconciliation pass needs to inspect
+   * (issue #50 review round 3: "reconcile pending rows after restart by
+   * reading live labels").
+   */
+  pendingRoutingEvents(repo) {
+    return this.db.prepare("SELECT * FROM routing_events WHERE repo = ? AND delivery_status != 'resolved' ORDER BY created_at ASC").all(repo);
   }
 
   recordQueueEvent({ repo, eventType, issueNumber = null, statusLabel = null, reason = null, payload = null, createdAt = this.now() }) {
