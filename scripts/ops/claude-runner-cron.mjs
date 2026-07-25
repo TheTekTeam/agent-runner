@@ -6,7 +6,7 @@ import { mkdirSync, openSync, closeSync, readFileSync, rmSync, writeFileSync } f
 import { dirname, join as joinPath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadAgentRunnerConfig, stripConfigArgs } from './agent-runner-config.mjs';
+import { loadAgentRunnerConfig, resolveConfigPath, stripConfigArgs } from './agent-runner-config.mjs';
 import {
   AGENT_ADAPTERS,
   agentRunMetadata,
@@ -193,10 +193,15 @@ export function parseAgentLabels(value) {
 }
 
 export function parseArgs(argv = process.argv.slice(2), env = process.env) {
-  const config = loadAgentRunnerConfig({ argv, env });
+  // Preserve the exact project-config authority before stripping CLI-only
+  // transport arguments. Every child must resolve the same repository and
+  // checkout as the scheduler instead of falling back to compiled defaults.
+  const configPath = resolveConfigPath(argv, env);
+  const config = loadAgentRunnerConfig({ argv, env, configPath });
   argv = stripConfigArgs(argv);
   const outputDir = env.CLAUDE_RUNNER_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT;
   const args = {
+    configPath,
     repo: env.GITHUB_REPOSITORY || config.githubRepo || DEFAULT_REPO,
     lockPath: env.CLAUDE_RUNNER_CRON_LOCK || config.runner?.lockPath || DEFAULT_LOCK,
     outputDir,
@@ -352,7 +357,9 @@ export function evaluateChildRunResult({ execute, exitCode, childPayload }) {
 }
 
 export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeSessionId } = {}) {
-  const out = [CLAUDE_RUNNER_ENTRYPOINT, '--issue', String(issueNumber), '--output-dir', args.outputDir];
+  const out = [CLAUDE_RUNNER_ENTRYPOINT];
+  if (args.configPath) out.push('--config', args.configPath);
+  out.push('--issue', String(issueNumber), '--output-dir', args.outputDir);
   if (args.execute) out.push('--execute');
   // attemptId lets the child write its restricted recovery handle (session
   // id, worktree/branch identity) under the same attempt row the scheduler
@@ -367,7 +374,10 @@ export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeS
 }
 
 export function quotaPreflightArgs(args) {
-  return [CLAUDE_RUNNER_ENTRYPOINT, '--check-quota', '--force-quota-check', '--output-dir', args.outputDir];
+  const out = [CLAUDE_RUNNER_ENTRYPOINT];
+  if (args.configPath) out.push('--config', args.configPath);
+  out.push('--check-quota', '--force-quota-check', '--output-dir', args.outputDir);
+  return out;
 }
 
 function gh(jsonArgs) {
