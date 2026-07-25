@@ -13,6 +13,27 @@ export class CandidateAdmissionPausedError extends Error {
 
 export function snapshotFromSelectionRecord(record = {}) {
   const plan = record.payload || record;
+  const preflightIdentity = record.sourcePreflightCommentIdentity
+    ?? plan.sourcePreflightCommentIdentity
+    ?? null;
+  const preflightRevision = record.sourcePreflightRevision
+    ?? plan.sourcePreflightRevision
+    ?? null;
+  const preflightFingerprint = record.sourcePreflightFingerprint
+    ?? plan.sourcePreflightFingerprint
+    ?? null;
+  const preflightAuthorityKey = record.sourcePreflightAuthorityKey
+    ?? plan.sourcePreflightAuthorityKey
+    ?? null;
+  const preflightBodyDigest = record.sourcePreflightBodyDigest
+    ?? plan.sourcePreflightBodyDigest
+    ?? null;
+  const preflightApprovedAgent = record.sourcePreflightApprovedAgent
+    ?? plan.sourcePreflightApprovedAgent
+    ?? plan.agent?.agentId
+    ?? null;
+  const explicitPacketValid = record.sourcePreflightPacketValid
+    ?? plan.sourcePreflightPacketValid;
   return {
     issueNumber: record.issueNumber ?? plan.selectedIssue ?? null,
     statusLabel: record.statusLabel ?? plan.selectedStatusLabel ?? null,
@@ -21,9 +42,28 @@ export function snapshotFromSelectionRecord(record = {}) {
     commandKind: record.commandKind ?? plan.selectedCommandKind ?? null,
     commandIdentity: record.sourceCommentIdentity ?? plan.sourceCommentIdentity ?? null,
     commandRevision: record.sourceCommentId ?? plan.sourceCommentId ?? null,
-    preflightIdentity: record.sourcePreflightCommentIdentity ?? plan.sourcePreflightCommentIdentity ?? null,
-    preflightRevision: record.sourcePreflightCommentId ?? plan.sourcePreflightCommentId ?? null,
-    preflightAuthor: plan.sourcePreflightAuthor ?? null,
+    preflightIdentity,
+    preflightRevision,
+    preflightFingerprint,
+    preflightAuthorityKey,
+    preflightBodyDigest,
+    preflightPacketValid: explicitPacketValid === undefined
+      ? Boolean(
+        preflightRevision
+        && preflightFingerprint
+        && preflightAuthorityKey
+        && preflightBodyDigest
+        && preflightApprovedAgent
+      )
+      : explicitPacketValid === true,
+    preflightPacketReason: record.sourcePreflightPacketReason
+      ?? plan.sourcePreflightPacketReason
+      ?? null,
+    preflightApprovedAgent,
+    preflightCommentRevision: record.sourcePreflightCommentId
+      ?? plan.sourcePreflightCommentId
+      ?? null,
+    preflightAuthor: record.sourcePreflightAuthor ?? plan.sourcePreflightAuthor ?? null,
   };
 }
 
