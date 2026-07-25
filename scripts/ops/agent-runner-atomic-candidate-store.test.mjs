@@ -9,6 +9,10 @@ import {
   runAtomicCandidateRevalidation,
   snapshotFromSelectionRecord,
 } from './agent-runner-atomic-candidate-store.mjs';
+import {
+  evaluateCandidateAdmission,
+  normalizeCandidateSnapshot,
+} from './agent-runner-candidate-admission.mjs';
 
 function fakeStore() {
   const calls = [];
@@ -20,6 +24,11 @@ function fakeStore() {
     openHealthCondition(value) { calls.push(['health', value]); },
   };
 }
+
+const managerRevision = 'AR5-ATOMIC-CANARY-2026-07-25.1';
+const managerFingerprint = `sha256:${'a'.repeat(64)}`;
+const managerBodyDigest = `sha256:${'b'.repeat(64)}`;
+const managerAuthorityKey = `manager-preflight:${managerRevision}:${managerFingerprint}`;
 
 const selectionRecord = {
   issueNumber: 5,
@@ -37,6 +46,11 @@ const selectionRecord = {
     sourceCommentIdentity: null,
     sourcePreflightCommentIdentity: { databaseId: 100 },
     sourcePreflightCommentId: 'github-comment:database-id:100',
+    sourcePreflightRevision: managerRevision,
+    sourcePreflightFingerprint: managerFingerprint,
+    sourcePreflightBodyDigest: managerBodyDigest,
+    sourcePreflightAuthorityKey: managerAuthorityKey,
+    sourcePreflightAuthor: 'gpcola',
     agent: { agentId: 'claude' },
   },
 };
@@ -48,6 +62,16 @@ const initialAttempt = {
   attemptId: 'TheTekTeam/agent-runner#5:now',
 };
 
+function revalidateExpected(expected, mutateCurrent = (value) => value) {
+  const initial = normalizeCandidateSnapshot(expected);
+  const current = normalizeCandidateSnapshot(mutateCurrent(structuredClone(expected)));
+  return {
+    admission: evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }),
+    initial,
+    current,
+  };
+}
+
 test('selection record becomes the expected scheduler authority snapshot', () => {
   assert.deepEqual(snapshotFromSelectionRecord(selectionRecord), {
     issueNumber: 5,
@@ -58,17 +82,24 @@ test('selection record becomes the expected scheduler authority snapshot', () =>
     commandIdentity: null,
     commandRevision: null,
     preflightIdentity: { databaseId: 100 },
-    preflightRevision: 'github-comment:database-id:100',
-    preflightAuthor: null,
+    preflightRevision: managerRevision,
+    preflightFingerprint: managerFingerprint,
+    preflightAuthorityKey: managerAuthorityKey,
+    preflightBodyDigest: managerBodyDigest,
+    preflightPacketValid: true,
+    preflightPacketReason: null,
+    preflightApprovedAgent: 'claude',
+    preflightCommentRevision: 'github-comment:database-id:100',
+    preflightAuthor: 'gpcola',
   });
 });
 
-test('stable candidate permits the initial attempt insert', () => {
+test('stable canonical authority permits the initial attempt insert', () => {
   const raw = fakeStore();
   const pauseState = { result: null };
   const store = createAtomicAdmissionStore(raw, {
     pauseState,
-    revalidate: ({ expected }) => ({ admission: { allowed: true, reason: 'candidate-admitted' }, initial: expected, current: expected }),
+    revalidate: ({ expected }) => revalidateExpected(expected),
   });
   store.recordIssueSelection(selectionRecord);
   store.recordRecoveryAttempt(initialAttempt);
@@ -76,10 +107,84 @@ test('stable candidate permits the initial attempt insert', () => {
   assert.equal(raw.calls.filter(([kind]) => kind === 'attempt').length, 1);
 });
 
+test('changed authority key refuses attempt persistence before claim or child launch', () => {
+  const raw = fakeStore();
+  const pauseState = { result: null };
+  const store = createAtomicAdmissionStore(raw, {
+    pauseState,
+    revalidate: ({ expected }) => revalidateExpected(expected, (current) => ({
+      ...current,
+      preflightAuthorityKey: `${current.preflightAuthorityKey}:changed`,
+    })),
+  });
+  store.recordIssueSelection(selectionRecord);
+  assert.throws(() => store.recordRecoveryAttempt(initialAttempt), CandidateAdmissionPausedError);
+  assert.equal(raw.calls.filter(([kind]) => kind === 'attempt').length, 0);
+  assert.equal(pauseState.result.admission.reason, 'candidate-preflight-revision-changed');
+});
+
+test('changed packet body digest refuses attempt persistence before claim or child launch', () => {
+  const raw = fakeStore();
+  const pauseState = { result: null };
+  const store = createAtomicAdmissionStore(raw, {
+    pauseState,
+    revalidate: ({ expected }) => revalidateExpected(expected, (current) => ({
+      ...current,
+      preflightBodyDigest: `sha256:${'c'.repeat(64)}`,
+    })),
+  });
+  store.recordIssueSelection(selectionRecord);
+  assert.throws(() => store.recordRecoveryAttempt(initialAttempt), CandidateAdmissionPausedError);
+  assert.equal(raw.calls.filter(([kind]) => kind === 'attempt').length, 0);
+  assert.equal(pauseState.result.admission.reason, 'candidate-preflight-content-changed');
+});
+
+test('invalid current packet refuses attempt persistence before claim or child launch', () => {
+  const raw = fakeStore();
+  const pauseState = { result: null };
+  const store = createAtomicAdmissionStore(raw, {
+    pauseState,
+    revalidate: ({ expected }) => revalidateExpected(expected, (current) => ({
+      ...current,
+      preflightPacketValid: false,
+      preflightPacketReason: 'manager-preflight-invalid',
+    })),
+  });
+  store.recordIssueSelection(selectionRecord);
+  assert.throws(() => store.recordRecoveryAttempt(initialAttempt), CandidateAdmissionPausedError);
+  assert.equal(raw.calls.filter(([kind]) => kind === 'attempt').length, 0);
+  assert.equal(pauseState.result.admission.reason, 'manager-preflight-invalid');
+});
+
+test('wrong packet-approved agent refuses attempt persistence before claim or child launch', () => {
+  const raw = fakeStore();
+  const pauseState = { result: null };
+  const store = createAtomicAdmissionStore(raw, {
+    pauseState,
+    revalidate: ({ expected }) => revalidateExpected(expected, (current) => ({
+      ...current,
+      preflightApprovedAgent: 'codex-web',
+    })),
+  });
+  store.recordIssueSelection(selectionRecord);
+  assert.throws(() => store.recordRecoveryAttempt(initialAttempt), CandidateAdmissionPausedError);
+  assert.equal(raw.calls.filter(([kind]) => kind === 'attempt').length, 0);
+  assert.equal(pauseState.result.admission.reason, 'candidate-preflight-agent-not-approved');
+});
+
+test('comment identity remains evidence separate from canonical packet authority', () => {
+  const snapshot = snapshotFromSelectionRecord(selectionRecord);
+  assert.deepEqual(snapshot.preflightIdentity, { databaseId: 100 });
+  assert.equal(snapshot.preflightCommentRevision, 'github-comment:database-id:100');
+  assert.equal(snapshot.preflightRevision, managerRevision);
+  assert.equal(snapshot.preflightAuthorityKey, managerAuthorityKey);
+  assert.notEqual(snapshot.preflightCommentRevision, snapshot.preflightRevision);
+});
+
 test('stale candidate refuses attempt persistence before claim or child launch', () => {
   const raw = fakeStore();
   const pauseState = { result: null };
-  const current = { ...snapshotFromSelectionRecord(selectionRecord), preflightRevision: 'github-comment:database-id:101' };
+  const current = { ...snapshotFromSelectionRecord(selectionRecord), preflightAuthorityKey: `${managerAuthorityKey}:stale` };
   const store = createAtomicAdmissionStore(raw, {
     pauseState,
     revalidate: ({ expected }) => ({
@@ -118,7 +223,7 @@ test('candidate pause is audited without opening systemic health', () => {
   const pauseState = {
     result: {
       admission: { allowed: false, reason: 'candidate-status-changed' },
-      current: { issueNumber: 5, preflightRevision: 'github-comment:database-id:100' },
+      current: { issueNumber: 5, preflightRevision: managerRevision },
     },
   };
   const store = createAtomicAdmissionStore(raw, { pauseState });
