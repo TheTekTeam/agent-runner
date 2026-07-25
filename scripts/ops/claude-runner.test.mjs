@@ -23,7 +23,9 @@ import {
   findLatestClaudeProceedCommand,
   hasManagerPreflight,
   inferProfile,
+  implementationProcessCwd,
   latestManagerPreflightComment,
+  nativeClaudeWorktreeName,
   parseArgs,
   parseClaudeResultEnvelope,
   parseKeyValueBlock,
@@ -339,6 +341,37 @@ test('Claude args include model effort and budget without interaction caps', () 
     profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50', permissionMode: 'plan' },
   });
   assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.50', '--permission-mode', 'plan', '--output-format', 'json']);
+});
+
+
+test('#86: approved branches use the runner-prepared worktree and never Claude native branch generation', () => {
+  const approved = { name: 'agent-runner-743-github-comment-database-5079980543', expectedBranch: 'claude/supervised-canary-743' };
+  assert.equal(nativeClaudeWorktreeName(approved), undefined);
+  const args = buildClaudeArgs({
+    prompt: 'implement',
+    profile: { model: 'sonnet', effort: 'low', maxBudgetUsd: '0.50', permissionMode: 'dontAsk', worktreeName: nativeClaudeWorktreeName(approved) },
+  });
+  assert.equal(args.includes('--worktree'), false);
+
+  const legacy = { name: 'agent-runner-658-source', expectedBranch: 'worktree-agent-runner-658-source' };
+  assert.equal(nativeClaudeWorktreeName(legacy), legacy.name);
+});
+
+test('#86: worker cwd uses the approved runner-owned worktree and preserves legacy native worktree launch', () => {
+  const approved = {
+    rootPath: '/repo',
+    worktreePath: '/repo/.claude/worktrees/agent-runner-743-github-comment-database-5079980543',
+    workspacePreparedByRunner: true,
+  };
+  assert.equal(implementationProcessCwd(approved, '/fallback'), approved.worktreePath);
+
+  const legacy = {
+    rootPath: '/repo',
+    worktreePath: '/repo/.claude/worktrees/agent-runner-658-source',
+    workspacePreparedByRunner: false,
+  };
+  assert.equal(implementationProcessCwd(legacy, '/fallback'), legacy.rootPath);
+  assert.equal(implementationProcessCwd(null, '/fallback'), '/fallback');
 });
 
 test('critical defaults retain monetary bounds and do not silently select Opus/xhigh', () => {
@@ -658,38 +691,52 @@ test('implementation cannot report another plan or no repository change as succe
   }), 'implementation-no-repository-change');
 });
 
-test('runner publishes only its exact committed worktree branch as a draft PR', () => {
+test('#86: runner publishes the exact manager-approved branch as a draft PR', () => {
   const calls = [];
   let listCount = 0;
+  const branch = 'claude/supervised-canary-743';
   const runner = (command, args) => {
     calls.push([command, ...args]);
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
     if (command === 'git') return { status: 0, stdout: '' };
     if (args[0] === 'pr' && args[1] === 'list') {
       listCount += 1;
-      return {
-        status: 0,
-        stdout: listCount === 1 ? '[]' : JSON.stringify([{ number: 708, url: 'https://github.com/TheTekTeam/modelspend/pull/708', isDraft: true }]),
-      };
+      return { status: 0, stdout: listCount === 1 ? '[]' : JSON.stringify([{ number: 708, url: 'https://github.com/TheTekTeam/modelspend/pull/708', isDraft: true }]) };
     }
     if (args[0] === 'pr' && args[1] === 'create') return { status: 0, stdout: 'https://github.com/TheTekTeam/modelspend/pull/708\n' };
     return { status: 1, stdout: '', stderr: 'unexpected command' };
   };
   const result = publishImplementationDraft({
     workspace: { worktreePath: '/tmp/worktree', baseRef: 'origin/main' },
-    worktreeIdentity: { expectedBranch: 'worktree-agent-runner-658-77' },
+    worktreeIdentity: { expectedBranch: branch },
     repo: 'TheTekTeam/modelspend',
-    issueNumber: 658,
-    issueTitle: 'Portable runner entrypoints',
+    issueNumber: 743,
+    issueTitle: 'Supervised canary',
     runner,
     env: {},
   });
   assert.equal(result.published, true);
   assert.equal(result.prNumber, 708);
-  assert.deepEqual(calls[0], ['git', 'push', '--set-upstream', 'origin', 'worktree-agent-runner-658-77']);
+  assert.ok(calls.some((call) => call.join(' ') === `git push --set-upstream origin ${branch}`));
   const create = calls.find((call) => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create');
   assert.ok(create.includes('--draft'));
-  assert.ok(create.includes('TheTekTeam/modelspend'));
-  assert.ok(create.includes('worktree-agent-runner-658-77'));
+  assert.ok(create.includes(branch));
+});
+
+test('#86: publication rejects an actual worktree branch that differs from manager authority', () => {
+  const result = publishImplementationDraft({
+    workspace: { worktreePath: '/tmp/worktree', baseRef: 'origin/main' },
+    worktreeIdentity: { expectedBranch: 'claude/supervised-canary-743' },
+    repo: 'TheTekTeam/modelspend',
+    issueNumber: 743,
+    runner: (command, args) => {
+      if (command === 'git' && args[0] === 'check-ref-format') return { status: 0, stdout: '' };
+      if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: 'worktree-agent-runner-743-generated\n' };
+      return { status: 1, stdout: '' };
+    },
+  });
+  assert.equal(result.published, false);
+  assert.equal(result.failureReason, 'implementation-publication-branch-mismatch');
 });
 
 test('draft publication targets the resolved implementation repository, not just whatever "repo" happens to be passed', () => {
@@ -697,6 +744,7 @@ test('draft publication targets the resolved implementation repository, not just
   let listCount = 0;
   const runner = (command, args) => {
     calls.push([command, ...args]);
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: 'worktree-agent-runner-686-x\n' };
     if (command === 'git') return { status: 0, stdout: '' };
     if (args[0] === 'pr' && args[1] === 'list') {
       listCount += 1;
@@ -779,21 +827,56 @@ test('implementation workspace preparation proves fresh origin/main and exclusiv
   assert.equal(result.worktreePath, '/repo/.claude/worktrees/agent-runner-658-77');
 });
 
+test('#86: exact #743 approved branch is created in the deterministic worktree before worker launch', (t) => {
+  const repoRoot = mkdtempSync(join(tmpdir(), 'agent-runner-86-approved-branch-'));
+  t.after(() => rmSync(repoRoot, { recursive: true, force: true }));
+  const calls = [];
+  const branch = 'claude/supervised-canary-743';
+  const name = 'agent-runner-743-github-comment-database-5079980543';
+  const worktreePath = `${repoRoot}/.claude/worktrees/${name}`;
+  const base = 'fb83e1c8ec6a918c100f0278a4aacc67f89560a9';
+  const runner = (_command, args, options = {}) => {
+    const joined = args.join(' ');
+    calls.push({ joined, cwd: options.cwd });
+    if (joined === 'rev-parse --show-toplevel') return { status: 0, stdout: `${repoRoot}\n` };
+    if (joined === 'fetch --quiet origin main') return { status: 0, stdout: '' };
+    if (joined === 'rev-parse origin/main') return { status: 0, stdout: `${base}\n` };
+    if (joined === 'symbolic-ref refs/remotes/origin/HEAD') return { status: 0, stdout: 'refs/remotes/origin/main\n' };
+    if (joined.startsWith('show-ref --verify --quiet')) return { status: 1, stdout: '' };
+    if (joined === 'worktree list --porcelain') return { status: 0, stdout: `worktree ${repoRoot}\nHEAD ${base}\nbranch refs/heads/main\n` };
+    if (options.cwd === `${repoRoot}` && joined === 'rev-parse HEAD') return { status: 0, stdout: `${base}\n` };
+    if (options.cwd === `${repoRoot}` && joined === 'branch --show-current') return { status: 0, stdout: 'main\n' };
+    if (options.cwd === `${repoRoot}` && joined === 'status --porcelain=v1 --untracked-files=no') return { status: 0, stdout: '' };
+    if (joined === `check-ref-format --branch ${branch}`) return { status: 0, stdout: '' };
+    if (joined === `worktree add --quiet -b ${branch} ${worktreePath} ${base}`) return { status: 0, stdout: '' };
+    if (options.cwd === worktreePath && joined === 'rev-parse HEAD') return { status: 0, stdout: `${base}\n` };
+    if (options.cwd === worktreePath && joined === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
+    if (options.cwd === worktreePath && joined === 'status --porcelain=v1 --untracked-files=all') return { status: 0, stdout: '' };
+    return { status: 1, stdout: '', stderr: `unexpected: ${joined} cwd=${options.cwd}` };
+  };
+  const result = prepareImplementationWorkspace({ worktreeIdentity: { name, expectedBranch: branch }, env: {}, runner });
+  assert.equal(result.allowed, true);
+  assert.equal(result.workspacePreparedByRunner, true);
+  assert.equal(result.worktreePath, worktreePath);
+  assert.ok(calls.some((call) => call.joined === `worktree add --quiet -b ${branch} ${worktreePath} ${base}`));
+  assert.equal(calls.some((call) => call.joined.includes('worktree-agent-runner-743')), false);
+});
+
 function continuationWorktreeRunner({ worktreeHead = 'resume-sha' } = {}) {
-  const worktreeList = 'worktree /repo\nHEAD base-sha\nbranch refs/heads/main\n\n'
-    + 'worktree /repo/.claude/worktrees/agent-runner-698-41\nHEAD resume-sha\nbranch refs/heads/worktree-agent-runner-698-41\n';
+  const worktreeList = `worktree /repo\nHEAD base-sha\nbranch refs/heads/main\n\n`
+    + `worktree /repo/.claude/worktrees/agent-runner-698-41\nHEAD resume-sha\nbranch refs/heads/worktree-agent-runner-698-41\n`;
   return (_command, args, options = {}) => {
     const joined = args.join(' ');
     const cwd = options.cwd;
-    if (joined === 'rev-parse --show-toplevel') return { status: 0, stdout: '/repo\n' };
+    if (joined === 'rev-parse --show-toplevel') return { status: 0, stdout: `/repo\n` };
     if (joined.startsWith('show-ref --verify --quiet')) return { status: 0, stdout: '' };
     if (joined === 'worktree list --porcelain') return { status: 0, stdout: worktreeList };
-    if (cwd === '/repo/.claude/worktrees/agent-runner-698-41') {
+    if (cwd === `/repo/.claude/worktrees/agent-runner-698-41`) {
       if (joined === 'rev-parse HEAD') return { status: 0, stdout: `${worktreeHead}\n` };
       if (joined === 'branch --show-current') return { status: 0, stdout: 'worktree-agent-runner-698-41\n' };
       if (joined === 'status --porcelain=v1 --untracked-files=all') return { status: 0, stdout: '' };
     }
-    if (cwd === '/repo') {
+    if (cwd === `/repo`) {
       if (joined === 'rev-parse HEAD') return { status: 0, stdout: 'base-sha\n' };
       if (joined === 'branch --show-current') return { status: 0, stdout: 'main\n' };
       if (joined === 'status --porcelain=v1 --untracked-files=no') return { status: 0, stdout: '' };
@@ -812,6 +895,7 @@ test('continuation workspace preparation requires the exact preserved worktree/b
   assert.equal(result.baseHead, 'resume-sha');
   assert.equal(result.rootBefore.branch, 'main');
   assert.equal(result.worktreePath, '/repo/.claude/worktrees/agent-runner-698-41');
+  assert.equal(result.workspacePreparedByRunner, false);
 });
 
 test('continuation workspace preparation fails closed when the expected branch is missing', () => {
