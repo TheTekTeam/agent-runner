@@ -146,9 +146,87 @@ test('parseArgs can load reusable project defaults from explicit config', () => 
     assert.deepEqual(args.agentLabels, ['agent:example']);
     assert.equal(args.limit, 42);
     assert.equal(args.project.id, 'example');
+    assert.equal(args.configPath, configPath);
+
+    const envArgs = parseArgs([], { AGENT_RUNNER_CONFIG: configPath });
+    assert.equal(envArgs.configPath, configPath);
+    assert.equal(envArgs.project.id, 'example');
+    assert.equal(envArgs.project.localRepoPath, '/srv/example');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('parseArgs fails closed when an explicit child config path is unreadable', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cron-config-missing-'));
+  try {
+    assert.throws(
+      () => parseArgs(['--config', join(dir, 'missing.json')], {}),
+      /Unable to read agent runner config/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('runnerArgs propagates the exact project config to ordinary and recovery children', () => {
+  const configPath = '/home/gp/.config/agent-runner/modelspend.json';
+  const args = { configPath, outputDir: '/tmp/agent-runner', execute: true };
+
+  assert.deepEqual(
+    runnerArgs(743, args, { attemptId: 'attempt-743' }),
+    [
+      CLAUDE_RUNNER_ENTRYPOINT,
+      '--config', configPath,
+      '--issue', '743',
+      '--output-dir', '/tmp/agent-runner',
+      '--execute',
+      '--attempt-id', 'attempt-743',
+    ],
+  );
+
+  assert.deepEqual(
+    runnerArgs(743, args, {
+      attemptId: 'attempt-743',
+      recoveryMode: 'native_resume',
+      resumeSessionId: 'session-743',
+    }),
+    [
+      CLAUDE_RUNNER_ENTRYPOINT,
+      '--config', configPath,
+      '--issue', '743',
+      '--output-dir', '/tmp/agent-runner',
+      '--execute',
+      '--attempt-id', 'attempt-743',
+      '--recovery-mode', 'native_resume',
+      '--resume-session', 'session-743',
+    ],
+  );
+});
+
+test('runnerArgs preserves compiled-default compatibility when no config path exists', () => {
+  assert.deepEqual(
+    runnerArgs(743, { configPath: null, outputDir: '.var/runner', execute: false }),
+    [CLAUDE_RUNNER_ENTRYPOINT, '--issue', '743', '--output-dir', '.var/runner'],
+  );
+});
+
+test('quotaPreflightArgs propagates project config and preserves no-config compatibility', () => {
+  const configPath = '/home/gp/.config/agent-runner/modelspend.json';
+  assert.deepEqual(
+    quotaPreflightArgs({ configPath, outputDir: '/tmp/agent-runner' }),
+    [
+      CLAUDE_RUNNER_ENTRYPOINT,
+      '--config', configPath,
+      '--check-quota',
+      '--force-quota-check',
+      '--output-dir', '/tmp/agent-runner',
+    ],
+  );
+  assert.deepEqual(
+    quotaPreflightArgs({ configPath: null, outputDir: '.var/runner' }),
+    [CLAUDE_RUNNER_ENTRYPOINT, '--check-quota', '--force-quota-check', '--output-dir', '.var/runner'],
+  );
 });
 
 test('parseArgs keeps explicit state DB independent of output-dir argument order', () => {
