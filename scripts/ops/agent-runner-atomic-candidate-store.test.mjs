@@ -51,7 +51,7 @@ const selectionRecord = {
     sourcePreflightBodyDigest: managerBodyDigest,
     sourcePreflightAuthorityKey: managerAuthorityKey,
     sourcePreflightAuthor: 'gpcola',
-    agent: { agentId: 'claude' },
+    agent: { agentId: 'claude-code-cli' },
   },
 };
 
@@ -76,7 +76,7 @@ test('selection record becomes the expected scheduler authority snapshot', () =>
   assert.deepEqual(snapshotFromSelectionRecord(selectionRecord), {
     issueNumber: 5,
     statusLabel: 'status:ready',
-    agentLabel: 'agent:claude',
+    agentLabel: 'agent:claude-code-cli',
     selectionMode: 'preflight-direct',
     commandKind: null,
     commandIdentity: null,
@@ -88,7 +88,7 @@ test('selection record becomes the expected scheduler authority snapshot', () =>
     preflightBodyDigest: managerBodyDigest,
     preflightPacketValid: true,
     preflightPacketReason: null,
-    preflightApprovedAgent: 'claude',
+    preflightApprovedAgent: 'claude-code-cli',
     preflightCommentRevision: 'github-comment:database-id:100',
     preflightAuthor: 'gpcola',
   });
