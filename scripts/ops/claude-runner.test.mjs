@@ -23,6 +23,7 @@ import {
   findLatestClaudeProceedCommand,
   hasManagerPreflight,
   inferProfile,
+  implementationProcessCwd,
   latestManagerPreflightComment,
   nativeClaudeWorktreeName,
   parseArgs,
@@ -354,6 +355,23 @@ test('#86: approved branches use the runner-prepared worktree and never Claude n
 
   const legacy = { name: 'agent-runner-658-source', expectedBranch: 'worktree-agent-runner-658-source' };
   assert.equal(nativeClaudeWorktreeName(legacy), legacy.name);
+});
+
+test('#86: worker cwd uses the approved runner-owned worktree and preserves legacy native worktree launch', () => {
+  const approved = {
+    rootPath: '/repo',
+    worktreePath: '/repo/.claude/worktrees/agent-runner-743-github-comment-database-5079980543',
+    workspacePreparedByRunner: true,
+  };
+  assert.equal(implementationProcessCwd(approved, '/fallback'), approved.worktreePath);
+
+  const legacy = {
+    rootPath: '/repo',
+    worktreePath: '/repo/.claude/worktrees/agent-runner-658-source',
+    workspacePreparedByRunner: false,
+  };
+  assert.equal(implementationProcessCwd(legacy, '/fallback'), legacy.rootPath);
+  assert.equal(implementationProcessCwd(null, '/fallback'), '/fallback');
 });
 
 test('critical defaults retain monetary bounds and do not silently select Opus/xhigh', () => {
@@ -877,6 +895,7 @@ test('continuation workspace preparation requires the exact preserved worktree/b
   assert.equal(result.baseHead, 'resume-sha');
   assert.equal(result.rootBefore.branch, 'main');
   assert.equal(result.worktreePath, '/repo/.claude/worktrees/agent-runner-698-41');
+  assert.equal(result.workspacePreparedByRunner, false);
 });
 
 test('continuation workspace preparation fails closed when the expected branch is missing', () => {

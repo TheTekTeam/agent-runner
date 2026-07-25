@@ -585,6 +585,13 @@ export function nativeClaudeWorktreeName(worktreeIdentity) {
   return name && expectedBranch === `worktree-${name}` ? name : undefined;
 }
 
+export function implementationProcessCwd(workspace, fallbackCwd = resolve('.')) {
+  if (workspace?.workspacePreparedByRunner && workspace?.worktreePath) {
+    return workspace.worktreePath;
+  }
+  return workspace?.rootPath || fallbackCwd;
+}
+
 export function prepareImplementationWorkspace({ worktreeIdentity, implementationCheckout, env = process.env, runner = spawnSync } = {}) {
   const baseRef = String(env.CLAUDE_RUNNER_BASE_REF || 'origin/main').trim();
   if (!/^origin\/[A-Za-z0-9._/-]+$/.test(baseRef)) {
@@ -724,6 +731,7 @@ export function prepareContinuationWorkspace({ worktreeIdentity, implementationC
     rootPath,
     rootBefore,
     worktreePath,
+    workspacePreparedByRunner: !nativeClaudeWorktreeName(worktreeIdentity),
   };
 }
 
@@ -1313,7 +1321,7 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
   const claudeEnv = buildClaudeProcessEnv(env, { inheritProviderAuth: args.inheritProviderAuth });
   const startedAt = new Date().toISOString();
   const result = processRunner(args.claudeBin, claudeArgs, {
-    cwd: implementationWorkspace?.rootPath || resolve('.'),
+    cwd: implementationProcessCwd(implementationWorkspace),
     encoding: 'utf8',
     maxBuffer: 20 * 1024 * 1024,
     env: claudeEnv,
