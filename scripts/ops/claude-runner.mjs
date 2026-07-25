@@ -262,7 +262,7 @@ Usage:
   node scripts/ops/claude-runner.mjs --check-quota
 
 Issue execution phases:
-  implementation  Default for docs/narrow/complex issues with a current manager preflight. Requires machine-local opt-in and an allowlisted preflight author. Uses dontAsk, an explicit tool allowlist, and a native Claude worktree.
+  implementation  Default for docs/narrow/complex issues with a current manager preflight. Requires machine-local opt-in and an allowlisted preflight author. Uses dontAsk, an explicit tool allowlist, and an isolated Git worktree bound to manager branch authority.
   plan            Default only for critical profiles, or when the current command/preflight says Phase: plan. Never counts as implementation.
 
 Required implementation policy:
@@ -579,6 +579,12 @@ export function captureGitRepositoryEvidence({ cwd = resolve('.'), includeUntrac
   };
 }
 
+export function nativeClaudeWorktreeName(worktreeIdentity) {
+  const name = String(worktreeIdentity?.name || '').trim();
+  const expectedBranch = String(worktreeIdentity?.expectedBranch || '').trim();
+  return name && expectedBranch === `worktree-${name}` ? name : undefined;
+}
+
 export function prepareImplementationWorkspace({ worktreeIdentity, implementationCheckout, env = process.env, runner = spawnSync } = {}) {
   const baseRef = String(env.CLAUDE_RUNNER_BASE_REF || 'origin/main').trim();
   if (!/^origin\/[A-Za-z0-9._/-]+$/.test(baseRef)) {
@@ -603,13 +609,15 @@ export function prepareImplementationWorkspace({ worktreeIdentity, implementatio
     return { allowed: false, failureReason: 'implementation-origin-head-mismatch', baseRef, rootPath };
   }
 
-  const expectedBranch = worktreeIdentity?.expectedBranch;
+  const expectedBranch = String(worktreeIdentity?.expectedBranch || '').trim();
+  const worktreePath = join(rootPath, '.claude', 'worktrees', worktreeIdentity?.name || '');
   const branchResult = runGit(['show-ref', '--verify', '--quiet', `refs/heads/${expectedBranch}`], { cwd: rootPath, runner });
   if (branchResult?.status === 0) {
     return { allowed: false, failureReason: 'implementation-worktree-branch-already-exists', baseRef, baseHead, rootPath };
   }
   const worktreeList = successfulGitText(['worktree', 'list', '--porcelain'], { cwd: rootPath, runner }) || '';
-  if (worktreeList.includes(`/.claude/worktrees/${worktreeIdentity?.name}\n`)
+  if (worktreeList.includes(`/.claude/worktrees/${worktreeIdentity?.name}
+`)
     || worktreeList.includes(`branch refs/heads/${expectedBranch}`)) {
     return { allowed: false, failureReason: 'implementation-worktree-already-exists', baseRef, baseHead, rootPath };
   }
@@ -619,6 +627,32 @@ export function prepareImplementationWorkspace({ worktreeIdentity, implementatio
     return { allowed: false, failureReason: 'runner-checkout-evidence-unavailable', baseRef, baseHead, rootPath };
   }
 
+  const nativeWorktreeName = nativeClaudeWorktreeName(worktreeIdentity);
+  if (!nativeWorktreeName) {
+    const branchFormat = runGit(['check-ref-format', '--branch', expectedBranch], { cwd: rootPath, runner });
+    if (branchFormat?.status !== 0) {
+      return { allowed: false, failureReason: 'implementation-approved-branch-invalid', baseRef, baseHead, rootPath };
+    }
+    mkdirSync(dirname(worktreePath), { recursive: true });
+    const createResult = runGit(['worktree', 'add', '--quiet', '-b', expectedBranch, worktreePath, baseHead], { cwd: rootPath, runner });
+    if (createResult?.status !== 0) {
+      return { allowed: false, failureReason: 'implementation-worktree-create-failed', baseRef, baseHead, rootPath, worktreePath };
+    }
+    const worktreeBefore = captureGitRepositoryEvidence({ cwd: worktreePath, includeUntracked: true, runner });
+    if (!worktreeBefore) {
+      return { allowed: false, failureReason: 'implementation-worktree-evidence-unavailable', baseRef, baseHead, rootPath, worktreePath };
+    }
+    if (worktreeBefore.branch !== expectedBranch) {
+      return { allowed: false, failureReason: 'implementation-worktree-branch-mismatch', baseRef, baseHead, rootPath, worktreePath };
+    }
+    if (worktreeBefore.head !== baseHead) {
+      return { allowed: false, failureReason: 'implementation-worktree-base-mismatch', baseRef, baseHead, rootPath, worktreePath };
+    }
+    if (worktreeBefore.dirtyEntryCount !== 0) {
+      return { allowed: false, failureReason: 'implementation-worktree-dirty-before-launch', baseRef, baseHead, rootPath, worktreePath };
+    }
+  }
+
   return {
     allowed: true,
     failureReason: null,
@@ -626,7 +660,8 @@ export function prepareImplementationWorkspace({ worktreeIdentity, implementatio
     baseHead,
     rootPath,
     rootBefore,
-    worktreePath: join(rootPath, '.claude', 'worktrees', worktreeIdentity.name),
+    worktreePath,
+    workspacePreparedByRunner: !nativeWorktreeName,
   };
 }
 
@@ -733,7 +768,6 @@ export function publishImplementationDraft({
   const branch = String(worktreeIdentity?.expectedBranch || '');
   const base = String(workspace?.baseRef || '').replace(/^origin\//, '');
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo || ''))
-    || !/^worktree-agent-runner-[a-z0-9-]+$/.test(branch)
     || !/^[A-Za-z0-9._/-]+$/.test(base)
     || !workspace?.worktreePath) {
     return { published: false, failureReason: 'implementation-publication-input-invalid' };
@@ -745,6 +779,14 @@ export function publishImplementationDraft({
     maxBuffer: 5 * 1024 * 1024,
     env,
   };
+  const branchFormat = runner('git', ['check-ref-format', '--branch', branch], processOptions);
+  if (branchFormat?.status !== 0) {
+    return { published: false, failureReason: 'implementation-publication-branch-invalid' };
+  }
+  const actualBranch = runner('git', ['branch', '--show-current'], processOptions);
+  if (actualBranch?.status !== 0 || String(actualBranch.stdout || '').trim() !== branch) {
+    return { published: false, failureReason: 'implementation-publication-branch-mismatch' };
+  }
   const push = runner('git', ['push', '--set-upstream', 'origin', branch], processOptions);
   if (push?.status !== 0) {
     return { published: false, failureReason: 'implementation-branch-push-failed', stage: 'push', exitCode: push?.status ?? null };
@@ -1601,7 +1643,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     tools: implementationToolPolicy?.tools,
     allowedTools: implementationToolPolicy?.allowedTools,
     disallowedTools: implementationToolPolicy?.disallowedTools,
-    worktreeName: worktreeIdentity?.name,
+    worktreeName: nativeClaudeWorktreeName(worktreeIdentity),
     strictMcpConfig: implementationToolPolicy?.strictMcpConfig,
     disableSlashCommands: implementationToolPolicy?.disableSlashCommands,
     settings: implementationToolPolicy?.settings,
