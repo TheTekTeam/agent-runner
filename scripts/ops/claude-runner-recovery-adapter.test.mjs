@@ -199,9 +199,12 @@ test('writeRestrictedRecoveryHandle throws when post-write verification finds a 
   try {
     assert.throws(() => {
       writeRestrictedRecoveryHandle(dir, 'attempt-11', { attemptId: 'attempt-11', sessionId: 'x' }, {
-        // Omit the mode option so the OS/umask-default (not 0600) mode is
-        // used, and make chmod a no-op — verification must still catch it.
-        writeFn: (path, data) => writeFileSync(path, data),
+        // Force the temporary file to the known-wrong final mode after the
+        // write, independent of the process umask, then suppress correction.
+        writeFn: (path, data, options) => {
+          writeFileSync(path, data, options);
+          chmodSync(path, 0o644);
+        },
         chmodFn: () => {},
       });
     }, /permission verification/);
@@ -210,22 +213,27 @@ test('writeRestrictedRecoveryHandle throws when post-write verification finds a 
   }
 });
 
-test('writeRestrictedRecoveryHandle succeeds and round-trips with genuine owner-exclusive 0700/0600 permissions', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'restricted-recovery-'));
-  try {
-    writeRestrictedRecoveryHandle(dir, 'attempt-12', { attemptId: 'attempt-12', sessionId: 'x' });
-    const dirStats = statSync(restrictedRecoveryDir(dir));
-    assert.equal(dirStats.mode & 0o777, 0o700);
-    assert.equal(dirStats.uid, process.getuid());
-    const filePath = join(restrictedRecoveryDir(dir), 'attempt-12.json');
-    const fileStats = statSync(filePath);
-    assert.equal(fileStats.mode & 0o777, 0o600);
-    assert.equal(fileStats.uid, process.getuid());
-    const read = readRestrictedRecoveryHandle(dir, 'attempt-12');
-    assert.equal(read.available, true);
-    assert.equal(read.permissionSafe, true);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
+test('writeRestrictedRecoveryHandle succeeds and round-trips under umask 022 and 077 with genuine owner-exclusive 0700/0600 permissions', () => {
+  for (const mask of [0o022, 0o077]) {
+    const previousMask = process.umask(mask);
+    const dir = mkdtempSync(join(tmpdir(), `restricted-recovery-umask-${mask.toString(8)}-`));
+    try {
+      const attemptId = `attempt-12-${mask.toString(8)}`;
+      writeRestrictedRecoveryHandle(dir, attemptId, { attemptId, sessionId: 'x' });
+      const dirStats = statSync(restrictedRecoveryDir(dir));
+      assert.equal(dirStats.mode & 0o777, 0o700);
+      assert.equal(dirStats.uid, process.getuid());
+      const filePath = join(restrictedRecoveryDir(dir), `${attemptId}.json`);
+      const fileStats = statSync(filePath);
+      assert.equal(fileStats.mode & 0o777, 0o600);
+      assert.equal(fileStats.uid, process.getuid());
+      const read = readRestrictedRecoveryHandle(dir, attemptId);
+      assert.equal(read.available, true);
+      assert.equal(read.permissionSafe, true);
+    } finally {
+      process.umask(previousMask);
+      rmSync(dir, { recursive: true, force: true });
+    }
   }
 });
 
