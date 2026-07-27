@@ -288,6 +288,15 @@
         "reason": "Issue #43 retires legacy proceed/continue and generated-preflight authority, establishes immutable ChatGPT manager packet revision/fingerprint authority, and updates the standalone runner contract and regression evidence.",
         "reference": "https://github.com/TheTekTeam/agent-runner/pull/55"
       }
+    },
+    {
+      "path": "scripts/ops/claude-runner-recovery-adapter.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-07-27T21:16:00.000Z",
+        "reason": "Issue #92 corrects a test-portability defect in this repository: the restricted-recovery permission test must be deterministic under both umask 022 and 077, so this test can no longer remain byte-locked to the historical ModelSpend import.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/93"
+      }
     }
   ]
 }
