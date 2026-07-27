@@ -592,7 +592,7 @@ export function implementationProcessCwd(workspace, fallbackCwd = resolve('.')) 
   return workspace?.rootPath || fallbackCwd;
 }
 
-export function prepareImplementationWorkspace({ worktreeIdentity, implementationCheckout, env = process.env, runner = spawnSync } = {}) {
+export function inspectImplementationWorkspaceAvailability({ worktreeIdentity, implementationCheckout, env = process.env, runner = spawnSync } = {}) {
   const baseRef = String(env.CLAUDE_RUNNER_BASE_REF || 'origin/main').trim();
   if (!/^origin\/[A-Za-z0-9._/-]+$/.test(baseRef)) {
     return { allowed: false, failureReason: 'implementation-base-ref-invalid', baseRef };
@@ -623,8 +623,7 @@ export function prepareImplementationWorkspace({ worktreeIdentity, implementatio
     return { allowed: false, failureReason: 'implementation-worktree-branch-already-exists', baseRef, baseHead, rootPath };
   }
   const worktreeList = successfulGitText(['worktree', 'list', '--porcelain'], { cwd: rootPath, runner }) || '';
-  if (worktreeList.includes(`/.claude/worktrees/${worktreeIdentity?.name}
-`)
+  if (worktreeList.includes(`/.claude/worktrees/${worktreeIdentity?.name}\n`)
     || worktreeList.includes(`branch refs/heads/${expectedBranch}`)) {
     return { allowed: false, failureReason: 'implementation-worktree-already-exists', baseRef, baseHead, rootPath };
   }
@@ -634,6 +633,26 @@ export function prepareImplementationWorkspace({ worktreeIdentity, implementatio
     return { allowed: false, failureReason: 'runner-checkout-evidence-unavailable', baseRef, baseHead, rootPath };
   }
 
+  return {
+    allowed: true,
+    failureReason: null,
+    baseRef,
+    baseHead,
+    rootPath,
+    rootBefore,
+    worktreePath,
+  };
+}
+
+export function prepareImplementationWorkspace(input = {}) {
+  const { worktreeIdentity, runner = spawnSync } = input;
+  const availability = inspectImplementationWorkspaceAvailability(input);
+  if (availability.allowed !== true) return availability;
+
+  const {
+    baseRef, baseHead, rootPath, rootBefore, worktreePath,
+  } = availability;
+  const expectedBranch = String(worktreeIdentity?.expectedBranch || '').trim();
   const nativeWorktreeName = nativeClaudeWorktreeName(worktreeIdentity);
   if (!nativeWorktreeName) {
     const branchFormat = runGit(['check-ref-format', '--branch', expectedBranch], { cwd: rootPath, runner });
@@ -661,13 +680,7 @@ export function prepareImplementationWorkspace({ worktreeIdentity, implementatio
   }
 
   return {
-    allowed: true,
-    failureReason: null,
-    baseRef,
-    baseHead,
-    rootPath,
-    rootBefore,
-    worktreePath,
+    ...availability,
     workspacePreparedByRunner: !nativeWorktreeName,
   };
 }
