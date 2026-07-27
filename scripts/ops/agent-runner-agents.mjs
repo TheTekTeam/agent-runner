@@ -1,3 +1,9 @@
+export const SHARED_CODEX_CLAUDE_LABEL = 'agent:codex-claude';
+
+export const AGENT_ASSIGNMENT_DISPLAY_NAMES = Object.freeze({
+  [SHARED_CODEX_CLAUDE_LABEL]: 'Codex / Claude',
+});
+
 const FUTURE_CONTROLS = {
   model: { supported: false },
   effort: { supported: false },
@@ -21,7 +27,10 @@ export const AGENT_ADAPTERS = Object.freeze({
     type: 'claude',
     command: 'claude',
     implemented: true,
-    labels: Object.freeze(['agent:claude', 'agent:claude-code-cli']),
+    // The composite label is one assignment choice, not two simultaneous
+    // agents. Local execution resolves it to the already-qualified Claude
+    // adapter; Codex Web remains a manager/manual route outside this process.
+    labels: Object.freeze(['agent:claude', 'agent:claude-code-cli', SHARED_CODEX_CLAUDE_LABEL]),
     controls: Object.freeze({
       model: Object.freeze({ supported: true, flag: '--model' }),
       effort: Object.freeze({ supported: true, flag: '--effort' }),
@@ -58,6 +67,11 @@ export function allAgentLabels({ includeFuture = true } = {}) {
   return Object.values(AGENT_ADAPTERS)
     .filter((adapter) => includeFuture || adapter.implemented)
     .flatMap((adapter) => adapter.labels);
+}
+
+export function agentAssignmentDisplayName(label = '') {
+  const value = String(label?.name || label || '').trim();
+  return AGENT_ASSIGNMENT_DISPLAY_NAMES[value] || value || null;
 }
 
 export function resolveAgentById(agentId = 'claude-code-cli') {
@@ -100,12 +114,17 @@ export function validateAgentControls(agent, controls = {}, { ignoreUnsupported 
 }
 
 export function agentRunMetadata(agent, profile = {}) {
+  const assignmentLabel = String(profile.assignmentLabel || '').trim() || null;
   return {
     agentId: agent?.agentId || null,
     agentType: agent?.type || null,
     implemented: Boolean(agent?.implemented),
     model: profile.model || null,
     effort: profile.effort || null,
+    ...(assignmentLabel ? {
+      assignmentLabel,
+      assignmentDisplayName: agentAssignmentDisplayName(assignmentLabel),
+    } : {}),
   };
 }
 
