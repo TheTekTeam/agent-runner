@@ -155,7 +155,11 @@ test('public canary entrypoint uses one resolved runtime for probes, execution a
       status: 0,
       stdout: JSON.stringify({
         admission: { allowed: true },
-        current: { issueNumber: 686, preflightRevision: PREFLIGHT },
+        current: {
+          issueNumber: 686,
+          preflightRevision: 'AR686-SUPERVISED-CANARY-RUNTIME-TEST',
+          preflightCommentRevision: PREFLIGHT,
+        },
       }),
       stderr: '',
     },

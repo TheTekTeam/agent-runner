@@ -33,7 +33,11 @@ function baseResults(run = { status: 0, stdout: '', stderr: '' }) {
       status: 0,
       stdout: JSON.stringify({
         admission: { allowed: true },
-        current: { issueNumber: 5, preflightRevision: PREFLIGHT },
+        current: {
+          issueNumber: 5,
+          preflightRevision: 'AR5-SUPERVISED-CANARY-TEST',
+          preflightCommentRevision: PREFLIGHT,
+        },
       }),
       stderr: '',
     },
@@ -121,7 +125,7 @@ test('refuses when standalone candidate admission cannot prove the exact authori
   assert.equal(result.payload.launched, false);
 });
 
-test('reports terminal success only after correlated durable evidence exists', () => {
+test('uses the typed preflight comment identity before reporting correlated terminal success', () => {
   const { dependencies, calls } = dependenciesFor({
     state: 'terminal_success',
     claimPersisted: true,

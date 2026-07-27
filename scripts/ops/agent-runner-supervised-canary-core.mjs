@@ -268,7 +268,7 @@ export function runSupervisedCanary(args, env = process.env, dependencies = {}) 
     };
   }
 
-  const admittedPreflight = admissionPayload.current.preflightRevision || null;
+  const admittedPreflight = admissionPayload.current.preflightCommentRevision || null;
   const requestedPreflight = args.sourcePreflightComment || admittedPreflight;
   if (!normalizeCommentIdentity(requestedPreflight, { context: 'supervised-canary-admitted-preflight' })) {
     return {
