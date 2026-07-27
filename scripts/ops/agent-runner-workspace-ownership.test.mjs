@@ -27,6 +27,42 @@ test('inspectWorkspaceOwnership allows a genuinely fresh workspace', async () =>
   assert.equal(result.branchName, WORKTREE_IDENTITY.expectedBranch);
 });
 
+test('inspectWorkspaceOwnership uses a non-creating availability probe by default (#90)', async () => {
+  const calls = [];
+  const rootPath = '/repo';
+  const baseHead = '7b9969e56dc3aed29cee19657bb5a83766bf0019';
+  const runner = (command, args, options = {}) => {
+    assert.equal(command, 'git');
+    calls.push({ args: [...args], cwd: options.cwd });
+    const joined = args.join(' ');
+    if (joined === 'rev-parse --show-toplevel') return { status: 0, stdout: `${rootPath}\n`, stderr: '' };
+    if (joined === 'fetch --quiet origin main') return { status: 0, stdout: '', stderr: '' };
+    if (joined === 'rev-parse origin/main') return { status: 0, stdout: `${baseHead}\n`, stderr: '' };
+    if (joined === 'symbolic-ref refs/remotes/origin/HEAD') return { status: 0, stdout: 'refs/remotes/origin/main\n', stderr: '' };
+    if (joined === `show-ref --verify --quiet refs/heads/${WORKTREE_IDENTITY.expectedBranch}`) return { status: 1, stdout: '', stderr: '' };
+    if (joined === 'worktree list --porcelain') return { status: 0, stdout: '', stderr: '' };
+    if (joined === 'rev-parse HEAD') return { status: 0, stdout: `${baseHead}\n`, stderr: '' };
+    if (joined === 'branch --show-current') return { status: 0, stdout: 'main\n', stderr: '' };
+    if (args[0] === 'status') return { status: 0, stdout: '', stderr: '' };
+    return { status: 1, stdout: '', stderr: `unexpected git command: ${joined}` };
+  };
+
+  const result = await inspectWorkspaceOwnership({
+    worktreeIdentity: WORKTREE_IDENTITY,
+    implementationCheckout: rootPath,
+    attemptId: 'attempt-1',
+    issueNumber: 686,
+    env: { CLAUDE_RUNNER_BASE_REF: 'origin/main' },
+    runner,
+  });
+
+  assert.equal(result.allowed, true);
+  assert.equal(result.action, 'create');
+  assert.equal(result.worktreePath, `${rootPath}/.claude/worktrees/${WORKTREE_IDENTITY.name}`);
+  assert.equal(calls.some(({ args }) => args[0] === 'worktree' && args[1] === 'add'), false);
+  assert.equal(calls.some(({ args }) => args[0] === 'check-ref-format'), false);
+});
+
 test('inspectWorkspaceOwnership passes a pre-existing git/infra failure through unchanged', async () => {
   const result = await inspectWorkspaceOwnership({
     worktreeIdentity: WORKTREE_IDENTITY,

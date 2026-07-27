@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 
-import { prepareImplementationWorkspace } from './claude-runner.mjs';
+import { inspectImplementationWorkspaceAvailability } from './claude-runner.mjs';
 import { findLinkedOpenPullRequests } from './claude-runner-review-followup.mjs';
 
 /**
@@ -153,7 +153,7 @@ export async function inspectWorkspaceOwnership({
   processProbe = async () => null,
   env = process.env,
   runner = spawnSync,
-  prepareWorkspace = prepareImplementationWorkspace,
+  prepareWorkspace = inspectImplementationWorkspaceAvailability,
 } = {}) {
   const gitResult = prepareWorkspace({ worktreeIdentity, implementationCheckout, env, runner });
 
