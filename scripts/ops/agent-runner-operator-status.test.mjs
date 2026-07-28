@@ -312,6 +312,58 @@ test('status accepts an installed, disabled/inactive timer and service as a heal
   }
 });
 
+test('operator status shows the shared assignment as Codex / Claude and the actual selected worker separately, without leaking the rest of the selection plan (#97)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'status-shared-assignment-'));
+  try {
+    const { config } = writeConfig(dir);
+    mkdirSync(config.outputDir, { recursive: true });
+    const store = openRunnerStateStore(config.stateDbPath);
+    try {
+      store.recordIssueSelection({
+        repo: 'TheTekTeam/modelspend',
+        issueNumber: 97,
+        statusLabel: 'status:ready',
+        selectionMode: 'preflight-direct',
+        payload: {
+          agent: { agentId: 'claude-code-cli', assignmentLabel: 'agent:codex-claude', assignmentDisplayName: 'Codex / Claude' },
+          // The rest of the persisted plan must stay inside the state DB:
+          // only the two assignment-evidence fields are projected out.
+          stateDbPath: '/home/status-user/secret-state-path',
+          statePersistenceErrors: ['restricted-selection-sentinel-value'],
+        },
+      });
+      store.recordClaim({
+        repo: 'TheTekTeam/modelspend',
+        issueNumber: 97,
+        claim: { action: 'claim-ready-issue', statusLabel: 'status:in-progress', selectionMode: 'preflight-direct' },
+      });
+    } finally {
+      store.close();
+    }
+
+    const report = buildOperatorStatus(config, {}, { spawn: installedSpawn(config) });
+    assert.equal(report.ok, true);
+    assert.equal(report.currentTask.activeIssue.issue_number, 97);
+    assert.equal(report.currentTask.activeIssue.assignment_label, 'agent:codex-claude');
+    assert.equal(report.currentTask.activeIssue.assignment_display_name, 'Codex / Claude');
+    // The shared label is eligibility metadata; the attempt still names the
+    // one worker that actually holds it.
+    assert.equal(report.currentTask.activeIssue.agent, 'claude-code-cli');
+    assert.deepEqual(report.queue.assignments, [
+      { assignmentLabel: 'agent:codex-claude', assignmentDisplayName: 'Codex / Claude', issueCount: 1 },
+    ]);
+
+    const serialized = JSON.stringify(report);
+    assert.equal(serialized.includes('restricted-selection-sentinel-value'), false);
+    assert.equal(serialized.includes('/home/status-user/secret-state-path'), false);
+    assert.equal(redactSensitiveText(serialized), serialized);
+    assert.equal(report.issueMutation, false);
+    assert.equal(report.stateMutation, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('exitCodeForStatus is a closed function of ok/service/timer/operatorStatus/circuit', () => {
   const installed = { status: 'installed' };
   const notFound = { status: 'not-found' };

@@ -156,7 +156,9 @@ test('explainQueue reports every candidate exactly once, continuing past skips t
   // Every candidate has exactly one bounded field set -- no raw error text,
   // routing internals, or label objects leaked.
   for (const entry of report.candidates) {
-    assert.deepEqual(Object.keys(entry).sort(), ['issueNumber', 'reason', 'runnable', 'statusLabel']);
+    assert.deepEqual(Object.keys(entry).sort(), [
+      'agentId', 'assignmentDisplayName', 'assignmentLabel', 'issueNumber', 'reason', 'runnable', 'statusLabel',
+    ]);
   }
 
   assertNoMutatingCalls(calls);
@@ -176,6 +178,52 @@ test('explainQueue reports metadata-conflict when a project Status field disagre
   assert.equal(byNumber[301].reason, 'metadata-conflict');
   assert.equal(byNumber[301].runnable, false);
   assert.equal(byNumber[302].reason, 'runnable');
+});
+
+test('explainQueue displays the shared assignment as Codex / Claude while keeping the actual selected worker separate (#97)', async () => {
+  const issues = [
+    issue({ number: 401, agentLabels: ['agent:codex-claude'] }), // shared assignment, runnable
+    issue({ number: 402, agentLabels: ['agent:codex-claude'] }), // shared assignment, skipped
+    issue({ number: 403, agentLabels: ['agent:claude-code-cli'] }), // unchanged non-shared assignment
+  ];
+  const commentsByIssue = { 401: [preflightComment({ id: 1 })], 402: [], 403: [] };
+  const { runner, calls } = fakeGh({ issues, commentsByIssue });
+  const env = { CLAUDE_RUNNER_CRON_AGENT_LABELS: 'agent:claude-code-cli,agent:codex-claude' };
+
+  const report = await explainQueue({ project: 'modelspend' }, env, { baseGhRunner: runner });
+  const byNumber = Object.fromEntries(report.candidates.map((entry) => [entry.issueNumber, entry]));
+
+  // The shared label is eligibility metadata and displays as `Codex / Claude`
+  // -- it never replaces the agent that would actually do the work.
+  assert.equal(byNumber[401].reason, 'runnable');
+  assert.equal(byNumber[401].assignmentLabel, 'agent:codex-claude');
+  assert.equal(byNumber[401].assignmentDisplayName, 'Codex / Claude');
+  assert.equal(byNumber[401].agentId, 'claude-code-cli');
+
+  // A skipped shared-assignment candidate still shows the assignment; with no
+  // agent resolved by the selector it reports null rather than guessing.
+  assert.equal(byNumber[402].runnable, false);
+  assert.equal(byNumber[402].assignmentDisplayName, 'Codex / Claude');
+  assert.equal(byNumber[402].agentId, null);
+
+  // Non-shared assignments are unchanged: no display alias exists for them,
+  // so the canonical helper returns the label itself.
+  assert.equal(byNumber[403].assignmentLabel, 'agent:claude-code-cli');
+  assert.equal(byNumber[403].assignmentDisplayName, 'agent:claude-code-cli');
+
+  assertNoMutatingCalls(calls);
+  const serialized = JSON.stringify(report);
+  assert.equal(redactSensitiveText(serialized), serialized);
+});
+
+test('explainQueue never forwards an issue label the adapter catalogue does not know (#97)', async () => {
+  const issues = [issue({ number: 501, agentLabels: ['agent:codex-claude', 'agent:not-a-real-catalogue-label'] })];
+  const { runner } = fakeGh({ issues, commentsByIssue: { 501: [] } });
+  const env = { CLAUDE_RUNNER_CRON_AGENT_LABELS: 'agent:codex-claude' };
+  const report = await explainQueue({ project: 'modelspend' }, env, { baseGhRunner: runner });
+  const entry = report.candidates.find((candidate) => candidate.issueNumber === 501);
+  assert.equal(entry.assignmentLabel, 'agent:codex-claude');
+  assert.equal(JSON.stringify(report).includes('not-a-real-catalogue-label'), false);
 });
 
 test('normalizeReason maps every canonical selectIssue() reason to itself and anything else to the closed unclassified-skip fallback', () => {

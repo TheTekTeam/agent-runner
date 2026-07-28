@@ -2,6 +2,7 @@
 import { existsSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 
+import { agentAssignmentDisplayName, allAgentLabels } from './agent-runner-agents.mjs';
 import { loadAgentRunnerConfig, projectIdentity, stripConfigArgs } from './agent-runner-config.mjs';
 import { defaultRunnerStateDbPath, RUNNER_STATE_SCHEMA_VERSION, summarizeRunnerState } from './claude-runner-state.mjs';
 
@@ -217,6 +218,30 @@ function skippedQueueReasons(queueEvents = []) {
   return [...counts.values()].sort((a, b) => b.count - a.count || String(b.latestAt).localeCompare(String(a.latestAt)));
 }
 
+/**
+ * Which assignments the retained queue window is currently carrying, counted
+ * once per distinct issue and rendered through the canonical display helper
+ * (#97). Purely descriptive: it reports the labels already present on
+ * selected/skipped issues and never influences routing, eligibility or
+ * selection.
+ */
+function queueAssignments(rows = []) {
+  const byLabel = new Map();
+  const counted = new Set();
+  for (const row of rows) {
+    const issueNumber = row?.issue_number;
+    if (!Number.isInteger(issueNumber) || counted.has(issueNumber)) continue;
+    const { assignment_label: assignmentLabel, assignment_display_name: assignmentDisplayName } = issueAssignmentEvidence(row);
+    if (!assignmentLabel) continue;
+    counted.add(issueNumber);
+    const entry = byLabel.get(assignmentLabel) || { assignmentLabel, assignmentDisplayName, issueCount: 0 };
+    entry.issueCount += 1;
+    byLabel.set(assignmentLabel, entry);
+  }
+  return [...byLabel.values()]
+    .sort((left, right) => right.issueCount - left.issueCount || left.assignmentLabel.localeCompare(right.assignmentLabel));
+}
+
 function toTimestamp(value) {
   if (typeof value !== 'string' || value.length === 0) return null;
   const timestamp = Date.parse(value);
@@ -297,6 +322,98 @@ function buildEtaMetrics({ durationsSeconds, outstandingCount }) {
   };
 }
 
+/**
+ * Issue #97 — shared-assignment display for read-only operator/dashboard
+ * projections.
+ *
+ * An issue's `agent:` label is *eligibility metadata*: `agent:codex-claude`
+ * says the work may be done by Codex Web or Claude Code CLI, and displays as
+ * `Codex / Claude`. It is never the worker that actually ran. The actual
+ * selected worker (`claude-code-cli`) stays in its own `agent` field on every
+ * row that carries attempt evidence, so no projection can collapse one into
+ * the other.
+ *
+ * The display string itself is never computed here: it comes from
+ * `agentAssignmentDisplayName()`, the canonical helper merged by #96. This
+ * module only decides which already-persisted field carries the label, and
+ * bounds what may leave the process:
+ *
+ * - a label is forwarded only when the adapter catalogue already knows it, so
+ *   arbitrary issue-label text can never reach output through this path;
+ * - an agent id is forwarded only when it is a bounded lower-case token, so a
+ *   corrupt or hand-edited payload cannot leak free text either.
+ *
+ * Both fail closed to `null` rather than passing anything through unchecked.
+ */
+const KNOWN_AGENT_LABELS = new Set(allAgentLabels({ includeFuture: true }));
+const BOUNDED_AGENT_ID = /^[a-z][a-z0-9-]{0,63}$/;
+
+export function boundedAssignmentLabel(value) {
+  const label = String(value?.name || value || '').trim();
+  return KNOWN_AGENT_LABELS.has(label) ? label : null;
+}
+
+export function boundedAgentId(value) {
+  const agentId = String(value || '').trim();
+  return BOUNDED_AGENT_ID.test(agentId) ? agentId : null;
+}
+
+/**
+ * Bounded assignment evidence for one persisted row. `agent` is the actual
+ * selected worker (never the eligibility label); `assignment_label` /
+ * `assignment_display_name` are the shared-assignment metadata, absent
+ * whenever the row does not carry a catalogue-known label.
+ */
+export function issueAssignmentEvidence(source) {
+  const payload = source?.payload && typeof source.payload === 'object' ? source.payload : {};
+  const agentMetadata = payload.agent && typeof payload.agent === 'object' ? payload.agent : {};
+  const assignmentLabel = boundedAssignmentLabel(agentMetadata.assignmentLabel)
+    || boundedAssignmentLabel(payload.assignmentLabel)
+    || (Array.isArray(payload.labels) ? payload.labels.map((label) => boundedAssignmentLabel(label)).find(Boolean) || null : null);
+  return {
+    assignment_label: assignmentLabel,
+    assignment_display_name: assignmentLabel ? agentAssignmentDisplayName(assignmentLabel) : null,
+    agent: boundedAgentId(source?.agent) || boundedAgentId(agentMetadata.agentId),
+  };
+}
+
+/**
+ * A claim row records *that* an issue was claimed, not which adapter ran it
+ * or under which assignment — the scheduler persists that on the selection
+ * (and later on recovery/attention rows) for the same issue. Fill only the
+ * fields the activity row itself could not supply, from the same bounded
+ * latest-N window already fetched for this dashboard, so the current attempt
+ * shows both `Codex / Claude` and `claude-code-cli` without either one being
+ * substituted for the other.
+ */
+function withAssignmentEvidence(row, latest) {
+  if (!row) return row;
+  let assignmentLabel = row.assignment_label;
+  let assignmentDisplayName = row.assignment_display_name;
+  let agent = row.agent;
+  if (assignmentLabel && agent) return row;
+  const sameIssue = [
+    ...(latest.selections || []),
+    ...(latest.recoveryAttempts || []),
+    ...(latest.attentionEvents || []),
+  ].filter((candidate) => candidate?.issue_number === row.issue_number);
+  for (const candidate of sameIssue) {
+    if (assignmentLabel && agent) break;
+    const evidence = issueAssignmentEvidence(candidate);
+    if (!assignmentLabel && evidence.assignment_label) {
+      assignmentLabel = evidence.assignment_label;
+      assignmentDisplayName = evidence.assignment_display_name;
+    }
+    if (!agent && evidence.agent) agent = evidence.agent;
+  }
+  return {
+    ...row,
+    assignment_label: assignmentLabel || null,
+    assignment_display_name: assignmentDisplayName || null,
+    agent: agent || null,
+  };
+}
+
 function issueActivityRow(row, kind) {
   if (!Number.isInteger(row?.issue_number)) return null;
   return {
@@ -307,6 +424,7 @@ function issueActivityRow(row, kind) {
     status_label: row.status_label || null,
     timestamp: row.finished_at || row.started_at || row.created_at || null,
     exit_code: Number.isInteger(row.exit_code) ? row.exit_code : null,
+    ...issueAssignmentEvidence(row),
   };
 }
 
@@ -334,10 +452,11 @@ export function buildRunnerActivity(latest = baseLatest()) {
   }
 
   if (activeClaim) {
+    const currentAttempt = withAssignmentEvidence(activeClaim, latest);
     return {
       status: 'active-or-unresolved',
-      activeIssue: activeClaim,
-      latestIssue: allActivity[0] || activeClaim,
+      activeIssue: currentAttempt,
+      latestIssue: allActivity[0] ? withAssignmentEvidence(allActivity[0], latest) : currentAttempt,
       message: 'A claim has no later terminal run result in the retained history.',
     };
   }
@@ -346,7 +465,7 @@ export function buildRunnerActivity(latest = baseLatest()) {
     return {
       status: 'idle',
       activeIssue: null,
-      latestIssue: allActivity[0],
+      latestIssue: withAssignmentEvidence(allActivity[0], latest),
       message: 'No active claim is evidenced; showing the latest issue activity only.',
     };
   }
@@ -401,6 +520,7 @@ export function buildRunnerMetrics(dashboard) {
       skippedIssueCount: skippedIssueNumbers.size,
       skipReasonCount: skipReasons.length,
       oldestQueuedOrSkippedAt: oldestTimestamp(selectedOrSkipped),
+      assignments: queueAssignments(selectedOrSkipped),
     },
     eta: buildEtaMetrics({
       durationsSeconds: completedDurations,

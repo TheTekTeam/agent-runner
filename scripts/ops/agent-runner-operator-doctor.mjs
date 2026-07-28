@@ -42,6 +42,10 @@ import { resolveAgentForLabels } from './agent-runner-agents.mjs';
 import { getAgentSettings } from './agent-runner-agent-settings.mjs';
 import { CANDIDATE_PAUSED_EXIT_CODE } from './agent-runner-candidate-admission.mjs';
 import { loadAgentRunnerConfig, projectIdentity } from './agent-runner-config.mjs';
+// #97: the same bounded assignment-evidence guards the dashboard projection
+// uses, so an assignment label/agent id is validated once, in one place,
+// rather than being re-checked (and possibly re-interpreted) per reader.
+import { boundedAgentId, boundedAssignmentLabel } from './claude-runner-dashboard-api.mjs';
 import { RUNNER_STATE_TABLES } from './claude-runner-state.mjs';
 
 export const DOCTOR_SCHEMA_VERSION = 'agent-runner-operator-doctor/v1';
@@ -215,6 +219,38 @@ function extractPayloadReason(payloadJson) {
   }
 }
 
+/**
+ * `issue_selections.payload_json` holds the scheduler's whole selection plan
+ * (skip evidence, comment identities, state paths). Only the two bounded
+ * assignment-evidence fields are projected out of it (#97), in the same
+ * positive-allowlist style as `extractPayloadReason()` above: the shared
+ * assignment label so operator status can display `Codex / Claude`, and the
+ * actual selected agent id so that display can never stand in for the worker
+ * that ran. Anything the catalogue does not recognise fails closed to null.
+ */
+function extractAssignmentEvidence(payloadJson) {
+  try {
+    const parsed = JSON.parse(payloadJson || '{}');
+    const agent = parsed?.agent && typeof parsed.agent === 'object' ? parsed.agent : {};
+    return {
+      agent: {
+        agentId: boundedAgentId(agent.agentId),
+        assignmentLabel: boundedAssignmentLabel(agent.assignmentLabel),
+      },
+    };
+  } catch {
+    return { agent: { agentId: null, assignmentLabel: null } };
+  }
+}
+
+function fetchIssueSelections(db, limit) {
+  const rows = db.prepare(`SELECT ${ISSUE_SELECTIONS_COLUMNS.join(', ')}, payload_json FROM issue_selections ORDER BY id DESC LIMIT ?`).all(limit);
+  return rows.map((row) => {
+    const { payload_json: payloadJson, ...rest } = row;
+    return { ...rest, payload: extractAssignmentEvidence(payloadJson) };
+  });
+}
+
 function fetchQueueEvents(db, limit) {
   const rows = db.prepare(`SELECT ${QUEUE_EVENTS_COLUMNS.join(', ')}, payload_json FROM queue_events ORDER BY id DESC LIMIT ?`).all(limit);
   return rows.map((row) => {
@@ -282,7 +318,7 @@ export function readOnlyRunnerStateSnapshot(dbPath, { historyLimit = 10, include
         attentionEvents: fetchLatest(db, 'attention_events', ATTENTION_EVENTS_COLUMNS, limit),
         notifications: fetchLatest(db, 'notification_events', NOTIFICATION_EVENTS_COLUMNS, limit),
         claims: fetchLatest(db, 'claims', CLAIMS_COLUMNS, limit),
-        selections: fetchLatest(db, 'issue_selections', ISSUE_SELECTIONS_COLUMNS, limit),
+        selections: fetchIssueSelections(db, limit),
         queueEvents: fetchQueueEvents(db, limit),
         quota: fetchLatest(db, 'quota_history', QUOTA_HISTORY_COLUMNS, limit),
       };
