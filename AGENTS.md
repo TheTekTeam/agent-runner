@@ -8,6 +8,13 @@ This private repository is the canonical home of the reusable Agent Runner imple
 - `TheTekTeam/modelspend#686` governs the initial extraction and Dell cutover.
 - Project repositories provide configuration and optional policy hooks; they must not fork the runner implementation.
 
+## Assignment policy
+
+- `agent:codex-claude` is the one canonical shared-assignment label for work that may be completed by Codex Web or Claude Code CLI.
+- An issue labelled `agent:codex-claude` may be implemented by either Codex Web or Claude Code CLI. The selected implementation attempt still uses one named agent and one current manager packet. The label does not authorise Codex CLI, automatic fallback or parallel duplicate execution.
+- For local Agent Runner execution, the shared label resolves only to the approved `claude-code-cli` adapter and records Claude as the actual selected agent.
+- Keep `agent:codex` for manual Codex Web-only exceptions with a specific current technical reason. Keep `agent:codex-cli` separate and disabled unless it is explicitly qualified and authorised under its paid-use controls.
+
 ## Safety
 
 - Preserve human merge/approval gates, manager preflight, quota controls, claim guards, state durability, redaction and fail-closed unsupported-agent behaviour.

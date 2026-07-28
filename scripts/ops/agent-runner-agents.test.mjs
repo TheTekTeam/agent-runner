@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  SHARED_CODEX_CLAUDE_LABEL,
+  agentAssignmentDisplayName,
   allAgentLabels,
   buildAgentCommandArgs,
   resolveAgentById,
@@ -114,10 +116,46 @@ test('agent run metadata includes agent id model and effort', () => {
   });
 });
 
+test('shared Codex / Claude assignment resolves to Claude and records the actual selected agent', () => {
+  const agent = resolveAgentForLabels([SHARED_CODEX_CLAUDE_LABEL]);
+  assert.equal(agent.agentId, 'claude-code-cli');
+  assert.equal(agent.command, 'claude');
+  assert.equal(agent.implemented, true);
+  assert.equal(agentAssignmentDisplayName(SHARED_CODEX_CLAUDE_LABEL), 'Codex / Claude');
+  assert.deepEqual(agentRunMetadata(agent, {
+    model: 'sonnet',
+    effort: 'medium',
+    assignmentLabel: SHARED_CODEX_CLAUDE_LABEL,
+  }), {
+    agentId: 'claude-code-cli',
+    agentType: 'claude',
+    implemented: true,
+    model: 'sonnet',
+    effort: 'medium',
+    assignmentLabel: 'agent:codex-claude',
+    assignmentDisplayName: 'Codex / Claude',
+  });
+});
+
+test('shared assignment remains one supported label and cannot resolve to Codex CLI or paid fallback', () => {
+  const labels = allAgentLabels();
+  assert.equal(labels.filter((label) => label === SHARED_CODEX_CLAUDE_LABEL).length, 1);
+  assert.equal(resolveAgentById('codex-cli').labels.includes(SHARED_CODEX_CLAUDE_LABEL), false);
+  assert.equal(resolveAgentForLabels([SHARED_CODEX_CLAUDE_LABEL]).agentId, 'claude-code-cli');
+  assert.equal(resolveAgentById('codex-cli').implemented, false);
+  assert.equal(resolveAgentById('codex-cli').command, null);
+});
+
+test('unknown composite-like labels still fail closed', () => {
+  assert.equal(resolveAgentForLabels(['agent:claude-codex']), null);
+  assert.equal(resolveAgentForLabels(['agent:either']), null);
+});
+
 test('default label registry includes Claude and future agents without implementing them', () => {
   assert.ok(allAgentLabels().includes('agent:claude-code-cli'));
+  assert.ok(allAgentLabels().includes(SHARED_CODEX_CLAUDE_LABEL));
   assert.ok(allAgentLabels().includes('agent:codex-cli'));
-  assert.deepEqual(allAgentLabels({ includeFuture: false }), ['agent:claude', 'agent:claude-code-cli']);
+  assert.deepEqual(allAgentLabels({ includeFuture: false }), ['agent:claude', 'agent:claude-code-cli', SHARED_CODEX_CLAUDE_LABEL]);
 });
 
 test('agent:codex is Codex Web/manual and is not one of codex-cli\'s labels, nor any other adapter\'s', () => {
