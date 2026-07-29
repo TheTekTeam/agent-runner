@@ -5,9 +5,11 @@ import { DatabaseSync } from 'node:sqlite';
 
 export const GITHUB_POLLING_SCHEMA_VERSION = 1;
 export const DEFAULT_POLL_OVERLAP_MS = 5 * 60_000;
-export const DEFAULT_BOOTSTRAP_LOOKBACK_MS = 30 * 24 * 60 * 60_000;
+export const DEFAULT_BOOTSTRAP_LOOKBACK_MS = 24 * 60 * 60_000;
+export const DEFAULT_BOOTSTRAP_ISSUE_LIMIT = 20;
 export const DEFAULT_POLL_PER_PAGE = 100;
 export const DEFAULT_POLL_MAX_PAGES = 20;
+const MAX_BOOTSTRAP_ISSUE_PAGES = 2;
 
 function iso(value) {
   const date = value instanceof Date ? value : new Date(value);
@@ -48,6 +50,47 @@ async function pagedArray({ requestJson, endpoint, query = {}, perPage, maxPages
     if (payload.length < perPage) return { items, complete: true, pages: page };
   }
   return { items, complete: false, pages: maxPages };
+}
+
+async function boundedBootstrapIssues({
+  requestJson,
+  endpoint,
+  observedAt,
+  lookbackMs,
+  issueLimit,
+  perPage,
+  maxPages,
+}) {
+  if (issueLimit === 0) return { items: [], pages: 0 };
+  const cutoffMs = Date.parse(observedAt) - lookbackMs;
+  const items = [];
+  const pageLimit = Math.min(maxPages, MAX_BOOTSTRAP_ISSUE_PAGES);
+
+  for (let page = 1; page <= pageLimit; page += 1) {
+    const payload = await requestJson(endpoint, {
+      state: 'all',
+      sort: 'updated',
+      direction: 'desc',
+      per_page: perPage,
+      page,
+    });
+    if (!Array.isArray(payload)) throw new Error(`GitHub polling response is malformed for ${endpoint}`);
+
+    let reachedCutoff = false;
+    for (const item of payload) {
+      const updatedMs = Date.parse(iso(item?.updated_at ?? observedAt));
+      if (updatedMs < cutoffMs) {
+        reachedCutoff = true;
+        break;
+      }
+      if (!item?.pull_request) items.push(item);
+      if (items.length >= issueLimit) return { items: items.slice(0, issueLimit), pages: page };
+    }
+
+    if (reachedCutoff || payload.length < perPage) return { items, pages: page };
+  }
+
+  return { items: items.slice(0, issueLimit), pages: pageLimit };
 }
 
 function issueEnvelope(project, item, observedAt) {
@@ -223,6 +266,7 @@ async function pollOneProject({
   observedAt,
   overlapMs,
   bootstrapLookbackMs,
+  bootstrapIssueLimit,
   perPage,
   maxPages,
 }) {
@@ -230,10 +274,12 @@ async function pollOneProject({
   if (cursor && cursor.repository.toLowerCase() !== project.githubRepo.toLowerCase()) {
     throw new Error(`poll cursor repository mismatch for ${project.projectId}`);
   }
-  const sinceBase = cursor?.lastSuccessAt
-    ? Date.parse(cursor.lastSuccessAt) - overlapMs
-    : Date.parse(observedAt) - bootstrapLookbackMs;
-  const since = new Date(sinceBase).toISOString();
+
+  const incremental = Boolean(cursor?.lastSuccessAt);
+  const since = incremental
+    ? new Date(Date.parse(cursor.lastSuccessAt) - overlapMs).toISOString()
+    : null;
+
   const repoMeta = await client.requestJson(`/repos/${project.githubRepo}`, {});
   const defaultBranch = repoMeta?.default_branch;
   if (typeof defaultBranch !== 'string' || !defaultBranch) throw new Error(`default branch unavailable for ${project.githubRepo}`);
@@ -241,14 +287,33 @@ async function pollOneProject({
   const defaultSha = sha(commit?.sha);
   if (!defaultSha) throw new Error(`default branch SHA unavailable for ${project.githubRepo}`);
 
-  const changedIssues = await pagedArray({
-    requestJson: client.requestJson.bind(client),
-    endpoint: `/repos/${project.githubRepo}/issues`,
-    query: { state: 'all', since, sort: 'updated', direction: 'asc' },
-    perPage,
-    maxPages,
-  });
-  if (!changedIssues.complete) throw new Error(`issue polling pagination limit reached for ${project.githubRepo}`);
+  let changedItems;
+  let issueItems;
+  if (incremental) {
+    const changed = await pagedArray({
+      requestJson: client.requestJson.bind(client),
+      endpoint: `/repos/${project.githubRepo}/issues`,
+      query: { state: 'all', since, sort: 'updated', direction: 'asc' },
+      perPage,
+      maxPages,
+    });
+    if (!changed.complete) throw new Error(`issue polling pagination limit reached for ${project.githubRepo}`);
+    changedItems = changed.items;
+    issueItems = changed.items.filter((item) => !item?.pull_request);
+  } else {
+    const bootstrap = await boundedBootstrapIssues({
+      requestJson: client.requestJson.bind(client),
+      endpoint: `/repos/${project.githubRepo}/issues`,
+      observedAt,
+      lookbackMs: bootstrapLookbackMs,
+      issueLimit: bootstrapIssueLimit,
+      perPage,
+      maxPages,
+    });
+    changedItems = [];
+    issueItems = bootstrap.items;
+  }
+
   const openPrs = await pagedArray({
     requestJson: client.requestJson.bind(client),
     endpoint: `/repos/${project.githubRepo}/pulls`,
@@ -258,11 +323,11 @@ async function pollOneProject({
   });
   if (!openPrs.complete) throw new Error(`PR polling pagination limit reached for ${project.githubRepo}`);
 
-  const issueItems = changedIssues.items.filter((item) => !item?.pull_request);
   const prNumbers = new Set([
-    ...changedIssues.items.filter((item) => item?.pull_request).map((item) => Number(item.number)),
+    ...(incremental ? changedItems.filter((item) => item?.pull_request).map((item) => Number(item.number)) : []),
     ...openPrs.items.map((item) => Number(item.number)),
   ].filter((number) => Number.isInteger(number) && number > 0));
+
   const prItems = [];
   for (const number of [...prNumbers].sort((left, right) => left - right)) {
     prItems.push(await client.requestJson(`/repos/${project.githubRepo}/pulls/${number}`, {}));
@@ -283,10 +348,12 @@ async function pollOneProject({
     if (recorded.inserted) inserted += 1;
     else duplicates += 1;
   }
+
   pollingStore.commitCursor(project, { observedAt, defaultSha });
   return Object.freeze({
     projectId: project.projectId,
     repository: project.githubRepo,
+    bootstrap: !incremental,
     since,
     issuesObserved: issueItems.length,
     pullRequestsObserved: prItems.length,
@@ -305,6 +372,7 @@ export async function pollRegisteredGitHubProjects({
   observedAt = new Date().toISOString(),
   overlapMs = DEFAULT_POLL_OVERLAP_MS,
   bootstrapLookbackMs = DEFAULT_BOOTSTRAP_LOOKBACK_MS,
+  bootstrapIssueLimit = DEFAULT_BOOTSTRAP_ISSUE_LIMIT,
   perPage = DEFAULT_POLL_PER_PAGE,
   maxPages = DEFAULT_POLL_MAX_PAGES,
 } = {}) {
@@ -312,6 +380,7 @@ export async function pollRegisteredGitHubProjects({
   if (!pollingStore?.getCursor) throw new Error('polling store is required');
   if (!ingressStore?.recordDelivery) throw new Error('event ingress store is required');
   if (!client?.requestJson) throw new Error('GitHub read client is required');
+
   const timestamp = iso(observedAt);
   const boundedOverlapMs = boundedInteger(overlapMs, DEFAULT_POLL_OVERLAP_MS, {
     min: 0, max: 24 * 60 * 60_000, name: 'overlapMs',
@@ -319,8 +388,12 @@ export async function pollRegisteredGitHubProjects({
   const boundedBootstrapLookbackMs = boundedInteger(bootstrapLookbackMs, DEFAULT_BOOTSTRAP_LOOKBACK_MS, {
     min: 60_000, max: 365 * 24 * 60 * 60_000, name: 'bootstrapLookbackMs',
   });
+  const boundedBootstrapIssueLimit = boundedInteger(bootstrapIssueLimit, DEFAULT_BOOTSTRAP_ISSUE_LIMIT, {
+    min: 0, max: 100, name: 'bootstrapIssueLimit',
+  });
   const boundedPerPage = boundedInteger(perPage, DEFAULT_POLL_PER_PAGE, { min: 1, max: 100, name: 'perPage' });
   const boundedMaxPages = boundedInteger(maxPages, DEFAULT_POLL_MAX_PAGES, { min: 1, max: 100, name: 'maxPages' });
+
   const outcomes = [];
   for (const project of registry.projects) {
     try {
@@ -332,6 +405,7 @@ export async function pollRegisteredGitHubProjects({
         observedAt: timestamp,
         overlapMs: boundedOverlapMs,
         bootstrapLookbackMs: boundedBootstrapLookbackMs,
+        bootstrapIssueLimit: boundedBootstrapIssueLimit,
         perPage: boundedPerPage,
         maxPages: boundedMaxPages,
       }));
@@ -345,6 +419,7 @@ export async function pollRegisteredGitHubProjects({
       }));
     }
   }
+
   return Object.freeze({
     schemaVersion: 1,
     observedAt: timestamp,
