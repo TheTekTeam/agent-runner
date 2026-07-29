@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "defaultProjectId": "modelspend",
+  "projects": [
+    {
+      "configPath": "config.modelspend.example.json",
+      "enabled": true
+    },
+    {
+      "configPath": "config.agent-runner.example.json",
+      "enabled": true
+    }
+  ]
+}
