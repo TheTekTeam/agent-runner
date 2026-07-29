@@ -52,6 +52,7 @@ test('queue triage policy defaults disabled and cannot widen core ceilings', () 
   assert.throws(() => normalizeQueueTriagePolicy({ maxMutations: 4 }), /maxMutations/);
   assert.throws(() => normalizeQueueTriagePolicy({ rotatingBacklogSlice: 3 }), /rotatingBacklogSlice/);
   assert.throws(() => normalizeQueueTriagePolicy({ fallbackIntervalMinutes: 30 }), /fallbackIntervalMinutes/);
+  assert.throws(() => normalizeQueueTriagePolicy({ timezone: 'Not/A_Timezone' }), /valid IANA timezone/);
 });
 
 test('creates an immutable full-label replacement with deterministic evidence identity', () => {
@@ -65,6 +66,17 @@ test('creates an immutable full-label replacement with deterministic evidence id
   assert.equal(first.actionPlans[0].evidenceFingerprint, second.actionPlans[0].evidenceFingerprint);
   assert.equal(first.actionPlans[0].authority, null);
   assert.equal(Object.isFrozen(first.actionPlans[0]), true);
+});
+
+test('idempotency is stable across observations but changes with manager authority', () => {
+  const first = planQueueTriageRun(run({ observedAt: '2026-07-29T18:05:00Z' }));
+  const replay = planQueueTriageRun(run({ observedAt: '2026-07-29T18:15:00Z' }));
+  assert.equal(first.actionPlans[0].idempotencyKey, replay.actionPlans[0].idempotencyKey);
+
+  const authorised = planQueueTriageRun(run({ changedItems: [item({
+    authority: { revision: 'AR-1', fingerprint: `sha256:${'a'.repeat(64)}` },
+  })] }));
+  assert.notEqual(first.actionPlans[0].evidenceFingerprint, authorised.actionPlans[0].evidenceFingerprint);
 });
 
 test('raw or sensitive evidence fields are rejected before reporting', () => {
@@ -83,6 +95,28 @@ test('priority conflicts are reconciled as one complete label-set plan', () => {
   assert.equal(report.actionPlans.length, 1);
   assert.deepEqual(report.actionPlans[0].intendedFullLabelSet, ['agent:claude', 'priority:P0', 'status:blocked']);
   assert.ok(report.actionPlans[0].reasons.includes('conflicting-priority-labels'));
+});
+
+test('tightened policy still removes conflicts from the full configured label vocabulary', () => {
+  const report = planQueueTriageRun(run({
+    project: project({ priorityLabels: ['priority:P0'], acceptedStatusLabels: ['status:ready', 'status:blocked'] }),
+    changedItems: [item({
+      labels: ['priority:P0', 'priority:P1', 'status:blocked', 'status:done', 'agent:claude'],
+      intendedStatus: 'status:blocked',
+      intendedPriority: 'priority:P0',
+      flags: { explicitHold: true },
+    })],
+  }));
+  assert.deepEqual(report.actionPlans[0].intendedFullLabelSet, ['agent:claude', 'priority:P0', 'status:blocked']);
+});
+
+test('conflicts without a canonical decision become typed exceptions', () => {
+  const report = planQueueTriageRun(run({ changedItems: [item({
+    intendedStatus: null,
+    flags: {},
+  })] }));
+  assert.equal(report.actionPlans.length, 0);
+  assert.equal(report.exceptions[0].code, 'canonical-label-decision-missing');
 });
 
 test('active ownership suppresses mutation and creates a typed exception', () => {
