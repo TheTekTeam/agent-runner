@@ -1,0 +1,26 @@
+{
+  "projectId": "agent-runner",
+  "displayName": "Agent Runner",
+  "githubRepo": "TheTekTeam/agent-runner",
+  "localRepoPath": "/workspace/agent-runner",
+  "outputDir": ".var/agent-runner",
+  "stateDbPath": ".var/agent-runner/runner-state.sqlite",
+  "acceptedAgentLabels": ["agent:chatgpt", "agent:codex-claude"],
+  "statusLabels": {
+    "ready": "status:ready",
+    "inProgress": "status:in-progress"
+  },
+  "priorityLabelRanking": ["priority:P0", "priority:P1", "priority:P2", "priority:P3"],
+  "safeDefaultValidationCommands": [
+    "node --test scripts/ops/agent-runner-project-registry.test.mjs",
+    "bash scripts/validate.sh"
+  ],
+  "systemd": {
+    "serviceName": "agent-runner-agent-runner.service",
+    "timerName": "agent-runner-agent-runner.timer"
+  },
+  "runner": {
+    "lockPath": ".var/agent-runner/cron.lock",
+    "candidateLimit": 100
+  }
+}
