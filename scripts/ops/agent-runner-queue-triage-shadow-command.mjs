@@ -11,7 +11,12 @@ import {
 import { pathToFileURL } from 'node:url';
 
 import { EventControllerReleaseReader } from './agent-runner-event-controller.mjs';
-import { QueueTriageShadowStore } from './agent-runner-queue-triage-shadow-store.mjs';
+import { planQueueTriageRun } from './agent-runner-queue-triage.mjs';
+import {
+  normalizeShadowRelease,
+  QueueTriageShadowStore,
+  validateShadowEvidenceIdentity,
+} from './agent-runner-queue-triage-shadow-store.mjs';
 
 function boundedLimit(value) {
   const limit = Number(value);
@@ -168,6 +173,12 @@ export function runQueueTriageShadowCommand({
     const evidence = args.evidence
       ? JSON.parse(readFile(resolve(args.evidence), 'utf8'))
       : null;
+    if (evidence) {
+      const normalizedRelease = normalizeShadowRelease(releases[0]);
+      validateShadowEvidenceIdentity(normalizedRelease, evidence);
+      planQueueTriageRun(evidence);
+    }
+
     store = new QueueTriageShadowStore(shadowDb);
     const outcomes = [];
     let observationsInserted = 0;
