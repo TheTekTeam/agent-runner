@@ -86,6 +86,12 @@ export function normalizeQueueTriagePolicy(input = {}, {
   if (input.timezone !== undefined && !nonEmptyString(input.timezone)) {
     throw new Error('queueTriage.timezone must be a non-empty string');
   }
+  const timezone = input.timezone ?? 'Europe/London';
+  try {
+    new Intl.DateTimeFormat('en-GB', { timeZone: timezone }).format(new Date(0));
+  } catch {
+    throw new Error('queueTriage.timezone must be a valid IANA timezone');
+  }
 
   const acceptedStatusLabels = uniqueStrings(
     input.acceptedStatusLabels ?? statusLabels,
@@ -111,7 +117,7 @@ export function normalizeQueueTriagePolicy(input = {}, {
       CORE_QUEUE_TRIAGE_LIMITS.fallbackIntervalMinutes,
       { name: 'queueTriage.fallbackIntervalMinutes', min: CORE_QUEUE_TRIAGE_LIMITS.fallbackIntervalMinutes, max: 24 * 60 },
     ),
-    timezone: input.timezone ?? 'Europe/London',
+    timezone,
     rotatingBacklogSlice: boundedInteger(
       input.rotatingBacklogSlice,
       CORE_QUEUE_TRIAGE_LIMITS.rotatingBacklogSlice,
@@ -161,6 +167,9 @@ function normalizeItem(item, project) {
   const labels = uniqueStrings(item.labels ?? [], `${identity}.labels`, { allowEmpty: true, maxItems: 100 });
   const evidenceRefs = uniqueStrings(item.evidenceRefs ?? [], `${identity}.evidenceRefs`, { allowEmpty: true, maxItems: 20 });
   const flags = isPlainObject(item.flags) ? Object.freeze({ ...item.flags }) : Object.freeze({});
+  if (Array.isArray(item.dependencies) && item.dependencies.length > 20) {
+    throw new Error(`${identity}.dependencies exceeds the bounded limit`);
+  }
   const dependencies = Array.isArray(item.dependencies)
     ? Object.freeze(item.dependencies.map((dependency, index) => {
       if (!isPlainObject(dependency) || !nonEmptyString(dependency.id) || typeof dependency.complete !== 'boolean') {
@@ -233,8 +242,8 @@ function replaceLabelFamily(labels, family, replacement) {
 
 function buildLabelAction(item, project) {
   let resultingLabels = Object.freeze([...item.labels].sort());
-  const currentStatuses = item.labels.filter((label) => project.policy.acceptedStatusLabels.includes(label));
-  const currentPriorities = item.labels.filter((label) => project.policy.priorityLabels.includes(label));
+  const currentStatuses = item.labels.filter((label) => project.statusVocabulary.includes(label));
+  const currentPriorities = item.labels.filter((label) => project.priorityVocabulary.includes(label));
   const currentAgents = item.labels.filter((label) => project.acceptedAgentLabels.includes(label));
   const reasons = [];
 
@@ -243,12 +252,12 @@ function buildLabelAction(item, project) {
     if (item.intendedStatus === project.statusLabels.ready && !dependenciesComplete) return null;
     if (item.intendedStatus === project.statusLabels.ready && item.flags.explicitHold) return null;
     if (item.intendedStatus === project.statusLabels.blocked && !item.flags.explicitHold && currentStatuses.length === 1) return null;
-    resultingLabels = replaceLabelFamily(resultingLabels, project.policy.acceptedStatusLabels, item.intendedStatus);
+    resultingLabels = replaceLabelFamily(resultingLabels, project.statusVocabulary, item.intendedStatus);
     reasons.push(currentStatuses.length > 1 ? 'conflicting-status-labels' : 'status-reconciliation');
   }
 
   if (item.intendedPriority && (currentPriorities.length !== 1 || currentPriorities[0] !== item.intendedPriority)) {
-    resultingLabels = replaceLabelFamily(resultingLabels, project.policy.priorityLabels, item.intendedPriority);
+    resultingLabels = replaceLabelFamily(resultingLabels, project.priorityVocabulary, item.intendedPriority);
     reasons.push(currentPriorities.length > 1 ? 'conflicting-priority-labels' : 'priority-alignment');
   }
 
@@ -274,6 +283,7 @@ function actionPlan(item, action, project, runIdentity) {
     updatedAt: item.updatedAt,
     beforeLabels: [...item.labels].sort(),
     evidenceRefs: item.evidenceRefs,
+    authority: item.authority,
     reasons: action.reasons,
     intendedAction: action.type,
     resultingLabels: action.resultingLabels,
@@ -319,23 +329,35 @@ export function planQueueTriageRun(input) {
   if (!nonEmptyString(statusLabelMap.ready) || !nonEmptyString(statusLabelMap.inProgress) || !nonEmptyString(statusLabelMap.blocked)) {
     throw new Error('project.statusLabels must define ready, inProgress and blocked labels');
   }
-  const configuredStatusLabels = [...new Set(Object.values(statusLabelMap).filter(nonEmptyString))];
+  const statusValues = Object.values(statusLabelMap).filter(nonEmptyString);
+  const configuredStatusLabels = [...new Set(statusValues)];
+  if (configuredStatusLabels.length !== statusValues.length) {
+    throw new Error('project.statusLabels semantic values must be unique');
+  }
+  const configuredPriorityLabels = uniqueStrings(
+    projectInput.priorityLabels ?? ['priority:P0', 'priority:P1', 'priority:P2', 'priority:P3'],
+    'project.priorityLabels',
+  );
   const policy = normalizeQueueTriagePolicy(projectInput.policy ?? {}, {
     statusLabels: configuredStatusLabels,
-    priorityLabels: projectInput.priorityLabels ?? ['priority:P0', 'priority:P1', 'priority:P2', 'priority:P3'],
+    priorityLabels: configuredPriorityLabels,
   });
   const project = Object.freeze({
     projectId: projectInput.projectId,
     repository: projectInput.repository,
     acceptedAgentLabels,
     statusLabels: statusLabelMap,
+    statusVocabulary: Object.freeze(configuredStatusLabels),
+    priorityVocabulary: configuredPriorityLabels,
     policy,
   });
   const observedAt = canonicalTimestamp(input.observedAt, 'observedAt');
   const mode = input.mode ?? 'release';
   if (!['release', 'fallback'].includes(mode)) throw new Error('mode must be release or fallback');
   const releaseId = input.releaseId ?? null;
+  const fallbackId = input.fallbackId ?? null;
   if (mode === 'release' && !nonEmptyString(releaseId)) throw new Error('releaseId is required in release mode');
+  if (mode === 'fallback' && !nonEmptyString(fallbackId)) throw new Error('fallbackId is required in fallback mode');
 
   const changedInput = Array.isArray(input.changedItems) ? input.changedItems : [];
   const rotatingInput = Array.isArray(input.rotatingItems) ? input.rotatingItems : [];
@@ -347,7 +369,12 @@ export function planQueueTriageRun(input) {
     debuggerAnomalies: 0,
     proposedMutations: 0,
   });
-  const runIdentity = evidenceFingerprint({ projectId: project.projectId, repository: project.repository, mode, releaseId, observedAt });
+  const runIdentity = evidenceFingerprint({
+    projectId: project.projectId,
+    repository: project.repository,
+    mode,
+    sourceId: mode === 'release' ? releaseId : fallbackId,
+  });
   const plans = [];
   const exceptions = [];
   const inspected = [...changedItems, ...rotatingItems];
@@ -364,7 +391,20 @@ export function planQueueTriageRun(input) {
     }
     let action = buildCloseAction(item);
     if (!action) action = buildLabelAction(item, project);
-    if (action) plans.push(actionPlan(item, action, project, runIdentity));
+    if (action) {
+      plans.push(actionPlan(item, action, project, runIdentity));
+      continue;
+    }
+    const statusConflicts = item.labels.filter((label) => project.statusVocabulary.includes(label)).length > 1;
+    const priorityConflicts = item.labels.filter((label) => project.priorityVocabulary.includes(label)).length > 1;
+    const agentConflicts = item.labels.filter((label) => project.acceptedAgentLabels.includes(label)).length > 1;
+    if ((statusConflicts && !item.intendedStatus) || (priorityConflicts && !item.intendedPriority)
+      || (agentConflicts && !item.authoritativeAgentLabel)) {
+      exceptions.push(exceptionFor(item, 'unsupported-or-incomplete-evidence', 'canonical-label-decision-missing'));
+    } else if (item.intendedStatus || item.intendedPriority || item.authoritativeAgentLabel
+      || item.linkedMergedPrComplete || item.postMergeSettled) {
+      exceptions.push(exceptionFor(item, 'unsupported-or-incomplete-evidence', 'mutation-evidence-insufficient'));
+    }
   }
 
   const boundedExceptions = exceptions.slice(0, policy.maxDebuggerAnomalies);
@@ -383,6 +423,7 @@ export function planQueueTriageRun(input) {
     dryRun: true,
     mode,
     releaseId,
+    fallbackId,
     project: Object.freeze({ projectId: project.projectId, repository: project.repository }),
     policy,
     inspected: Object.freeze({ changed: changedItems.length, rotating: rotatingItems.length, total: inspected.length }),
@@ -418,6 +459,7 @@ export function renderQueueTriageMarkdown(report) {
     `- Project: \`${report.project.projectId}\` (\`${report.project.repository}\`)`,
     `- Mode: \`${report.mode}\``,
     `- Release: ${report.releaseId ? `\`${report.releaseId}\`` : '`none`'}`,
+    `- Fallback: ${report.fallbackId ? `\`${report.fallbackId}\`` : '`none`'}`,
     `- Inspected: ${report.inspected.total} (${report.inspected.changed} changed, ${report.inspected.rotating} rotating)`,
     `- Proposed mutations: ${report.actionPlans.length}`,
     `- Exceptions: ${report.exceptions.length}`,
