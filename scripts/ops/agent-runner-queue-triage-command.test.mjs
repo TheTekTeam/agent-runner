@@ -14,6 +14,7 @@ const input = {
   },
   observedAt: '2026-07-29T18:05:00Z',
   mode: 'fallback',
+  fallbackId: 'fallback-2026-07-29T18',
   changedItems: [],
   rotatingItems: [],
 };
