@@ -250,7 +250,6 @@ export class QueueTriageShadowStore {
   }
 
   attachEvidenceAndPlan(release, evidence, { plannedAt = this.now() } = {}) {
-    const observation = this.observeRelease(release, { observedAt: plannedAt }).observation;
     const normalized = normalizeShadowRelease(release);
     validateShadowEvidenceIdentity(normalized, evidence);
     const evidenceJson = boundedJson(evidence, 'normalized evidence');
@@ -258,6 +257,7 @@ export class QueueTriageShadowStore {
     const report = planQueueTriageRun(evidence);
     const reportJson = boundedJson(report, 'dry-run report');
     const reportFingerprint = evidenceFingerprint(JSON.parse(reportJson));
+    const observation = this.observeRelease(release, { observedAt: plannedAt }).observation;
     const reportId = `shadow-report-${evidenceFingerprint({
       batchId: normalized.batchId,
       evidenceFingerprint: evidenceFingerprintValue,
