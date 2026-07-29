@@ -137,7 +137,29 @@ test('shadow command orchestrates live read-only evidence and parity without con
   writeFileSync(controllerDb, 'fixture');
   writeFileSync(projectPath, JSON.stringify({ projectId: 'alpha', repository: 'Owner/Alpha' }));
   writeFileSync(oversightPath, JSON.stringify(candidate()));
-  const inputRelease = { batchId: 'batch-1', state: 'pending', payload: { projectId: 'alpha', repository: 'Owner/Alpha', objectKind: 'issue', objectNumber: 7 } };
+  const inputRelease = {
+    batchId: 'batch-1',
+    state: 'pending',
+    releasedAt: '2026-07-29T18:00:00Z',
+    updatedAt: '2026-07-29T18:00:00Z',
+    payload: {
+      schemaVersion: 1,
+      batchId: 'batch-1',
+      projectId: 'alpha',
+      repository: 'Owner/Alpha',
+      objectKind: 'issue',
+      objectNumber: 7,
+      settledAt: '2026-07-29T18:00:00Z',
+      deliveryIds: ['delivery-batch-1'],
+      shas: [],
+      settlement: {
+        reason: 'ci-settled',
+        requiredShas: [],
+        terminalFailures: [],
+      },
+    },
+    result: {},
+  };
   const evidence = {
     releaseId: 'batch-1', project: { projectId: 'alpha', repository: 'Owner/Alpha' },
     changedItems: [{ kind: 'issue', number: 7, updatedAt: '2026-07-29T18:00:00Z', labels: [] }], rotatingItems: [],
