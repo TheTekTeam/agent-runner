@@ -161,6 +161,36 @@ test('argument parser requires one bounded observation mode', () => {
   );
 });
 
+test('refuses a shadow database path that aliases the controller or a sidecar', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-runner-triage-shadow-alias-'));
+  const controllerDb = join(directory, 'controller.sqlite');
+  try {
+    createControllerDatabase(controllerDb, [release()]);
+    assert.throws(
+      () => runQueueTriageShadowCommand({
+        argv: [
+          '--controller-db', controllerDb,
+          '--shadow-db', controllerDb,
+          '--pending',
+        ],
+      }),
+      /must be separate/,
+    );
+    assert.throws(
+      () => runQueueTriageShadowCommand({
+        argv: [
+          '--controller-db', controllerDb,
+          '--shadow-db', `${controllerDb}-wal`,
+          '--pending',
+        ],
+      }),
+      /must be separate/,
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('pending mode observes at most 20 releases and preserves controller files byte-for-byte', () => {
   const directory = mkdtempSync(join(tmpdir(), 'agent-runner-triage-shadow-command-'));
   const controllerDb = join(directory, 'controller.sqlite');
