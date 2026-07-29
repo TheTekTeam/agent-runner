@@ -50,23 +50,37 @@ function releasePayload(batch) {
 
 function parseReleaseJson(value, name) {
   try {
-    return JSON.parse(value);
+    const parsed = JSON.parse(value);
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('not an object');
+    }
+    return parsed;
   } catch {
-    throw new Error(`${name} contains invalid JSON`);
+    throw new Error(`${name} contains invalid JSON object`);
   }
 }
 
-function releaseFromRow(row) {
+function releaseFromRow(row, { freeze = false, includeClaim = true } = {}) {
   if (!row) return null;
-  return Object.freeze({
+  const payload = parseReleaseJson(row.payload_json, `release ${row.batch_id} payload`);
+  const result = parseReleaseJson(row.result_json, `release ${row.batch_id} result`);
+  const release = {
     batchId: row.batch_id,
     state: row.state,
     releasedAt: row.released_at,
     updatedAt: row.updated_at,
-    claimToken: row.claim_token,
-    claimExpiresAt: row.claim_expires_at,
-    payload: Object.freeze(parseReleaseJson(row.payload_json, `release ${row.batch_id} payload`)),
-    result: Object.freeze(parseReleaseJson(row.result_json, `release ${row.batch_id} result`)),
+    payload,
+    result,
+  };
+  if (includeClaim) {
+    release.claimToken = row.claim_token;
+    release.claimExpiresAt = row.claim_expires_at;
+  }
+  if (!freeze) return release;
+  return Object.freeze({
+    ...release,
+    payload: Object.freeze(payload),
+    result: Object.freeze(result),
   });
 }
 
@@ -99,7 +113,7 @@ export class EventControllerReleaseReader {
     if (typeof batchId !== 'string' || batchId.length === 0) throw new Error('batchId is required');
     return releaseFromRow(this.db.prepare(`
       SELECT * FROM event_triage_releases WHERE batch_id = ?
-    `).get(batchId));
+    `).get(batchId), { freeze: true, includeClaim: false });
   }
 
   listReleases({ states = ['pending'], limit = 20 } = {}) {
@@ -113,7 +127,10 @@ export class EventControllerReleaseReader {
       WHERE state IN (${placeholders})
       ORDER BY released_at ASC, batch_id ASC
       LIMIT ?
-    `).all(...states, boundedLimit).map(releaseFromRow));
+    `).all(...states, boundedLimit).map((row) => releaseFromRow(row, {
+      freeze: true,
+      includeClaim: false,
+    })));
   }
 
   close() {
