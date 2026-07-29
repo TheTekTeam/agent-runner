@@ -1,12 +1,11 @@
 [Unit]
-Description=Run Agent Runner GitHub polling and CI settlement every minute
+Description=Run Agent Runner GitHub polling and CI settlement after each completed cycle
 
 [Timer]
 OnBootSec=2min
-OnUnitActiveSec=1min
+OnUnitInactiveSec=1min
 AccuracySec=10s
 RandomizedDelaySec=5s
-Persistent=true
 Unit=agent-runner-event-polling.service
 
 [Install]
