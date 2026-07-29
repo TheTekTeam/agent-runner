@@ -315,6 +315,52 @@ test('readOnlyRunnerStateSnapshot is genuinely read-only: DB byte digest, schema
   }
 });
 
+test('readOnlyRunnerStateSnapshot projects only bounded assignment evidence out of the selection plan (#97)', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'doctor-snapshot-assignment-'));
+  try {
+    const dbPath = join(dir, 'state.sqlite');
+    const store = openRunnerStateStore(dbPath);
+    try {
+      store.recordIssueSelection({
+        repo: 'TheTekTeam/modelspend',
+        issueNumber: 97,
+        statusLabel: 'status:ready',
+        selectionMode: 'preflight-direct',
+        payload: {
+          agent: { agentId: 'claude-code-cli', assignmentLabel: 'agent:codex-claude' },
+          stateDbPath: '/home/doctor-user/secret-state-path',
+          skipped: [{ issue: 96, reason: 'restricted-doctor-sentinel-value' }],
+        },
+      });
+      store.recordIssueSelection({
+        repo: 'TheTekTeam/modelspend',
+        issueNumber: 95,
+        statusLabel: 'status:ready',
+        selectionMode: 'preflight-direct',
+        payload: { agent: { agentId: 'claude-code-cli', assignmentLabel: 'agent:not-a-catalogue-label' } },
+      });
+    } finally {
+      store.close();
+    }
+
+    const snapshot = readOnlyRunnerStateSnapshot(dbPath, { includeLatest: true, historyLimit: 5 });
+    assert.equal(snapshot.ok, true);
+    const byIssue = Object.fromEntries(snapshot.latest.selections.map((row) => [row.issue_number, row]));
+    assert.deepEqual(byIssue[97].payload, { agent: { agentId: 'claude-code-cli', assignmentLabel: 'agent:codex-claude' } });
+    // A label the adapter catalogue does not know fails closed rather than
+    // being forwarded verbatim.
+    assert.deepEqual(byIssue[95].payload, { agent: { agentId: 'claude-code-cli', assignmentLabel: null } });
+
+    const serialized = JSON.stringify(snapshot);
+    assert.equal(serialized.includes('restricted-doctor-sentinel-value'), false);
+    assert.equal(serialized.includes('/home/doctor-user/secret-state-path'), false);
+    assert.equal(serialized.includes('not-a-catalogue-label'), false);
+    assert.equal(redactSensitiveText(serialized), serialized);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('doctor report is genuinely read-only end to end: DB digest/schema/directory unchanged, no WAL/SHM created', () => {
   const dir = mkdtempSync(join(tmpdir(), 'doctor-readonly-e2e-'));
   try {

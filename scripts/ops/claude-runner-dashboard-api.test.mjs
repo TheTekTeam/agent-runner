@@ -151,7 +151,9 @@ test('dashboard API returns valid empty payload for empty DB', () => withTempDir
       averageDurationSeconds: null,
     },
     quota: { blockedCount: 0, latestSessionUsagePercent: null, latestWeeklyUsagePercent: null },
-    queue: { skipReasons: [], skipEventCount: 0, skippedIssueCount: 0, skipReasonCount: 0, oldestQueuedOrSkippedAt: null },
+    queue: {
+      skipReasons: [], skipEventCount: 0, skippedIssueCount: 0, skipReasonCount: 0, oldestQueuedOrSkippedAt: null, assignments: [],
+    },
     eta: {
       status: 'insufficient-data',
       confidence: 'low',
@@ -260,6 +262,7 @@ test('dashboard API groups populated DB rows into operator-readable sections', (
     skippedIssueCount: 1,
     skipReasonCount: 1,
     oldestQueuedOrSkippedAt: '2026-07-09T13:03:01.000Z',
+    assignments: [],
   });
   assert.equal(dashboard.metrics.eta.status, 'insufficient-data');
   assert.equal(dashboard.activity.status, 'idle');
@@ -389,6 +392,82 @@ test('buildRunnerMetrics excludes no-selection polls from implementation success
     basis: { completedRuns: 3, outstandingIssues: 4 },
     message: 'Rough ETA range based on persisted issue-run durations and distinct selected/skipped issues.',
   });
+});
+
+test('current-attempt projection shows the shared assignment as Codex / Claude and keeps the actual selected worker separate (#97)', () => {
+  const latest = {
+    claims: [{ repo: 'TheTekTeam/modelspend', issue_number: 97, action: 'claim-ready-issue', status_label: 'status:in-progress', created_at: '2026-07-28T12:00:00.000Z' }],
+    selections: [{
+      repo: 'TheTekTeam/modelspend',
+      issue_number: 97,
+      status_label: 'status:ready',
+      selection_mode: 'preflight-direct',
+      created_at: '2026-07-28T11:59:00.000Z',
+      payload: { agent: { agentId: 'claude-code-cli', assignmentLabel: 'agent:codex-claude' } },
+    }],
+    runResults: [], queueEvents: [], quota: [], preflights: [], recoveryAttempts: [], attentionEvents: [], runs: [],
+  };
+
+  const activity = buildRunnerActivity(latest);
+  assert.equal(activity.status, 'active-or-unresolved');
+  assert.equal(activity.activeIssue.issue_number, 97);
+  // The eligibility label is displayed, and the worker that actually holds
+  // the attempt is retained beside it -- never in place of it.
+  assert.equal(activity.activeIssue.assignment_label, 'agent:codex-claude');
+  assert.equal(activity.activeIssue.assignment_display_name, 'Codex / Claude');
+  assert.equal(activity.activeIssue.agent, 'claude-code-cli');
+
+  const queue = buildRunnerMetrics({ latest }).queue;
+  assert.deepEqual(queue.assignments, [
+    { assignmentLabel: 'agent:codex-claude', assignmentDisplayName: 'Codex / Claude', issueCount: 1 },
+  ]);
+});
+
+test('assignment projection preserves non-shared labels, fails closed on unknown label/agent text and never invents evidence (#97)', () => {
+  const nonShared = buildRunnerActivity({
+    claims: [{ repo: 'TheTekTeam/modelspend', issue_number: 11, action: 'claim-ready-issue', created_at: '2026-07-28T12:00:00.000Z' }],
+    selections: [{
+      repo: 'TheTekTeam/modelspend',
+      issue_number: 11,
+      created_at: '2026-07-28T11:00:00.000Z',
+      payload: { agent: { agentId: 'claude-code-cli', assignmentLabel: 'agent:claude-code-cli' } },
+    }],
+    runResults: [], queueEvents: [], quota: [], preflights: [], recoveryAttempts: [], attentionEvents: [], runs: [],
+  });
+  // No display alias exists for a non-shared label, so the canonical helper
+  // returns the label unchanged -- existing output is not rewritten.
+  assert.equal(nonShared.activeIssue.assignment_display_name, 'agent:claude-code-cli');
+  assert.equal(nonShared.activeIssue.agent, 'claude-code-cli');
+
+  const untrusted = buildRunnerActivity({
+    claims: [{ repo: 'TheTekTeam/modelspend', issue_number: 12, action: 'claim-ready-issue', created_at: '2026-07-28T12:00:00.000Z' }],
+    selections: [{
+      repo: 'TheTekTeam/modelspend',
+      issue_number: 12,
+      created_at: '2026-07-28T11:00:00.000Z',
+      payload: { agent: { agentId: '/home/secret/path', assignmentLabel: 'agent:UNTRUSTED-LABEL-TEXT' } },
+    }],
+    runResults: [], queueEvents: [], quota: [], preflights: [], recoveryAttempts: [], attentionEvents: [], runs: [],
+  });
+  assert.equal(untrusted.activeIssue.assignment_label, null);
+  assert.equal(untrusted.activeIssue.assignment_display_name, null);
+  assert.equal(untrusted.activeIssue.agent, null);
+  assert.equal(JSON.stringify(untrusted).includes('UNTRUSTED-LABEL-TEXT'), false);
+  assert.equal(JSON.stringify(untrusted).includes('/home/secret/path'), false);
+
+  // Assignment evidence for a different issue is never borrowed.
+  const unrelated = buildRunnerActivity({
+    claims: [{ repo: 'TheTekTeam/modelspend', issue_number: 13, action: 'claim-ready-issue', created_at: '2026-07-28T12:00:00.000Z' }],
+    selections: [{
+      repo: 'TheTekTeam/modelspend',
+      issue_number: 99,
+      created_at: '2026-07-28T11:00:00.000Z',
+      payload: { agent: { agentId: 'claude-code-cli', assignmentLabel: 'agent:codex-claude' } },
+    }],
+    runResults: [], queueEvents: [], quota: [], preflights: [], recoveryAttempts: [], attentionEvents: [], runs: [],
+  });
+  assert.equal(unrelated.activeIssue.assignment_display_name, null);
+  assert.equal(unrelated.activeIssue.agent, null);
 });
 
 test('dashboard API allowlists recovery_attempts/run_results/attention_events output and never exposes restricted columns (#698 finding 9)', () => withTempDir('modelspend-runner-dashboard-allowlist-', (dir) => {

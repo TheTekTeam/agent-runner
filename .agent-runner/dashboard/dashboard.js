@@ -95,6 +95,12 @@
     const active = Boolean(activity.activeIssue);
     const badgeClass = active ? 'warn' : 'ok';
     const badgeText = active ? 'Active or unresolved claim' : 'Idle — latest activity only';
+    // #97: assignment and agent are two different facts and are never
+    // collapsed into one another. "Assignment" is the issue's eligibility
+    // label as the canonical helper displays it (`Codex / Claude` for the
+    // shared label); "Agent" is the worker that was actually selected for
+    // this attempt (`claude-code-cli`). Either may legitimately be absent,
+    // in which case it shows as em dash rather than borrowing the other.
     target.innerHTML = `
       <p class="badge ${badgeClass}">${escapeHtml(badgeText)}</p>
       <h3>${issueLink(row.repo, row.issue_number)}</h3>
@@ -102,6 +108,8 @@
       <dl class="activity-grid">
         <dt>Record</dt><dd>${escapeHtml(row.kind || '—')}</dd>
         <dt>Mode</dt><dd>${escapeHtml(row.mode || '—')}</dd>
+        <dt>Assignment</dt><dd>${escapeHtml(row.assignment_display_name || '—')}</dd>
+        <dt>Agent</dt><dd>${escapeHtml(row.agent || '—')}</dd>
         <dt>Status</dt><dd>${escapeHtml(row.status_label || '—')}</dd>
         <dt>Time</dt><dd>${escapeHtml(fmtDate(row.timestamp))}</dd>
       </dl>`;
@@ -251,7 +259,14 @@
     text('metric-quota', metrics.quota?.latestSessionUsagePercent == null ? '—' : `${metrics.quota.latestSessionUsagePercent}%`);
     text('metric-quota-detail', `Weekly ${metrics.quota?.latestWeeklyUsagePercent ?? '—'}% · ${metrics.quota?.blockedCount ?? 0} blocked samples`);
     text('metric-skips', metrics.queue?.skipEventCount ?? 0);
-    text('metric-skips-detail', `${metrics.queue?.skippedIssueCount ?? 0} issues · ${metrics.queue?.skipReasonCount ?? 0} reason types`);
+    // #97: which assignments the retained queue window is carrying, using the
+    // canonical display name. Bounded to the three largest so a long tail can
+    // never grow this one-line summary without limit.
+    const queueAssignments = (metrics.queue?.assignments || [])
+      .slice(0, 3)
+      .map((entry) => `${entry.assignmentDisplayName || entry.assignmentLabel} ×${entry.issueCount}`)
+      .join(' · ');
+    text('metric-skips-detail', `${metrics.queue?.skippedIssueCount ?? 0} issues · ${metrics.queue?.skipReasonCount ?? 0} reason types${queueAssignments ? ` · ${queueAssignments}` : ''}`);
     text('metric-eta', metrics.eta?.status || '—');
     text('metric-eta-detail', metrics.eta?.estimatedSecondsLow ? `${fmtDuration(metrics.eta.estimatedSecondsLow)}–${fmtDuration(metrics.eta.estimatedSecondsHigh)}` : (metrics.eta?.message || '—'));
 

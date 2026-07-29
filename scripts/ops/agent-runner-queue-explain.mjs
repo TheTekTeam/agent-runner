@@ -18,7 +18,12 @@
 import { execFileSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
-import { AGENT_ADAPTERS } from './agent-runner-agents.mjs';
+import {
+  AGENT_ADAPTERS,
+  agentAssignmentDisplayName,
+  allAgentLabels,
+  resolveAgentForLabels,
+} from './agent-runner-agents.mjs';
 import { snapshotAgentSettings } from './agent-runner-agent-settings.mjs';
 import { loadAgentRunnerConfig, projectIdentity } from './agent-runner-config.mjs';
 import * as cron from './claude-runner-cron.mjs';
@@ -61,7 +66,52 @@ function gh(jsonArgs) {
   return execFileSync('gh', jsonArgs, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 }
 
-function excludingGhRunner(baseGhRunner, excluded) {
+// Issue #97: the assignment label a candidate carries (`agent:codex-claude`
+// displays as `Codex / Claude`) is eligibility metadata, not the worker that
+// runs it. It is read off the same already-fetched `gh issue list` JSON this
+// module already inspects -- no extra GitHub call, no second opinion about
+// which issues are candidates -- and is bounded to labels the adapter
+// catalogue already knows, so arbitrary issue-label text can never reach
+// output through this path.
+const KNOWN_AGENT_LABELS = new Set(allAgentLabels({ includeFuture: true }));
+
+function knownAgentLabelsOf(issue) {
+  return (issue?.labels || [])
+    .map((label) => String(label?.name || label || '').trim())
+    .filter((label) => KNOWN_AGENT_LABELS.has(label));
+}
+
+function observedAgentLabels() {
+  const byIssueNumber = new Map();
+  return {
+    observe(issues) {
+      for (const issue of issues) {
+        if (!Number.isInteger(issue?.number)) continue;
+        byIssueNumber.set(issue.number, knownAgentLabelsOf(issue));
+      }
+    },
+    labelsFor(issueNumber) {
+      return byIssueNumber.get(issueNumber) || [];
+    },
+  };
+}
+
+/**
+ * The assignment display for one candidate. The first catalogue-known
+ * `agent:` label wins, exactly as `resolveAgentForLabels()` already resolves
+ * an agent from a label list -- this reports that same canonical ordering
+ * rather than introducing a second rule -- and the display string itself
+ * comes from the canonical helper merged by #96.
+ */
+function assignmentProjection(labels) {
+  const assignmentLabel = labels.find((label) => KNOWN_AGENT_LABELS.has(label)) || null;
+  return {
+    assignmentLabel,
+    assignmentDisplayName: assignmentLabel ? agentAssignmentDisplayName(assignmentLabel) : null,
+  };
+}
+
+function excludingGhRunner(baseGhRunner, excluded, observed) {
   return (jsonArgs) => {
     const raw = baseGhRunner(jsonArgs);
     if (jsonArgs[0] !== 'issue' || jsonArgs[1] !== 'list') return raw;
@@ -72,6 +122,7 @@ function excludingGhRunner(baseGhRunner, excluded) {
       return raw;
     }
     if (!Array.isArray(parsed)) return raw;
+    observed.observe(parsed);
     return JSON.stringify(parsed.filter((issue) => !excluded.has(issue?.number)));
   };
 }
@@ -83,21 +134,35 @@ export function normalizeReason(rawReason) {
   return RECOGNIZED_REASON_CODES.has(rawReason) ? rawReason : 'unclassified-skip';
 }
 
-function boundedSkipEntry(entry) {
+// `agentId` is the actual worker, and only ever what selectIssue() itself
+// resolved for this candidate -- never inferred from the assignment label.
+// A skipped candidate for which the selector recorded no agent (an ambiguous
+// or conflicting one, say) reports null rather than a guess.
+function boundedSkipEntry(entry, observed) {
+  const issueNumber = Number.isInteger(entry.issue) ? entry.issue : null;
   return {
-    issueNumber: Number.isInteger(entry.issue) ? entry.issue : null,
+    issueNumber,
     statusLabel: entry.statusLabel || null,
     runnable: false,
     reason: normalizeReason(entry.reason),
+    ...assignmentProjection(issueNumber === null ? [] : observed.labelsFor(issueNumber)),
+    agentId: Object.hasOwn(AGENT_ADAPTERS, entry.agentId ?? '') ? entry.agentId : null,
   };
 }
 
 function boundedRunnableEntry(result) {
+  const issue = result.issue;
   return {
-    issueNumber: result.issue.number,
-    statusLabel: result.issue.statusLabel || null,
+    issueNumber: issue.number,
+    statusLabel: issue.statusLabel || null,
     runnable: true,
     reason: 'runnable',
+    ...assignmentProjection(knownAgentLabelsOf(issue)),
+    // The agent this pass actually resolved for the issue, resolved exactly
+    // as the scheduler resolves it (claude-runner-cron.mjs `selectIssue()`).
+    // For the shared assignment this is `claude-code-cli`, never the
+    // `Codex / Claude` eligibility label.
+    agentId: resolveAgentForLabels([...(issue.labels || []), issue.agentLabel])?.agentId || null,
   };
 }
 
@@ -136,7 +201,8 @@ export async function explainQueue(args, env = process.env, {
     : {};
 
   const excluded = new Set();
-  const ghRunner = excludingGhRunner(baseGhRunner, excluded);
+  const observed = observedAgentLabels();
+  const ghRunner = excludingGhRunner(baseGhRunner, excluded, observed);
   const candidates = [];
   let queueInspectionDegraded = false;
 
@@ -157,7 +223,7 @@ export async function explainQueue(args, env = process.env, {
 
     for (const entry of result.skipped) {
       if (Number.isInteger(entry.issue)) excluded.add(entry.issue);
-      candidates.push(boundedSkipEntry(entry));
+      candidates.push(boundedSkipEntry(entry, observed));
     }
 
     if (result.issue) {
