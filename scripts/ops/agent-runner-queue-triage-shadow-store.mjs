@@ -26,6 +26,14 @@ function boundedJson(value, name) {
   return json;
 }
 
+function boundedString(value, name, maxLength = 255, { nullable = false } = {}) {
+  if (nullable && value == null) return null;
+  if (typeof value !== 'string' || value.length === 0 || value.length > maxLength) {
+    throw new Error(`${name} is invalid`);
+  }
+  return value;
+}
+
 function codedError(code, message) {
   const error = new Error(message);
   error.code = code;
@@ -36,10 +44,13 @@ export function normalizeShadowRelease(release) {
   if (!release || !ID_PATTERN.test(release.batchId || '')) throw new Error('release batchId is invalid');
   if (release.state !== 'pending') throw new Error('only pending releases may be shadow-observed');
   const payload = release.payload;
-  if (!payload || payload.batchId !== release.batchId || !ID_PATTERN.test(payload.projectId || '')
-    || typeof payload.repository !== 'string' || !payload.repository.includes('/')) {
+  boundedJson(payload, 'controller release payload');
+  if (!payload || payload.schemaVersion !== 1 || payload.batchId !== release.batchId
+    || !ID_PATTERN.test(payload.projectId || '')) {
     throw new Error('release payload identity is invalid');
   }
+  const repository = boundedString(payload.repository, 'release payload repository');
+  if (!repository.includes('/')) throw new Error('release payload identity is invalid');
   if (!['issue', 'pull_request', 'repository'].includes(payload.objectKind)) {
     throw new Error('release payload objectKind is invalid');
   }
@@ -48,6 +59,15 @@ export function normalizeShadowRelease(release) {
   } else if (!Number.isInteger(payload.objectNumber) || payload.objectNumber < 1) {
     throw new Error('release payload objectNumber is invalid');
   }
+  if (!Array.isArray(payload.deliveryIds) || payload.deliveryIds.length > 1_000) {
+    throw new Error('release payload deliveryIds are invalid');
+  }
+  if (!Array.isArray(payload.shas) || payload.shas.length > 100) {
+    throw new Error('release payload shas are invalid');
+  }
+  const settlementReason = payload.settlement?.reason == null
+    ? null
+    : boundedString(payload.settlement.reason, 'release settlement reason', 64, { nullable: true });
 
   return Object.freeze({
     batchId: release.batchId,
@@ -55,14 +75,14 @@ export function normalizeShadowRelease(release) {
     releasedAt: iso(release.releasedAt),
     updatedAt: iso(release.updatedAt),
     projectId: payload.projectId,
-    repository: payload.repository,
+    repository,
     objectKind: payload.objectKind,
     objectNumber: payload.objectNumber ?? null,
     settledAt: payload.settledAt ? iso(payload.settledAt) : null,
-    settlementReason: payload.settlement?.reason ?? null,
+    settlementReason,
     payloadFingerprint: evidenceFingerprint(payload),
-    deliveryFingerprint: evidenceFingerprint(payload.deliveryIds ?? []),
-    shaFingerprint: evidenceFingerprint(payload.shas ?? []),
+    deliveryFingerprint: evidenceFingerprint(payload.deliveryIds),
+    shaFingerprint: evidenceFingerprint(payload.shas),
     settlementFingerprint: evidenceFingerprint(payload.settlement ?? {}),
   });
 }
@@ -163,21 +183,8 @@ export class QueueTriageShadowStore {
 
   observeRelease(release, { observedAt = this.now() } = {}) {
     const normalized = normalizeShadowRelease(release);
-    const existing = this.getObservation(normalized.batchId);
-    if (existing) {
-      if (existing.payloadFingerprint !== normalized.payloadFingerprint
-        || existing.projectId !== normalized.projectId
-        || existing.repository.toLowerCase() !== normalized.repository.toLowerCase()) {
-        throw codedError(
-          'shadow-release-collision',
-          `release ${normalized.batchId} changed after shadow observation`,
-        );
-      }
-      return Object.freeze({ inserted: false, replayed: true, observation: existing });
-    }
-
-    this.db.prepare(`
-      INSERT INTO queue_triage_shadow_observations(
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO queue_triage_shadow_observations(
         batch_id,
         project_id,
         repository,
@@ -209,11 +216,18 @@ export class QueueTriageShadowStore {
       normalized.settlementFingerprint,
       iso(observedAt),
     );
-    return Object.freeze({
-      inserted: true,
-      replayed: false,
-      observation: this.getObservation(normalized.batchId),
-    });
+    const observation = this.getObservation(normalized.batchId);
+    if (!observation
+      || observation.payloadFingerprint !== normalized.payloadFingerprint
+      || observation.projectId !== normalized.projectId
+      || observation.repository.toLowerCase() !== normalized.repository.toLowerCase()) {
+      throw codedError(
+        'shadow-release-collision',
+        `release ${normalized.batchId} changed after shadow observation`,
+      );
+    }
+    const inserted = Number(insert.changes) === 1;
+    return Object.freeze({ inserted, replayed: !inserted, observation });
   }
 
   attachEvidenceAndPlan(release, evidence, { plannedAt = this.now() } = {}) {
@@ -225,32 +239,12 @@ export class QueueTriageShadowStore {
     const report = planQueueTriageRun(evidence);
     const reportJson = boundedJson(report, 'dry-run report');
     const reportFingerprint = evidenceFingerprint(JSON.parse(reportJson));
-    const existing = this.db.prepare(`
-      SELECT * FROM queue_triage_shadow_reports
-      WHERE batch_id = ? AND evidence_fingerprint = ?
-    `).get(normalized.batchId, evidenceFingerprintValue);
-    if (existing) {
-      if (existing.report_fingerprint !== reportFingerprint) {
-        throw codedError(
-          'shadow-report-collision',
-          `release ${normalized.batchId} produced a changed report for identical evidence`,
-        );
-      }
-      return Object.freeze({
-        inserted: false,
-        replayed: true,
-        observation,
-        report: Object.freeze(JSON.parse(existing.report_json)),
-        reportId: existing.report_id,
-      });
-    }
-
     const reportId = `shadow-report-${evidenceFingerprint({
       batchId: normalized.batchId,
       evidenceFingerprint: evidenceFingerprintValue,
     }).slice(7, 31)}`;
-    this.db.prepare(`
-      INSERT INTO queue_triage_shadow_reports(
+    const insert = this.db.prepare(`
+      INSERT OR IGNORE INTO queue_triage_shadow_reports(
         report_id,
         batch_id,
         evidence_fingerprint,
@@ -266,12 +260,23 @@ export class QueueTriageShadowStore {
       iso(plannedAt),
       reportJson,
     );
+    const row = this.db.prepare(`
+      SELECT * FROM queue_triage_shadow_reports
+      WHERE batch_id = ? AND evidence_fingerprint = ?
+    `).get(normalized.batchId, evidenceFingerprintValue);
+    if (!row || row.report_fingerprint !== reportFingerprint) {
+      throw codedError(
+        'shadow-report-collision',
+        `release ${normalized.batchId} produced a changed report for identical evidence`,
+      );
+    }
+    const inserted = Number(insert.changes) === 1;
     return Object.freeze({
-      inserted: true,
-      replayed: false,
+      inserted,
+      replayed: !inserted,
       observation,
-      report: Object.freeze(report),
-      reportId,
+      report: Object.freeze(JSON.parse(row.report_json)),
+      reportId: row.report_id,
     });
   }
 
