@@ -161,6 +161,7 @@ test('shadow command orchestrates live read-only evidence and parity without con
     result: {},
   };
   const evidence = {
+    mode: 'release',
     releaseId: 'batch-1', project: { projectId: 'alpha', repository: 'Owner/Alpha' },
     changedItems: [{ kind: 'issue', number: 7, updatedAt: '2026-07-29T18:00:00Z', labels: [] }], rotatingItems: [],
     liveEvidence: { queryComplete: true, identity: { releasePayloadFingerprint: `sha256:${'a'.repeat(64)}`, shaEvidenceFingerprint: `sha256:${'b'.repeat(64)}` } },
