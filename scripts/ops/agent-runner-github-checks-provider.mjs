@@ -7,6 +7,7 @@ const SHA_PATTERN = /^[0-9a-f]{40,64}$/i;
 const DEFAULT_PER_PAGE = 100;
 const DEFAULT_MAX_PAGES = 20;
 const DEFAULT_TIMEOUT_MS = 30_000;
+const DEFAULT_MAX_WORKFLOW_RUNS_FOR_JOBS = 200;
 const DEFAULT_MAX_OUTPUT_BYTES = 10 * 1024 * 1024;
 
 const CHILD_ENV_ALLOWLIST = Object.freeze([
@@ -107,6 +108,16 @@ function workflowRun(item) {
   };
 }
 
+function workflowJob(item) {
+  return {
+    provider: 'workflow_job',
+    externalId: text(item?.id, `unknown-${text(item?.name, 'job')}`),
+    name: text(item?.name, 'unnamed-workflow-job'),
+    status: status(item?.status),
+    conclusion: conclusion(item?.conclusion),
+  };
+}
+
 function commitStatus(item) {
   return {
     provider: 'commit_status',
@@ -133,13 +144,15 @@ async function pagedCollection({
   maxPages,
 }) {
   const collected = [];
+  const rawItems = [];
   for (let page = 1; page <= maxPages; page += 1) {
     const payload = await requestJson(endpoint, { ...query, per_page: perPage, page });
     const items = pageItems(payload, field);
+    rawItems.push(...items);
     collected.push(...items.map(normalize));
-    if (items.length < perPage) return { checks: collected, complete: true, pages: page };
+    if (items.length < perPage) return { checks: collected, items: rawItems, complete: true, pages: page };
   }
-  return { checks: collected, complete: false, pages: maxPages, reasonCode: 'pagination-limit-reached' };
+  return { checks: collected, items: rawItems, complete: false, pages: maxPages, reasonCode: 'pagination-limit-reached' };
 }
 
 function diagnostic(surface, reasonCode) {
@@ -153,12 +166,18 @@ export async function collectGitHubCheckSnapshot({
   observedAt = new Date().toISOString(),
   perPage = DEFAULT_PER_PAGE,
   maxPages = DEFAULT_MAX_PAGES,
+  maxWorkflowRunsForJobs = DEFAULT_MAX_WORKFLOW_RUNS_FOR_JOBS,
 } = {}) {
   const repo = repository(repositoryName);
   const normalizedSha = commitSha(sha);
   if (typeof requestJson !== 'function') throw new Error('requestJson function is required');
   const boundedPerPage = boundedInteger(perPage, DEFAULT_PER_PAGE, { min: 1, max: 100, name: 'perPage' });
   const boundedMaxPages = boundedInteger(maxPages, DEFAULT_MAX_PAGES, { min: 1, max: 100, name: 'maxPages' });
+  const boundedMaxWorkflowRunsForJobs = boundedInteger(
+    maxWorkflowRunsForJobs,
+    DEFAULT_MAX_WORKFLOW_RUNS_FOR_JOBS,
+    { min: 1, max: 1_000, name: 'maxWorkflowRunsForJobs' },
+  );
   const diagnostics = [];
   const checks = [];
   let queryComplete = true;
@@ -194,6 +213,7 @@ export async function collectGitHubCheckSnapshot({
     },
   ];
 
+  let workflowRuns = [];
   for (const surface of surfaces) {
     try {
       const result = await pagedCollection({
@@ -206,6 +226,7 @@ export async function collectGitHubCheckSnapshot({
         maxPages: boundedMaxPages,
       });
       checks.push(...result.checks);
+      if (surface.name === 'workflow-runs') workflowRuns = result.items;
       if (!result.complete) {
         queryComplete = false;
         diagnostics.push(diagnostic(surface.name, result.reasonCode));
@@ -213,6 +234,37 @@ export async function collectGitHubCheckSnapshot({
     } catch (error) {
       queryComplete = false;
       diagnostics.push(diagnostic(surface.name, text(error?.code, 'provider-read-failed', 64)));
+    }
+  }
+
+  if (workflowRuns.length > boundedMaxWorkflowRunsForJobs) {
+    queryComplete = false;
+    diagnostics.push(diagnostic('workflow-jobs', 'workflow-run-limit-reached'));
+  }
+  for (const run of workflowRuns.slice(0, boundedMaxWorkflowRunsForJobs)) {
+    if (!Number.isInteger(run?.id) || run.id <= 0) {
+      queryComplete = false;
+      diagnostics.push(diagnostic('workflow-jobs', 'workflow-run-missing-id'));
+      continue;
+    }
+    try {
+      const result = await pagedCollection({
+        requestJson,
+        endpoint: `/repos/${repo}/actions/runs/${run.id}/jobs`,
+        query: {},
+        field: 'jobs',
+        normalize: workflowJob,
+        perPage: boundedPerPage,
+        maxPages: boundedMaxPages,
+      });
+      checks.push(...result.checks);
+      if (!result.complete) {
+        queryComplete = false;
+        diagnostics.push(diagnostic(`workflow-jobs:${run.id}`, result.reasonCode));
+      }
+    } catch (error) {
+      queryComplete = false;
+      diagnostics.push(diagnostic(`workflow-jobs:${run.id}`, text(error?.code, 'provider-read-failed', 64)));
     }
   }
 
@@ -280,7 +332,12 @@ export class GhCliGitHubReadClient {
     }
     if (result.status !== 0) {
       const error = new Error('GitHub API read failed');
-      error.code = result.status === 4 ? 'provider-auth-failed' : 'provider-read-failed';
+      const stderr = String(result.stderr || '').toLowerCase();
+      if (stderr.includes('rate limit') || stderr.includes('secondary rate')) {
+        error.code = 'provider-rate-limited';
+      } else {
+        error.code = result.status === 4 ? 'provider-auth-failed' : 'provider-read-failed';
+      }
       throw error;
     }
     try {
@@ -300,6 +357,7 @@ export async function refreshBatchGitHubCheckSnapshots({
   observedAt = new Date().toISOString(),
   perPage = DEFAULT_PER_PAGE,
   maxPages = DEFAULT_MAX_PAGES,
+  maxWorkflowRunsForJobs = DEFAULT_MAX_WORKFLOW_RUNS_FOR_JOBS,
 } = {}) {
   if (!settlementStore || typeof settlementStore.getBatch !== 'function') {
     throw new Error('settlementStore is required');
@@ -316,6 +374,7 @@ export async function refreshBatchGitHubCheckSnapshots({
       observedAt,
       perPage,
       maxPages,
+      maxWorkflowRunsForJobs,
     });
     settlementStore.recordCheckSnapshot(batchId, collected.snapshot);
     results.push(Object.freeze({ sha: requiredSha, ...collected }));
