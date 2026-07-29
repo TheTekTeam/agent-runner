@@ -8,6 +8,7 @@ function isObject(value) { return value !== null && typeof value === 'object' &&
 function nonEmpty(value) { return typeof value === 'string' && value.trim().length > 0; }
 function iso(value, name) { if (!nonEmpty(value) || !Number.isFinite(Date.parse(value))) throw new Error(`${name} is invalid`); return new Date(value).toISOString(); }
 function positiveInteger(value, name) { if (!Number.isInteger(value) || value < 1) throw new Error(`${name} is invalid`); return value; }
+function sha256Fingerprint(value, name) { if (!nonEmpty(value) || !/^sha256:[0-9a-f]{64}$/i.test(value)) throw new Error(`${name} is invalid`); return value.toLowerCase(); }
 function assertNoForbidden(value, path = 'candidate') {
   if (Array.isArray(value)) { value.forEach((entry, index) => assertNoForbidden(entry, `${path}[${index}]`)); return; }
   if (!isObject(value)) return;
@@ -18,7 +19,7 @@ function assertNoForbidden(value, path = 'candidate') {
 }
 function boundedArray(value, name, max) { if (!Array.isArray(value) || value.length > max) throw new Error(`${name} is invalid`); return value; }
 function labelsFingerprint(item) {
-  if (nonEmpty(item.labelsFingerprint) && item.labelsFingerprint.startsWith('sha256:')) return item.labelsFingerprint;
+  if (nonEmpty(item.labelsFingerprint)) return sha256Fingerprint(item.labelsFingerprint, 'labelsFingerprint');
   if (Array.isArray(item.labels)) return evidenceFingerprint([...new Set(item.labels)].sort());
   throw new Error('inspected labels fingerprint is required');
 }
@@ -49,7 +50,9 @@ function normalizeActions(value) {
       number: positiveInteger(plan.number, `candidate.actionPlans[${index}].number`),
       action: plan.action,
       intendedFullLabelSet: labels,
-      evidenceFingerprint: nonEmpty(plan.evidenceFingerprint) ? plan.evidenceFingerprint : evidenceFingerprint(plan),
+      evidenceFingerprint: nonEmpty(plan.evidenceFingerprint)
+        ? sha256Fingerprint(plan.evidenceFingerprint, `candidate.actionPlans[${index}].evidenceFingerprint`)
+        : evidenceFingerprint(plan),
     });
   }).sort((a, b) => a.kind.localeCompare(b.kind) || a.number - b.number || a.action.localeCompare(b.action)));
 }
@@ -63,7 +66,9 @@ function normalizeExceptions(value) {
       number: positiveInteger(entry.number, `candidate.exceptions[${index}].number`),
       category: entry.category,
       code: entry.code,
-      fingerprint: nonEmpty(entry.fingerprint) ? entry.fingerprint : evidenceFingerprint(entry),
+      fingerprint: nonEmpty(entry.fingerprint)
+        ? sha256Fingerprint(entry.fingerprint, `candidate.exceptions[${index}].fingerprint`)
+        : evidenceFingerprint(entry),
     });
   }).sort((a, b) => a.kind.localeCompare(b.kind) || a.number - b.number || a.category.localeCompare(b.category) || a.code.localeCompare(b.code)));
 }
@@ -84,8 +89,8 @@ export function normalizeQueueTriageParityCandidate(input) {
     projectId: input.projectId,
     repository: input.repository,
     settlement: Object.freeze({
-      releasePayloadFingerprint: input.settlement.releasePayloadFingerprint,
-      shaEvidenceFingerprint: input.settlement.shaEvidenceFingerprint,
+      releasePayloadFingerprint: sha256Fingerprint(input.settlement.releasePayloadFingerprint, 'settlement.releasePayloadFingerprint'),
+      shaEvidenceFingerprint: sha256Fingerprint(input.settlement.shaEvidenceFingerprint, 'settlement.shaEvidenceFingerprint'),
       queryComplete: input.settlement.queryComplete === true,
     }),
     inspected: normalizeInspected(input.inspected ?? []),
@@ -206,9 +211,12 @@ export function persistQueueTriageParity({ db, releaseId, agentCandidate, oversi
   const agent = normalizeQueueTriageParityCandidate(agentCandidate);
   const oversight = normalizeQueueTriageParityCandidate(oversightCandidate);
   if (agent.releaseId !== releaseId) throw new Error('agent parity candidate release identity mismatch');
-  ensureQueueTriageParitySchema(db, { appliedAt: comparedAt });
+  const shadowSchema = db.prepare("SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'queue_triage_shadow_schema'").get();
+  const observations = db.prepare("SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'queue_triage_shadow_observations'").get();
+  if (!shadowSchema || !observations) throw new Error('queue triage shadow schema is required before parity');
   const observation = db.prepare('SELECT batch_id FROM queue_triage_shadow_observations WHERE batch_id = ?').get(releaseId);
   if (!observation) throw new Error('shadow observation is required before parity persistence');
+  ensureQueueTriageParitySchema(db, { appliedAt: comparedAt });
   const result = compareQueueTriageParity(agent, oversight, { comparedAt });
   const resultJson = boundedResultJson(result);
   const parityId = `shadow-parity-${evidenceFingerprint({
