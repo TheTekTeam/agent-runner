@@ -71,6 +71,20 @@ test('raw or sensitive evidence fields are rejected before reporting', () => {
   assert.throws(() => planQueueTriageRun(run({ changedItems: [item({ body: 'raw issue body' })] })), /forbidden raw or sensitive/);
 });
 
+test('priority conflicts are reconciled as one complete label-set plan', () => {
+  const report = planQueueTriageRun(run({
+    changedItems: [item({
+      labels: ['priority:P0', 'priority:P1', 'status:blocked', 'agent:claude'],
+      intendedStatus: 'status:blocked',
+      intendedPriority: 'priority:P0',
+      flags: { explicitHold: true },
+    })],
+  }));
+  assert.equal(report.actionPlans.length, 1);
+  assert.deepEqual(report.actionPlans[0].intendedFullLabelSet, ['agent:claude', 'priority:P0', 'status:blocked']);
+  assert.ok(report.actionPlans[0].reasons.includes('conflicting-priority-labels'));
+});
+
 test('active ownership suppresses mutation and creates a typed exception', () => {
   const report = planQueueTriageRun(run({ changedItems: [item({ flags: { explicitHold: true, activeClaim: true } })] }));
   assert.equal(report.actionPlans.length, 0);
