@@ -5,6 +5,7 @@ import test from 'node:test';
 import {
   collectGitHubCheckSnapshot,
   GhCliGitHubReadClient,
+  refreshBatchGitHubCheckSnapshots,
 } from './agent-runner-github-checks-provider.mjs';
 
 const SHA = 'a'.repeat(40);
@@ -139,6 +140,41 @@ test('the same provider implementation accepts another registered repository nam
     },
   });
   assert.ok(endpoints.every((endpoint) => endpoint.includes('/repos/Other/Project/')));
+});
+
+test('refreshes and records every required SHA for one settlement batch', async () => {
+  const recorded = [];
+  const secondSha = 'b'.repeat(40);
+  const settlementStore = {
+    getBatch(batchId) {
+      assert.equal(batchId, 'batch-1');
+      return { repository: 'Owner/Alpha' };
+    },
+    requiredShas(batchId) {
+      assert.equal(batchId, 'batch-1');
+      return [SHA, secondSha];
+    },
+    recordCheckSnapshot(batchId, snapshot) {
+      recorded.push({ batchId, snapshot });
+    },
+  };
+  const client = {
+    async requestJson(endpoint) {
+      if (endpoint.includes('check-runs')) return { check_runs: [] };
+      if (endpoint.includes('check-suites')) return { check_suites: [] };
+      if (endpoint.includes('actions/runs')) return { workflow_runs: [] };
+      return [];
+    },
+  };
+  const result = await refreshBatchGitHubCheckSnapshots({
+    settlementStore,
+    batchId: 'batch-1',
+    client,
+    observedAt: '2026-07-29T02:00:00.000Z',
+  });
+  assert.deepEqual(result.map((item) => item.sha), [SHA, secondSha]);
+  assert.deepEqual(recorded.map((item) => item.snapshot.sha), [SHA, secondSha]);
+  assert.ok(recorded.every((item) => item.batchId === 'batch-1' && item.snapshot.queryComplete));
 });
 
 test('Gh CLI client uses a read-only bounded command and restricted environment', () => {
