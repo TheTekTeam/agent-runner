@@ -48,6 +48,79 @@ function releasePayload(batch) {
   });
 }
 
+function parseReleaseJson(value, name) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    throw new Error(`${name} contains invalid JSON`);
+  }
+}
+
+function releaseFromRow(row) {
+  if (!row) return null;
+  return Object.freeze({
+    batchId: row.batch_id,
+    state: row.state,
+    releasedAt: row.released_at,
+    updatedAt: row.updated_at,
+    claimToken: row.claim_token,
+    claimExpiresAt: row.claim_expires_at,
+    payload: Object.freeze(parseReleaseJson(row.payload_json, `release ${row.batch_id} payload`)),
+    result: Object.freeze(parseReleaseJson(row.result_json, `release ${row.batch_id} result`)),
+  });
+}
+
+export class EventControllerReleaseReader {
+  constructor(dbPath) {
+    if (typeof dbPath !== 'string' || dbPath.length === 0 || dbPath === ':memory:') {
+      throw new Error('read-only controller database path is required');
+    }
+    this.dbPath = dbPath;
+    this.db = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const releaseTable = this.db.prepare(
+        "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'event_triage_releases'",
+      ).get();
+      const schemaTable = this.db.prepare(
+        "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'event_controller_schema'",
+      ).get();
+      if (!releaseTable || !schemaTable) throw new Error('controller database release schema is missing');
+      const schema = this.db.prepare('SELECT MAX(version) AS version FROM event_controller_schema').get();
+      if (Number(schema?.version) !== EVENT_CONTROLLER_SCHEMA_VERSION) {
+        throw new Error(`unsupported controller release schema version: ${String(schema?.version ?? 'missing')}`);
+      }
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
+  }
+
+  getRelease(batchId) {
+    if (typeof batchId !== 'string' || batchId.length === 0) throw new Error('batchId is required');
+    return releaseFromRow(this.db.prepare(`
+      SELECT * FROM event_triage_releases WHERE batch_id = ?
+    `).get(batchId));
+  }
+
+  listReleases({ states = ['pending'], limit = 20 } = {}) {
+    if (!Array.isArray(states) || states.length === 0 || states.some((state) => !TRIAGE_RELEASE_STATES.includes(state))) {
+      throw new Error('triage release states are invalid');
+    }
+    const boundedLimit = boundedInteger(limit, 20, { min: 1, max: 20, name: 'limit' });
+    const placeholders = states.map(() => '?').join(', ');
+    return Object.freeze(this.db.prepare(`
+      SELECT * FROM event_triage_releases
+      WHERE state IN (${placeholders})
+      ORDER BY released_at ASC, batch_id ASC
+      LIMIT ?
+    `).all(...states, boundedLimit).map(releaseFromRow));
+  }
+
+  close() {
+    this.db.close();
+  }
+}
+
 export class EventControllerReleaseStore {
   constructor(dbPath, { now = () => new Date().toISOString() } = {}) {
     if (typeof dbPath !== 'string' || dbPath.length === 0) throw new Error('event controller db path is required');
@@ -116,18 +189,7 @@ export class EventControllerReleaseStore {
   }
 
   getRelease(batchId) {
-    const row = this.db.prepare(`SELECT * FROM event_triage_releases WHERE batch_id = ?`).get(batchId);
-    if (!row) return null;
-    return {
-      batchId: row.batch_id,
-      state: row.state,
-      releasedAt: row.released_at,
-      updatedAt: row.updated_at,
-      claimToken: row.claim_token,
-      claimExpiresAt: row.claim_expires_at,
-      payload: JSON.parse(row.payload_json),
-      result: JSON.parse(row.result_json),
-    };
+    return releaseFromRow(this.db.prepare(`SELECT * FROM event_triage_releases WHERE batch_id = ?`).get(batchId));
   }
 
   listReleases({ states = ['pending'], limit = 100 } = {}) {
