@@ -6,7 +6,7 @@ This document defines the reusable queue-triage policy and the first, dry-run-on
 
 ## Current implementation boundary
 
-The current command accepts a normalized evidence file and produces a deterministic dry-run report:
+The current command accepts a normalized evidence file and produces a deterministic dry-run report. Release-mode input requires a durable `releaseId`; fallback-mode input requires a durable `fallbackId` so replay identity never depends on wall-clock observation time:
 
 ```bash
 npm run queue:triage -- --input /path/to/normalized-evidence.json
@@ -36,7 +36,7 @@ The planner accepts already-collected, bounded metadata only. Each item contains
 
 Raw issue/comment bodies, raw GitHub payloads, provider output, prompts and secrets are rejected. Evidence references are bounded identifiers, not copied content.
 
-Safety flags such as active claim, reservation, recovery, newer authority or unresolved human decision suppress a mutation proposal and create a typed debugger exception. An incomplete dependency cannot produce a blocked-to-ready proposal.
+Safety flags such as active claim, reservation, recovery, newer authority or unresolved human decision suppress a mutation proposal and create a typed debugger exception. An incomplete dependency cannot produce a blocked-to-ready proposal. Conflicting label families without a canonical normalized decision become typed incomplete-evidence exceptions rather than guesses.
 
 ## Typed immutable action plans
 
@@ -48,9 +48,9 @@ Every proposed action records:
 - manager authority revision/fingerprint when supplied;
 - intended complete label set or close action;
 - risk classification and expected post-write state;
-- deterministic idempotency key and evidence fingerprint.
+- deterministic idempotency key and evidence fingerprint. Manager authority is part of that fingerprint when supplied.
 
-Status, priority and agent-label changes are reconciled into one complete final label set. They never describe a transient dual-status or partial-family write.
+Status, priority and agent-label changes are reconciled against the full configured label vocabulary into one complete final label set, even when project policy narrows which target labels are allowed. They never describe a transient dual-status or partial-family write.
 
 ## Count semantics
 
