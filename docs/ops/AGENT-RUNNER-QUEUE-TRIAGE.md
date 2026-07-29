@@ -28,7 +28,7 @@ npm run queue:triage:shadow -- \
   --pending --limit 20
 ```
 
-The controller database is opened with SQLite read-only mode. The command never migrates it, claims or finishes a release, or changes a release state. All durable shadow observations and optional planner reports are written only to the separately supplied shadow database.
+The authoritative database and optional WAL are read only as bounded byte files. Two consecutive snapshots must match exactly; otherwise observation fails closed. SQLite opens only a private temporary copy, which is removed on close or construction failure. The command never opens, migrates or writes the authoritative controller path, claims or finishes a release, or changes a release state. All durable shadow observations and optional planner reports are written only to the separately supplied shadow database.
 
 `--execute` remains unsupported. No live GitHub issue, PR, comment, branch or check evidence is fetched by queue triage yet. No systemd unit or unattended queue-triage schedule is installed or enabled. The preserved live release ledger remains authoritative and unchanged.
 
@@ -56,7 +56,7 @@ Safety flags such as active claim, reservation, recovery, newer authority or unr
 
 ## Durable shadow observations
 
-The read-only release reader validates the existing controller release schema and exposes only bounded deterministic snapshots. Pending releases are ordered by release time and batch identity. Multi-release observation is capped at 20.
+The release reader validates the existing controller release schema against a private stable snapshot and exposes only bounded deterministic snapshots. Pending releases are ordered by release time and batch identity. Multi-release observation is capped at 20. Read-only snapshots are frozen and omit controller claim tokens.
 
 The separate shadow store records only normalized identity and fingerprints:
 
@@ -66,7 +66,7 @@ The separate shadow store records only normalized identity and fingerprints:
 - first observation time;
 - normalized evidence fingerprint and bounded dry-run report when explicitly supplied.
 
-It does not store the controller payload JSON, delivery identifiers, raw provider evidence or live issue/comment content. Re-observing an unchanged release is an idempotent replay. Reusing a batch identity with a changed payload fingerprint fails closed as a collision. An evidence file must match the observed release, project, repository and object identity before the planner runs.
+It does not store the controller payload JSON, delivery identifiers, raw provider evidence or live issue/comment content. Re-observing an unchanged release is an idempotent replay. Reusing a batch identity with a changed payload fingerprint fails closed as a collision. An evidence file must match the observed release, project, repository and object identity, and pass the existing planner validation, before any shadow observation or report is written.
 
 ## Typed immutable action plans
 
@@ -108,7 +108,7 @@ The OpenAI oversight prompt is generated from the same exported core policy cons
 ## Staged delivery
 
 1. **Foundation — complete:** validated policy, pure planner, dry-run command, bounded reports, fixtures and deterministic oversight prompt.
-2. **Read-only release shadow — current:** bounded controller snapshots and restart-safe separate shadow observations, without release claims or live GitHub reads.
+2. **Read-only release shadow — current:** bounded private controller snapshots and restart-safe separate shadow observations, without release claims or live GitHub reads.
 3. **Read-only live evidence and parity:** collect bounded GitHub evidence, persist comparable shadow reports, and compare with the existing scheduled task. Any disagreement blocks progression.
 4. **Durable consumption:** separately authorise release claim/finish semantics after shadow parity. GitHub mutation remains disabled.
 5. **Bounded execution:** separately authorise the low-risk mutation allowlist, final live rechecks, atomic writes and read-back verification.
