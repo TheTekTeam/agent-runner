@@ -220,6 +220,8 @@ test('release claims are leased, recoverable and require the matching token to f
   await cycle(context, { now: at(0) });
   await cycle(context, { now: at(1_000) });
   const [pending] = context.releases.listReleases();
+  assert.equal(Object.isFrozen(pending), false);
+  assert.equal(Object.hasOwn(pending, 'claimToken'), true);
   const token = 'claim-token-1234';
   const claimed = context.releases.claimRelease(pending.batchId, { claimToken: token, leaseMs: 1_000, now: at(1_100) });
   assert.equal(claimed.state, 'claimed');
@@ -253,7 +255,7 @@ test('pending releases and batches survive process restart', () => fixture(async
   assert.equal(duplicate.inserted, false);
 }));
 
-test('read-only release snapshots preserve controller files and release state byte-for-byte', () => fixture(async (context) => {
+test('read-only release snapshots preserve controller files, state and claim-token privacy', () => fixture(async (context) => {
   deliver(context, issuePayload(14), { deliveryId: 'issue-shadow-read', eventName: 'issues', receivedAt: at(0) });
   await cycle(context, { now: at(0) });
   await cycle(context, { now: at(1_000) });
@@ -271,6 +273,9 @@ test('read-only release snapshots preserve controller files and release state by
   try {
     const snapshot = reader.getRelease(pending.batchId);
     assert.equal(snapshot.state, 'pending');
+    assert.equal(Object.isFrozen(snapshot), true);
+    assert.equal(Object.hasOwn(snapshot, 'claimToken'), false);
+    assert.equal(Object.hasOwn(snapshot, 'claimExpiresAt'), false);
     assert.equal(reader.listReleases({ states: ['pending'], limit: 20 }).length, 1);
     assert.throws(() => reader.listReleases({ limit: 21 }), /1 to 20/);
   } finally {
