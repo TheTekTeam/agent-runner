@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
+  existsSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
@@ -29,8 +30,6 @@ function release({
     state: 'pending',
     releasedAt,
     updatedAt: releasedAt,
-    claimToken: null,
-    claimExpiresAt: null,
     payload: {
       schemaVersion: 1,
       batchId,
@@ -90,8 +89,8 @@ function createControllerDatabase(dbPath, releases) {
       inputRelease.state,
       inputRelease.releasedAt,
       inputRelease.updatedAt,
-      inputRelease.claimToken,
-      inputRelease.claimExpiresAt,
+      null,
+      null,
       JSON.stringify(inputRelease.payload),
       JSON.stringify(inputRelease.result),
     );
@@ -191,6 +190,28 @@ test('refuses a shadow database path that aliases the controller or a sidecar', 
   }
 });
 
+test('missing explicit release is rejected before shadow storage is created', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-runner-triage-shadow-missing-'));
+  const controllerDb = join(directory, 'controller.sqlite');
+  const shadowDb = join(directory, 'shadow.sqlite');
+  try {
+    createControllerDatabase(controllerDb, [release()]);
+    assert.throws(
+      () => runQueueTriageShadowCommand({
+        argv: [
+          '--controller-db', controllerDb,
+          '--shadow-db', shadowDb,
+          '--release', 'batch-does-not-exist',
+        ],
+      }),
+      /pending release not found/,
+    );
+    assert.equal(existsSync(shadowDb), false);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('pending mode observes at most 20 releases and preserves controller files byte-for-byte', () => {
   const directory = mkdtempSync(join(tmpdir(), 'agent-runner-triage-shadow-command-'));
   const controllerDb = join(directory, 'controller.sqlite');
@@ -259,7 +280,7 @@ test('explicit release mode persists one matching planner report and replays aft
   }
 });
 
-test('explicit release mode rejects mismatched normalized evidence', () => {
+test('explicit release mode rejects mismatched evidence before shadow storage is created', () => {
   const directory = mkdtempSync(join(tmpdir(), 'agent-runner-triage-shadow-mismatch-'));
   const controllerDb = join(directory, 'controller.sqlite');
   const shadowDb = join(directory, 'shadow.sqlite');
@@ -281,6 +302,7 @@ test('explicit release mode rejects mismatched normalized evidence', () => {
       }),
       /object identity does not match/,
     );
+    assert.equal(existsSync(shadowDb), false);
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
