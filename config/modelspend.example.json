@@ -13,7 +13,8 @@
   "statusLabels": {
     "ready": "status:ready",
     "inProgress": "status:in-progress",
-    "blocked": "status:blocked"
+    "blocked": "status:blocked",
+    "done": "status:done"
   },
   "priorityLabelRanking": [
     "priority:P0",
@@ -25,6 +26,27 @@
     "npm run validate:quick:plan -- --files <changed-files>",
     "npm run validate:thorough"
   ],
+  "queueTriage": {
+    "enabled": false,
+    "fallbackIntervalMinutes": 60,
+    "timezone": "Europe/London",
+    "rotatingBacklogSlice": 2,
+    "maxChangedItems": 20,
+    "maxDebuggerAnomalies": 4,
+    "maxMutations": 3,
+    "acceptedStatusLabels": [
+      "status:ready",
+      "status:in-progress",
+      "status:blocked",
+      "status:done"
+    ],
+    "priorityLabels": [
+      "priority:P0",
+      "priority:P1",
+      "priority:P2",
+      "priority:P3"
+    ]
+  },
   "systemd": {
     "serviceName": "agent-runner-modelspend.service",
     "timerName": "agent-runner-modelspend.timer",

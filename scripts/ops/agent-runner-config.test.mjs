@@ -31,7 +31,7 @@ const validConfig = {
   outputDir: '.var/agent-runner',
   stateDbPath: '.var/agent-runner/state.sqlite',
   acceptedAgentLabels: ['agent:claude'],
-  statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress' },
+  statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress', blocked: 'status:blocked', done: 'status:done' },
   priorityLabelRanking: ['priority:P0', 'priority:P1'],
   safeDefaultValidationCommands: ['npm test'],
   systemd: { serviceName: 'example-agent-runner.service', timerName: 'example-agent-runner.timer' },
@@ -43,6 +43,8 @@ test('loadAgentRunnerConfig returns default ModelSpend config without an explici
   assert.equal(config.githubRepo, 'TheTekTeam/modelspend');
   assert.equal(config.outputDir, '.var/claude-runner');
   assert.deepEqual(config.acceptedAgentLabels, ['agent:claude', 'agent:claude-code-cli']);
+  assert.equal(config.queueTriage.enabled, false);
+  assert.equal(config.queueTriage.maxMutations, 3);
 });
 
 test('loadAgentRunnerConfig accepts an explicit config path from CLI or env', () => withTempConfig(validConfig, (configPath) => {
@@ -64,6 +66,30 @@ test('validateAgentRunnerConfig fills missing optional runner fields from safe d
   assert.equal(config.runner.candidateLimit, DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG.runner.candidateLimit);
   assert.equal(Object.hasOwn(config.runner, 'requireManagerPreflight'), false);
   assert.equal(Object.hasOwn(config.runner, 'autoProceedFromPreflight'), false);
+  assert.equal(config.queueTriage.enabled, false);
+});
+
+test('queue triage policy may tighten but cannot widen core limits or invent labels', () => {
+  const tightened = validateAgentRunnerConfig({
+    ...validConfig,
+    queueTriage: {
+      enabled: true,
+      maxChangedItems: 5,
+      rotatingBacklogSlice: 1,
+      maxDebuggerAnomalies: 2,
+      maxMutations: 1,
+      fallbackIntervalMinutes: 120,
+      acceptedStatusLabels: ['status:ready', 'status:blocked'],
+      priorityLabels: ['priority:P0'],
+    },
+  });
+  assert.equal(tightened.queueTriage.enabled, true);
+  assert.equal(tightened.queueTriage.maxMutations, 1);
+  assert.throws(() => validateAgentRunnerConfig({ ...validConfig, queueTriage: { maxMutations: 4 } }), /maxMutations/);
+  assert.throws(() => validateAgentRunnerConfig({
+    ...validConfig,
+    queueTriage: { acceptedStatusLabels: ['status:unknown'] },
+  }), /subset of configured status labels/);
 });
 
 test('loadAgentRunnerConfig supports the existing scaffold config shape', () => withTempConfig({
@@ -88,4 +114,5 @@ test('loadAgentRunnerConfig supports the existing scaffold config shape', () => 
   assert.equal(config.projectId, 'legacy-shape');
   assert.equal(config.githubRepo, 'owner/legacy');
   assert.equal(config.statusLabels.ready, 'ready');
+  assert.equal(config.queueTriage.enabled, false);
 }));
