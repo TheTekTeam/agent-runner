@@ -114,10 +114,25 @@ export class QueueTriageShadowStore {
     this.now = now;
     if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
     this.db = new DatabaseSync(dbPath);
-    this.migrate();
+    try {
+      this.migrate();
+    } catch (error) {
+      this.db.close();
+      throw error;
+    }
   }
 
   migrate() {
+    const schemaExists = this.db.prepare(
+      "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'queue_triage_shadow_schema'",
+    ).get();
+    if (schemaExists) {
+      const schema = this.db.prepare('SELECT MAX(version) AS version FROM queue_triage_shadow_schema').get();
+      if (Number(schema?.version) !== QUEUE_TRIAGE_SHADOW_SCHEMA_VERSION) {
+        throw new Error(`unsupported queue triage shadow schema version: ${String(schema?.version ?? 'missing')}`);
+      }
+    }
+
     this.db.exec(`
       PRAGMA journal_mode = WAL;
       PRAGMA foreign_keys = ON;
@@ -159,6 +174,10 @@ export class QueueTriageShadowStore {
       INSERT OR IGNORE INTO queue_triage_shadow_schema(version, applied_at)
       VALUES (?, ?)
     `).run(QUEUE_TRIAGE_SHADOW_SCHEMA_VERSION, iso(this.now()));
+    const schema = this.db.prepare('SELECT MAX(version) AS version FROM queue_triage_shadow_schema').get();
+    if (Number(schema?.version) !== QUEUE_TRIAGE_SHADOW_SCHEMA_VERSION) {
+      throw new Error(`unsupported queue triage shadow schema version: ${String(schema?.version ?? 'missing')}`);
+    }
   }
 
   getObservation(batchId) {
