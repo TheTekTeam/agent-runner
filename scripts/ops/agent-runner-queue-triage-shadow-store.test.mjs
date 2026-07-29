@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 
 import { QueueTriageShadowStore } from './agent-runner-queue-triage-shadow-store.mjs';
@@ -17,8 +18,6 @@ function release({
     state: 'pending',
     releasedAt: '2026-07-29T18:00:00Z',
     updatedAt: '2026-07-29T18:00:00Z',
-    claimToken: null,
-    claimExpiresAt: null,
     payload: {
       schemaVersion: 1,
       batchId,
@@ -150,5 +149,39 @@ test('stores two materially different project releases with the same implementat
     assert.equal(store.getObservation(beta.batchId).repository, 'Elsewhere/Beta');
   } finally {
     store.close();
+  }
+});
+
+test('rejects an incompatible existing shadow schema without modifying it', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-runner-triage-shadow-schema-'));
+  const dbPath = join(directory, 'shadow.sqlite');
+  try {
+    const db = new DatabaseSync(dbPath);
+    db.exec(`
+      CREATE TABLE queue_triage_shadow_schema(
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      );
+      INSERT INTO queue_triage_shadow_schema(version, applied_at)
+      VALUES (2, '2026-07-29T18:00:00Z');
+    `);
+    db.close();
+    const before = readFileSync(dbPath);
+    assert.throws(
+      () => new QueueTriageShadowStore(dbPath),
+      /unsupported queue triage shadow schema version: 2/,
+    );
+    assert.deepEqual(readFileSync(dbPath), before);
+    const verify = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const observationTable = verify.prepare(
+        "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'queue_triage_shadow_observations'",
+      ).get();
+      assert.equal(observationTable, undefined);
+    } finally {
+      verify.close();
+    }
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
   }
 });
