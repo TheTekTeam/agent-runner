@@ -1,5 +1,13 @@
-import { mkdirSync } from 'node:fs';
-import { dirname } from 'node:path';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import { refreshBatchGitHubCheckSnapshots } from './agent-runner-github-checks-provider.mjs';
@@ -9,6 +17,8 @@ export const EVENT_CONTROLLER_SCHEMA_VERSION = 1;
 export const TRIAGE_RELEASE_STATES = Object.freeze(['pending', 'claimed', 'processed', 'failed']);
 const ACTIVE_BATCH_STATES = Object.freeze(['collecting', 'waiting_for_checks', 'quiet_period', 'settlement_blocked']);
 const CLAIM_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+const MAX_CONTROLLER_SNAPSHOT_BYTES = 256 * 1024 * 1024;
+const CONTROLLER_SNAPSHOT_ATTEMPTS = 8;
 
 function iso(value) {
   const date = value instanceof Date ? value : new Date(value);
@@ -84,14 +94,54 @@ function releaseFromRow(row, { freeze = false, includeClaim = true } = {}) {
   });
 }
 
+function readOptionalFile(path) {
+  try {
+    return readFileSync(path);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function controllerSnapshotSet(dbPath) {
+  const database = readFileSync(dbPath);
+  const wal = readOptionalFile(`${dbPath}-wal`);
+  const bytes = database.length + (wal?.length ?? 0);
+  if (bytes > MAX_CONTROLLER_SNAPSHOT_BYTES) {
+    throw new Error('controller database snapshot exceeds the bounded size');
+  }
+  return { database, wal };
+}
+
+function sameSnapshot(left, right) {
+  return left.database.equals(right.database)
+    && ((left.wal === null && right.wal === null)
+      || (left.wal !== null && right.wal !== null && left.wal.equals(right.wal)));
+}
+
+function stableControllerSnapshot(dbPath) {
+  for (let attempt = 0; attempt < CONTROLLER_SNAPSHOT_ATTEMPTS; attempt += 1) {
+    const first = controllerSnapshotSet(dbPath);
+    const second = controllerSnapshotSet(dbPath);
+    if (sameSnapshot(first, second)) return second;
+  }
+  throw new Error('controller database changed during bounded snapshot capture');
+}
+
 export class EventControllerReleaseReader {
   constructor(dbPath) {
     if (typeof dbPath !== 'string' || dbPath.length === 0 || dbPath === ':memory:') {
       throw new Error('read-only controller database path is required');
     }
-    this.dbPath = dbPath;
-    this.db = new DatabaseSync(dbPath, { readOnly: true });
+    this.dbPath = realpathSync(dbPath);
+    this.snapshotDir = mkdtempSync(join(tmpdir(), 'agent-runner-controller-release-snapshot-'));
+    this.db = null;
     try {
+      const snapshot = stableControllerSnapshot(this.dbPath);
+      const snapshotPath = join(this.snapshotDir, basename(this.dbPath));
+      writeFileSync(snapshotPath, snapshot.database, { mode: 0o600 });
+      if (snapshot.wal !== null) writeFileSync(`${snapshotPath}-wal`, snapshot.wal, { mode: 0o600 });
+      this.db = new DatabaseSync(snapshotPath, { readOnly: true });
       const releaseTable = this.db.prepare(
         "SELECT 1 AS present FROM sqlite_schema WHERE type = 'table' AND name = 'event_triage_releases'",
       ).get();
@@ -104,7 +154,9 @@ export class EventControllerReleaseReader {
         throw new Error(`unsupported controller release schema version: ${String(schema?.version ?? 'missing')}`);
       }
     } catch (error) {
-      this.db.close();
+      this.db?.close();
+      this.db = null;
+      rmSync(this.snapshotDir, { recursive: true, force: true });
       throw error;
     }
   }
@@ -134,7 +186,9 @@ export class EventControllerReleaseReader {
   }
 
   close() {
-    this.db.close();
+    this.db?.close();
+    this.db = null;
+    rmSync(this.snapshotDir, { recursive: true, force: true });
   }
 }
 
