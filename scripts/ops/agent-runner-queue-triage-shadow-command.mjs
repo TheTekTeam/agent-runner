@@ -154,7 +154,7 @@ export function runQueueTriageShadowCommand({
   const shadowDb = resolve(args.shadowDb);
   assertSeparateDatabases(controllerDb, shadowDb);
   const reader = new EventControllerReleaseReader(controllerDb);
-  const store = new QueueTriageShadowStore(shadowDb);
+  let store = null;
   try {
     const releases = args.batchId
       ? [reader.getRelease(args.batchId)].filter(Boolean)
@@ -168,6 +168,7 @@ export function runQueueTriageShadowCommand({
     const evidence = args.evidence
       ? JSON.parse(readFile(resolve(args.evidence), 'utf8'))
       : null;
+    store = new QueueTriageShadowStore(shadowDb);
     const outcomes = [];
     let observationsInserted = 0;
     let observationsReplayed = 0;
@@ -219,7 +220,7 @@ export function runQueueTriageShadowCommand({
       ? renderMarkdown(result)
       : `${JSON.stringify(result)}\n`;
   } finally {
-    store.close();
+    store?.close();
     reader.close();
   }
 }
