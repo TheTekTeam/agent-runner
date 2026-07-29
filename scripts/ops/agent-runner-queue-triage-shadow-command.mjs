@@ -1,5 +1,13 @@
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import {
+  existsSync,
+  readFileSync,
+  realpathSync,
+} from 'node:fs';
+import {
+  basename,
+  dirname,
+  resolve,
+} from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { EventControllerReleaseReader } from './agent-runner-event-controller.mjs';
@@ -77,6 +85,34 @@ export function parseQueueTriageShadowArgs(argv = []) {
   return Object.freeze(parsed);
 }
 
+function canonicalCandidate(path) {
+  const absolute = resolve(path);
+  if (existsSync(absolute)) return realpathSync(absolute);
+  const suffix = [basename(absolute)];
+  let parent = dirname(absolute);
+  while (!existsSync(parent)) {
+    const next = dirname(parent);
+    if (next === parent) throw new Error(`unable to resolve shadow database parent: ${absolute}`);
+    suffix.unshift(basename(parent));
+    parent = next;
+  }
+  return resolve(realpathSync(parent), ...suffix);
+}
+
+function assertSeparateDatabases(controllerDb, shadowDb) {
+  const controller = realpathSync(resolve(controllerDb));
+  const shadow = canonicalCandidate(shadowDb);
+  const forbidden = new Set([
+    controller,
+    `${controller}-wal`,
+    `${controller}-shm`,
+    `${controller}-journal`,
+  ]);
+  if (forbidden.has(shadow)) {
+    throw new Error('--shadow-db must be separate from the controller database and its sidecars');
+  }
+}
+
 function renderMarkdown(result) {
   const lines = [
     '# Agent Runner queue-triage shadow observation',
@@ -114,8 +150,11 @@ export function runQueueTriageShadowCommand({
 } = {}) {
   const args = parseQueueTriageShadowArgs(argv);
   if (args.help) return `${usage()}\n`;
-  const reader = new EventControllerReleaseReader(resolve(args.controllerDb));
-  const store = new QueueTriageShadowStore(resolve(args.shadowDb));
+  const controllerDb = resolve(args.controllerDb);
+  const shadowDb = resolve(args.shadowDb);
+  assertSeparateDatabases(controllerDb, shadowDb);
+  const reader = new EventControllerReleaseReader(controllerDb);
+  const store = new QueueTriageShadowStore(shadowDb);
   try {
     const releases = args.batchId
       ? [reader.getRelease(args.batchId)].filter(Boolean)
