@@ -10,7 +10,7 @@ const MAX_RELEASE_SHAS = 10;
 const MAX_WORKFLOW_RUNS = 20;
 const MAX_EVIDENCE_REFS = 20;
 const MANAGER_MARKER = '<!-- agent-runner:manager-preflight -->';
-const RECOVERY_MARKERS = ['<!-- agent-runner:recovery -->', 'recovery forbidden', 'fresh manager review required'];
+const RECOVERY_MARKER = '<!-- agent-runner:recovery -->';
 const HOLD_PHRASES = ['keep blocked', 'quarantine', 'pause', 'do not claim', 'do not retry', 'recovery forbidden', 'fresh manager review required'];
 const CLAIM_MARKERS = ['<!-- agent-runner:claim -->'];
 const RESERVATION_MARKERS = ['<!-- agent-runner:reservation -->'];
@@ -50,6 +50,19 @@ function pagedRead(client, endpoint, { field, maxItems, diagnostics, surface }) 
   }
   return Object.freeze(items);
 }
+function containsControlPhrase(body, phrases) {
+  const normalizedPhrases = phrases.map((phrase) => phrase.toLowerCase());
+  return String(body).split(/\r?\n/).some((line) => {
+    const normalized = line.trim().replace(/^[-*]\s*/, '').toLowerCase();
+    return normalizedPhrases.some((phrase) => (
+      normalized === phrase
+      || normalized.startsWith(`${phrase} `)
+      || normalized.startsWith(`${phrase}.`)
+      || normalized.startsWith(`${phrase}:`)
+      || normalized.startsWith(`${phrase};`)
+    ));
+  });
+}
 function extractDependencyRefs(body, defaultRepository) {
   if (!nonEmpty(body)) return Object.freeze([]);
   const dependencies = body.match(/(?:^|\n)##\s+Dependencies\s*\n([\s\S]*?)(?=\n##\s+|$)/i)?.[1] ?? '';
@@ -72,20 +85,19 @@ function commentMarker(comment) {
   const lower = body.toLowerCase();
   const revision = body.match(/(?:^|\n)Revision:\s*`?([^`\n]+)`?/i)?.[1]?.trim() ?? null;
   const fingerprint = body.match(/(?:^|\n)Fingerprint:\s*`?(sha256:[0-9a-f]{64})`?/i)?.[1]?.toLowerCase() ?? null;
-  const authorityState = /\b(?:consumed|superseded|revoked)\b/i.test(body)
-    ? body.match(/\b(consumed|superseded|revoked)\b/i)[1].toLowerCase()
-    : 'current';
+  const authorityState = body.match(/(?:^|\n)(?:authority|packet|manager authority)\s+state:\s*`?(current|consumed|superseded|revoked)`?/i)?.[1]?.toLowerCase() ?? 'current';
   const types = [];
   if (body.includes(MANAGER_MARKER)) types.push('manager-preflight');
-  if (RECOVERY_MARKERS.some((marker) => lower.includes(marker))) types.push('recovery');
+  if (body.includes(RECOVERY_MARKER) || containsControlPhrase(body, ['recovery forbidden', 'fresh manager review required'])) types.push('recovery');
   if (CLAIM_MARKERS.some((marker) => lower.includes(marker))) types.push('claim');
   if (RESERVATION_MARKERS.some((marker) => lower.includes(marker))) types.push('reservation');
-  if (types.length === 0 && !HOLD_PHRASES.some((phrase) => lower.includes(phrase))) return null;
+  const explicitHold = !body.includes(MANAGER_MARKER) && containsControlPhrase(body, HOLD_PHRASES);
+  if (types.length === 0 && !explicitHold) return null;
   return Object.freeze({
     id: positiveInteger(Number(comment?.id), 'comment id'),
     updatedAt: iso(comment?.updated_at ?? comment?.created_at, 'comment timestamp'),
     types: Object.freeze(types.sort()),
-    explicitHold: !body.includes(MANAGER_MARKER) && HOLD_PHRASES.some((phrase) => lower.includes(phrase)),
+    explicitHold,
     active: /(?:^|\n)(?:state|status):\s*`?(?:active|claimed|reserved)`?/i.test(body),
     authorityState,
     revision,
@@ -255,6 +267,9 @@ export function collectQueueTriageGitHubEvidence({ release, project, client, obs
     if (roleMatches.some((entry) => entry.state === 'replacement_detected')) {
       queryCompleteDiagnostic(diagnostics, `release-sha:${sha}`, 'replacement-sha-detected');
     }
+    if (roleMatches.some((entry) => entry.state === 'not_verifiable' && entry.role !== 'before')) {
+      queryCompleteDiagnostic(diagnostics, `release-sha:${sha}`, 'release-sha-role-not-verifiable');
+    }
     return Object.freeze({
       ...collectShaEvidence(client, normalizedProject.repository, sha, diagnostics),
       roles: Object.freeze(roles),
@@ -303,7 +318,7 @@ export function collectQueueTriageGitHubEvidence({ release, project, client, obs
     markerFingerprint: evidenceFingerprint(markers),
     dependencyFingerprint: evidenceFingerprint(dependencies),
   });
-  const evidence = Object.freeze({
+  return Object.freeze({
     schemaVersion: QUEUE_TRIAGE_GITHUB_EVIDENCE_SCHEMA_VERSION,
     project: normalizedProject,
     observedAt: iso(observedAt, 'observedAt'),
@@ -332,5 +347,4 @@ export function collectQueueTriageGitHubEvidence({ release, project, client, obs
       fingerprint: evidenceFingerprint(liveIdentity),
     }),
   });
-  return evidence;
 }
