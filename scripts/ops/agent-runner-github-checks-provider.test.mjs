@@ -29,6 +29,9 @@ test('collects and normalizes all GitHub CI surfaces', async () => {
     ['/repos/Owner/Alpha/actions/runs?page=1']: {
       workflow_runs: [{ id: 3, name: 'Validate', status: 'in_progress', conclusion: null }],
     },
+    ['/repos/Owner/Alpha/actions/runs/3/jobs?page=1']: {
+      jobs: [{ id: 30, name: 'validate', status: 'queued', conclusion: null }],
+    },
     [`/repos/Owner/Alpha/commits/${SHA}/statuses?page=1`]: [
       { id: 4, context: 'external/security', state: 'failure' },
     ],
@@ -41,8 +44,9 @@ test('collects and normalizes all GitHub CI surfaces', async () => {
     observedAt: '2026-07-29T01:00:00.000Z',
   });
   assert.equal(result.snapshot.queryComplete, true);
-  assert.equal(result.snapshot.checks.length, 4);
+  assert.equal(result.snapshot.checks.length, 5);
   assert.equal(result.snapshot.checks.find((item) => item.provider === 'workflow_run').terminal, false);
+  assert.equal(result.snapshot.checks.find((item) => item.provider === 'workflow_job').terminal, false);
   assert.equal(result.snapshot.checks.find((item) => item.provider === 'commit_status').conclusion, 'failure');
   assert.deepEqual(result.diagnostics, []);
 });
@@ -88,6 +92,27 @@ test('a provider failure produces an incomplete snapshot rather than an empty su
   });
   assert.equal(result.snapshot.queryComplete, false);
   assert.deepEqual(result.diagnostics, [{ surface: 'check-suites', reasonCode: 'provider-rate-limited' }]);
+});
+
+test('a partial workflow-job read blocks settlement even when the workflow run is terminal', async () => {
+  const error = new Error('jobs unavailable');
+  error.code = 'provider-read-failed';
+  const result = await collectGitHubCheckSnapshot({
+    repository: 'Owner/Alpha',
+    sha: SHA,
+    requestJson: async (endpoint) => {
+      if (endpoint.includes('check-runs')) return { check_runs: [] };
+      if (endpoint.includes('check-suites')) return { check_suites: [] };
+      if (endpoint.endsWith('/actions/runs')) {
+        return { workflow_runs: [{ id: 77, name: 'Validate', status: 'completed', conclusion: 'success' }] };
+      }
+      if (endpoint.includes('/actions/runs/77/jobs')) throw error;
+      return [];
+    },
+  });
+  assert.equal(result.snapshot.queryComplete, false);
+  assert.equal(result.snapshot.checks.find((item) => item.provider === 'workflow_run').terminal, true);
+  assert.deepEqual(result.diagnostics, [{ surface: 'workflow-jobs:77', reasonCode: 'provider-read-failed' }]);
 });
 
 test('an empty complete response is represented as a settled no-check snapshot', async () => {
@@ -208,6 +233,18 @@ test('Gh CLI client fails closed without returning raw stderr', () => {
   assert.throws(
     () => client.requestJson(`/repos/Owner/Alpha/commits/${SHA}/statuses`, {}),
     (error) => error.code === 'provider-read-failed' && !error.message.includes('sensitive'),
+  );
+});
+
+test('Gh CLI client classifies rate limiting without returning raw stderr', () => {
+  const client = new GhCliGitHubReadClient({
+    spawn() {
+      return { status: 1, stdout: '', stderr: 'API rate limit exceeded for token secret' };
+    },
+  });
+  assert.throws(
+    () => client.requestJson(`/repos/Owner/Alpha/commits/${SHA}/statuses`, {}),
+    (error) => error.code === 'provider-rate-limited' && !error.message.includes('token'),
   );
 });
 
