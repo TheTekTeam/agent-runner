@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "projects": [
+    {
+      "projectId": "agent-runner",
+      "defaultBranch": "main",
+      "worktreeRoot": "/workspace/worktrees/agent-runner",
+      "allowedOperations": [
+        "project.inspect",
+        "repository.fetch",
+        "repository.sync-default",
+        "worktree.create",
+        "worktree.inspect",
+        "worktree.remove",
+        "validation.run"
+      ],
+      "validationProfiles": {
+        "focused": {
+          "commands": [
+            {
+              "argv": [
+                "node",
+                "--test",
+                "scripts/ops/agent-runner-project-registry.test.mjs",
+                "scripts/ops/agent-runner-event-ingress.test.mjs",
+                "scripts/ops/agent-runner-event-settlement.test.mjs",
+                "scripts/ops/agent-runner-github-checks-provider.test.mjs",
+                "scripts/ops/agent-runner-event-controller.test.mjs",
+                "scripts/ops/agent-runner-local-executor.test.mjs"
+              ],
+              "timeoutSeconds": 1800
+            }
+          ]
+        },
+        "thorough": {
+          "commands": [
+            {
+              "argv": ["bash", "scripts/validate.sh"],
+              "timeoutSeconds": 3600
+            }
+          ]
+        }
+      }
+    },
+    {
+      "projectId": "example-python-project",
+      "defaultBranch": "main",
+      "worktreeRoot": "/workspace/worktrees/example-python-project",
+      "allowedOperations": [
+        "project.inspect",
+        "repository.fetch",
+        "repository.sync-default",
+        "worktree.create",
+        "worktree.inspect",
+        "worktree.remove",
+        "validation.run"
+      ],
+      "validationProfiles": {
+        "quick": {
+          "commands": [
+            {
+              "argv": ["python3", "-m", "pytest", "-q"],
+              "timeoutSeconds": 1800
+            }
+          ]
+        },
+        "thorough": {
+          "commands": [
+            {
+              "argv": ["python3", "-m", "ruff", "check", "."],
+              "timeoutSeconds": 600
+            },
+            {
+              "argv": ["python3", "-m", "pytest"],
+              "timeoutSeconds": 3600
+            }
+          ]
+        }
+      }
+    }
+  ]
+}
