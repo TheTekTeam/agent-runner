@@ -1,6 +1,8 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+import { normalizeQueueTriagePolicy } from './agent-runner-queue-triage.mjs';
+
 export const DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG = Object.freeze({
   projectId: 'modelspend',
   displayName: 'ModelSpend',
@@ -12,12 +14,25 @@ export const DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG = Object.freeze({
   statusLabels: {
     ready: 'status:ready',
     inProgress: 'status:in-progress',
+    blocked: 'status:blocked',
+    done: 'status:done',
   },
   priorityLabelRanking: ['priority:P0', 'priority:P1', 'priority:P2', 'priority:P3'],
   safeDefaultValidationCommands: [
     'npm run validate:quick:plan -- --files <changed files>',
     'node --test scripts/ops/agent-runner-config.test.mjs',
   ],
+  queueTriage: {
+    enabled: false,
+    fallbackIntervalMinutes: 60,
+    timezone: 'Europe/London',
+    rotatingBacklogSlice: 2,
+    maxChangedItems: 20,
+    maxDebuggerAnomalies: 4,
+    maxMutations: 3,
+    acceptedStatusLabels: ['status:ready', 'status:in-progress', 'status:blocked', 'status:done'],
+    priorityLabels: ['priority:P0', 'priority:P1', 'priority:P2', 'priority:P3'],
+  },
   systemd: {
     serviceName: 'modelspend-claude-runner.service',
     timerName: 'modelspend-claude-runner.timer',
@@ -102,6 +117,7 @@ function normalizeLegacyShape(raw) {
     },
     priorityLabelRanking: raw.priorityLabelRanking ?? raw.github?.priorityLabels,
     safeDefaultValidationCommands: raw.safeDefaultValidationCommands,
+    queueTriage: raw.queueTriage,
     systemd: raw.systemd ?? {
       serviceName: raw.runner?.serviceName,
       timerName: raw.runner?.timerName,
@@ -132,13 +148,26 @@ export function validateAgentRunnerConfig(input) {
   if (!nonEmptyString(config?.systemd?.timerName)) errors.push('systemd.timerName is required');
   if (errors.length > 0) throw new Error(`Invalid agent runner config: ${errors.join('; ')}`);
 
+  const statusLabels = { ...DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG.statusLabels, ...definedEntries(config.statusLabels) };
+  const priorityLabelRanking = [...config.priorityLabelRanking];
+  let queueTriage;
+  try {
+    queueTriage = normalizeQueueTriagePolicy(config.queueTriage ?? {}, {
+      statusLabels: [...new Set(Object.values(statusLabels))],
+      priorityLabels: priorityLabelRanking,
+    });
+  } catch (error) {
+    throw new Error(`Invalid agent runner config: ${error.message}`);
+  }
+
   return {
     ...DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG,
     ...config,
     acceptedAgentLabels: [...new Set(config.acceptedAgentLabels)],
-    statusLabels: { ...DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG.statusLabels, ...config.statusLabels },
-    priorityLabelRanking: [...config.priorityLabelRanking],
+    statusLabels,
+    priorityLabelRanking,
     safeDefaultValidationCommands: [...config.safeDefaultValidationCommands],
+    queueTriage,
     systemd: { ...DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG.systemd, ...definedEntries(config.systemd) },
     runner: { ...DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG.runner, ...definedEntries(config.runner) },
   };
