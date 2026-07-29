@@ -26,7 +26,7 @@ function release(overrides = {}) {
       repository: 'Owner/Alpha',
       objectKind: 'issue',
       objectNumber: 7,
-      shas: [{ sha: SHA, role: 'default_branch' }],
+      shas: [{ sha: SHA, role: 'after' }],
       settlement: { reason: 'settled', requiredShas: [SHA], terminalFailures: [] },
       deliveryIds: ['delivery-1'],
       ...overrides,
@@ -45,7 +45,7 @@ function client(handler) {
 }
 function baseHandler(endpoint) {
   if (endpoint === '/repos/Owner/Alpha') return { full_name: 'Owner/Alpha', default_branch: 'main' };
-  if (endpoint === '/repos/Owner/Alpha/commits/main') return { sha: 'b'.repeat(40) };
+  if (endpoint === '/repos/Owner/Alpha/commits/main') return { sha: SHA };
   if (endpoint === '/repos/Owner/Alpha/issues/7') return {
     number: 7,
     state: 'open',
@@ -114,7 +114,7 @@ test('treats pull requests distinctly and normalizes reviews without raw bodies'
   const betaRelease = {
     batchId: 'batch-beta', state: 'pending', payload: {
       schemaVersion: 1, batchId: 'batch-beta', projectId: 'beta', repository: 'Elsewhere/Beta',
-      objectKind: 'pull_request', objectNumber: 44, shas: [{ sha: 'e'.repeat(40), role: 'pr_head' }],
+      objectKind: 'pull_request', objectNumber: 44, shas: [{ sha: 'e'.repeat(40), role: 'head' }],
       settlement: {}, deliveryIds: [],
     },
   };
@@ -166,4 +166,38 @@ test('issue policy text does not become a live hold without an explicit marker c
   });
   const evidence = collectQueueTriageGitHubEvidence({ release: release(), project: project(), client: gh });
   assert.equal(evidence.changedItems[0].flags.explicitHold, false);
+});
+
+test('detects a replacement release SHA and fails evidence completeness closed', () => {
+  const gh = client((endpoint, query) => {
+    if (endpoint === '/repos/Owner/Alpha/commits/main') return { sha: 'b'.repeat(40) };
+    return baseHandler(endpoint, query);
+  });
+  const evidence = collectQueueTriageGitHubEvidence({ release: release(), project: project(), client: gh });
+  assert.equal(evidence.liveEvidence.queryComplete, false);
+  assert.ok(evidence.liveEvidence.diagnostics.some((entry) => entry.code === 'replacement-sha-detected'));
+  assert.equal(evidence.liveEvidence.shaEvidence[0].roleMatches[0].state, 'replacement_detected');
+});
+
+test('a newer manager packet supersedes an older explicit hold for current control flags', () => {
+  const gh = client((endpoint, query) => {
+    if (endpoint === '/repos/Owner/Alpha/issues/7/comments') return [
+      {
+        id: 1,
+        created_at: '2026-07-29T17:00:00Z',
+        updated_at: '2026-07-29T17:00:00Z',
+        body: 'keep blocked until manager review',
+      },
+      {
+        id: 2,
+        created_at: '2026-07-29T18:00:00Z',
+        updated_at: '2026-07-29T18:00:00Z',
+        body: '<!-- agent-runner:manager-preflight -->\nRevision: `R2`\nFingerprint: `sha256:' + 'd'.repeat(64) + '`',
+      },
+    ];
+    return baseHandler(endpoint, query);
+  });
+  const evidence = collectQueueTriageGitHubEvidence({ release: release(), project: project(), client: gh });
+  assert.equal(evidence.changedItems[0].flags.explicitHold, false);
+  assert.deepEqual(evidence.changedItems[0].authority, { revision: 'R2', fingerprint: `sha256:${'d'.repeat(64)}` });
 });
