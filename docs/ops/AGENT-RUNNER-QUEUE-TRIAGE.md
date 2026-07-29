@@ -32,7 +32,7 @@ Accepted status and priority labels must be subsets of the project’s configure
 
 ## Normalized evidence contract
 
-The planner accepts already-collected, bounded metadata only. Each item contains identity, exact labels, exact `updatedAt`, compact evidence references, intended canonical status or authoritative agent label, dependencies, and explicit safety flags. Optional manager authority is represented only by revision and fingerprint.
+The planner accepts already-collected, bounded metadata only. Each item contains identity, exact labels, exact `updatedAt`, compact evidence references, intended canonical status, priority or authoritative agent label, dependencies, and explicit safety flags. Optional manager authority is represented only by revision and fingerprint.
 
 Raw issue/comment bodies, raw GitHub payloads, provider output, prompts and secrets are rejected. Evidence references are bounded identifiers, not copied content.
 
@@ -50,7 +50,7 @@ Every proposed action records:
 - risk classification and expected post-write state;
 - deterministic idempotency key and evidence fingerprint.
 
-Status changes model one complete final label set. They never describe a transient dual-status write.
+Status, priority and agent-label changes are reconciled into one complete final label set. They never describe a transient dual-status or partial-family write.
 
 ## Count semantics
 
