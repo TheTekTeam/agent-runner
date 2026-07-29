@@ -173,6 +173,10 @@ function normalizeItem(item, project) {
   if (intendedStatus !== null && !project.policy.acceptedStatusLabels.includes(intendedStatus)) {
     throw new Error(`${identity}.intendedStatus is not accepted by project policy`);
   }
+  const intendedPriority = item.intendedPriority ?? null;
+  if (intendedPriority !== null && !project.policy.priorityLabels.includes(intendedPriority)) {
+    throw new Error(`${identity}.intendedPriority is not accepted by project policy`);
+  }
   const authoritativeAgentLabel = item.authoritativeAgentLabel ?? null;
   if (authoritativeAgentLabel !== null && !project.acceptedAgentLabels.includes(authoritativeAgentLabel)) {
     throw new Error(`${identity}.authoritativeAgentLabel is not accepted by project policy`);
@@ -195,6 +199,7 @@ function normalizeItem(item, project) {
     flags,
     dependencies,
     intendedStatus,
+    intendedPriority,
     authoritativeAgentLabel,
     authority,
     linkedMergedPrComplete: item.linkedMergedPrComplete === true,
@@ -229,6 +234,7 @@ function replaceLabelFamily(labels, family, replacement) {
 function buildLabelAction(item, project) {
   let resultingLabels = Object.freeze([...item.labels].sort());
   const currentStatuses = item.labels.filter((label) => project.policy.acceptedStatusLabels.includes(label));
+  const currentPriorities = item.labels.filter((label) => project.policy.priorityLabels.includes(label));
   const currentAgents = item.labels.filter((label) => project.acceptedAgentLabels.includes(label));
   const reasons = [];
 
@@ -239,6 +245,11 @@ function buildLabelAction(item, project) {
     if (item.intendedStatus === project.statusLabels.blocked && !item.flags.explicitHold && currentStatuses.length === 1) return null;
     resultingLabels = replaceLabelFamily(resultingLabels, project.policy.acceptedStatusLabels, item.intendedStatus);
     reasons.push(currentStatuses.length > 1 ? 'conflicting-status-labels' : 'status-reconciliation');
+  }
+
+  if (item.intendedPriority && (currentPriorities.length !== 1 || currentPriorities[0] !== item.intendedPriority)) {
+    resultingLabels = replaceLabelFamily(resultingLabels, project.policy.priorityLabels, item.intendedPriority);
+    reasons.push(currentPriorities.length > 1 ? 'conflicting-priority-labels' : 'priority-alignment');
   }
 
   if (item.authoritativeAgentLabel && (currentAgents.length !== 1 || currentAgents[0] !== item.authoritativeAgentLabel)) {
