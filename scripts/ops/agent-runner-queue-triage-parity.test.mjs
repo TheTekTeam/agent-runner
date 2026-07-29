@@ -25,8 +25,8 @@ function candidate(overrides = {}) {
 test('matches normalized candidates independent of input ordering', () => {
   const first = candidate({
     actionPlans: [
-      { kind: 'issue', number: 9, action: 'replace_labels', intendedFullLabelSet: ['status:blocked', 'priority:P0'], evidenceFingerprint: 'f2' },
-      { kind: 'issue', number: 7, action: 'replace_labels', intendedFullLabelSet: ['priority:P0', 'status:blocked'], evidenceFingerprint: 'f1' },
+      { kind: 'issue', number: 9, action: 'replace_labels', intendedFullLabelSet: ['status:blocked', 'priority:P0'], evidenceFingerprint: `sha256:${'2'.repeat(64)}` },
+      { kind: 'issue', number: 7, action: 'replace_labels', intendedFullLabelSet: ['priority:P0', 'status:blocked'], evidenceFingerprint: `sha256:${'1'.repeat(64)}` },
     ],
   });
   const second = candidate({ actionPlans: [...first.actionPlans].reverse() });
@@ -38,7 +38,7 @@ test('matches normalized candidates independent of input ordering', () => {
 test('classifies intended-action disagreement as material', () => {
   const result = compareQueueTriageParity(
     candidate(),
-    candidate({ actionPlans: [{ kind: 'issue', number: 7, action: 'close_issue', intendedFullLabelSet: null, evidenceFingerprint: 'different' }] }),
+    candidate({ actionPlans: [{ kind: 'issue', number: 7, action: 'close_issue', intendedFullLabelSet: null, evidenceFingerprint: `sha256:${'d'.repeat(64)}` }] }),
   );
   assert.equal(result.status, 'material_disagreement');
   assert.deepEqual(result.mismatchFields, ['action_plans']);
@@ -112,6 +112,7 @@ test('parity persistence requires the matching shadow observation', () => {
   const db = shadowDb();
   try {
     assert.throws(() => persistQueueTriageParity({ db, releaseId: 'batch-other', agentCandidate: candidate({ releaseId: 'batch-other' }), oversightCandidate: candidate({ releaseId: 'batch-other' }) }), /observation is required/);
+    assert.equal(db.prepare("SELECT COUNT(*) AS count FROM sqlite_schema WHERE type = 'table' AND name = 'queue_triage_parity_schema'").get().count, 0);
   } finally { db.close(); }
 });
 
