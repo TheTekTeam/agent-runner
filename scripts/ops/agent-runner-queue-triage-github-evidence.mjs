@@ -10,7 +10,7 @@ const MAX_RELEASE_SHAS = 10;
 const MAX_WORKFLOW_RUNS = 20;
 const MAX_EVIDENCE_REFS = 20;
 const MANAGER_MARKER = '<!-- agent-runner:manager-preflight -->';
-const RECOVERY_MARKERS = ['agent-runner:recovery', 'recovery forbidden', 'fresh manager review required'];
+const RECOVERY_MARKERS = ['<!-- agent-runner:recovery -->', 'recovery forbidden', 'fresh manager review required'];
 const HOLD_PHRASES = ['keep blocked', 'quarantine', 'pause', 'do not claim', 'do not retry', 'recovery forbidden', 'fresh manager review required'];
 const CLAIM_MARKERS = ['<!-- agent-runner:claim -->'];
 const RESERVATION_MARKERS = ['<!-- agent-runner:reservation -->'];
@@ -72,6 +72,9 @@ function commentMarker(comment) {
   const lower = body.toLowerCase();
   const revision = body.match(/(?:^|\n)Revision:\s*`?([^`\n]+)`?/i)?.[1]?.trim() ?? null;
   const fingerprint = body.match(/(?:^|\n)Fingerprint:\s*`?(sha256:[0-9a-f]{64})`?/i)?.[1]?.toLowerCase() ?? null;
+  const authorityState = /\b(?:consumed|superseded|revoked)\b/i.test(body)
+    ? body.match(/\b(consumed|superseded|revoked)\b/i)[1].toLowerCase()
+    : 'current';
   const types = [];
   if (body.includes(MANAGER_MARKER)) types.push('manager-preflight');
   if (RECOVERY_MARKERS.some((marker) => lower.includes(marker))) types.push('recovery');
@@ -84,6 +87,7 @@ function commentMarker(comment) {
     types: Object.freeze(types.sort()),
     explicitHold: !body.includes(MANAGER_MARKER) && HOLD_PHRASES.some((phrase) => lower.includes(phrase)),
     active: /(?:^|\n)(?:state|status):\s*`?(?:active|claimed|reserved)`?/i.test(body),
+    authorityState,
     revision,
     fingerprint,
     bodyFingerprint: evidenceFingerprint(body),
@@ -199,12 +203,22 @@ export function collectQueueTriageGitHubEvidence({ release, project, client, obs
   const markers = comments.map(commentMarker).filter(Boolean).sort((a, b) => a.updatedAt.localeCompare(b.updatedAt) || a.id - b.id);
   const bodyText = boundedText(issue.body, 128 * 1024);
   const dependencies = extractDependencyRefs(bodyText, normalizedProject.repository).map((dependency) => dependencyState(client, dependency, diagnostics));
-  const latestAuthority = [...markers].reverse().find((marker) => marker.types.includes('manager-preflight') && marker.revision && marker.fingerprint) ?? null;
+  const latestAuthority = [...markers].reverse().find((marker) => (
+    marker.types.includes('manager-preflight')
+    && marker.authorityState === 'current'
+    && marker.revision
+    && marker.fingerprint
+  )) ?? null;
+  const latestControl = [...markers].reverse().find((marker) => (
+    marker.types.includes('manager-preflight') || marker.types.includes('recovery') || marker.explicitHold
+  )) ?? null;
+  const latestClaim = [...markers].reverse().find((marker) => marker.types.includes('claim')) ?? null;
+  const latestReservation = [...markers].reverse().find((marker) => marker.types.includes('reservation')) ?? null;
   const flags = Object.freeze({
-    explicitHold: markers.some((marker) => marker.explicitHold),
-    activeClaim: markers.some((marker) => marker.types.includes('claim') && marker.active),
-    reservation: markers.some((marker) => marker.types.includes('reservation') && marker.active),
-    recovery: markers.some((marker) => marker.types.includes('recovery')),
+    explicitHold: Boolean(latestControl?.explicitHold),
+    activeClaim: Boolean(latestClaim?.active),
+    reservation: Boolean(latestReservation?.active),
+    recovery: Boolean(latestControl?.types.includes('recovery')),
   });
   const evidenceRefs = uniqueStrings([
     `${kind}:${number}`,
@@ -213,9 +227,40 @@ export function collectQueueTriageGitHubEvidence({ release, project, client, obs
     ...markers.slice(-8).map((marker) => `comment:${marker.id}`),
     ...dependencies.slice(0, 8).map((dependency) => `dependency:${dependency.id}`),
   ], MAX_EVIDENCE_REFS);
-  const releaseShas = [...new Set(normalizedRelease.payload.shas.map((entry) => String(entry?.sha ?? '').toLowerCase()))];
-  if (releaseShas.some((sha) => !SHA_PATTERN.test(sha))) throw new Error('release SHA is invalid');
-  const shaEvidence = Object.freeze(releaseShas.map((sha) => collectShaEvidence(client, normalizedProject.repository, sha, diagnostics)));
+  const releaseShaRoles = new Map();
+  for (const entry of normalizedRelease.payload.shas) {
+    const sha = String(entry?.sha ?? '').toLowerCase();
+    const role = String(entry?.role ?? '').toLowerCase();
+    if (!SHA_PATTERN.test(sha) || !['head', 'base', 'merge', 'before', 'after'].includes(role)) {
+      throw new Error('release SHA identity is invalid');
+    }
+    if (!releaseShaRoles.has(sha)) releaseShaRoles.set(sha, new Set());
+    releaseShaRoles.get(sha).add(role);
+  }
+  const liveRoleShas = Object.freeze({
+    head: pullRequest?.head?.sha && SHA_PATTERN.test(pullRequest.head.sha) ? String(pullRequest.head.sha).toLowerCase() : null,
+    base: pullRequest?.base?.sha && SHA_PATTERN.test(pullRequest.base.sha) ? String(pullRequest.base.sha).toLowerCase() : null,
+    merge: pullRequest?.merge_commit_sha && SHA_PATTERN.test(pullRequest.merge_commit_sha) ? String(pullRequest.merge_commit_sha).toLowerCase() : null,
+    after: String(defaultCommit.sha).toLowerCase(),
+  });
+  const shaEvidence = Object.freeze([...releaseShaRoles.entries()].sort(([left], [right]) => left.localeCompare(right)).map(([sha, roleSet]) => {
+    const roles = [...roleSet].sort();
+    const roleMatches = Object.freeze(roles.map((role) => Object.freeze({
+      role,
+      liveSha: liveRoleShas[role] ?? null,
+      state: role === 'before' || liveRoleShas[role] == null
+        ? 'not_verifiable'
+        : liveRoleShas[role] === sha ? 'match' : 'replacement_detected',
+    })));
+    if (roleMatches.some((entry) => entry.state === 'replacement_detected')) {
+      queryCompleteDiagnostic(diagnostics, `release-sha:${sha}`, 'replacement-sha-detected');
+    }
+    return Object.freeze({
+      ...collectShaEvidence(client, normalizedProject.repository, sha, diagnostics),
+      roles: Object.freeze(roles),
+      roleMatches,
+    });
+  }));
   const labels = labelsFrom(issue);
   const currentStatuses = labels.filter((label) => Object.values(normalizedProject.statusLabels).includes(label));
   const currentAgents = labels.filter((label) => normalizedProject.acceptedAgentLabels.includes(label));
