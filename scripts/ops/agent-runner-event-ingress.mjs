@@ -175,7 +175,7 @@ export function normalizeGitHubWebhookDelivery({
     action,
     issueNumber: issueNumber(payload),
     pullRequestNumber: pullRequestNumber(payload),
-    headSha: headSha(payload),
+    headSha: eventName === 'push' ? null : headSha(payload),
     baseSha: baseSha(payload),
     mergeSha: mergeSha(payload),
     beforeSha: normalizedSha(payload?.before),
