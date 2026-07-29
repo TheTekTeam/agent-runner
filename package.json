@@ -12,6 +12,7 @@
     "validate": "bash scripts/validate.sh",
     "test": "bash scripts/test-imported-runner.sh",
     "queue:triage": "node scripts/ops/agent-runner-queue-triage-command.mjs",
-    "queue:triage:prompt": "node scripts/ops/agent-runner-queue-triage-command.mjs --format openai"
+    "queue:triage:prompt": "node scripts/ops/agent-runner-queue-triage-command.mjs --format openai",
+    "queue:triage:shadow": "node scripts/ops/agent-runner-queue-triage-shadow-command.mjs"
   }
 }

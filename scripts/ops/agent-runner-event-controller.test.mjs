@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash, createHmac } from 'node:crypto';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
 import {
+  EventControllerReleaseReader,
   EventControllerReleaseStore,
   runEventControllerCycle,
 } from './agent-runner-event-controller.mjs';
@@ -48,13 +49,14 @@ async function fixture(fn) {
     settlement: new EventSettlementStore(dbPath),
     releases: new EventControllerReleaseStore(dbPath),
     dbPath,
+    dir,
   };
   try {
     return await fn(context);
   } finally {
-    context.releases.close();
-    context.settlement.close();
-    context.ingress.close();
+    context.releases?.close();
+    context.settlement?.close();
+    context.ingress?.close();
     rmSync(dir, { recursive: true, force: true });
   }
 }
@@ -138,6 +140,18 @@ function cycle(context, options = {}) {
   });
 }
 
+function controllerHashes(context) {
+  return Object.fromEntries(
+    readdirSync(context.dir)
+      .filter((name) => name.startsWith('controller.sqlite'))
+      .sort()
+      .map((name) => [
+        name,
+        createHash('sha256').update(readFileSync(join(context.dir, name))).digest('hex'),
+      ]),
+  );
+}
+
 test('releases an issue-only batch exactly once after debounce and quiet period', () => fixture(async (context) => {
   deliver(context, issuePayload(), { deliveryId: 'issue-1', eventName: 'issues', receivedAt: at(0) });
   const first = await cycle(context, { now: at(0) });
@@ -206,6 +220,8 @@ test('release claims are leased, recoverable and require the matching token to f
   await cycle(context, { now: at(0) });
   await cycle(context, { now: at(1_000) });
   const [pending] = context.releases.listReleases();
+  assert.equal(Object.isFrozen(pending), false);
+  assert.equal(Object.hasOwn(pending, 'claimToken'), true);
   const token = 'claim-token-1234';
   const claimed = context.releases.claimRelease(pending.batchId, { claimToken: token, leaseMs: 1_000, now: at(1_100) });
   assert.equal(claimed.state, 'claimed');
@@ -237,4 +253,33 @@ test('pending releases and batches survive process restart', () => fixture(async
   assert.equal(context.settlement.getBatch(batchId).state, 'settled');
   const duplicate = context.releases.releaseSettledBatch(context.settlement.getBatch(batchId), { now: at(2_000) });
   assert.equal(duplicate.inserted, false);
+}));
+
+test('read-only release snapshots preserve controller files, state and claim-token privacy', () => fixture(async (context) => {
+  deliver(context, issuePayload(14), { deliveryId: 'issue-shadow-read', eventName: 'issues', receivedAt: at(0) });
+  await cycle(context, { now: at(0) });
+  await cycle(context, { now: at(1_000) });
+  const [pending] = context.releases.listReleases();
+
+  context.releases.close();
+  context.settlement.close();
+  context.ingress.close();
+  context.releases = null;
+  context.settlement = null;
+  context.ingress = null;
+
+  const before = controllerHashes(context);
+  const reader = new EventControllerReleaseReader(context.dbPath);
+  try {
+    const snapshot = reader.getRelease(pending.batchId);
+    assert.equal(snapshot.state, 'pending');
+    assert.equal(Object.isFrozen(snapshot), true);
+    assert.equal(Object.hasOwn(snapshot, 'claimToken'), false);
+    assert.equal(Object.hasOwn(snapshot, 'claimExpiresAt'), false);
+    assert.equal(reader.listReleases({ states: ['pending'], limit: 20 }).length, 1);
+    assert.throws(() => reader.listReleases({ limit: 21 }), /1 to 20/);
+  } finally {
+    reader.close();
+  }
+  assert.deepEqual(controllerHashes(context), before);
 }));
