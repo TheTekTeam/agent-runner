@@ -119,6 +119,25 @@ test('routes a second configured project through the same ingress implementation
   }
 }));
 
+test('keeps push afterSha separate from PR/check headSha semantics', () => fixtureEnvironment(({ registry, dbPath }) => {
+  const store = new EventIngressStore(dbPath);
+  try {
+    const payload = {
+      repository: { full_name: 'Owner/Alpha', default_branch: 'main' },
+      ref: 'refs/heads/main',
+      before: 'a'.repeat(40),
+      after: 'b'.repeat(40),
+    };
+    const request = signedRequest(payload, { deliveryId: 'delivery-push', eventName: 'push' });
+    const result = acceptGitHubWebhook({ ...request, secret: SECRET, registry, store });
+    assert.equal(result.envelope.headSha, null);
+    assert.equal(result.envelope.beforeSha, 'a'.repeat(40));
+    assert.equal(result.envelope.afterSha, 'b'.repeat(40));
+  } finally {
+    store.close();
+  }
+}));
+
 test('accepts a signed GitHub App ping without assigning it to a project', () => fixtureEnvironment(({ registry, dbPath }) => {
   const store = new EventIngressStore(dbPath);
   try {
