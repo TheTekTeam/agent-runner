@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "enabled": false,
+  "revision": "REPLACE_WITH_APPROVED_REVISION",
+  "sourceSha": "0000000000000000000000000000000000000000",
+  "projectIds": [
+    "agent-runner",
+    "modelspend"
+  ],
+  "maxReleasesPerCycle": 20,
+  "fingerprint": "sha256:5178aaf1bd23918b603b287fc651012c431d51503a92e5e2f4c915a121c1be6e"
+}
