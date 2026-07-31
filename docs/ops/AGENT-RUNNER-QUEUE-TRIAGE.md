@@ -57,6 +57,29 @@ The authoritative controller database and optional WAL are read only as bounded 
 
 No systemd unit or unattended queue-triage schedule is installed or enabled. The preserved live release ledger remains authoritative and unchanged.
 
+## Durable single-release consumption
+
+After separately accepted live parity, one explicitly named pending release may be claimed and finished through the durable controller ledger:
+
+```bash
+npm run queue:triage:consume -- \
+  --controller-db /path/to/controller.sqlite \
+  --release batch-id \
+  --project-config /path/to/project.json \
+  [--lease-ms 300000] \
+  [--format json|markdown]
+```
+
+This command accepts exactly one `--release`. It does not provide `--pending`, `--all-enabled`, fallback or scheduled operation. The release transition is atomic `pending -> claimed`; only the exact bounded claim token may complete `claimed -> processed` or `claimed -> failed`.
+
+After claiming, the consumer reuses the existing GET-only live GitHub collector and deterministic planner. It finishes `processed` only when live evidence is complete, the report identity matches the claimed release, and the release payload and exact claim ownership remain unchanged at the final recheck. Action plans are persisted only as bounded counts and fingerprints; none are executed.
+
+The terminal controller result is bounded to 64 KiB and contains only normalized release identity, payload/evidence/report fingerprints, inspected/action/exception counts, completion state and zero-mutation `RUN_CONTROL`. Raw issue/comment/review bodies, raw GitHub payloads, provider output, prompts, claim tokens, secrets and credentials are forbidden.
+
+A repeated invocation after `processed` or `failed` returns a deterministic no-op without another claim or GitHub read. An interruption that occurs after claim but before a safe terminal result leaves the claim intact until the existing lease-expiry recovery path requeues it. Incomplete live evidence records a bounded `failed` result and can never be reported as processed.
+
+The implementation and tests use fixture databases only. The preserved live pending releases remain untouched until a separate live consumption acceptance is authorised. GitHub writes, action-plan execution, `--execute`, systemd changes and scheduled-task changes remain structurally unavailable.
+
 ## Project policy
 
 Each project may opt in through `queueTriage`. The default is disabled. Project configuration may make limits stricter but cannot widen the core ceilings:
@@ -168,16 +191,26 @@ Live shadow output records:
 - `mutationAllowed: false`;
 - shadow rows inserted and replayed.
 
+Durable-consumption output separately records:
+
+- whether exactly one release was claimed and finished;
+- whether the controller database changed only for those release transitions;
+- whether GET-only GitHub reads occurred;
+- `githubWritesPerformed: false`;
+- `actionPlansExecuted: 0`;
+- `mutationAllowed: false`;
+- no systemd or scheduled-task change.
+
 The OpenAI oversight prompt is generated from the same exported core policy constants used by the planner. During parity acceptance, OpenAI remains oversight-only and must fail closed on material disagreement. It must not duplicate Agent Runner mutations.
 
 ## Staged delivery
 
 1. **Foundation — complete:** validated policy, pure planner, dry-run command, bounded reports, fixtures and deterministic oversight prompt.
 2. **Read-only release shadow — complete:** bounded private controller snapshots and restart-safe separate shadow observations, without release claims or live GitHub reads.
-3. **Read-only live evidence and parity — current:** bounded explicit-release GitHub reads, normalized reports and durable parity comparison.
-4. **Live shadow acceptance:** separately run reviewed read-only comparisons for ModelSpend and Agent Runner; disagreement or incomplete evidence blocks progression.
-5. **Durable consumption:** separately authorise release claim/finish semantics after accepted parity. GitHub mutation remains disabled.
+3. **Read-only live evidence and parity — complete:** bounded explicit-release GitHub reads, normalized reports and durable parity comparison.
+4. **Live shadow acceptance — complete:** reviewed comparisons for ModelSpend and Agent Runner produced complete exact matches while preserving controller and release state.
+5. **Durable consumption — current:** implement explicit-release claim, GET-only planning and bounded terminal finish semantics without action execution.
 6. **Bounded execution:** separately authorise the low-risk mutation allowlist, final live rechecks, atomic writes and read-back verification.
-7. **Local authority:** enable the Dell fallback schedule and change the OpenAI task to oversight-only after proven parity.
+7. **Local authority:** enable the Dell fallback schedule and change the OpenAI task to oversight-only after proven parity and consumption acceptance.
 
-This implementation slice does not run against or consume the preserved live pending releases. Live Dell acceptance is a separate manager-authorised operator step. No later phase is authorised by the current implementation itself.
+This implementation slice does not run against or consume the preserved live pending releases. Live Dell release-consumption acceptance is a separate manager-authorised operator step. No GitHub mutation, queue action execution, systemd activation or later phase is authorised by this source implementation itself.
