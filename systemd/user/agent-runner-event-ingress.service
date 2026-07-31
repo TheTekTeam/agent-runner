@@ -20,14 +20,11 @@ RestrictAddressFamilies=AF_INET
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-ProtectControlGroups=true
-ProtectKernelModules=true
-ProtectKernelTunables=true
-ProtectKernelLogs=true
-ProtectClock=true
-# User services already run without effective capabilities. Avoid capability-set
-# transitions that unprivileged user managers cannot perform; NoNewPrivileges
-# still prevents this process from gaining capabilities.
+# This is a systemd --user service. The user manager and its children already
+# run without effective capabilities. Do not use directives that request an
+# explicit or implicit capability-bounding transition: on this Dell they fail
+# before ExecStart with status 218/CAPABILITIES. NoNewPrivileges and the
+# loopback-only inherited socket preserve the relevant privilege boundary.
 UMask=0077
 TimeoutStartSec=30s
 TimeoutStopSec=15s
