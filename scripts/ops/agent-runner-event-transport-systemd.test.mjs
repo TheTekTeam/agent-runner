@@ -17,8 +17,8 @@ test('systemd units verify and installer preserves explicit activation and rollb
   assert.match(service, /^NoNewPrivileges=true$/m);
   assert.doesNotMatch(
     service,
-    /^(?:CapabilityBoundingSet|AmbientCapabilities)=/m,
-    'unprivileged user managers must not be asked to perform capability-set transitions',
+    /^(?:CapabilityBoundingSet|AmbientCapabilities|ProtectClock|ProtectControlGroups|ProtectKernelModules|ProtectKernelTunables|ProtectKernelLogs)=/m,
+    'unprivileged user managers must not be asked to perform explicit or implicit capability-set transitions',
   );
 
   const installer = readFileSync(new URL('../install-event-ingress-transport.sh', import.meta.url), 'utf8');
