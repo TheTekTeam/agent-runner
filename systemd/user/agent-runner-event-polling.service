@@ -1,13 +1,14 @@
 [Unit]
-Description=Agent Runner GitHub polling and CI settlement cycle
-Documentation=https://github.com/TheTekTeam/agent-runner/blob/main/docs/ops/AGENT-RUNNER-GITHUB-POLLING.md
+Description=Agent Runner GitHub polling, CI settlement and bounded queue-triage cycle
+Documentation=https://github.com/TheTekTeam/agent-runner/blob/main/docs/ops/AGENT-RUNNER-QUEUE-TRIAGE.md
 Wants=network-online.target
 After=network-online.target
 
 [Service]
 Type=oneshot
 EnvironmentFile=%h/.config/agent-runner/event-polling.env
-ExecStart=/usr/bin/env node ${AGENT_RUNNER_HOME}/scripts/ops/agent-runner-polling-controller-summary.mjs --bootstrap-lookback-ms 86400000 --batch-limit 25
+EnvironmentFile=-%h/.config/agent-runner/queue-triage-authority.env
+ExecStart=/usr/bin/env node ${AGENT_RUNNER_HOME}/scripts/ops/agent-runner-queue-triage-local-authority.mjs --bootstrap-lookback-ms 86400000 --batch-limit 25 --all-enabled --execute
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -17,7 +18,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 RestrictRealtime=true
 UMask=0077
-TimeoutStartSec=5min
+TimeoutStartSec=15min
 
 [Install]
 WantedBy=default.target

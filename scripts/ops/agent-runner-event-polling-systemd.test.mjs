@@ -10,9 +10,13 @@ test('polling timer schedules after service completion instead of activation', (
   assert.doesNotMatch(timer, /^OnUnitActiveSec=/m);
 });
 
-test('polling service uses bounded bootstrap, batch and compact output settings', () => {
-  assert.match(service, /agent-runner-polling-controller-summary\.mjs/);
+test('polling service delegates one bounded local-authority cycle', () => {
+  assert.match(service, /agent-runner-queue-triage-local-authority\.mjs/);
+  assert.doesNotMatch(service, /agent-runner-polling-controller-summary\.mjs/);
+  assert.match(service, /^EnvironmentFile=-%h\/\.config\/agent-runner\/queue-triage-authority\.env$/m);
   assert.match(service, /--bootstrap-lookback-ms 86400000/);
   assert.match(service, /--batch-limit 25/);
-  assert.match(service, /^TimeoutStartSec=5min$/m);
+  assert.match(service, /--all-enabled/);
+  assert.match(service, /--execute/);
+  assert.match(service, /^TimeoutStartSec=15min$/m);
 });

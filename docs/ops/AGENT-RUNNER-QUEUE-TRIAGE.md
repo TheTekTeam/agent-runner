@@ -2,11 +2,37 @@
 
 Issue: `TheTekTeam/agent-runner#113`
 
-Agent Runner owns deterministic queue inspection and action planning for every configured project. GitHub Actions validates source only; it is not the queue scheduler or mutation engine.
+Agent Runner owns deterministic queue inspection, bounded GitHub evidence collection, durable release consumption and low-risk queue-hygiene execution for configured projects. GitHub Actions validates source only; the Dell user service is the local scheduler and mutation authority.
 
-## Current implementation boundary
+## Safety model
 
-The pure planner accepts a normalized evidence file and produces a deterministic dry-run report. Release-mode input requires a durable `releaseId`; fallback-mode input requires a durable `fallbackId` so replay identity never depends on wall-clock observation time:
+Queue triage has three independent opt-in gates:
+
+1. the project must be enabled in the project registry;
+2. the validated project config must set `queueTriage.enabled: true` with `maxMutations` from 1 to 3;
+3. a machine-local authority file must be enabled, fingerprint-valid, bound to the exact installed source SHA and explicitly allow the project ID.
+
+If any gate is absent or mismatched, the combined service still performs its existing read-only GitHub polling and CI settlement cycle but performs no queue-triage release claim, fallback pass or GitHub write.
+
+Source examples remain disabled. Machine-local authority, installed project configuration, tokens and credentials are never committed.
+
+## Project policy
+
+Each project may tighten but cannot widen the core limits:
+
+| Setting | Core limit/default | Rule |
+|---|---:|---|
+| `fallbackIntervalMinutes` | 60 | may increase only |
+| `rotatingBacklogSlice` | 2 | may reduce to 0–2 |
+| `maxChangedItems` | 20 | may reduce to 1–20 |
+| `maxDebuggerAnomalies` | 4 | may reduce to 0–4 |
+| `maxMutations` | 3 | may reduce to 0–3 |
+
+Accepted status and priority targets must be subsets of the project’s configured label vocabulary. Every configured status, priority and accepted-agent label must exist in the target repository before a write is attempted.
+
+## Dry-run planner
+
+The pure planner accepts normalized evidence and produces deterministic immutable action plans:
 
 ```bash
 npm run queue:triage -- --input /path/to/normalized-evidence.json
@@ -14,21 +40,22 @@ npm run queue:triage -- --input /path/to/normalized-evidence.json --format markd
 npm run queue:triage:prompt
 ```
 
-The shadow command can observe one explicit pending release or at most 20 pending releases from an existing controller database:
+Release-mode input requires a durable `releaseId`; fallback-mode input requires a durable `fallbackId`. Replay identity never depends on observation time.
+
+Raw issue/comment/review bodies, provider responses, prompts, tokens, secrets and arbitrary commands are forbidden from durable reports. Action plans contain exact object identity, before labels and timestamp, decisive evidence references, intended complete label set or completed-close action, manager authority fingerprint, risk classification and deterministic idempotency key.
+
+## Read-only shadow and parity
+
+One explicit pending release may be observed through a private byte-stable snapshot of the controller database:
 
 ```bash
 npm run queue:triage:shadow -- \
   --controller-db /path/to/controller.sqlite \
   --shadow-db /path/to/queue-triage-shadow.sqlite \
   --release batch-id
-
-npm run queue:triage:shadow -- \
-  --controller-db /path/to/controller.sqlite \
-  --shadow-db /path/to/queue-triage-shadow.sqlite \
-  --pending --limit 20
 ```
 
-For one explicit pending release, the command may collect bounded live GitHub evidence through the existing authenticated read-only client:
+Bounded live GitHub evidence may be added for that explicit release:
 
 ```bash
 npm run queue:triage:shadow -- \
@@ -39,27 +66,11 @@ npm run queue:triage:shadow -- \
   --project-config /path/to/project.json
 ```
 
-A separately generated normalized oversight candidate can be compared with the Agent Runner dry-run result:
-
-```bash
-npm run queue:triage:shadow -- \
-  --controller-db /path/to/controller.sqlite \
-  --shadow-db /path/to/queue-triage-shadow.sqlite \
-  --release batch-id \
-  --live-github \
-  --project-config /path/to/project.json \
-  --oversight /path/to/normalized-oversight.json
-```
-
-Live GitHub collection is deliberately unavailable with `--pending`; it requires one explicit `--release`. The command supports GET requests only. `--execute` remains unsupported.
-
-The authoritative controller database and optional WAL are read only as bounded byte files. Two consecutive snapshots must match exactly; otherwise observation fails closed. SQLite opens only a private temporary copy, which is removed on close or construction failure. The command never opens, migrates or writes the authoritative controller path, claims or finishes a release, or changes a release state. All durable observations, dry-run reports and parity results are written only to the separately supplied shadow database.
-
-No systemd unit or unattended queue-triage schedule is installed or enabled. The preserved live release ledger remains authoritative and unchanged.
+A separately normalized oversight candidate may be supplied with `--oversight`. Parity is one of `match`, `material_disagreement` or `incomplete`. Shadow mode never claims or finishes controller releases and never writes to GitHub.
 
 ## Durable single-release consumption
 
-After separately accepted live parity, one explicitly named pending release may be claimed and finished through the durable controller ledger:
+One explicitly named release can be claimed and finished without executing its action plans:
 
 ```bash
 npm run queue:triage:consume -- \
@@ -70,147 +81,152 @@ npm run queue:triage:consume -- \
   [--format json|markdown]
 ```
 
-This command accepts exactly one `--release`. It does not provide `--pending`, `--all-enabled`, fallback or scheduled operation. The release transition is atomic `pending -> claimed`; only the exact bounded claim token may complete `claimed -> processed` or `claimed -> failed`.
+The transition is atomic `pending -> claimed -> processed|failed`. Only the exact claim token may finish the release. Interrupted claims are preserved for existing lease-expiry recovery. Replaying a terminal release is a no-op without another GitHub read.
 
-After claiming, the consumer reuses the existing GET-only live GitHub collector and deterministic planner. It finishes `processed` only when live evidence is complete, the report identity matches the claimed release, and the release payload and exact claim ownership remain unchanged at the final recheck. Action plans are persisted only as bounded counts and fingerprints; none are executed.
+## Bounded single-release execution
 
-The terminal controller result is bounded to 64 KiB and contains only normalized release identity, payload/evidence/report fingerprints, inspected/action/exception counts, completion state and zero-mutation `RUN_CONTROL`. Raw issue/comment/review bodies, raw GitHub payloads, provider output, prompts, claim tokens, secrets and credentials are forbidden.
+One explicit release may execute allowlisted low-risk plans after complete initial and final live re-planning:
 
-A repeated invocation after `processed` or `failed` returns a deterministic no-op without another claim or GitHub read. An interruption that occurs after claim but before a safe terminal result leaves the claim intact until the existing lease-expiry recovery path requeues it. Incomplete live evidence records a bounded `failed` result and can never be reported as processed.
+```bash
+npm run queue:triage:execute -- \
+  --controller-db /path/to/controller.sqlite \
+  --release batch-id \
+  --project-config /path/to/project.json \
+  --manager-revision REVISION \
+  --manager-fingerprint sha256:... \
+  --execute
+```
 
-The implementation and tests use fixture databases only. The preserved live pending releases remain untouched until a separate live consumption acceptance is authorised. GitHub writes, action-plan execution, `--execute`, systemd changes and scheduled-task changes remain structurally unavailable.
+The command supports only issue-endpoint PATCH operations for:
 
-## Project policy
+- atomic replacement of the complete label set; or
+- closing an issue as `completed` after merged-completion evidence settles.
 
-Each project may opt in through `queueTriage`. The default is disabled. Project configuration may make limits stricter but cannot widen the core ceilings:
+Before each write it requires exact labels, timestamp, kind and open state from the immutable plan. After each write it immediately re-fetches the object and requires exact read-back. Any provider failure, stale snapshot, label-definition gap or verification mismatch stops later actions and finishes the release with a bounded failure result.
 
-| Setting | Core ceiling/default | Tightening rule |
-|---|---:|---|
-| `fallbackIntervalMinutes` | 60 | may increase only |
-| `rotatingBacklogSlice` | 2 | may reduce to 0–2 |
-| `maxChangedItems` | 20 | may reduce to 1–20 |
-| `maxDebuggerAnomalies` | 4 | may reduce to 0–4 |
-| `maxMutations` | 3 | may reduce to 0–3 |
+The explicit command intentionally has no pending sweep, all-enabled mode, fallback or scheduling. Those capabilities exist only behind the local-authority combined cycle.
 
-Accepted status and priority labels must be subsets of the project’s configured label vocabulary. The implementation contains no repository name, workflow name or ModelSpend-specific decision branch.
+## Machine-local authority
 
-## Normalized evidence contract
+The local authority file is a versioned JSON object containing:
 
-The planner accepts bounded metadata only. Each item contains identity, exact labels, exact `updatedAt`, compact evidence references, intended canonical status, priority or authoritative agent label, dependencies, and explicit safety flags. Optional manager authority is represented only by revision and fingerprint.
+- `schemaVersion: 1`;
+- `enabled`;
+- manager `revision`;
+- exact installed `sourceSha`;
+- explicit `projectIds` allowlist;
+- `maxReleasesPerCycle` from 1 to 20;
+- SHA-256 fingerprint over the canonical preceding fields.
 
-Raw issue/comment bodies, review bodies, raw GitHub payloads, provider output, prompts, tokens and secrets are rejected from persisted reports and parity candidates. Evidence references are bounded identifiers, not copied content.
+Use `.agent-runner/queue-triage-authority.example.json` only as a shape reference. The real file must be created outside the repository, mode-restricted and regenerated whenever the installed source SHA or authorised project set changes.
 
-Safety flags such as active claim, reservation, recovery, newer authority or unresolved human decision suppress a mutation proposal and create a typed debugger exception. An incomplete dependency cannot produce a blocked-to-ready proposal. Conflicting label families without a canonical normalized decision become typed incomplete-evidence exceptions rather than guesses.
+The combined command is:
 
-## Read-only live GitHub evidence
+```bash
+npm run queue:triage:closed-loop -- --help
+```
 
-The live collector operates on one explicit pending issue or pull-request release. It constructs only repository-scoped GET endpoints and collects:
+Production execution requires both `--all-enabled` and `--execute`. A supervised fallback pass may additionally use `--fallback`. `--pending` is not accepted.
 
-- current repository identity and default-branch SHA;
-- the exact released issue or pull request;
-- at most 100 issue/PR comments and 100 PR reviews;
-- at most 20 explicitly named dependencies from the issue’s `Dependencies` section;
-- at most ten release SHAs, with bounded check-run, check-suite, workflow-run, workflow-job and commit-status summaries;
-- current manager, hold, recovery, claim and reservation markers reduced to typed metadata and fingerprints.
+## Combined polling, settlement and triage cycle
 
-Issue and pull-request objects remain distinct even though GitHub exposes PRs through the issues API. Exact current labels, state and `updatedAt` are preserved. Release SHA roles (`head`, `base`, `merge`, `before`, `after`) are compared with live PR/default-branch identity where possible. A replacement or required-but-unverifiable SHA makes evidence incomplete.
+The existing `agent-runner-event-polling.timer` remains the only schedule. Its oneshot service:
 
-The newest applicable manager/control marker supersedes older holds. A manager packet explicitly marked consumed, superseded or revoked is not treated as current authority. Raw marker bodies are not persisted.
+1. polls every registry-enabled repository through GET-only GitHub APIs;
+2. performs CI settlement and creates durable releases;
+3. validates local authority and project opt-in;
+4. selects at most 20 authorised pending releases;
+5. executes them serially through the accepted single-release executor;
+6. runs due hourly fallback passes;
+7. exits, allowing `OnUnitInactiveSec=1min` to schedule the next cycle.
 
-Pagination limits, provider failures, malformed responses, replacement SHAs or unverifiable required roles create bounded diagnostics and set `queryComplete: false`. GitHub-only evidence never proves runtime-runnable state.
+There is no second controller writer or queue-triage timer.
 
-## Durable shadow observations
+Pending release selection filters to authority projects before applying the bound. It ranks releases within each project and then interleaves those ranks, preventing unrelated or high-volume projects from permanently starving later authorised work.
 
-The release reader validates the existing controller release schema against a private stable snapshot and exposes only bounded deterministic snapshots. Pending releases are ordered by release time and batch identity. Multi-release observation is capped at 20. Read-only snapshots are frozen and omit controller claim tokens.
+The entire combined cycle permits at most three verified mutations per project. Processing stops after the first failed terminal release or fallback result.
 
-The separate shadow store records normalized identity and fingerprints:
+## Rotating backlog and hourly fallback
 
-- batch, project, repository and object identity;
-- release/controller timestamps;
-- authoritative payload, delivery, SHA and settlement fingerprints;
-- first observation time;
-- normalized evidence fingerprint and bounded dry-run report when explicitly supplied;
-- normalized parity inputs, status and deterministic result fingerprint.
+Release-driven planning includes up to two unchanged open issues per project where available. The rotating items are selected in issue-number order, exclude objects already processed as changed in the same cycle, use a persisted cursor and wrap deterministically using the configured project timezone and local hour.
 
-It does not store controller payload JSON, delivery identifiers, raw provider evidence or live issue/comment content. Re-observing unchanged evidence is an idempotent replay. Reusing a release identity with changed payload, report or parity content fails closed as a collision. Identity and planner validation occur before any shadow write.
+A project fallback is due only when `fallbackIntervalMinutes` has elapsed since its last successful local pass. Its durable identity is:
 
-## Parity comparison
+```text
+fallback:<project-id>:<local-hour>
+```
 
-Parity input is a bounded, versioned normalized candidate. It compares:
+Fallback executes the selected issues through temporary synthetic single-release controller ledgers and the same accepted executor. It does not introduce another GitHub write client or planner. Current GitHub state, deterministic action plans and durable fallback identity make replay idempotent.
 
-- release and project identity;
-- settlement/release and SHA-evidence fingerprints;
-- inspected object identity, exact update timestamp and label fingerprint;
-- intended action plans;
-- typed exceptions.
+`fallbackPerformed` is true only when at least one project fallback actually starts. A normal one-minute polling cycle is not reported as an hourly fallback pass.
 
-The only parity statuses are:
+## Local state database
 
-- `match` — both complete candidates agree materially;
-- `material_disagreement` — complete candidates disagree on a material field;
-- `incomplete` — either candidate or its settlement evidence is incomplete.
+Queue-triage scheduling state is stored separately from the authoritative controller database, normally beside it as:
 
-Only `match` is potential acceptance evidence. No parity result authorises release consumption, GitHub mutation or unattended operation. Repository code does not assume that an OpenAI scheduled task exists; the oversight candidate is a separately supplied normalized file.
+```text
+queue-triage-local.sqlite
+```
 
-## Typed immutable action plans
+Schema version 1 stores:
 
-Every proposed action records:
+- per-project last successful pass;
+- last fallback identity;
+- rotating cursor;
+- running, processed and failed fallback outcomes;
+- persistent exception fingerprints and appearance counts.
 
-- project, repository, object kind and number;
-- exact before labels and update timestamp;
-- decisive evidence references;
-- manager authority revision/fingerprint when supplied;
-- intended complete label set or close action;
-- risk classification and expected post-write state;
-- deterministic idempotency key and evidence fingerprint.
+An incompatible existing schema fails closed before migration. A running fallback may be recovered only after the bounded stale interval. Terminal fallback identities are not re-executed.
 
-Status, priority and agent-label changes are reconciled against the full configured label vocabulary into one complete final label set, even when project policy narrows which target labels are allowed. They never describe a transient dual-status or partial-family write.
+The authoritative controller schema is unchanged.
 
-## Count semantics
+## Installation
 
-Reports keep these values separate:
+The non-root installer validates the checkout, registry, authority file, exact source SHA, project opt-in, Node, authenticated `gh` access and command availability before changing user-systemd files:
 
-1. **Inspected-scope GitHub-ready** — proved only among the bounded items supplied to this run.
-2. **Repository-wide ready-labelled** — `not_calculated` until every matching open issue is separately queried and final labels are verified.
-3. **Runtime-runnable confirmed** — `not_proven` unless normalized trusted machine evidence is supplied.
+```bash
+scripts/install-queue-triage-local-authority.sh \
+  --agent-runner-home /absolute/path/to/agent-runner \
+  --project-registry /absolute/path/to/projects.json \
+  --authority-file /absolute/path/to/queue-triage-authority.json \
+  --controller-db /absolute/path/to/controller.sqlite
+```
 
-A rotating slice is never presented as a repository-wide count.
+Add `--enable` only after supervised acceptance. The installer:
 
-## Output and `RUN_CONTROL`
+- copies the reviewed combined service unit;
+- writes a mode-0600 environment file containing only authority, source-SHA and local-state paths;
+- does not create or edit project configs or the authority JSON;
+- does not write a token or secret;
+- uses the existing polling timer.
 
-JSON and Markdown reports include inspected counts, proposed actions, typed exceptions, count provenance, overflow and a compact `RUN_CONTROL` footer.
+## Rollback
 
-Live shadow output records:
+To return to read-only polling without deleting evidence:
 
-- `controllerDatabaseReadOnly: true`;
-- zero controller releases claimed or finished;
-- whether read-only GitHub reads occurred;
-- `githubWritesPerformed: false`;
-- live-evidence completeness;
-- parity comparison and match state;
-- `mutationAllowed: false`;
-- shadow rows inserted and replayed.
+1. stop the polling timer and service;
+2. remove or disable the machine-local authority file/environment reference;
+3. reinstall the prior read-only polling service unit or run the combined unit without valid authority;
+4. reload user systemd and restart the timer;
+5. preserve the controller and local queue-triage databases for audit.
 
-Durable-consumption output separately records:
+Absence of valid authority is itself a fail-closed read-only rollback state.
 
-- whether exactly one release was claimed and finished;
-- whether the controller database changed only for those release transitions;
-- whether GET-only GitHub reads occurred;
-- `githubWritesPerformed: false`;
-- `actionPlansExecuted: 0`;
-- `mutationAllowed: false`;
-- no systemd or scheduled-task change.
+## Output and oversight
 
-The OpenAI oversight prompt is generated from the same exported core policy constants used by the planner. During parity acceptance, OpenAI remains oversight-only and must fail closed on material disagreement. It must not duplicate Agent Runner mutations.
+Every command emits bounded JSON or Markdown with `RUN_CONTROL` fields separating controller mutations, GitHub reads, GitHub writes, verified mutations, release sweep and actual fallback execution.
 
-## Staged delivery
+The OpenAI oversight prompt is generated from the same core planner constants. After live local-authority acceptance, the OpenAI scheduled task must be oversight-only: review exceptions, material disagreement and aggregate management signals without duplicating deterministic Agent Runner mutations.
 
-1. **Foundation — complete:** validated policy, pure planner, dry-run command, bounded reports, fixtures and deterministic oversight prompt.
-2. **Read-only release shadow — complete:** bounded private controller snapshots and restart-safe separate shadow observations, without release claims or live GitHub reads.
-3. **Read-only live evidence and parity — complete:** bounded explicit-release GitHub reads, normalized reports and durable parity comparison.
-4. **Live shadow acceptance — complete:** reviewed comparisons for ModelSpend and Agent Runner produced complete exact matches while preserving controller and release state.
-5. **Durable consumption — current:** implement explicit-release claim, GET-only planning and bounded terminal finish semantics without action execution.
-6. **Bounded execution:** separately authorise the low-risk mutation allowlist, final live rechecks, atomic writes and read-back verification.
-7. **Local authority:** enable the Dell fallback schedule and change the OpenAI task to oversight-only after proven parity and consumption acceptance.
+## Delivery status
 
-This implementation slice does not run against or consume the preserved live pending releases. Live Dell release-consumption acceptance is a separate manager-authorised operator step. No GitHub mutation, queue action execution, systemd activation or later phase is authorised by this source implementation itself.
+1. Deterministic planner and project policy — complete.
+2. Read-only shadow persistence — complete.
+3. Live evidence and parity — complete.
+4. Two-project live parity acceptance — complete.
+5. Durable single-release consumption — complete and live accepted.
+6. Bounded GitHub execution — complete and live accepted.
+7. Local authority, fair pending orchestration and hourly fallback — implemented; requires exact-head validation, merge and supervised Dell activation.
+8. OpenAI oversight-only transition and final #113 closure — after live activation, restart and rollback acceptance.
+
+Source implementation does not itself authorise Dell installation, project opt-in, service activation or scheduled-task changes. Those remain explicit post-merge operator gates.
