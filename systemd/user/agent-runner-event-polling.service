@@ -8,7 +8,7 @@ After=network-online.target
 Type=oneshot
 EnvironmentFile=%h/.config/agent-runner/event-polling.env
 EnvironmentFile=-%h/.config/agent-runner/queue-triage-authority.env
-ExecStart=/usr/bin/env node ${AGENT_RUNNER_HOME}/scripts/ops/agent-runner-queue-triage-local-authority.mjs --bootstrap-lookback-ms 86400000 --batch-limit 25 --execute
+ExecStart=/usr/bin/env node ${AGENT_RUNNER_HOME}/scripts/ops/agent-runner-queue-triage-local-authority.mjs --bootstrap-lookback-ms 86400000 --batch-limit 25 --all-enabled --execute
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
@@ -18,7 +18,7 @@ RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LockPersonality=true
 RestrictRealtime=true
 UMask=0077
-TimeoutStartSec=5min
+TimeoutStartSec=15min
 
 [Install]
 WantedBy=default.target
