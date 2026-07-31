@@ -25,8 +25,9 @@ ProtectKernelModules=true
 ProtectKernelTunables=true
 ProtectKernelLogs=true
 ProtectClock=true
-CapabilityBoundingSet=
-AmbientCapabilities=
+# User services already run without effective capabilities. Avoid capability-set
+# transitions that unprivileged user managers cannot perform; NoNewPrivileges
+# still prevents this process from gaining capabilities.
 UMask=0077
 TimeoutStartSec=30s
 TimeoutStopSec=15s
