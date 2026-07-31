@@ -1,0 +1,35 @@
+[Unit]
+Description=Agent Runner signed GitHub webhook ingress transport
+Documentation=https://github.com/TheTekTeam/agent-runner/blob/main/docs/ops/AGENT-RUNNER-EVENT-TRANSPORT.md
+Requires=agent-runner-event-ingress.socket
+After=agent-runner-event-ingress.socket
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/agent-runner/event-ingress-transport.env
+ExecStart=/usr/bin/env node ${AGENT_RUNNER_HOME}/scripts/ops/agent-runner-event-transport.mjs --listen-fd 3
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=%h/.config/agent-runner
+ReadWritePaths=%h/.local/state/agent-runner
+RestrictAddressFamilies=AF_INET
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+TimeoutStartSec=30s
+TimeoutStopSec=15s
+
+[Install]
+WantedBy=default.target
