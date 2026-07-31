@@ -89,6 +89,7 @@ UNIT_TARGET="$HOME/.config/systemd/user"
 ENV_DIR="$HOME/.config/agent-runner"
 STATE_DIR="$(dirname "$CONTROLLER_DB")"
 AUTHORITY_ENV="$ENV_DIR/queue-triage-authority.env"
+TRIAGE_STATE_DB="$STATE_DIR/queue-triage-local.sqlite"
 
 mkdir -p "$UNIT_TARGET" "$ENV_DIR" "$STATE_DIR"
 chmod 700 "$ENV_DIR" "$STATE_DIR"
@@ -98,6 +99,7 @@ umask 077
 cat >"$AUTHORITY_ENV" <<EOF_ENV
 AGENT_RUNNER_QUEUE_TRIAGE_AUTHORITY=$AUTHORITY_FILE
 AGENT_RUNNER_QUEUE_TRIAGE_SOURCE_SHA=$SOURCE_SHA
+AGENT_RUNNER_QUEUE_TRIAGE_STATE_DB=$TRIAGE_STATE_DB
 EOF_ENV
 chmod 600 "$AUTHORITY_ENV"
 
@@ -114,6 +116,7 @@ printf 'authority_file=%s\n' "$AUTHORITY_FILE"
 printf 'authority_sha256=%s\n' "$(sha256sum "$AUTHORITY_FILE" | awk '{print $1}')"
 printf 'source_sha=%s\n' "$SOURCE_SHA"
 printf 'controller_db=%s\n' "$CONTROLLER_DB"
+printf 'queue_triage_state_db=%s\n' "$TRIAGE_STATE_DB"
 printf 'timer_enabled=%s\n' "$(systemctl --user is-enabled agent-runner-event-polling.timer 2>/dev/null || true)"
 printf 'timer_active=%s\n' "$(systemctl --user is-active agent-runner-event-polling.timer 2>/dev/null || true)"
 printf 'service_result=%s\n' "$(systemctl --user show agent-runner-event-polling.service --property=Result --value 2>/dev/null || true)"
