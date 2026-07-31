@@ -13,6 +13,14 @@ test('systemd units verify and installer preserves explicit activation and rollb
     assert.equal(verify.status, 0, verify.stderr || verify.stdout);
   }
 
+  const service = readFileSync(servicePath, 'utf8');
+  assert.match(service, /^NoNewPrivileges=true$/m);
+  assert.doesNotMatch(
+    service,
+    /^(?:CapabilityBoundingSet|AmbientCapabilities)=/m,
+    'unprivileged user managers must not be asked to perform capability-set transitions',
+  );
+
   const installer = readFileSync(new URL('../install-event-ingress-transport.sh', import.meta.url), 'utf8');
   assert.match(installer, /ACTION=.*install.*rollback/s);
   assert.match(installer, /--enable/);
