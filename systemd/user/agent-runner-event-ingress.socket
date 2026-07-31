@@ -1,0 +1,12 @@
+[Unit]
+Description=Agent Runner local GitHub webhook ingress socket
+Documentation=https://github.com/TheTekTeam/agent-runner/blob/main/docs/ops/AGENT-RUNNER-EVENT-TRANSPORT.md
+
+[Socket]
+ListenStream=127.0.0.1:8787
+Accept=no
+NoDelay=true
+Service=agent-runner-event-ingress.service
+
+[Install]
+WantedBy=sockets.target
