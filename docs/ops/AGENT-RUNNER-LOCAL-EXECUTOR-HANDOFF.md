@@ -17,6 +17,12 @@ A processed release is eligible only when:
 
 Conflicting identity fails closed before a handoff row is created.
 
+## Activation baseline
+
+The first discovery cycle records the newest already-processed release as its durable cursor and creates no jobs. This prevents deployment from replaying historical queue-triage history. Only processed releases strictly after that baseline can create handoffs.
+
+The cursor advances in `(updated_at, batch_id)` order. Non-eligible processed rows are skipped but still advance the cursor, while malformed or conflicting eligible evidence fails the transaction and leaves the cursor unchanged for inspection.
+
 ## Initial operation
 
 Every eligible release creates one deterministic typed job:
@@ -77,7 +83,7 @@ Optional bounds:
 --execution-limit 1..20
 ```
 
-The command opens no listener and accepts no job body from GitHub. It is suitable for a later supervised serial scheduler.
+The command opens no listener and accepts no job body from GitHub. It refuses root execution and is suitable for a later supervised serial scheduler.
 
 ## Current non-goals
 
