@@ -154,6 +154,13 @@ export class LocalExecutorHandoffStore {
         applied_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS local_executor_handoff_activation (
+        singleton_id INTEGER PRIMARY KEY CHECK (singleton_id = 1),
+        activated_at TEXT NOT NULL,
+        cursor_updated_at TEXT,
+        cursor_batch_id TEXT
+      );
+
       CREATE TABLE IF NOT EXISTS local_executor_release_handoffs (
         batch_id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
@@ -226,17 +233,63 @@ export class LocalExecutorHandoffStore {
     `).get();
     if (!releaseTable) throw new Error('controller triage release table is missing');
 
-    const rows = this.db.prepare(`
-      SELECT releases.batch_id, releases.updated_at,
-             releases.payload_json, releases.result_json
-      FROM event_triage_releases AS releases
-      LEFT JOIN local_executor_release_handoffs AS handoffs
-        ON handoffs.batch_id = releases.batch_id
-      WHERE releases.state = 'processed'
-        AND handoffs.batch_id IS NULL
-      ORDER BY releases.updated_at ASC, releases.batch_id ASC
-      LIMIT ?
-    `).all(boundedLimit);
+    const activation = this.db.prepare(`
+      SELECT activated_at, cursor_updated_at, cursor_batch_id
+      FROM local_executor_handoff_activation WHERE singleton_id = 1
+    `).get();
+
+    if (!activation) {
+      const latest = this.db.prepare(`
+        SELECT updated_at, batch_id
+        FROM event_triage_releases
+        WHERE state = 'processed'
+        ORDER BY updated_at DESC, batch_id DESC
+        LIMIT 1
+      `).get();
+      this.db.prepare(`
+        INSERT INTO local_executor_handoff_activation(
+          singleton_id, activated_at, cursor_updated_at, cursor_batch_id
+        ) VALUES (1, ?, ?, ?)
+      `).run(
+        timestamp,
+        latest?.updated_at ?? null,
+        latest?.batch_id ?? null,
+      );
+      return Object.freeze([]);
+    }
+
+    const rows = activation.cursor_updated_at === null
+      ? this.db.prepare(`
+          SELECT releases.batch_id, releases.updated_at,
+                 releases.payload_json, releases.result_json
+          FROM event_triage_releases AS releases
+          LEFT JOIN local_executor_release_handoffs AS handoffs
+            ON handoffs.batch_id = releases.batch_id
+          WHERE releases.state = 'processed'
+            AND handoffs.batch_id IS NULL
+          ORDER BY releases.updated_at ASC, releases.batch_id ASC
+          LIMIT ?
+        `).all(boundedLimit)
+      : this.db.prepare(`
+          SELECT releases.batch_id, releases.updated_at,
+                 releases.payload_json, releases.result_json
+          FROM event_triage_releases AS releases
+          LEFT JOIN local_executor_release_handoffs AS handoffs
+            ON handoffs.batch_id = releases.batch_id
+          WHERE releases.state = 'processed'
+            AND handoffs.batch_id IS NULL
+            AND (
+              releases.updated_at > ?
+              OR (releases.updated_at = ? AND releases.batch_id > ?)
+            )
+          ORDER BY releases.updated_at ASC, releases.batch_id ASC
+          LIMIT ?
+        `).all(
+          activation.cursor_updated_at,
+          activation.cursor_updated_at,
+          activation.cursor_batch_id,
+          boundedLimit,
+        );
 
     const inserted = [];
     this.db.exec('BEGIN IMMEDIATE');
@@ -259,6 +312,14 @@ export class LocalExecutorHandoffStore {
           timestamp,
         );
         if (Number(result.changes) === 1) inserted.push(this.getHandoff(row.batch_id));
+      }
+      const last = rows.at(-1);
+      if (last) {
+        this.db.prepare(`
+          UPDATE local_executor_handoff_activation
+          SET cursor_updated_at = ?, cursor_batch_id = ?
+          WHERE singleton_id = 1
+        `).run(last.updated_at, last.batch_id);
       }
       this.db.exec('COMMIT');
       return Object.freeze(inserted);
@@ -387,6 +448,7 @@ export function runLocalExecutorHandoffCycle({
   if (typeof controllerDb !== 'string' || !controllerDb) throw new Error('controllerDb is required');
   if (!registry?.projectsById) throw new Error('project registry is required');
   if (!policy?.projectsById) throw new Error('local executor policy is required');
+  if (uid === 0) throw new Error('local executor handoff must not run as root');
   const timestamp = iso(now, 'handoff cycle timestamp');
   const boundedExecutionLimit = boundedInteger(executionLimit, 20, {
     name: 'handoff executionLimit', min: 1, max: 20,
