@@ -18,6 +18,6 @@
     "queue:triage:execute": "node scripts/ops/agent-runner-queue-triage-execute-command.mjs",
     "queue:triage:closed-loop": "node scripts/ops/agent-runner-queue-triage-local-authority.mjs",
     "local:executor:handoff": "node scripts/ops/agent-runner-local-executor-handoff-command.mjs",
-    "validation:run": "node scripts/ops/agent-runner-validation-command.mjs"
+    "validation:profile": "node scripts/ops/agent-runner-validation-profile-command.mjs"
   }
 }
