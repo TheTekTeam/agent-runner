@@ -110,18 +110,39 @@ function withStore(path, callback) {
   }
 }
 
-test('discovers one deterministic read-only handoff from a processed triage release', () => {
+function activate(path, now = T0) {
+  return withStore(
+    path,
+    (store) => store.discoverProcessedReleases(registry, { now }),
+  );
+}
+
+test('activation skips history and then discovers one deterministic read-only handoff', () => {
   const fixture = databaseFixture();
   try {
-    insertRelease(fixture.path, { batchId: 'batch-alpha-0001' });
+    insertRelease(fixture.path, {
+      batchId: 'batch-history-001',
+      updatedAt: '2026-08-01T01:00:00.000Z',
+    });
+
+    assert.equal(activate(fixture.path, T0).length, 0);
+
+    insertRelease(fixture.path, {
+      batchId: 'batch-alpha-0001',
+      updatedAt: T1,
+    });
 
     const first = withStore(
       fixture.path,
-      (store) => store.discoverProcessedReleases(registry, { now: T0 }),
+      (store) => store.discoverProcessedReleases(registry, {
+        now: '2026-08-01T02:31:00.000Z',
+      }),
     );
     const second = withStore(
       fixture.path,
-      (store) => store.discoverProcessedReleases(registry, { now: T1 }),
+      (store) => store.discoverProcessedReleases(registry, {
+        now: '2026-08-01T02:32:00.000Z',
+      }),
     );
 
     assert.equal(first.length, 1);
@@ -135,6 +156,10 @@ test('discovers one deterministic read-only handoff from a processed triage rele
     assert.match(first[0].job.jobId, /^triage-inspect-[0-9a-f]{48}$/);
     assert.match(first[0].job.nonce, /^triage-inspect-nonce-[0-9a-f]{64}$/);
     assert.equal(JSON.stringify(first[0].job).includes('must-not-enter'), false);
+    assert.equal(withStore(
+      fixture.path,
+      (store) => store.getHandoff('batch-history-001'),
+    ), null);
   } finally {
     fixture.close();
   }
@@ -143,6 +168,7 @@ test('discovers one deterministic read-only handoff from a processed triage rele
 test('does not consume pending releases or non-triage processed results', () => {
   const fixture = databaseFixture();
   try {
+    activate(fixture.path);
     insertRelease(fixture.path, {
       batchId: 'batch-pending-001',
       state: 'pending',
@@ -170,6 +196,7 @@ test('does not consume pending releases or non-triage processed results', () => 
 test('a processed release with conflicting project identity fails closed', () => {
   const fixture = databaseFixture();
   try {
+    activate(fixture.path);
     insertRelease(fixture.path, {
       batchId: 'batch-mismatch-001',
       repository: 'Example/Other',
@@ -194,7 +221,11 @@ test('a processed release with conflicting project identity fails closed', () =>
 test('expired handoff with no local job is requeued but an active lease is preserved', () => {
   const fixture = databaseFixture();
   try {
-    insertRelease(fixture.path, { batchId: 'batch-lease-00001' });
+    activate(fixture.path);
+    insertRelease(fixture.path, {
+      batchId: 'batch-lease-00001',
+      updatedAt: T1,
+    });
     withStore(fixture.path, (store) => {
       store.discoverProcessedReleases(registry, { now: T0 });
       const claimed = store.claimHandoff('batch-lease-00001', {
@@ -227,7 +258,11 @@ test('expired handoff with no local job is requeued but an active lease is prese
 test('an expired handoff adopts a durable final local job without re-execution', () => {
   const fixture = databaseFixture();
   try {
-    insertRelease(fixture.path, { batchId: 'batch-final-00001' });
+    activate(fixture.path);
+    insertRelease(fixture.path, {
+      batchId: 'batch-final-00001',
+      updatedAt: T1,
+    });
     withStore(fixture.path, (store) => {
       const [handoff] = store.discoverProcessedReleases(registry, { now: T0 });
       store.claimHandoff(handoff.batchId, {
@@ -269,7 +304,11 @@ test('an expired handoff adopts a durable final local job without re-execution',
 test('cycle recovers first, executes only project.inspect and persists a compact success', () => {
   const fixture = databaseFixture();
   try {
-    insertRelease(fixture.path, { batchId: 'batch-cycle-00001' });
+    activate(fixture.path);
+    insertRelease(fixture.path, {
+      batchId: 'batch-cycle-00001',
+      updatedAt: T1,
+    });
     const order = [];
     const localStore = {
       getJob() {
@@ -289,7 +328,7 @@ test('cycle recovers first, executes only project.inspect and persists a compact
       controllerDb: fixture.path,
       registry,
       policy,
-      now: T0,
+      now: '2026-08-01T02:31:00.000Z',
       uid: 1000,
       localStoreFactory() {
         return localStore;
@@ -340,7 +379,11 @@ test('cycle recovers first, executes only project.inspect and persists a compact
 test('a refusal before a final local job fails only the handoff with a bounded code', () => {
   const fixture = databaseFixture();
   try {
-    insertRelease(fixture.path, { batchId: 'batch-refused-0001' });
+    activate(fixture.path);
+    insertRelease(fixture.path, {
+      batchId: 'batch-refused-0001',
+      updatedAt: T1,
+    });
     const localStore = {
       getJob() {
         return null;
@@ -357,7 +400,7 @@ test('a refusal before a final local job fails only the handoff with a bounded c
       controllerDb: fixture.path,
       registry,
       policy,
-      now: T0,
+      now: '2026-08-01T02:31:00.000Z',
       uid: 1000,
       localStoreFactory() {
         return localStore;
