@@ -7,6 +7,7 @@ import {
   executeLocalExecutorJob,
   LocalExecutorStore,
 } from './agent-runner-local-executor.mjs';
+import { classifyInterruptedLocalExecutorJobs } from './agent-runner-local-executor-recovery.mjs';
 import {
   loadLocalExecutorPolicy,
   resolveLocalExecutorPolicyPath,
@@ -76,6 +77,7 @@ export function runLocalExecutorCommand({
   const policy = loadLocalExecutorPolicy({ policyPath: options.policyPath });
   const store = new LocalExecutorStore(options.dbPath);
   try {
+    classifyInterruptedLocalExecutorJobs(store, { now });
     return executeLocalExecutorJob({ input, registry, policy, store, env, now });
   } finally {
     store.close();
