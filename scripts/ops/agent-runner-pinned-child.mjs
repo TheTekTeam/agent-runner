@@ -254,8 +254,15 @@ export const PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS = Object.freeze([
   'pinned-child-preflight-not-found',
   'pinned-child-runner-start-not-found',
 ]);
-export const PINNED_COMMENT_READ_ATTEMPTS = 3;
-export const PINNED_COMMENT_READ_RETRY_DELAYS_MS = Object.freeze([250, 750]);
+// Issue #139 (PINNED.CONSISTENCY.2): issue #136 packet .3 published preflight comment
+// 5160751964 and runner-start comment 5160771496 as the exact pinned identities, and the
+// child still exhausted the previous 1000ms/three-read window on transient absence alone.
+// The schedule stays a fixed, literal ladder: no configuration, no environment override
+// and no adaptive widening can extend it beyond this compiled-in bound.
+export const PINNED_COMMENT_READ_RETRY_DELAYS_MS = Object.freeze([250, 750, 1500, 2500, 3000]);
+export const PINNED_COMMENT_READ_ATTEMPTS = PINNED_COMMENT_READ_RETRY_DELAYS_MS.length + 1;
+export const PINNED_COMMENT_READ_WINDOW_MS = PINNED_COMMENT_READ_RETRY_DELAYS_MS
+  .reduce((total, ms) => total + ms, 0);
 
 function transientCommentAbsence(reason) {
   return PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS.includes(reason);

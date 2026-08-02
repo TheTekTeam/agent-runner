@@ -9,6 +9,8 @@ import {
 import {
   PINNED_COMMENT_READ_ATTEMPTS,
   PINNED_COMMENT_READ_RETRY_DELAYS_MS,
+  PINNED_COMMENT_READ_WINDOW_MS,
+  PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS,
   createPinnedFetch,
   main as pinnedChildMain,
   pinManagerAuthorityComments,
@@ -532,6 +534,26 @@ async function pinnedFetchFailure(pinnedFetch, url = childCommentsUrl()) {
   return null;
 }
 
+// Issue #139 (PINNED.CONSISTENCY.2): issue #136 packet .3 pinned preflight comment
+// 5160751964 and runner-start comment 5160771496 exactly, and the child still exhausted
+// the previous 250ms/750ms window. The calibrated ladder stays deterministic and bounded.
+test('pinned comment reads follow an exact bounded retry ladder', () => {
+  assert.deepEqual([...PINNED_COMMENT_READ_RETRY_DELAYS_MS], [250, 750, 1500, 2500, 3000]);
+  assert.equal(PINNED_COMMENT_READ_ATTEMPTS, 6);
+  assert.equal(PINNED_COMMENT_READ_ATTEMPTS, PINNED_COMMENT_READ_RETRY_DELAYS_MS.length + 1);
+  assert.equal(PINNED_COMMENT_READ_WINDOW_MS, 8000);
+  assert.ok(PINNED_COMMENT_READ_WINDOW_MS >= 6000 && PINNED_COMMENT_READ_WINDOW_MS <= 10000);
+  assert.equal(Object.isFrozen(PINNED_COMMENT_READ_RETRY_DELAYS_MS), true);
+});
+
+test('retry eligibility stays restricted to the two transient absence reasons', () => {
+  assert.deepEqual([...PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS], [
+    'pinned-child-preflight-not-found',
+    'pinned-child-runner-start-not-found',
+  ]);
+  assert.equal(Object.isFrozen(PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS), true);
+});
+
 test('transiently absent pinned preflight is re-read and then authorized', async () => {
   const { pinnedFetch, calls, delays } = pinnedFetchReads([REPLICATED_LATE, CLAIMED_COMMENTS]);
   const comments = await (await pinnedFetch(childCommentsUrl())).json();
@@ -551,6 +573,16 @@ test('transiently absent runner-start marker is re-read within the bounded windo
   const comments = await (await pinnedFetch(childCommentsUrl())).json();
   assert.equal(comments.some((comment) => comment.id === PREFLIGHT_COMMENT_ID), true);
   assert.equal(comments.some((comment) => comment.id === RUNNER_STARTED_COMMENT_ID), false);
+  assert.equal(calls.length, 3);
+  assert.deepEqual(delays, PINNED_COMMENT_READ_RETRY_DELAYS_MS.slice(0, 2));
+});
+
+test('pinned comments appearing only on the final allowed read are authorized', async () => {
+  const late = Array.from({ length: PINNED_COMMENT_READ_ATTEMPTS - 1 }, () => REPLICATED_LATE);
+  const { pinnedFetch, calls, delays } = pinnedFetchReads([...late, CLAIMED_COMMENTS]);
+  const comments = await (await pinnedFetch(childCommentsUrl())).json();
+  assert.equal(comments.some((comment) => comment.id === PREFLIGHT_COMMENT_ID), true);
+  assert.equal(comments.some((comment) => comment.id === RUNNER_STARTED_COMMENT_ID), false);
   assert.equal(calls.length, PINNED_COMMENT_READ_ATTEMPTS);
   assert.deepEqual(delays, [...PINNED_COMMENT_READ_RETRY_DELAYS_MS]);
 });
@@ -565,12 +597,46 @@ test('retry reads request cache revalidation without dropping caller headers', a
   assert.equal(calls[1].init.cache, 'no-store');
 });
 
+test('every retry read in the widened window requests cache revalidation', async () => {
+  const { pinnedFetch, calls } = pinnedFetchReads([REPLICATED_LATE]);
+  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
+  assert.equal(calls.length, PINNED_COMMENT_READ_ATTEMPTS);
+  for (const { init } of calls.slice(1)) {
+    assert.equal(init.headers.get('cache-control'), 'no-cache');
+    assert.equal(init.headers.get('pragma'), 'no-cache');
+    assert.equal(init.cache, 'no-store');
+  }
+});
+
 test('exhausted transient absence fails closed with the original pinned reason', async () => {
   const { pinnedFetch, calls, delays } = pinnedFetchReads([REPLICATED_LATE]);
   assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
   assert.equal(calls.length, PINNED_COMMENT_READ_ATTEMPTS);
   assert.deepEqual(delays, [...PINNED_COMMENT_READ_RETRY_DELAYS_MS]);
 });
+
+test('exhaustion reports the first reason even when later reads report the other absence', async () => {
+  const partial = [OLD_CONTINUE, FRESH_PREFLIGHT, PARTIALLY_REPLICATED_RUNNER_STARTED];
+  const { pinnedFetch, calls, delays } = pinnedFetchReads([REPLICATED_LATE, partial]);
+  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
+  assert.equal(calls.length, PINNED_COMMENT_READ_ATTEMPTS);
+  assert.deepEqual(delays, [...PINNED_COMMENT_READ_RETRY_DELAYS_MS]);
+});
+
+const harderLaterFailureCases = [
+  ['changed packet content', [OLD_CONTINUE, { ...FRESH_PREFLIGHT, body: `${FRESH_PREFLIGHT.body}\nExpanded scope after claim.` }, RUNNER_STARTED]],
+  ['duplicate runner-start markers', [OLD_CONTINUE, FRESH_PREFLIGHT, RUNNER_STARTED, runnerStartedComment({ id: RUNNER_STARTED_COMMENT_ID + 1 })]],
+  ['runner-start identity mismatch', [OLD_CONTINUE, FRESH_PREFLIGHT, runnerStartedComment({ id: RUNNER_STARTED_COMMENT_ID + 7 })]],
+];
+
+for (const [name, comments] of harderLaterFailureCases) {
+  test(`a later ${name} read fails closed without extending the retry window`, async () => {
+    const { pinnedFetch, calls, delays } = pinnedFetchReads([REPLICATED_LATE, comments, CLAIMED_COMMENTS]);
+    assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
+    assert.equal(calls.length, 2);
+    assert.deepEqual(delays, PINNED_COMMENT_READ_RETRY_DELAYS_MS.slice(0, 1));
+  });
+}
 
 const singlePassFailureCases = [
   ['runner-start identity mismatch', {
