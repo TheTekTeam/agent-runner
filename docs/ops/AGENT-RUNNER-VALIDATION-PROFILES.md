@@ -79,7 +79,7 @@ A final run is bound to:
 
 The local-executor job result is atomically replaced with a compact validation reference. Absolute paths, raw stdout/stderr, environment values, remotes and credentials are not retained in validation evidence.
 
-A repeated request reuses the same durable evidence. If the process completed the executor job but stopped before recording evidence, the next identical request adopts that final job and reconstructs the bounded evidence without running commands again.
+A repeated request reuses the same durable evidence. If the executor completed a raw job before durable evidence was recorded, the next identical request may adopt that final job without running commands again. Once a compact validation-evidence reference has been written to the job, a missing durable evidence row is treated as store inconsistency and fails closed.
 
 ## Freshness and post-merge comparison
 

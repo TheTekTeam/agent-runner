@@ -332,7 +332,7 @@ test('artifact bounds convert an otherwise successful command into failed eviden
   }
 });
 
-test('replay is idempotent and recovers a missing evidence row without re-execution', () => {
+test('replay is idempotent and fails closed when referenced durable evidence is missing', () => {
   const value = fixture();
   try {
     const input = {
@@ -352,10 +352,15 @@ test('replay is idempotent and recovers a missing evidence row without re-execut
 
     value.store.db.prepare('DELETE FROM validation_runs WHERE validation_id = ?')
       .run(first.evidence.validationId);
-    const recovered = runValidationProfile(input);
-    assert.equal(recovered.replay, true);
-    assert.equal(recovered.recovered, true);
-    assert.equal(recovered.evidence.state, 'succeeded');
+
+    assert.throws(
+      () => runValidationProfile(input),
+      (error) => (
+        error?.code === 'validation-evidence-store-inconsistent'
+        && error?.message
+          === 'validation job references missing durable evidence'
+      ),
+    );
   } finally {
     value.close();
   }

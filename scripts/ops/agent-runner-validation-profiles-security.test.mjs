@@ -293,9 +293,12 @@ test('an interrupted evidence write is adopted only when target state is unchang
     });
     assert.equal(raw.job.state, 'succeeded');
     assert.equal(
-      value.store.db.prepare(
-        'SELECT COUNT(*) AS count FROM validation_runs',
-      ).get().count,
+      value.store.db.prepare(`
+        SELECT COUNT(*) AS count
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = 'validation_runs'
+      `).get().count,
       0,
     );
     const recovered = runValidationProfile({
