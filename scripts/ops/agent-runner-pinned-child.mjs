@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 
 import { resolveDispatchAuthority } from './agent-runner-dispatch-authority.mjs';
@@ -244,18 +245,71 @@ function commentsRequestForIssue(input, issueNumber) {
   return new RegExp(`/issues/${issueNumber}/comments(?:\\?|$)`).test(raw);
 }
 
-export function createPinnedFetch({ authority, originalFetch = globalThis.fetch, onPinned = null } = {}) {
+// A comment read issued immediately after claim publication can still observe a GitHub
+// replica that has not yet materialised the manager preflight comment or this attempt's
+// own runner-start marker. Only that transient absence is re-read; every other fail-closed
+// reason (identity, digest, fingerprint, duplicate marker, stale authority, dispatch
+// projection, malformed or non-successful responses) stays single-pass.
+export const PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS = Object.freeze([
+  'pinned-child-preflight-not-found',
+  'pinned-child-runner-start-not-found',
+]);
+export const PINNED_COMMENT_READ_ATTEMPTS = 3;
+export const PINNED_COMMENT_READ_RETRY_DELAYS_MS = Object.freeze([250, 750]);
+
+function transientCommentAbsence(reason) {
+  return PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS.includes(reason);
+}
+
+function revalidatedCommentRead(input, init) {
+  const inheritedHeaders = init?.headers
+    ?? (typeof Request === 'function' && input instanceof Request ? input.headers : undefined);
+  const headers = new Headers(inheritedHeaders);
+  headers.set('cache-control', 'no-cache');
+  headers.set('pragma', 'no-cache');
+  return { ...(init || {}), headers, cache: 'no-store' };
+}
+
+export function createPinnedFetch({
+  authority,
+  originalFetch = globalThis.fetch,
+  onPinned = null,
+  sleep = delay,
+} = {}) {
   if (typeof originalFetch !== 'function') throw new Error('pinned-child-fetch-unavailable');
   return async (input, init) => {
     const response = await originalFetch(input, init);
     if (!commentsRequestForIssue(input, authority.issueNumber)) return response;
-    const comments = await response.clone().json();
-    const pinned = pinManagerAuthorityComments(comments, authority);
-    if (!pinned.allowed) throw new Error(pinned.reason);
+    let read = response;
+    let pinned = pinManagerAuthorityComments(await read.clone().json(), authority);
+    const originalReason = pinned.allowed ? null : pinned.reason;
+
+    for (let attempt = 1;
+      !pinned.allowed
+      && read.ok
+      && transientCommentAbsence(pinned.reason)
+      && attempt < PINNED_COMMENT_READ_ATTEMPTS;
+      attempt += 1) {
+      await sleep(PINNED_COMMENT_READ_RETRY_DELAYS_MS[attempt - 1]);
+      const revalidated = await originalFetch(input, revalidatedCommentRead(input, init));
+      if (!revalidated.ok) break;
+      let revalidatedComments;
+      try {
+        revalidatedComments = await revalidated.clone().json();
+      } catch {
+        break; // A malformed re-read is never retried and never replaces the pinned response.
+      }
+      read = revalidated;
+      pinned = pinManagerAuthorityComments(revalidatedComments, authority);
+    }
+
+    // Retry exhaustion never invents a new verdict: the first fail-closed reason is what
+    // the child reports, and any harder failure seen on a re-read still fails closed.
+    if (!pinned.allowed) throw new Error(originalReason);
     onPinned?.(pinned);
-    const headers = new Headers(response.headers);
+    const headers = new Headers(read.headers);
     headers.delete('content-length');
-    return new Response(JSON.stringify(pinned.comments), { status: response.status, statusText: response.statusText, headers });
+    return new Response(JSON.stringify(pinned.comments), { status: read.status, statusText: read.statusText, headers });
   };
 }
 
