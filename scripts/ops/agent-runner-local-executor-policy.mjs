@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { isAbsolute, posix, resolve } from 'node:path';
 
 const POLICY_ENV = 'AGENT_RUNNER_LOCAL_EXECUTOR_POLICY';
 const OPERATION_NAMES = Object.freeze([
@@ -14,6 +14,9 @@ const OPERATION_NAMES = Object.freeze([
 const ENV_NAME_PATTERN = /^[A-Z][A-Z0-9_]{0,63}$/;
 const PROFILE_NAME_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
 const PROJECT_ID_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
+const RISK_CLASSES = Object.freeze(['R0', 'R1', 'R2', 'R3', 'R4']);
+const MAX_ARTIFACT_COUNT = 32;
+const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -26,6 +29,20 @@ function nonEmptyString(value) {
 function positiveInteger(value, fallback, { min = 1, max = 24 * 60 * 60 } = {}) {
   if (value == null) return fallback;
   return Number.isInteger(value) && value >= min && value <= max ? value : null;
+}
+
+function normalizeRelativePath(value, name, { allowDot = true } = {}) {
+  if (!nonEmptyString(value) || isAbsolute(value) || value.includes('\\')) {
+    throw new Error(`Invalid local executor policy: ${name} must be a relative POSIX path`);
+  }
+  const normalized = posix.normalize(value);
+  if ((!allowDot && normalized === '.') || normalized === '..' || normalized.startsWith('../')) {
+    throw new Error(`Invalid local executor policy: ${name} escapes the validation target`);
+  }
+  if (normalized.length > 512) {
+    throw new Error(`Invalid local executor policy: ${name} exceeds bounds`);
+  }
+  return normalized;
 }
 
 function normalizeCommand(command, profileName, index) {
@@ -46,11 +63,42 @@ function normalizeCommand(command, profileName, index) {
   if (!Array.isArray(environment) || environment.some((name) => !ENV_NAME_PATTERN.test(name))) {
     throw new Error(`Invalid local executor policy: validationProfiles.${profileName}.commands[${index}].environment is invalid`);
   }
+  if (environment.length > 64) {
+    throw new Error(`Invalid local executor policy: validationProfiles.${profileName}.commands[${index}].environment exceeds bounds`);
+  }
   return Object.freeze({
     argv: Object.freeze([...command.argv]),
     timeoutSeconds,
     environment: Object.freeze([...new Set(environment)]),
+    workingDirectory: normalizeRelativePath(
+      command.workingDirectory ?? '.',
+      `validationProfiles.${profileName}.commands[${index}].workingDirectory`,
+    ),
   });
+}
+
+function normalizeArtifacts(value, profileName) {
+  const artifacts = value ?? [];
+  if (!Array.isArray(artifacts) || artifacts.length > MAX_ARTIFACT_COUNT) {
+    throw new Error(`Invalid local executor policy: validationProfiles.${profileName}.artifacts exceeds bounds`);
+  }
+  const normalized = artifacts.map((artifact, index) => normalizeRelativePath(
+    artifact,
+    `validationProfiles.${profileName}.artifacts[${index}]`,
+    { allowDot: false },
+  ));
+  if (new Set(normalized).size !== normalized.length) {
+    throw new Error(`Invalid local executor policy: validationProfiles.${profileName}.artifacts contains duplicates`);
+  }
+  return Object.freeze(normalized);
+}
+
+function normalizeRiskClasses(value, profileName) {
+  const riskClasses = value ?? [];
+  if (!Array.isArray(riskClasses) || riskClasses.some((riskClass) => !RISK_CLASSES.includes(riskClass))) {
+    throw new Error(`Invalid local executor policy: validationProfiles.${profileName}.riskClasses is invalid`);
+  }
+  return Object.freeze([...new Set(riskClasses)]);
 }
 
 function normalizeValidationProfiles(value, projectId) {
@@ -68,13 +116,41 @@ function normalizeValidationProfiles(value, projectId) {
     if (profile.commands.length > 64) {
       throw new Error(`Invalid local executor policy: validationProfiles.${name}.commands exceeds bounds`);
     }
+    const evidenceTtlSeconds = positiveInteger(profile.evidenceTtlSeconds, 6 * 60 * 60, {
+      min: 60,
+      max: 7 * 24 * 60 * 60,
+    });
+    if (evidenceTtlSeconds == null) {
+      throw new Error(`Invalid local executor policy: validationProfiles.${name}.evidenceTtlSeconds is invalid`);
+    }
     profiles[name] = Object.freeze({
       commands: Object.freeze(profile.commands.map((command, index) => normalizeCommand(command, name, index))),
       requireCleanBefore: profile.requireCleanBefore !== false,
       requireCleanAfter: profile.requireCleanAfter !== false,
+      artifacts: normalizeArtifacts(profile.artifacts, name),
+      evidenceTtlSeconds,
+      riskClasses: normalizeRiskClasses(profile.riskClasses, name),
     });
   }
   return Object.freeze(profiles);
+}
+
+function normalizeRequiredValidationProfiles(value, profiles, projectId) {
+  const mapping = value ?? {};
+  if (!isPlainObject(mapping)) {
+    throw new Error(`Invalid local executor policy: project ${projectId} requiredValidationProfiles must be an object`);
+  }
+  const normalized = {};
+  for (const [riskClass, names] of Object.entries(mapping)) {
+    if (!RISK_CLASSES.includes(riskClass) || !Array.isArray(names) || names.length === 0) {
+      throw new Error(`Invalid local executor policy: project ${projectId} requiredValidationProfiles.${riskClass} is invalid`);
+    }
+    if (names.some((name) => !PROFILE_NAME_PATTERN.test(name) || !profiles[name])) {
+      throw new Error(`Invalid local executor policy: project ${projectId} requiredValidationProfiles.${riskClass} references an unknown profile`);
+    }
+    normalized[riskClass] = Object.freeze([...new Set(names)]);
+  }
+  return Object.freeze(normalized);
 }
 
 function normalizeProject(input, index) {
@@ -104,13 +180,35 @@ function normalizeProject(input, index) {
   if (maxOutputBytes == null) {
     throw new Error(`Invalid local executor policy: project ${input.projectId} maxOutputBytes is invalid`);
   }
+  const maxValidationArtifactCount = positiveInteger(input.maxValidationArtifactCount, 16, {
+    min: 1,
+    max: MAX_ARTIFACT_COUNT,
+  });
+  if (maxValidationArtifactCount == null) {
+    throw new Error(`Invalid local executor policy: project ${input.projectId} maxValidationArtifactCount is invalid`);
+  }
+  const maxValidationArtifactBytes = positiveInteger(input.maxValidationArtifactBytes, 5 * 1024 * 1024, {
+    min: 1,
+    max: MAX_ARTIFACT_BYTES,
+  });
+  if (maxValidationArtifactBytes == null) {
+    throw new Error(`Invalid local executor policy: project ${input.projectId} maxValidationArtifactBytes is invalid`);
+  }
+  const validationProfiles = normalizeValidationProfiles(input.validationProfiles, input.projectId);
   return Object.freeze({
     projectId: input.projectId,
     defaultBranch: input.defaultBranch,
     worktreeRoot: resolve(input.worktreeRoot),
     allowedOperations: Object.freeze([...new Set(allowedOperations)]),
-    validationProfiles: normalizeValidationProfiles(input.validationProfiles, input.projectId),
+    validationProfiles,
+    requiredValidationProfiles: normalizeRequiredValidationProfiles(
+      input.requiredValidationProfiles,
+      validationProfiles,
+      input.projectId,
+    ),
     maxOutputBytes,
+    maxValidationArtifactCount,
+    maxValidationArtifactBytes,
   });
 }
 
@@ -191,4 +289,7 @@ export function localExecutorProjectPolicy(policy, projectId) {
   return policy?.projectsById?.[projectId] ?? null;
 }
 
-export { OPERATION_NAMES as LOCAL_EXECUTOR_OPERATION_NAMES };
+export {
+  OPERATION_NAMES as LOCAL_EXECUTOR_OPERATION_NAMES,
+  RISK_CLASSES as LOCAL_EXECUTOR_RISK_CLASSES,
+};
