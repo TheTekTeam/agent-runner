@@ -231,6 +231,21 @@ export async function runChildWithPinnedAuthority(input, {
     ...(input.options || {}),
     env: {
       ...(input.options?.env || {}),
+      // Issue #143 (PINNED.CONSISTENCY.4): the scheduler resolves its repository from
+      // `GITHUB_REPOSITORY || config.githubRepo || DEFAULT_REPO`, but claude-runner's
+      // parseArgs resolves the child's GitHub request repository from
+      // `GITHUB_REPOSITORY || DEFAULT_REPO` alone -- it never consults the project
+      // config, and runnerArgs never passes --repo. In the documented standalone
+      // deployment `GITHUB_REPOSITORY` is unset (bin/run-project.sh exports only
+      // AGENT_RUNNER_CONFIG/CLAUDE_RUNNER_ENV_FILE), so the scheduler pinned
+      // config.githubRepo while the child read DEFAULT_REPO's issue comments instead.
+      // The pinned comments can never appear in that list, exactCommentUrl can never
+      // derive a direct URL for a foreign repository path, and the attempt fails closed
+      // on pinned-child-preflight-not-found no matter how the exact reads behave --
+      // which is why #137, #139 and #141 changed nothing in production. The already
+      // validated pinned issue repository is projected here so every GitHub request the
+      // child makes is bound to the repository this attempt was pinned against.
+      GITHUB_REPOSITORY: authority.issueRepository,
       AGENT_RUNNER_PINNED_CHILD_ENTRYPOINT: originalEntrypoint,
       AGENT_RUNNER_PINNED_ISSUE: String(authority.issueNumber || ''),
       AGENT_RUNNER_PINNED_ISSUE_REPOSITORY: authority.issueRepository,

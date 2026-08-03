@@ -26,6 +26,42 @@ const COMMIT_PATTERN = /^[0-9a-f]{40}$/i;
 const FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const ATTEMPT_PATTERN = /^([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)#([1-9][0-9]*):(.+)$/;
 
+/**
+ * Every reason this module is allowed to publish. Nothing else may ever reach the
+ * structured failure payload: a raw exception message from the child (GitHub transport
+ * errors in particular embed a response body slice), a provider diagnostic or any other
+ * free text is replaced by `pinned-child-authority-failed` rather than emitted.
+ */
+export const PINNED_PUBLIC_FAILURE_REASONS = Object.freeze([
+  'pinned-child-issue-invalid',
+  'pinned-child-issue-repository-invalid',
+  'pinned-child-selection-mode-invalid',
+  'pinned-child-claim-mode-invalid',
+  'pinned-child-preflight-invalid',
+  'pinned-child-runner-start-invalid',
+  'pinned-child-immutable-manager-packet-invalid',
+  'pinned-child-manager-authority-key-mismatch',
+  'pinned-child-dispatch-authority-invalid',
+  'pinned-child-attempt-id-mismatch',
+  'pinned-child-invocation-mismatch',
+  'pinned-child-comments-invalid',
+  'pinned-child-preflight-not-found',
+  'pinned-child-preflight-not-current',
+  'pinned-child-preflight-comment-changed',
+  'pinned-child-dispatch-authority-mismatch',
+  'pinned-child-runner-start-not-found',
+  'pinned-child-runner-start-duplicate',
+  'pinned-child-runner-start-mismatch',
+  'pinned-child-inherited-authority-not-current',
+  'pinned-child-fetch-unavailable',
+  'pinned-child-authority-failed',
+]);
+
+function boundedFailureReason(error) {
+  const reason = typeof error?.message === 'string' ? error.message : '';
+  return PINNED_PUBLIC_FAILURE_REASONS.includes(reason) ? reason : 'pinned-child-authority-failed';
+}
+
 function commentWithCommandAuthorityRemoved(comment) {
   const body = String(comment?.body || '').replace(
     COMMAND_HEADING,
@@ -261,6 +297,85 @@ export const PINNED_EXACT_COMMENT_READ_WINDOW_MS = PINNED_EXACT_COMMENT_NOT_FOUN
   .reduce((total, ms) => total + ms, 0);
 
 /**
+ * Issue #143 (PINNED.CONSISTENCY.4): the public refusal stays exactly
+ * `pinned-child-preflight-not-found`, which is correct but covers eleven distinct
+ * boundaries. Issues #137, #139 and #141 each shipped a plausible repair for one of them
+ * without production ever proving which boundary it actually reached. These literals are
+ * the whole diagnostic vocabulary, and a diagnostic is assembled only from them plus a
+ * comment role, a bounded HTTP status and immutable database identities. No response
+ * body, header, credential, URL, prompt, provider output or exception text can reach it,
+ * because none of those values is ever read into the payload.
+ */
+export const PINNED_DIAGNOSTIC_REASONS = Object.freeze([
+  'exact-url-invalid',
+  'direct-preflight-404',
+  'direct-preflight-non-success',
+  'direct-preflight-malformed',
+  'direct-preflight-identity-mismatch',
+  'direct-runner-start-404',
+  'direct-runner-start-non-success',
+  'direct-runner-start-malformed',
+  'direct-runner-start-identity-mismatch',
+  'exact-comment-merge-conflict',
+  'post-merge-authority-rejected',
+]);
+
+export const PINNED_COMMENT_ROLES = Object.freeze(['manager-preflight', 'runner-start']);
+
+// The exact-read outcomes, per comment role. A transport exception carries no status and
+// is classified as a non-successful direct read; the exception itself is discarded unread.
+const DIRECT_READ_REASONS = Object.freeze({
+  'manager-preflight': Object.freeze({
+    'not-found': 'direct-preflight-404',
+    'non-success': 'direct-preflight-non-success',
+    malformed: 'direct-preflight-malformed',
+    'identity-mismatch': 'direct-preflight-identity-mismatch',
+  }),
+  'runner-start': Object.freeze({
+    'not-found': 'direct-runner-start-404',
+    'non-success': 'direct-runner-start-non-success',
+    malformed: 'direct-runner-start-malformed',
+    'identity-mismatch': 'direct-runner-start-identity-mismatch',
+  }),
+});
+
+function boundedHttpStatus(status) {
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : null;
+}
+
+function boundedDatabaseId(value) {
+  return Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+/**
+ * The only constructor of a diagnostic payload, and the only place its shape is decided.
+ * An unrecognised reason yields no diagnostic at all, and every retained field is bounded
+ * by value shape rather than trusted from its caller.
+ */
+function pinnedDiagnostic({ reason, commentRole = null, httpStatus = null, commentDatabaseId = null, attemptId = null } = {}) {
+  if (!PINNED_DIAGNOSTIC_REASONS.includes(reason)) return null;
+  return Object.freeze({
+    reason,
+    commentRole: PINNED_COMMENT_ROLES.includes(commentRole) ? commentRole : null,
+    httpStatus: boundedHttpStatus(httpStatus),
+    commentDatabaseId: boundedDatabaseId(commentDatabaseId),
+    attemptId: typeof attemptId === 'string' && ATTEMPT_PATTERN.test(attemptId) ? attemptId : null,
+  });
+}
+
+// Re-runs the bounded constructor over anything claiming to be a diagnostic, so a payload
+// that reached this module from elsewhere can never widen what is emitted.
+function sanitizedDiagnostic(value) {
+  return value && typeof value === 'object' ? pinnedDiagnostic(value) : null;
+}
+
+function pinnedFailure(reason, diagnostic) {
+  const error = new Error(reason);
+  error.pinnedDiagnostic = diagnostic || null;
+  return error;
+}
+
+/**
  * Issue #141 (PINNED.CONSISTENCY.3): issue #136 packet .4 pinned preflight comment
  * 5160875310 and runner-start comment 5160880611, and the child exhausted the whole
  * eight-second issue-comments-list ladder because the replica it kept re-reading never
@@ -325,8 +440,9 @@ function exactCommentUrl(input, authority, databaseId) {
 /**
  * Reads exactly one comment by immutable database id. Success of the endpoint alone
  * proves nothing: the payload must be a single JSON object whose own proven database
- * identity is the identity that was requested. Every other outcome returns null so the
- * pinned attempt fails closed on its original reason.
+ * identity is the identity that was requested. Every other outcome returns a bounded
+ * `failure` classification so the pinned attempt still fails closed on its original
+ * reason, now with the stage that produced it recorded.
  */
 async function readExactComment({ originalFetch, input, init, url, identity, sleep }) {
   for (let attempt = 0; ; attempt += 1) {
@@ -334,33 +450,40 @@ async function readExactComment({ originalFetch, input, init, url, identity, sle
     try {
       response = await originalFetch(url, revalidatedCommentRead(input, init));
     } catch {
-      return null; // A transport failure is never retried and never authorizes.
+      // A transport failure is never retried and never authorizes.
+      return { failure: 'non-success', httpStatus: null };
     }
-    if (response?.status === 404 && attempt < PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS.length) {
-      await sleep(PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS[attempt]);
-      continue;
+    const httpStatus = boundedHttpStatus(response?.status);
+    if (response?.status === 404) {
+      if (attempt < PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS.length) {
+        await sleep(PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS[attempt]);
+        continue;
+      }
+      return { failure: 'not-found', httpStatus };
     }
-    if (!response?.ok) return null;
+    if (!response?.ok) return { failure: 'non-success', httpStatus };
     let payload;
     try {
       payload = await response.json();
     } catch {
-      return null;
+      return { failure: 'malformed', httpStatus };
     }
-    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      return { failure: 'malformed', httpStatus };
+    }
     let payloadIdentity = null;
     try {
       payloadIdentity = normalizeCommentIdentity(payload, { context: 'pinned-child-exact-comment' });
     } catch {
-      return null;
+      return { failure: 'identity-mismatch', httpStatus };
     }
     if (!payloadIdentity
       || payloadIdentity.databaseId === null
       || payloadIdentity.databaseId !== identity.databaseId
       || !sameCommentIdentity(payloadIdentity, identity)) {
-      return null;
+      return { failure: 'identity-mismatch', httpStatus };
     }
-    return payload;
+    return { comment: payload, httpStatus };
   }
 }
 
@@ -379,51 +502,73 @@ function commentContentSignature(comment) {
  * Combines the original list payload with the directly read exact comments purely so the
  * existing validator sees them. A list row is never replaced: an exact row with the same
  * database identity may only collapse into the row already present, and only when their
- * content is equivalent. Conflicting content returns null and fails the attempt closed.
+ * content is equivalent. Conflicting content reports the conflicting exact row and fails
+ * the attempt closed.
  */
 function mergedExactComments(listComments, exactComments) {
   const merged = [...listComments];
   for (const exact of exactComments) {
-    const index = merged.findIndex((comment) => sameCommentIdentity(comment, exact));
+    const index = merged.findIndex((comment) => sameCommentIdentity(comment, exact.comment));
     if (index === -1) {
-      merged.push(exact);
+      merged.push(exact.comment);
       continue;
     }
-    if (commentContentSignature(merged[index]) !== commentContentSignature(exact)) return null;
+    if (commentContentSignature(merged[index]) !== commentContentSignature(exact.comment)) {
+      return { conflict: exact };
+    }
   }
-  return merged;
+  return { merged };
 }
 
 /**
  * Unclaimed mode reads only the exact manager-preflight comment; claimed mode also reads
  * this attempt's own exact runner-start comment. Both must succeed, and the merged
- * payload still has to satisfy every existing pinned validation unchanged.
+ * payload still has to satisfy every existing pinned validation unchanged. A refusal
+ * returns the bounded diagnostic for the stage that produced it and nothing else.
  */
 async function authorizeFromExactComments({ authority, listComments, input, init, originalFetch, sleep }) {
-  const identities = [authority.preflightIdentity];
-  if (authority.claimMode === 'claimed') identities.push(authority.runnerStartedIdentity);
+  const diagnose = (fields) => ({ diagnostic: pinnedDiagnostic({ ...fields, attemptId: authority.attemptId }) });
+  const required = [{ role: 'manager-preflight', identity: authority.preflightIdentity }];
+  if (authority.claimMode === 'claimed') {
+    required.push({ role: 'runner-start', identity: authority.runnerStartedIdentity });
+  }
 
   const exactComments = [];
-  for (const identity of identities) {
+  for (const { role, identity } of required) {
     const databaseId = identity?.databaseId ?? null;
-    if (databaseId === null) return null;
-    const url = exactCommentUrl(input, authority, databaseId);
-    if (!url) return null;
-    const comment = await readExactComment({ originalFetch, input, init, url, identity, sleep });
-    if (!comment) return null;
-    exactComments.push(comment);
+    const url = databaseId === null ? null : exactCommentUrl(input, authority, databaseId);
+    if (!url) {
+      return diagnose({ reason: 'exact-url-invalid', commentRole: role, commentDatabaseId: databaseId });
+    }
+    const read = await readExactComment({ originalFetch, input, init, url, identity, sleep });
+    if (!read.comment) {
+      return diagnose({
+        reason: DIRECT_READ_REASONS[role][read.failure],
+        commentRole: role,
+        httpStatus: read.httpStatus,
+        commentDatabaseId: databaseId,
+      });
+    }
+    exactComments.push({ role, databaseId, comment: read.comment });
   }
 
   const merged = mergedExactComments(listComments, exactComments);
-  if (!merged) return null;
-  const pinned = pinManagerAuthorityComments(merged, authority);
-  return pinned.allowed ? pinned : null;
+  if (merged.conflict) {
+    return diagnose({
+      reason: 'exact-comment-merge-conflict',
+      commentRole: merged.conflict.role,
+      commentDatabaseId: merged.conflict.databaseId,
+    });
+  }
+  const pinned = pinManagerAuthorityComments(merged.merged, authority);
+  return pinned.allowed ? { pinned } : diagnose({ reason: 'post-merge-authority-rejected' });
 }
 
 export function createPinnedFetch({
   authority,
   originalFetch = globalThis.fetch,
   onPinned = null,
+  onDiagnostic = null,
   sleep = delay,
 } = {}) {
   if (typeof originalFetch !== 'function') throw new Error('pinned-child-fetch-unavailable');
@@ -438,16 +583,23 @@ export function createPinnedFetch({
     }
     let pinned = pinManagerAuthorityComments(listComments, authority);
     const originalReason = pinned.allowed ? null : pinned.reason;
+    let diagnostic = null;
 
     if (!pinned.allowed && response.ok && requiredExactCommentsAbsent(listComments, authority)) {
-      pinned = await authorizeFromExactComments({
+      const exact = await authorizeFromExactComments({
         authority, listComments, input, init, originalFetch, sleep,
-      }) || pinned;
+      });
+      diagnostic = exact.diagnostic || null;
+      pinned = exact.pinned || pinned;
     }
 
     // An exact read never invents a new verdict: the first fail-closed reason is what the
     // child reports, and any harder failure seen on the exact rows still fails closed.
-    if (!pinned.allowed) throw new Error(originalReason);
+    // The diagnostic only records which bounded stage produced that refusal.
+    if (!pinned.allowed) {
+      if (diagnostic) onDiagnostic?.(diagnostic);
+      throw pinnedFailure(originalReason, diagnostic);
+    }
     onPinned?.(pinned);
     const headers = new Headers(response.headers);
     headers.delete('content-length');
@@ -481,7 +633,7 @@ function projectionEvidence(authority, allowed, reason) {
   };
 }
 
-function structuredFailure(authority, reason) {
+function structuredFailure(authority, reason, diagnostic = null) {
   return {
     mode: 'pinned-execution-authority',
     blocked: true,
@@ -491,6 +643,7 @@ function structuredFailure(authority, reason) {
     sourcePreflightCommentId: authority.preflightCommentRevision || null,
     sourcePreflightCommentIdentity: authority.preflightIdentity || null,
     pinnedExecutionAuthority: projectionEvidence(authority, false, reason),
+    pinnedAuthorityDiagnostic: sanitizedDiagnostic(diagnostic),
   };
 }
 
@@ -521,11 +674,13 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
   const previousLog = console.log;
   let noChangePolicy = parseNoChangeCompletionPolicy('');
   let noChangeAccepted = false;
+  let pinnedFetchDiagnostic = null;
 
   globalThis.fetch = createPinnedFetch({
     authority,
     originalFetch,
     onPinned: (pinned) => { noChangePolicy = pinned.noChangePolicy; },
+    onDiagnostic: (value) => { pinnedFetchDiagnostic = value; },
   });
   console.log = (...values) => {
     if (values.length === 1 && typeof values[0] === 'string') {
@@ -549,8 +704,12 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     const exitCode = await runChildMain(argv, env);
     return noChangeAccepted ? 0 : exitCode;
   } catch (error) {
-    const reason = String(error?.message || error || 'pinned-child-authority-failed');
-    previousLog(JSON.stringify(structuredFailure(authority, reason), null, 2));
+    // Only a reason this module itself publishes may be emitted. Anything else — a
+    // GitHub transport error carrying a response-body slice, a provider diagnostic, any
+    // raw exception text — is replaced by the bounded generic reason.
+    const reason = boundedFailureReason(error);
+    const diagnostic = pinnedFetchDiagnostic || error?.pinnedDiagnostic || null;
+    previousLog(JSON.stringify(structuredFailure(authority, reason, diagnostic), null, 2));
     return 4;
   } finally {
     globalThis.fetch = previousFetch;
@@ -560,11 +719,13 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().then((code) => { process.exitCode = code; }).catch((error) => {
+    const reason = boundedFailureReason(error);
     console.log(JSON.stringify({
       mode: 'pinned-execution-authority',
       blocked: true,
-      reason: String(error?.message || error),
-      failureReason: String(error?.message || error),
+      reason,
+      failureReason: reason,
+      pinnedAuthorityDiagnostic: sanitizedDiagnostic(error?.pinnedDiagnostic),
     }, null, 2));
     process.exitCode = 4;
   });
