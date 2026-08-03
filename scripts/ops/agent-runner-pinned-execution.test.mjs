@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import {
@@ -7,9 +8,12 @@ import {
   runChildWithPinnedAuthority,
 } from './agent-runner-pinned-atomic-cron.mjs';
 import {
+  PINNED_COMMENT_ROLES,
+  PINNED_DIAGNOSTIC_REASONS,
   PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS,
   PINNED_EXACT_COMMENT_READ_ATTEMPTS,
   PINNED_EXACT_COMMENT_READ_WINDOW_MS,
+  PINNED_PUBLIC_FAILURE_REASONS,
   createPinnedFetch,
   main as pinnedChildMain,
   pinManagerAuthorityComments,
@@ -20,6 +24,7 @@ import {
   packetBodyDigest,
   resolveCurrentManagerAuthority,
 } from './agent-runner-manager-authority.mjs';
+import { sameCommentIdentity } from './claude-runner-comment-identity.mjs';
 import { findLatestClaudeCommand } from './claude-runner-selection.mjs';
 
 const ISSUE = 743;
@@ -841,4 +846,566 @@ test('requests outside the pinned comments endpoint remain single-pass and uncha
   const exactResponse = await pinnedFetch(EXACT_PREFLIGHT_URL);
   assert.equal(exactResponse, original);
   assert.equal(calls.length, 3);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #143 (PINNED.CONSISTENCY.4): the exact issue #136 packet .5 production
+// boundary. Everything below reproduces the real child request shape — a string URL
+// built by claude-runner's githubJson, its inherited Authorization/Accept headers,
+// database-only authority identities whose nodeId is null, and realistic REST
+// issue-comment payloads carrying both `id` and `node_id`.
+// ---------------------------------------------------------------------------
+const P5_REPOSITORY = 'TheTekTeam/agent-runner';
+const P5_ISSUE = 136;
+const P5_PREFLIGHT_COMMENT_ID = 5160984382;
+const P5_RUNNER_STARTED_COMMENT_ID = 5167317080;
+const P5_REVISION = 'AR136-PR-CONTRACT-IMPLEMENTATION-2026-08-03.5';
+const P5_FINGERPRINT = 'sha256:b3b8a9af0e64ee9122ab1977e92524a64c7619338e50b2ff6f499a1f91fb2aed';
+const P5_BASE = '38a38daa20d2dfbc5eb19c14170498f92971a068';
+const P5_BRANCH = 'claude/pinned-production-diagnostics-143';
+const P5_AGENT = 'claude-code-cli';
+const P5_ATTEMPT_ID = `${P5_REPOSITORY}#${P5_ISSUE}:2026-08-03T13:59:22.801Z`;
+const P5_AUTHORITY_KEY = `manager-preflight:${P5_REVISION}:${P5_FINGERPRINT}`;
+// The manager packet body digest recorded in the production evidence. A digest binds to
+// exact bytes and the production packet body itself is not reproducible here, so the
+// fixture binds its own reconstructed body through packetBodyDigest and this recorded
+// value is used to prove the digest comparison is live rather than assumed.
+const P5_PRODUCTION_BODY_DIGEST = 'sha256:a35845a21fdc69f2561604e40cb321b1d573423c93ecb0147afae389919a610c';
+
+const P5_PREFLIGHT_BODY = `<!-- agent-runner:manager-preflight -->
+
+\`\`\`yaml
+schema_version: agent-runner-manager-preflight/v1
+revision: ${P5_REVISION}
+fingerprint: ${P5_FINGERPRINT}
+producer_type: normal_chatgpt_manager_session
+approved_agent: ${P5_AGENT}
+execution_phase: implementation
+approved_repository_scope:
+  - ${P5_REPOSITORY}
+approved_branch: ${P5_BRANCH}
+base_commit: ${P5_BASE}
+scope:
+  - one bounded internal pinned-authority diagnostic reason
+required_validation:
+  - node --test scripts/ops/agent-runner-pinned-execution.test.mjs
+stop_conditions:
+  - fail closed before worktree/model launch
+\`\`\``;
+const P5_BODY_DIGEST = packetBodyDigest(P5_PREFLIGHT_BODY);
+
+// The REST shape the child actually receives: numeric `id`, GraphQL `node_id`,
+// snake_case timestamps, an API `url` and an `html_url` carrying `#issuecomment-<id>`.
+function restIssueComment({ id, body, createdAt, login = 'gpcola' }) {
+  return {
+    url: `https://api.github.com/repos/${P5_REPOSITORY}/issues/comments/${id}`,
+    html_url: `https://github.com/${P5_REPOSITORY}/issues/${P5_ISSUE}#issuecomment-${id}`,
+    issue_url: `https://api.github.com/repos/${P5_REPOSITORY}/issues/${P5_ISSUE}`,
+    id,
+    node_id: `IC_kwDOPinned${id}`,
+    user: { login, id: 424242, node_id: 'U_kgDOPinnedAuthor', type: 'User' },
+    created_at: createdAt,
+    updated_at: createdAt,
+    author_association: 'OWNER',
+    body,
+  };
+}
+
+const P5_PREFLIGHT = restIssueComment({
+  id: P5_PREFLIGHT_COMMENT_ID,
+  createdAt: '2026-08-03T13:57:41Z',
+  body: P5_PREFLIGHT_BODY,
+});
+
+function p5RunnerStartedComment(overrides = {}) {
+  const { id = P5_RUNNER_STARTED_COMMENT_ID, bodyDigest = P5_BODY_DIGEST, authorityKey = P5_AUTHORITY_KEY } = overrides;
+  return restIssueComment({
+    id,
+    createdAt: '2026-08-03T13:59:23Z',
+    login: 'gpcola',
+    body: `## Claude runner started
+
+- Runner action: claim-ready-issue
+- Selection mode: preflight-direct
+- Source preflight comment: github-comment:database:${P5_PREFLIGHT_COMMENT_ID}
+- Manager packet revision: ${P5_REVISION}
+- Manager packet fingerprint: ${P5_FINGERPRINT}
+- Manager packet authority: ${authorityKey}
+- Manager packet body digest: ${bodyDigest}
+- Started at: 2026-08-03T13:59:23Z
+- Output directory: /home/gp/.local/state/agent-runner/agent-runner
+
+This marker records consumption of exactly this immutable manager packet revision and fingerprint.`,
+  });
+}
+
+const P5_RUNNER_STARTED = p5RunnerStartedComment();
+const P5_OLD_COMMAND = restIssueComment({
+  id: 5033672061,
+  createdAt: '2026-08-01T09:00:00Z',
+  body: '## Claude continue command\n\nContinue the old attempt.',
+});
+// The replica the child actually read: the pinned packet .5 comments are not in it.
+const P5_STALE_LIST = [P5_OLD_COMMAND];
+
+function p5Env(overrides = {}) {
+  return {
+    AGENT_RUNNER_PINNED_ISSUE: String(P5_ISSUE),
+    AGENT_RUNNER_PINNED_ISSUE_REPOSITORY: P5_REPOSITORY,
+    AGENT_RUNNER_PINNED_SELECTION_MODE: 'preflight-direct',
+    AGENT_RUNNER_PINNED_CLAIM_MODE: 'claimed',
+    AGENT_RUNNER_PINNED_PREFLIGHT_COMMENT_REVISION: `github-comment:database:${P5_PREFLIGHT_COMMENT_ID}`,
+    AGENT_RUNNER_PINNED_RUNNER_STARTED_COMMENT_REVISION: `github-comment:database:${P5_RUNNER_STARTED_COMMENT_ID}`,
+    AGENT_RUNNER_PINNED_MANAGER_REVISION: P5_REVISION,
+    AGENT_RUNNER_PINNED_MANAGER_FINGERPRINT: P5_FINGERPRINT,
+    AGENT_RUNNER_PINNED_MANAGER_BODY_DIGEST: P5_BODY_DIGEST,
+    AGENT_RUNNER_PINNED_MANAGER_AUTHORITY_KEY: P5_AUTHORITY_KEY,
+    AGENT_RUNNER_PINNED_APPROVED_REPOSITORY: P5_REPOSITORY,
+    AGENT_RUNNER_PINNED_APPROVED_BRANCH: P5_BRANCH,
+    AGENT_RUNNER_PINNED_APPROVED_BASE_COMMIT: P5_BASE,
+    AGENT_RUNNER_PINNED_APPROVED_AGENT: P5_AGENT,
+    AGENT_RUNNER_PINNED_ATTEMPT_ID: P5_ATTEMPT_ID,
+    ...overrides,
+  };
+}
+
+const P5_AUTHORITY = pinnedAuthorityFromEnv(p5Env());
+
+// Exactly the headers claude-runner's githubJson attaches to the comments-list request.
+const P5_REQUEST_HEADERS = Object.freeze({
+  Accept: 'application/vnd.github+json',
+  Authorization: 'Bearer ghs_pinned_child_token',
+  'X-GitHub-Api-Version': '2022-11-28',
+  'User-Agent': 'modelspend-claude-runner',
+});
+
+function p5ExactUrl(id, { origin = 'https://api.github.com', prefix = '' } = {}) {
+  return `${origin}${prefix}/repos/${P5_REPOSITORY}/issues/comments/${id}`;
+}
+
+function urlOf(input) {
+  return typeof input === 'string' ? input : String(input?.url || input);
+}
+
+/**
+ * Drives createPinnedFetch exactly as production does. `requestAs: 'request'` sends the
+ * same URL as a Request object with the same inherited headers; `origin`/`prefix` cover
+ * api.github.com and a GitHub Enterprise `/api/v3` API prefix; `listUrl` overrides the
+ * request the child issues without changing the pinned authority projection.
+ */
+function productionBoundary({
+  authority = P5_AUTHORITY,
+  origin = 'https://api.github.com',
+  prefix = '',
+  listUrl = null,
+  list = P5_STALE_LIST,
+  exact = {},
+  requestAs = 'string',
+} = {}) {
+  const requestUrl = listUrl || `${origin}${prefix}/repos/${P5_REPOSITORY}/issues/${P5_ISSUE}/comments?per_page=100`;
+  const calls = [];
+  const delays = [];
+  const diagnostics = [];
+  const pinnedFetch = createPinnedFetch({
+    authority,
+    originalFetch: async (input, init) => {
+      const url = urlOf(input);
+      calls.push({ url, init });
+      if (url.includes(`/issues/${P5_ISSUE}/comments?`)) {
+        return typeof list === 'function' ? list() : jsonResponse(list);
+      }
+      const handler = exact[url];
+      if (handler === undefined) return notFoundResponse();
+      return typeof handler === 'function' ? handler() : jsonResponse(handler);
+    },
+    onDiagnostic: (value) => { diagnostics.push(value); },
+    sleep: async (ms) => { delays.push(ms); },
+  });
+  const input = requestAs === 'request'
+    ? new Request(requestUrl, { headers: { ...P5_REQUEST_HEADERS } })
+    : requestUrl;
+  const init = requestAs === 'request' ? undefined : { headers: { ...P5_REQUEST_HEADERS } };
+  return {
+    calls,
+    delays,
+    diagnostics,
+    requestUrl,
+    run: () => pinnedFetch(input, init),
+  };
+}
+
+async function p5Failure(boundary) {
+  try {
+    await boundary.run();
+  } catch (error) {
+    return { message: String(error?.message || error), diagnostic: error?.pinnedDiagnostic || null };
+  }
+  return { message: null, diagnostic: null };
+}
+
+function p5ExactReads({ origin = 'https://api.github.com', prefix = '', preflight = P5_PREFLIGHT, runnerStarted = P5_RUNNER_STARTED } = {}) {
+  return {
+    [p5ExactUrl(P5_PREFLIGHT_COMMENT_ID, { origin, prefix })]: preflight,
+    [p5ExactUrl(P5_RUNNER_STARTED_COMMENT_ID, { origin, prefix })]: runnerStarted,
+  };
+}
+
+test('the packet .5 production fixture carries the exact recorded production identities', () => {
+  assert.equal(P5_AUTHORITY.allowed, true);
+  assert.equal(P5_AUTHORITY.claimMode, 'claimed');
+  assert.equal(P5_AUTHORITY.issueRepository, P5_REPOSITORY);
+  assert.equal(P5_AUTHORITY.issueNumber, P5_ISSUE);
+  assert.equal(P5_AUTHORITY.managerPreflightRevision, P5_REVISION);
+  assert.equal(P5_AUTHORITY.managerPreflightFingerprint, P5_FINGERPRINT);
+  assert.equal(P5_AUTHORITY.managerAuthorityKey, P5_AUTHORITY_KEY);
+  assert.equal(P5_AUTHORITY.approvedBranch, P5_BRANCH);
+  assert.equal(P5_AUTHORITY.approvedBaseCommit, P5_BASE);
+  assert.equal(P5_AUTHORITY.attemptId, P5_ATTEMPT_ID);
+  assert.equal(P5_AUTHORITY.preflightIdentity.databaseId, P5_PREFLIGHT_COMMENT_ID);
+  assert.equal(P5_AUTHORITY.runnerStartedIdentity.databaseId, P5_RUNNER_STARTED_COMMENT_ID);
+});
+
+test('the packet .5 production fixture authorizes claimed mode from the exact reads', async () => {
+  const boundary = productionBoundary({ exact: p5ExactReads() });
+  const comments = await (await boundary.run()).json();
+  assert.equal(comments.some((comment) => comment.id === P5_PREFLIGHT_COMMENT_ID), true);
+  assert.equal(comments.some((comment) => comment.id === P5_RUNNER_STARTED_COMMENT_ID), false);
+  const inherited = resolveCurrentManagerAuthority(comments);
+  assert.equal(inherited.allowed, true);
+  assert.equal(inherited.authority.authorityKey, P5_AUTHORITY_KEY);
+  assert.equal(inherited.authority.packetDigest, P5_BODY_DIGEST);
+  assert.equal(inherited.authority.approvedAgent, P5_AGENT);
+  assert.deepEqual(boundary.diagnostics, []);
+  assert.deepEqual(boundary.delays, []);
+});
+
+// The recorded production digest belongs to bytes this fixture cannot reproduce, so it
+// must not authorize this reconstructed body. The refusal proves the body-digest
+// comparison is live rather than assumed by the fixture.
+test('the recorded production body digest does not authorize a different packet body', async () => {
+  const authority = pinnedAuthorityFromEnv(p5Env({ AGENT_RUNNER_PINNED_MANAGER_BODY_DIGEST: P5_PRODUCTION_BODY_DIGEST }));
+  assert.equal(authority.allowed, true);
+  assert.notEqual(P5_PRODUCTION_BODY_DIGEST, P5_BODY_DIGEST);
+  const failure = await p5Failure(productionBoundary({ authority, exact: p5ExactReads() }));
+  assert.equal(failure.message, 'pinned-child-preflight-not-found');
+  assert.equal(failure.diagnostic.reason, 'post-merge-authority-rejected');
+});
+
+test('a database-only authority identity matches a REST comment carrying id and node_id', () => {
+  assert.deepEqual({ ...P5_AUTHORITY.preflightIdentity }, { version: 1, nodeId: null, databaseId: P5_PREFLIGHT_COMMENT_ID });
+  assert.deepEqual({ ...P5_AUTHORITY.runnerStartedIdentity }, { version: 1, nodeId: null, databaseId: P5_RUNNER_STARTED_COMMENT_ID });
+  assert.match(P5_PREFLIGHT.node_id, /^IC_[A-Za-z0-9_-]+$/);
+  assert.equal(typeof P5_PREFLIGHT.id, 'number');
+  assert.equal(sameCommentIdentity(P5_PREFLIGHT, P5_AUTHORITY.preflightIdentity), true);
+  assert.equal(sameCommentIdentity(P5_RUNNER_STARTED, P5_AUTHORITY.runnerStartedIdentity), true);
+  assert.equal(sameCommentIdentity(P5_PREFLIGHT, P5_AUTHORITY.runnerStartedIdentity), false);
+  const pinned = pinManagerAuthorityComments([P5_OLD_COMMAND, P5_PREFLIGHT, P5_RUNNER_STARTED], P5_AUTHORITY);
+  assert.equal(pinned.allowed, true);
+});
+
+const p5RequestInputCases = ['string', 'request'];
+
+for (const requestAs of p5RequestInputCases) {
+  test(`a ${requestAs} comments-list input derives the exact expected direct URLs`, async () => {
+    const boundary = productionBoundary({ requestAs, exact: p5ExactReads() });
+    await boundary.run();
+    assert.equal(boundary.calls.length, 3);
+    assert.equal(boundary.calls[1].url, `https://api.github.com/repos/${P5_REPOSITORY}/issues/comments/${P5_PREFLIGHT_COMMENT_ID}`);
+    assert.equal(boundary.calls[2].url, `https://api.github.com/repos/${P5_REPOSITORY}/issues/comments/${P5_RUNNER_STARTED_COMMENT_ID}`);
+    assert.equal(boundary.calls[1].url.includes('?'), false);
+  });
+
+  test(`a ${requestAs} comments-list input keeps its Authorization and Accept headers on the direct reads`, async () => {
+    const boundary = productionBoundary({ requestAs, exact: p5ExactReads() });
+    await boundary.run();
+    for (const call of boundary.calls.slice(1)) {
+      assert.equal(call.init.headers.get('authorization'), P5_REQUEST_HEADERS.Authorization);
+      assert.equal(call.init.headers.get('accept'), P5_REQUEST_HEADERS.Accept);
+      assert.equal(call.init.headers.get('x-github-api-version'), P5_REQUEST_HEADERS['X-GitHub-Api-Version']);
+      assert.equal(call.init.headers.get('cache-control'), 'no-cache');
+      assert.equal(call.init.cache, 'no-store');
+    }
+  });
+
+  test(`a ${requestAs} GitHub Enterprise comments-list input keeps its API path prefix`, async () => {
+    const origin = 'https://github.enterprise.example';
+    const prefix = '/api/v3';
+    const boundary = productionBoundary({
+      requestAs,
+      origin,
+      prefix,
+      exact: p5ExactReads({ origin, prefix }),
+    });
+    const comments = await (await boundary.run()).json();
+    assert.equal(comments.some((comment) => comment.id === P5_PREFLIGHT_COMMENT_ID), true);
+    assert.equal(boundary.calls[1].url, `${origin}${prefix}/repos/${P5_REPOSITORY}/issues/comments/${P5_PREFLIGHT_COMMENT_ID}`);
+    assert.equal(boundary.calls[2].url, `${origin}${prefix}/repos/${P5_REPOSITORY}/issues/comments/${P5_RUNNER_STARTED_COMMENT_ID}`);
+  });
+}
+
+// Every bounded stage, each reached by the one condition that produces it. The public
+// reason is whatever the list already proved and never changes; only the diagnostic
+// distinguishes the stage.
+const p5DiagnosticStages = [
+  ['exact-url-invalid', {
+    // The production defect this issue repairs: the child's comments-list request named a
+    // repository other than the pinned one, so no direct URL can be derived at all.
+    listUrl: `https://api.github.com/repos/TheTekTeam/modelspend/issues/${P5_ISSUE}/comments?per_page=100`,
+    exact: p5ExactReads(),
+    publicReason: 'pinned-child-preflight-not-found',
+    commentRole: 'manager-preflight',
+    httpStatus: null,
+    commentDatabaseId: P5_PREFLIGHT_COMMENT_ID,
+    delays: [],
+  }],
+  ['direct-preflight-404', {
+    exact: {},
+    publicReason: 'pinned-child-preflight-not-found',
+    commentRole: 'manager-preflight',
+    httpStatus: 404,
+    commentDatabaseId: P5_PREFLIGHT_COMMENT_ID,
+    delays: [...PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS],
+  }],
+  ['direct-preflight-non-success', {
+    exact: { [p5ExactUrl(P5_PREFLIGHT_COMMENT_ID)]: () => jsonResponse({ message: 'server error' }, 503, 'Service Unavailable') },
+    publicReason: 'pinned-child-preflight-not-found',
+    commentRole: 'manager-preflight',
+    httpStatus: 503,
+    commentDatabaseId: P5_PREFLIGHT_COMMENT_ID,
+    delays: [],
+  }],
+  ['direct-preflight-malformed', {
+    exact: { [p5ExactUrl(P5_PREFLIGHT_COMMENT_ID)]: () => new Response('not json', { status: 200, headers: { 'content-type': 'application/json' } }) },
+    publicReason: 'pinned-child-preflight-not-found',
+    commentRole: 'manager-preflight',
+    httpStatus: 200,
+    commentDatabaseId: P5_PREFLIGHT_COMMENT_ID,
+    delays: [],
+  }],
+  ['direct-preflight-identity-mismatch', {
+    exact: { [p5ExactUrl(P5_PREFLIGHT_COMMENT_ID)]: restIssueComment({ id: P5_PREFLIGHT_COMMENT_ID + 3, createdAt: '2026-08-03T13:57:41Z', body: P5_PREFLIGHT_BODY }) },
+    publicReason: 'pinned-child-preflight-not-found',
+    commentRole: 'manager-preflight',
+    httpStatus: 200,
+    commentDatabaseId: P5_PREFLIGHT_COMMENT_ID,
+    delays: [],
+  }],
+  ['direct-runner-start-404', {
+    exact: { [p5ExactUrl(P5_PREFLIGHT_COMMENT_ID)]: P5_PREFLIGHT },
+    publicReason: 'pinned-child-preflight-not-found',
+    commentRole: 'runner-start',
+    httpStatus: 404,
+    commentDatabaseId: P5_RUNNER_STARTED_COMMENT_ID,
+    delays: [...PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS],
+  }],
+  ['direct-runner-start-non-success', {
+    exact: {
+      [p5ExactUrl(P5_PREFLIGHT_COMMENT_ID)]: P5_PREFLIGHT,
+      [p5ExactUrl(P5_RUNNER_STARTED_COMMENT_ID)]: () => jsonResponse({ message: 'server error' }, 500, 'Internal Server Error'),
+    },
+    publicReason: 'pinned-child-preflight-not-found',
+    commentRole: 'runner-start',
+    httpStatus: 500,
+    commentDatabaseId: P5_RUNNER_STARTED_COMMENT_ID,
+    delays: [],
+  }],
+  ['direct-runner-start-malformed', {
+    exact: {
+      [p5ExactUrl(P5_PREFLIGHT_COMMENT_ID)]: P5_PREFLIGHT,
+      [p5ExactUrl(P5_RUNNER_STARTED_COMMENT_ID)]: () => jsonResponse([P5_RUNNER_STARTED]),
+    },
+    publicReason: 'pinned-child-preflight-not-found',
+    commentRole: 'runner-start',
+    httpStatus: 200,
+    commentDatabaseId: P5_RUNNER_STARTED_COMMENT_ID,
+    delays: [],
+  }],
+  ['direct-runner-start-identity-mismatch', {
+    exact: {
+      [p5ExactUrl(P5_PREFLIGHT_COMMENT_ID)]: P5_PREFLIGHT,
+      [p5ExactUrl(P5_RUNNER_STARTED_COMMENT_ID)]: p5RunnerStartedComment({ id: P5_RUNNER_STARTED_COMMENT_ID + 7 }),
+    },
+    publicReason: 'pinned-child-preflight-not-found',
+    commentRole: 'runner-start',
+    httpStatus: 200,
+    commentDatabaseId: P5_RUNNER_STARTED_COMMENT_ID,
+    delays: [],
+  }],
+  ['exact-comment-merge-conflict', {
+    // The list already holds this exact database identity with different immutable
+    // content, so the direct row may not collapse into it.
+    list: [P5_OLD_COMMAND, { ...P5_PREFLIGHT, body: `${P5_PREFLIGHT_BODY}\nExpanded scope after claim.` }],
+    exact: p5ExactReads(),
+    publicReason: 'pinned-child-preflight-not-current',
+    commentRole: 'manager-preflight',
+    httpStatus: null,
+    commentDatabaseId: P5_PREFLIGHT_COMMENT_ID,
+    delays: [],
+  }],
+  ['post-merge-authority-rejected', {
+    // Both direct reads succeed, and the merged payload then carries two distinct claim
+    // markers for one immutable authority key.
+    list: [P5_OLD_COMMAND, p5RunnerStartedComment({ id: P5_RUNNER_STARTED_COMMENT_ID + 11 })],
+    exact: p5ExactReads(),
+    publicReason: 'pinned-child-preflight-not-found',
+    commentRole: null,
+    httpStatus: null,
+    commentDatabaseId: null,
+    delays: [],
+  }],
+];
+
+for (const [reason, fixture] of p5DiagnosticStages) {
+  test(`the ${reason} stage fails closed with only its bounded diagnostic`, async () => {
+    const boundary = productionBoundary({
+      listUrl: fixture.listUrl || null,
+      list: fixture.list || P5_STALE_LIST,
+      exact: fixture.exact,
+    });
+    const failure = await p5Failure(boundary);
+    assert.equal(failure.message, fixture.publicReason);
+    assert.deepEqual(boundary.delays, fixture.delays);
+    assert.deepEqual(boundary.diagnostics.length, 1);
+    assert.deepEqual({ ...failure.diagnostic }, {
+      reason,
+      commentRole: fixture.commentRole,
+      httpStatus: fixture.httpStatus,
+      commentDatabaseId: fixture.commentDatabaseId,
+      attemptId: P5_ATTEMPT_ID,
+    });
+    assert.equal(Object.isFrozen(failure.diagnostic), true);
+  });
+}
+
+test('every required bounded diagnostic reason is covered and the vocabulary is closed', () => {
+  assert.deepEqual([...PINNED_DIAGNOSTIC_REASONS].sort(), [...new Set(PINNED_DIAGNOSTIC_REASONS)].sort());
+  assert.equal(Object.isFrozen(PINNED_DIAGNOSTIC_REASONS), true);
+  assert.equal(Object.isFrozen(PINNED_COMMENT_ROLES), true);
+  assert.deepEqual([...PINNED_COMMENT_ROLES], ['manager-preflight', 'runner-start']);
+  assert.deepEqual(p5DiagnosticStages.map(([reason]) => reason).sort(), [...PINNED_DIAGNOSTIC_REASONS].sort());
+});
+
+test('an exact read never reports a stage diagnostic when the pinned attempt is authorized', async () => {
+  const boundary = productionBoundary({ exact: p5ExactReads() });
+  await boundary.run();
+  assert.deepEqual(boundary.diagnostics, []);
+});
+
+// A response body, an Authorization header, a token, a query-bearing URL, a prompt and a
+// raw exception message are all present in this boundary; none of them may appear in the
+// refusal the child publishes.
+const P5_FORBIDDEN_SUBSTRINGS = [
+  'ghs_pinned_child_token',
+  'Bearer',
+  'authorization',
+  'per_page',
+  'documentation_url',
+  'socket hang up',
+  'Not Found',
+  'https://',
+];
+
+test('a bounded diagnostic never carries a body, credential, URL or exception text', async () => {
+  const boundary = productionBoundary({
+    exact: {
+      [p5ExactUrl(P5_PREFLIGHT_COMMENT_ID)]: () => { throw new Error('socket hang up to https://api.github.com'); },
+    },
+  });
+  const failure = await p5Failure(boundary);
+  assert.equal(failure.message, 'pinned-child-preflight-not-found');
+  assert.deepEqual(Object.keys(failure.diagnostic).sort(), ['attemptId', 'commentDatabaseId', 'commentRole', 'httpStatus', 'reason']);
+  assert.equal(failure.diagnostic.reason, 'direct-preflight-non-success');
+  assert.equal(failure.diagnostic.httpStatus, null);
+  const serialized = JSON.stringify(failure.diagnostic);
+  for (const forbidden of P5_FORBIDDEN_SUBSTRINGS) {
+    assert.equal(serialized.includes(forbidden), false, `diagnostic leaked ${forbidden}`);
+  }
+});
+
+async function capturedPinnedChild({ childEnv, childMain, originalFetch = async () => jsonResponse([]) }) {
+  const previousLog = console.log;
+  const lines = [];
+  console.log = (...values) => { lines.push(values.map(String).join(' ')); };
+  try {
+    const exitCode = await pinnedChildMain(
+      ['--issue', String(P5_ISSUE), '--execute', '--attempt-id', P5_ATTEMPT_ID],
+      childEnv,
+      { originalFetch, childMain },
+    );
+    return { exitCode, output: lines.join('\n') };
+  } finally {
+    console.log = previousLog;
+  }
+}
+
+// The child's own entrypoint compiles in the bounded 404 ladder, so this end-to-end case
+// uses a non-404 direct failure: it reaches the identical publication path without any
+// test ever sleeping.
+test('the published refusal keeps the public reason and adds only the bounded diagnostic', async () => {
+  const { exitCode, output } = await capturedPinnedChild({
+    childEnv: p5Env(),
+    originalFetch: async (input) => (urlOf(input).includes(`/issues/${P5_ISSUE}/comments?`)
+      ? jsonResponse(P5_STALE_LIST)
+      : jsonResponse({ message: 'server error' }, 503, 'Service Unavailable')),
+    childMain: async () => {
+      await globalThis.fetch(`https://api.github.com/repos/${P5_REPOSITORY}/issues/${P5_ISSUE}/comments?per_page=100`, {
+        headers: { ...P5_REQUEST_HEADERS },
+      });
+      return 0;
+    },
+  });
+  assert.equal(exitCode, 4);
+  const payload = JSON.parse(output);
+  assert.equal(payload.blocked, true);
+  assert.equal(payload.reason, 'pinned-child-preflight-not-found');
+  assert.equal(payload.failureReason, 'pinned-child-preflight-not-found');
+  assert.equal(payload.pinnedExecutionAuthority.allowed, false);
+  assert.equal(payload.pinnedAuthorityDiagnostic.reason, 'direct-preflight-non-success');
+  assert.equal(payload.pinnedAuthorityDiagnostic.commentRole, 'manager-preflight');
+  assert.equal(payload.pinnedAuthorityDiagnostic.httpStatus, 503);
+  assert.equal(payload.pinnedAuthorityDiagnostic.commentDatabaseId, P5_PREFLIGHT_COMMENT_ID);
+  assert.equal(payload.pinnedAuthorityDiagnostic.attemptId, P5_ATTEMPT_ID);
+  for (const forbidden of ['server error', 'ghs_pinned_child_token', 'per_page']) {
+    assert.equal(output.includes(forbidden), false, `published refusal leaked ${forbidden}`);
+  }
+});
+
+// GitHub transport errors raised inside the child embed a slice of the response body, so
+// the published refusal may never repeat an exception message verbatim.
+test('a raw child exception message is never published by the pinned child', async () => {
+  const leaked = 'GitHub request failed 404 Not Found: {"message":"Not Found","documentation_url":"https://docs.github.com/rest"}';
+  const { exitCode, output } = await capturedPinnedChild({
+    childEnv: p5Env(),
+    childMain: async () => { throw new Error(leaked); },
+  });
+  assert.equal(exitCode, 4);
+  const payload = JSON.parse(output);
+  assert.equal(payload.reason, 'pinned-child-authority-failed');
+  assert.equal(payload.failureReason, 'pinned-child-authority-failed');
+  assert.equal(payload.pinnedAuthorityDiagnostic, null);
+  assert.equal(output.includes('documentation_url'), false);
+  assert.equal(output.includes('GitHub request failed'), false);
+});
+
+test('the published failure reason vocabulary is a closed allowlist of this module', () => {
+  assert.equal(Object.isFrozen(PINNED_PUBLIC_FAILURE_REASONS), true);
+  assert.deepEqual([...PINNED_PUBLIC_FAILURE_REASONS].sort(), [...new Set(PINNED_PUBLIC_FAILURE_REASONS)].sort());
+  const source = readFileSync(new URL('./agent-runner-pinned-child.mjs', import.meta.url), 'utf8');
+  // Identity-normalisation contexts share the prefix but are never published reasons.
+  const identityContexts = new Set(['pinned-child-preflight', 'pinned-child-runner-start', 'pinned-child-exact-comment']);
+  const literals = new Set([...source.matchAll(/'(pinned-child-[a-z0-9-]+)'/g)].map((match) => match[1]));
+  for (const literal of literals) {
+    if (identityContexts.has(literal)) continue;
+    assert.equal(
+      PINNED_PUBLIC_FAILURE_REASONS.includes(literal) || literal === 'pinned-child-comments-authorized' || literal === 'pinned-child-authority-valid' || literal === 'pinned-child-authority-applied',
+      true,
+      `${literal} is not in the published failure reason allowlist`,
+    );
+  }
+});
+
+test('the scheduler pins the child GitHub request repository to the pinned issue repository', async () => {
+  const { observed } = await schedulerDispatch();
+  assert.equal(observed.options.env.GITHUB_REPOSITORY, ISSUE_REPOSITORY);
+  assert.equal(observed.options.env.AGENT_RUNNER_PINNED_ISSUE_REPOSITORY, ISSUE_REPOSITORY);
 });
