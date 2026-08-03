@@ -240,32 +240,46 @@ export function pinManagerAuthorityComments(comments = [], authority = {}) {
   };
 }
 
-function commentsRequestForIssue(input, issueNumber) {
-  const raw = typeof input === 'string' || input instanceof URL ? String(input) : String(input?.url || '');
-  return new RegExp(`/issues/${issueNumber}/comments(?:\\?|$)`).test(raw);
+const GITHUB_API_ORIGIN = 'https://api.github.com';
+
+function requestUrl(input) {
+  return typeof input === 'string' || input instanceof URL ? String(input) : String(input?.url || '');
 }
 
-// A comment read issued immediately after claim publication can still observe a GitHub
-// replica that has not yet materialised the manager preflight comment or this attempt's
-// own runner-start marker. Only that transient absence is re-read; every other fail-closed
-// reason (identity, digest, fingerprint, duplicate marker, stale authority, dispatch
-// projection, malformed or non-successful responses) stays single-pass.
-export const PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS = Object.freeze([
-  'pinned-child-preflight-not-found',
-  'pinned-child-runner-start-not-found',
-]);
-// Issue #139 (PINNED.CONSISTENCY.2): issue #136 packet .3 published preflight comment
-// 5160751964 and runner-start comment 5160771496 as the exact pinned identities, and the
-// child still exhausted the previous 1000ms/three-read window on transient absence alone.
-// The schedule stays a fixed, literal ladder: no configuration, no environment override
-// and no adaptive widening can extend it beyond this compiled-in bound.
-export const PINNED_COMMENT_READ_RETRY_DELAYS_MS = Object.freeze([250, 750, 1500, 2500, 3000]);
-export const PINNED_COMMENT_READ_ATTEMPTS = PINNED_COMMENT_READ_RETRY_DELAYS_MS.length + 1;
-export const PINNED_COMMENT_READ_WINDOW_MS = PINNED_COMMENT_READ_RETRY_DELAYS_MS
+function commentsRequestForIssue(input, issueNumber) {
+  return new RegExp(`/issues/${issueNumber}/comments(?:\\?|$)`).test(requestUrl(input));
+}
+
+// The only retained delay, and it no longer polls a list. GitHub's exact single-comment
+// endpoint can still answer 404 for a few hundred milliseconds for a comment this runner
+// published moments earlier, so exactly two short re-reads cover that publication window.
+// A 404 is the only retried outcome: every other exact-read failure is terminal on the
+// first read, and no configuration or environment input can widen this compiled-in bound.
+export const PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS = Object.freeze([200, 400]);
+export const PINNED_EXACT_COMMENT_READ_ATTEMPTS = PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS.length + 1;
+export const PINNED_EXACT_COMMENT_READ_WINDOW_MS = PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS
   .reduce((total, ms) => total + ms, 0);
 
-function transientCommentAbsence(reason) {
-  return PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS.includes(reason);
+/**
+ * Issue #141 (PINNED.CONSISTENCY.3): issue #136 packet .4 pinned preflight comment
+ * 5160875310 and runner-start comment 5160880611, and the child exhausted the whole
+ * eight-second issue-comments-list ladder because the replica it kept re-reading never
+ * exposed them. Re-reading the same list endpoint cannot repair that, so the exact
+ * comments are read by their immutable database identity instead.
+ *
+ * Exactly one condition opens that path: the list this child already read does not
+ * contain one of the exact comments the pinned attempt requires. Every other fail-closed
+ * verdict — identity, revision, fingerprint, body digest, authority key, duplicate
+ * marker, stale or edited authority, dispatch projection, malformed or non-successful
+ * responses — is reached with the required exact comments already present in the list
+ * and stays single-pass.
+ */
+function requiredExactCommentsAbsent(listComments, authority) {
+  if (!Array.isArray(listComments)) return false;
+  const absent = (identity) => identity?.databaseId != null
+    && !listComments.some((comment) => sameCommentIdentity(comment, identity));
+  return absent(authority.preflightIdentity)
+    || (authority.claimMode === 'claimed' && absent(authority.runnerStartedIdentity));
 }
 
 function revalidatedCommentRead(input, init) {
@@ -275,6 +289,135 @@ function revalidatedCommentRead(input, init) {
   headers.set('cache-control', 'no-cache');
   headers.set('pragma', 'no-cache');
   return { ...(init || {}), headers, cache: 'no-store' };
+}
+
+function boundedRepositoryIdentity(issueRepository) {
+  const repository = String(issueRepository || '').trim();
+  if (!REPO_PATTERN.test(repository)) return null;
+  const [owner, repo] = repository.split('/');
+  return owner && repo ? { owner, repo } : null;
+}
+
+/**
+ * GET /repos/{owner}/{repo}/issues/comments/{comment_id}. The owner and repository
+ * segments come only from the validated `authority.issueRepository` projection, never
+ * from the observed request; the origin and any API path prefix are inherited from the
+ * list request the child already issued so enterprise hosts keep working. Anything that
+ * does not resolve to the expected bounded list path yields no URL, and the caller then
+ * fails closed on the original reason.
+ */
+function exactCommentUrl(input, authority, databaseId) {
+  const identity = boundedRepositoryIdentity(authority.issueRepository);
+  if (!identity) return null;
+  if (!Number.isSafeInteger(databaseId) || databaseId < 1) return null;
+  let listUrl;
+  try {
+    listUrl = new URL(requestUrl(input), GITHUB_API_ORIGIN);
+  } catch {
+    return null;
+  }
+  const listPath = `/repos/${identity.owner}/${identity.repo}/issues/${authority.issueNumber}/comments`;
+  if (!listUrl.pathname.endsWith(listPath)) return null;
+  const prefix = listUrl.pathname.slice(0, listUrl.pathname.length - listPath.length);
+  return `${listUrl.origin}${prefix}/repos/${identity.owner}/${identity.repo}/issues/comments/${databaseId}`;
+}
+
+/**
+ * Reads exactly one comment by immutable database id. Success of the endpoint alone
+ * proves nothing: the payload must be a single JSON object whose own proven database
+ * identity is the identity that was requested. Every other outcome returns null so the
+ * pinned attempt fails closed on its original reason.
+ */
+async function readExactComment({ originalFetch, input, init, url, identity, sleep }) {
+  for (let attempt = 0; ; attempt += 1) {
+    let response;
+    try {
+      response = await originalFetch(url, revalidatedCommentRead(input, init));
+    } catch {
+      return null; // A transport failure is never retried and never authorizes.
+    }
+    if (response?.status === 404 && attempt < PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS.length) {
+      await sleep(PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS[attempt]);
+      continue;
+    }
+    if (!response?.ok) return null;
+    let payload;
+    try {
+      payload = await response.json();
+    } catch {
+      return null;
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
+    let payloadIdentity = null;
+    try {
+      payloadIdentity = normalizeCommentIdentity(payload, { context: 'pinned-child-exact-comment' });
+    } catch {
+      return null;
+    }
+    if (!payloadIdentity
+      || payloadIdentity.databaseId === null
+      || payloadIdentity.databaseId !== identity.databaseId
+      || !sameCommentIdentity(payloadIdentity, identity)) {
+      return null;
+    }
+    return payload;
+  }
+}
+
+// The immutable content a stale list row and an exact direct row must agree on before
+// they may collapse into one row.
+function commentContentSignature(comment) {
+  return JSON.stringify([
+    String(comment?.body ?? ''),
+    String(comment?.user?.login ?? comment?.author?.login ?? comment?.login ?? ''),
+    String(comment?.created_at ?? comment?.createdAt ?? ''),
+    String(comment?.updated_at ?? comment?.updatedAt ?? ''),
+  ]);
+}
+
+/**
+ * Combines the original list payload with the directly read exact comments purely so the
+ * existing validator sees them. A list row is never replaced: an exact row with the same
+ * database identity may only collapse into the row already present, and only when their
+ * content is equivalent. Conflicting content returns null and fails the attempt closed.
+ */
+function mergedExactComments(listComments, exactComments) {
+  const merged = [...listComments];
+  for (const exact of exactComments) {
+    const index = merged.findIndex((comment) => sameCommentIdentity(comment, exact));
+    if (index === -1) {
+      merged.push(exact);
+      continue;
+    }
+    if (commentContentSignature(merged[index]) !== commentContentSignature(exact)) return null;
+  }
+  return merged;
+}
+
+/**
+ * Unclaimed mode reads only the exact manager-preflight comment; claimed mode also reads
+ * this attempt's own exact runner-start comment. Both must succeed, and the merged
+ * payload still has to satisfy every existing pinned validation unchanged.
+ */
+async function authorizeFromExactComments({ authority, listComments, input, init, originalFetch, sleep }) {
+  const identities = [authority.preflightIdentity];
+  if (authority.claimMode === 'claimed') identities.push(authority.runnerStartedIdentity);
+
+  const exactComments = [];
+  for (const identity of identities) {
+    const databaseId = identity?.databaseId ?? null;
+    if (databaseId === null) return null;
+    const url = exactCommentUrl(input, authority, databaseId);
+    if (!url) return null;
+    const comment = await readExactComment({ originalFetch, input, init, url, identity, sleep });
+    if (!comment) return null;
+    exactComments.push(comment);
+  }
+
+  const merged = mergedExactComments(listComments, exactComments);
+  if (!merged) return null;
+  const pinned = pinManagerAuthorityComments(merged, authority);
+  return pinned.allowed ? pinned : null;
 }
 
 export function createPinnedFetch({
@@ -287,36 +430,32 @@ export function createPinnedFetch({
   return async (input, init) => {
     const response = await originalFetch(input, init);
     if (!commentsRequestForIssue(input, authority.issueNumber)) return response;
-    let read = response;
-    let pinned = pinManagerAuthorityComments(await read.clone().json(), authority);
+    let listComments = null;
+    try {
+      listComments = await response.clone().json();
+    } catch {
+      listComments = null; // A malformed list never authorizes and is never re-read.
+    }
+    let pinned = pinManagerAuthorityComments(listComments, authority);
     const originalReason = pinned.allowed ? null : pinned.reason;
 
-    for (let attempt = 1;
-      !pinned.allowed
-      && read.ok
-      && transientCommentAbsence(pinned.reason)
-      && attempt < PINNED_COMMENT_READ_ATTEMPTS;
-      attempt += 1) {
-      await sleep(PINNED_COMMENT_READ_RETRY_DELAYS_MS[attempt - 1]);
-      const revalidated = await originalFetch(input, revalidatedCommentRead(input, init));
-      if (!revalidated.ok) break;
-      let revalidatedComments;
-      try {
-        revalidatedComments = await revalidated.clone().json();
-      } catch {
-        break; // A malformed re-read is never retried and never replaces the pinned response.
-      }
-      read = revalidated;
-      pinned = pinManagerAuthorityComments(revalidatedComments, authority);
+    if (!pinned.allowed && response.ok && requiredExactCommentsAbsent(listComments, authority)) {
+      pinned = await authorizeFromExactComments({
+        authority, listComments, input, init, originalFetch, sleep,
+      }) || pinned;
     }
 
-    // Retry exhaustion never invents a new verdict: the first fail-closed reason is what
-    // the child reports, and any harder failure seen on a re-read still fails closed.
+    // An exact read never invents a new verdict: the first fail-closed reason is what the
+    // child reports, and any harder failure seen on the exact rows still fails closed.
     if (!pinned.allowed) throw new Error(originalReason);
     onPinned?.(pinned);
-    const headers = new Headers(read.headers);
+    const headers = new Headers(response.headers);
     headers.delete('content-length');
-    return new Response(JSON.stringify(pinned.comments), { status: read.status, statusText: read.statusText, headers });
+    return new Response(JSON.stringify(pinned.comments), {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
   };
 }
 

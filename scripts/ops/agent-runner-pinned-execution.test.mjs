@@ -7,10 +7,9 @@ import {
   runChildWithPinnedAuthority,
 } from './agent-runner-pinned-atomic-cron.mjs';
 import {
-  PINNED_COMMENT_READ_ATTEMPTS,
-  PINNED_COMMENT_READ_RETRY_DELAYS_MS,
-  PINNED_COMMENT_READ_WINDOW_MS,
-  PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS,
+  PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS,
+  PINNED_EXACT_COMMENT_READ_ATTEMPTS,
+  PINNED_EXACT_COMMENT_READ_WINDOW_MS,
   createPinnedFetch,
   main as pinnedChildMain,
   pinManagerAuthorityComments,
@@ -491,14 +490,16 @@ test('pinned fetch rewrites only the expected issue comments response', async ()
   assert.equal(comments.some((comment) => comment.id === PREFLIGHT_COMMENT_ID), true);
 });
 
-// Issue #137 (PINNED.CONSISTENCY.1): issue #136 published manager preflight comment
-// 5160410073 and runner-start marker 5160642875, and the child's first comment read
-// observed a replica containing neither, failing closed on transient absence alone.
+// Issue #141 (PINNED.CONSISTENCY.3): issue #136 packet .4 pinned preflight comment
+// 5160875310 and runner-start comment 5160880611, and the child exhausted the whole
+// eight-second issue-comments-list ladder against a replica that never exposed either
+// comment. The list is now read once; absent exact comments are read by their immutable
+// database identity through GET /repos/{owner}/{repo}/issues/comments/{comment_id}.
 const REPLICATED_LATE = [OLD_CONTINUE];
 
 // The same claim marker comment as read from a replica that has not yet exposed the
-// manager packet authority line, so the packet reads as claimed while this attempt's
-// own marker is not yet locatable.
+// manager packet authority line, so this attempt's own marker is not locatable even
+// though a comment with the right database identity is returned.
 const PARTIALLY_REPLICATED_RUNNER_STARTED = runnerStartedComment({
   body: `## Claude runner started
 
@@ -510,15 +511,44 @@ const PARTIALLY_REPLICATED_RUNNER_STARTED = runnerStartedComment({
 - Started at: 2026-07-25T13:20:07Z`,
 });
 
-function pinnedFetchReads(reads, { authority = pinnedAuthorityFromEnv(env()) } = {}) {
+const UNCLAIMED_AUTHORITY = pinnedAuthorityFromEnv(env({ AGENT_RUNNER_PINNED_CLAIM_MODE: 'unclaimed' }));
+const UNCLAIMED_LIST = [OLD_CONTINUE, FRESH_PREFLIGHT];
+const EXACT_PREFLIGHT_URL = `https://api.github.com/repos/${ISSUE_REPOSITORY}/issues/comments/${PREFLIGHT_COMMENT_ID}`;
+const EXACT_RUNNER_STARTED_URL = `https://api.github.com/repos/${ISSUE_REPOSITORY}/issues/comments/${RUNNER_STARTED_COMMENT_ID}`;
+
+function jsonResponse(value, status = 200, statusText = '') {
+  return new Response(typeof value === 'string' ? value : JSON.stringify(value), {
+    status,
+    statusText,
+    headers: { 'content-type': 'application/json' },
+  });
+}
+
+function notFoundResponse() {
+  return jsonResponse({ message: 'Not Found' }, 404, 'Not Found');
+}
+
+// `list` answers the intercepted issue comments-list request; `exact` maps the direct
+// single-comment URLs the child is expected to derive. Any unmapped exact URL answers
+// 404, which is exactly how GitHub reports a comment this replica cannot see yet.
+function pinnedExactReads({
+  authority = pinnedAuthorityFromEnv(env()),
+  list = REPLICATED_LATE,
+  exact = {},
+} = {}) {
   const calls = [];
   const delays = [];
   const pinnedFetch = createPinnedFetch({
     authority,
     originalFetch: async (input, init) => {
-      calls.push({ input, init });
-      const read = reads[Math.min(calls.length - 1, reads.length - 1)];
-      return typeof read === 'function' ? read() : commentsResponse(read);
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.includes(`/issues/${ISSUE}/comments`)) {
+        return typeof list === 'function' ? list() : commentsResponse(list);
+      }
+      const handler = exact[url];
+      if (handler === undefined) return notFoundResponse();
+      return typeof handler === 'function' ? handler() : jsonResponse(handler);
     },
     sleep: async (ms) => { delays.push(ms); },
   });
@@ -534,61 +564,77 @@ async function pinnedFetchFailure(pinnedFetch, url = childCommentsUrl()) {
   return null;
 }
 
-// Issue #139 (PINNED.CONSISTENCY.2): issue #136 packet .3 pinned preflight comment
-// 5160751964 and runner-start comment 5160771496 exactly, and the child still exhausted
-// the previous 250ms/750ms window. The calibrated ladder stays deterministic and bounded.
-test('pinned comment reads follow an exact bounded retry ladder', () => {
-  assert.deepEqual([...PINNED_COMMENT_READ_RETRY_DELAYS_MS], [250, 750, 1500, 2500, 3000]);
-  assert.equal(PINNED_COMMENT_READ_ATTEMPTS, 6);
-  assert.equal(PINNED_COMMENT_READ_ATTEMPTS, PINNED_COMMENT_READ_RETRY_DELAYS_MS.length + 1);
-  assert.equal(PINNED_COMMENT_READ_WINDOW_MS, 8000);
-  assert.ok(PINNED_COMMENT_READ_WINDOW_MS >= 6000 && PINNED_COMMENT_READ_WINDOW_MS <= 10000);
-  assert.equal(Object.isFrozen(PINNED_COMMENT_READ_RETRY_DELAYS_MS), true);
+function listReads(calls) {
+  return calls.filter(({ url }) => url.includes(`/issues/${ISSUE}/comments`));
+}
+
+// The eight-second list-polling ladder is gone. All that remains is a bounded re-read of
+// an exact 404 for a comment this runner published moments earlier.
+test('the only retained delay is a very small bounded exact-read 404 ladder', () => {
+  assert.deepEqual([...PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS], [200, 400]);
+  assert.equal(PINNED_EXACT_COMMENT_READ_ATTEMPTS, 3);
+  assert.equal(PINNED_EXACT_COMMENT_READ_ATTEMPTS, PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS.length + 1);
+  assert.equal(PINNED_EXACT_COMMENT_READ_WINDOW_MS, 600);
+  assert.ok(PINNED_EXACT_COMMENT_READ_WINDOW_MS <= 1000);
+  assert.equal(Object.isFrozen(PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS), true);
 });
 
-test('retry eligibility stays restricted to the two transient absence reasons', () => {
-  assert.deepEqual([...PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS], [
-    'pinned-child-preflight-not-found',
-    'pinned-child-runner-start-not-found',
-  ]);
-  assert.equal(Object.isFrozen(PINNED_COMMENT_TRANSIENT_ABSENCE_REASONS), true);
-});
-
-test('transiently absent pinned preflight is re-read and then authorized', async () => {
-  const { pinnedFetch, calls, delays } = pinnedFetchReads([REPLICATED_LATE, CLAIMED_COMMENTS]);
+test('a stale comments list plus the exact preflight read authorizes unclaimed mode', async () => {
+  const { pinnedFetch, calls, delays } = pinnedExactReads({
+    authority: UNCLAIMED_AUTHORITY,
+    list: REPLICATED_LATE,
+    exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT },
+  });
   const comments = await (await pinnedFetch(childCommentsUrl())).json();
   assert.equal(comments.some((comment) => comment.id === PREFLIGHT_COMMENT_ID), true);
-  assert.equal(comments.some((comment) => comment.id === RUNNER_STARTED_COMMENT_ID), false);
   assert.equal(calls.length, 2);
-  assert.deepEqual(delays, [PINNED_COMMENT_READ_RETRY_DELAYS_MS[0]]);
+  assert.equal(calls[1].url, EXACT_PREFLIGHT_URL);
+  assert.deepEqual(delays, []);
 });
 
-test('transiently absent runner-start marker is re-read within the bounded window', async () => {
-  const partial = [OLD_CONTINUE, FRESH_PREFLIGHT, PARTIALLY_REPLICATED_RUNNER_STARTED];
-  assert.equal(
-    pinManagerAuthorityComments(partial, pinnedAuthorityFromEnv(env())).reason,
-    'pinned-child-runner-start-not-found',
-  );
-  const { pinnedFetch, calls, delays } = pinnedFetchReads([partial, partial, CLAIMED_COMMENTS]);
+test('unclaimed mode never reads a runner-start comment', async () => {
+  const { pinnedFetch, calls } = pinnedExactReads({
+    authority: UNCLAIMED_AUTHORITY,
+    exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT, [EXACT_RUNNER_STARTED_URL]: RUNNER_STARTED },
+  });
+  await pinnedFetch(childCommentsUrl());
+  assert.equal(calls.length, 2);
+  assert.equal(calls.some(({ url }) => url.includes(String(RUNNER_STARTED_COMMENT_ID))), false);
+});
+
+test('a stale comments list plus both exact reads authorizes claimed mode', async () => {
+  const { pinnedFetch, calls, delays } = pinnedExactReads({
+    list: REPLICATED_LATE,
+    exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT, [EXACT_RUNNER_STARTED_URL]: RUNNER_STARTED },
+  });
   const comments = await (await pinnedFetch(childCommentsUrl())).json();
   assert.equal(comments.some((comment) => comment.id === PREFLIGHT_COMMENT_ID), true);
   assert.equal(comments.some((comment) => comment.id === RUNNER_STARTED_COMMENT_ID), false);
+  assert.equal(resolveCurrentManagerAuthority(comments).authority.authorityKey, AUTHORITY_KEY);
   assert.equal(calls.length, 3);
-  assert.deepEqual(delays, PINNED_COMMENT_READ_RETRY_DELAYS_MS.slice(0, 2));
+  assert.deepEqual(delays, []);
 });
 
-test('pinned comments appearing only on the final allowed read are authorized', async () => {
-  const late = Array.from({ length: PINNED_COMMENT_READ_ATTEMPTS - 1 }, () => REPLICATED_LATE);
-  const { pinnedFetch, calls, delays } = pinnedFetchReads([...late, CLAIMED_COMMENTS]);
-  const comments = await (await pinnedFetch(childCommentsUrl())).json();
-  assert.equal(comments.some((comment) => comment.id === PREFLIGHT_COMMENT_ID), true);
-  assert.equal(comments.some((comment) => comment.id === RUNNER_STARTED_COMMENT_ID), false);
-  assert.equal(calls.length, PINNED_COMMENT_READ_ATTEMPTS);
-  assert.deepEqual(delays, [...PINNED_COMMENT_READ_RETRY_DELAYS_MS]);
+test('exact direct URLs come from the authority repository and immutable database ids', async () => {
+  const { pinnedFetch, calls } = pinnedExactReads({
+    exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT, [EXACT_RUNNER_STARTED_URL]: RUNNER_STARTED },
+  });
+  await pinnedFetch(childCommentsUrl());
+  assert.equal(calls[1].url, `https://api.github.com/repos/${ISSUE_REPOSITORY}/issues/comments/${PREFLIGHT_COMMENT_ID}`);
+  assert.equal(calls[2].url, `https://api.github.com/repos/${ISSUE_REPOSITORY}/issues/comments/${RUNNER_STARTED_COMMENT_ID}`);
 });
 
-test('retry reads request cache revalidation without dropping caller headers', async () => {
-  const { pinnedFetch, calls } = pinnedFetchReads([REPLICATED_LATE, CLAIMED_COMMENTS]);
+test('the exact-read path never re-polls the issue comments list', async () => {
+  const { pinnedFetch, calls } = pinnedExactReads({ authority: UNCLAIMED_AUTHORITY });
+  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
+  assert.equal(listReads(calls).length, 1);
+});
+
+test('exact direct reads keep caller authentication and request cache revalidation', async () => {
+  const { pinnedFetch, calls } = pinnedExactReads({
+    authority: UNCLAIMED_AUTHORITY,
+    exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT },
+  });
   await pinnedFetch(childCommentsUrl(), { headers: { authorization: 'token pinned' } });
   assert.equal(calls[0].init.headers.authorization, 'token pinned');
   assert.equal(calls[1].init.headers.get('authorization'), 'token pinned');
@@ -597,52 +643,146 @@ test('retry reads request cache revalidation without dropping caller headers', a
   assert.equal(calls[1].init.cache, 'no-store');
 });
 
-test('every retry read in the widened window requests cache revalidation', async () => {
-  const { pinnedFetch, calls } = pinnedFetchReads([REPLICATED_LATE]);
-  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
-  assert.equal(calls.length, PINNED_COMMENT_READ_ATTEMPTS);
-  for (const { init } of calls.slice(1)) {
-    assert.equal(init.headers.get('cache-control'), 'no-cache');
-    assert.equal(init.headers.get('pragma'), 'no-cache');
-    assert.equal(init.cache, 'no-store');
-  }
+test('an exact 404 immediately after publication is re-read within the bounded window', async () => {
+  let reads = 0;
+  const { pinnedFetch, calls, delays } = pinnedExactReads({
+    authority: UNCLAIMED_AUTHORITY,
+    exact: {
+      [EXACT_PREFLIGHT_URL]: () => {
+        reads += 1;
+        return reads === 1 ? notFoundResponse() : jsonResponse(FRESH_PREFLIGHT);
+      },
+    },
+  });
+  const comments = await (await pinnedFetch(childCommentsUrl())).json();
+  assert.equal(comments.some((comment) => comment.id === PREFLIGHT_COMMENT_ID), true);
+  assert.equal(calls.length, 3);
+  assert.deepEqual(delays, [PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS[0]]);
 });
 
-test('exhausted transient absence fails closed with the original pinned reason', async () => {
-  const { pinnedFetch, calls, delays } = pinnedFetchReads([REPLICATED_LATE]);
-  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
-  assert.equal(calls.length, PINNED_COMMENT_READ_ATTEMPTS);
-  assert.deepEqual(delays, [...PINNED_COMMENT_READ_RETRY_DELAYS_MS]);
-});
-
-test('exhaustion reports the first reason even when later reads report the other absence', async () => {
-  const partial = [OLD_CONTINUE, FRESH_PREFLIGHT, PARTIALLY_REPLICATED_RUNNER_STARTED];
-  const { pinnedFetch, calls, delays } = pinnedFetchReads([REPLICATED_LATE, partial]);
-  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
-  assert.equal(calls.length, PINNED_COMMENT_READ_ATTEMPTS);
-  assert.deepEqual(delays, [...PINNED_COMMENT_READ_RETRY_DELAYS_MS]);
-});
-
-const harderLaterFailureCases = [
-  ['changed packet content', [OLD_CONTINUE, { ...FRESH_PREFLIGHT, body: `${FRESH_PREFLIGHT.body}\nExpanded scope after claim.` }, RUNNER_STARTED]],
-  ['duplicate runner-start markers', [OLD_CONTINUE, FRESH_PREFLIGHT, RUNNER_STARTED, runnerStartedComment({ id: RUNNER_STARTED_COMMENT_ID + 1 })]],
-  ['runner-start identity mismatch', [OLD_CONTINUE, FRESH_PREFLIGHT, runnerStartedComment({ id: RUNNER_STARTED_COMMENT_ID + 7 })]],
+const exactReadTransportFailureCases = [
+  ['an exhausted 404', notFoundResponse, {
+    reads: PINNED_EXACT_COMMENT_READ_ATTEMPTS,
+    delays: [...PINNED_EXACT_COMMENT_NOT_FOUND_RETRY_DELAYS_MS],
+  }],
+  ['a non-successful status', () => jsonResponse({ message: 'server error' }, 500, 'Internal Server Error'), { reads: 1, delays: [] }],
+  ['malformed JSON', () => new Response('not json', { status: 200, headers: { 'content-type': 'application/json' } }), { reads: 1, delays: [] }],
+  ['a JSON array payload', () => jsonResponse([FRESH_PREFLIGHT]), { reads: 1, delays: [] }],
+  ['a transport exception', () => { throw new Error('socket hang up'); }, { reads: 1, delays: [] }],
 ];
 
-for (const [name, comments] of harderLaterFailureCases) {
-  test(`a later ${name} read fails closed without extending the retry window`, async () => {
-    const { pinnedFetch, calls, delays } = pinnedFetchReads([REPLICATED_LATE, comments, CLAIMED_COMMENTS]);
+for (const [name, handler, expected] of exactReadTransportFailureCases) {
+  test(`${name} on an exact read fails closed`, async () => {
+    const { pinnedFetch, calls, delays } = pinnedExactReads({
+      authority: UNCLAIMED_AUTHORITY,
+      exact: { [EXACT_PREFLIGHT_URL]: handler },
+    });
     assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
-    assert.equal(calls.length, 2);
-    assert.deepEqual(delays, PINNED_COMMENT_READ_RETRY_DELAYS_MS.slice(0, 1));
+    assert.equal(calls.length, 1 + expected.reads);
+    assert.deepEqual(delays, expected.delays);
   });
 }
 
+// Endpoint success alone proves nothing: the returned comment still has to satisfy every
+// existing identity, revision, fingerprint, body-digest and authority-marker check.
+const exactPreflightRejectionCases = [
+  ['a mismatched database identity', { ...FRESH_PREFLIGHT, id: PREFLIGHT_COMMENT_ID + 3 }],
+  ['a missing database identity', { ...FRESH_PREFLIGHT, id: undefined }],
+  ['an edited packet body', { ...FRESH_PREFLIGHT, body: `${FRESH_PREFLIGHT.body}\nExpanded scope after claim.` }],
+  ['a tampered manager revision', { ...FRESH_PREFLIGHT, body: FRESH_PREFLIGHT.body.replace(REVISION, `${REVISION}.tampered`) }],
+  ['a tampered packet fingerprint', { ...FRESH_PREFLIGHT, body: FRESH_PREFLIGHT.body.replace(FINGERPRINT, `sha256:${'e'.repeat(64)}`) }],
+  ['a missing manager packet marker', { ...FRESH_PREFLIGHT, body: '## Claude continue command\n\nnot a manager packet' }],
+];
+
+for (const [name, comment] of exactPreflightRejectionCases) {
+  test(`an exact preflight read with ${name} fails closed`, async () => {
+    const { pinnedFetch, calls } = pinnedExactReads({
+      authority: UNCLAIMED_AUTHORITY,
+      exact: { [EXACT_PREFLIGHT_URL]: comment },
+    });
+    assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
+    assert.equal(listReads(calls).length, 1);
+  });
+}
+
+test('an exact runner-start read missing its authority marker fails closed', async () => {
+  const { pinnedFetch } = pinnedExactReads({
+    exact: {
+      [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT,
+      [EXACT_RUNNER_STARTED_URL]: PARTIALLY_REPLICATED_RUNNER_STARTED,
+    },
+  });
+  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
+});
+
+test('an exact runner-start read for another comment identity fails closed', async () => {
+  const { pinnedFetch } = pinnedExactReads({
+    exact: {
+      [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT,
+      [EXACT_RUNNER_STARTED_URL]: runnerStartedComment({ id: RUNNER_STARTED_COMMENT_ID + 7 }),
+    },
+  });
+  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
+});
+
+test('equivalent list and direct rows with the same id deduplicate safely', async () => {
+  const { pinnedFetch, calls } = pinnedExactReads({
+    list: UNCLAIMED_LIST,
+    exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT, [EXACT_RUNNER_STARTED_URL]: RUNNER_STARTED },
+  });
+  const comments = await (await pinnedFetch(childCommentsUrl())).json();
+  assert.equal(comments.filter((comment) => comment.id === PREFLIGHT_COMMENT_ID).length, 1);
+  assert.equal(comments.some((comment) => comment.id === RUNNER_STARTED_COMMENT_ID), false);
+  assert.equal(calls.length, 3);
+});
+
+const conflictingDirectRowCases = [
+  ['body', { ...FRESH_PREFLIGHT, body: `${FRESH_PREFLIGHT.body}\nExpanded scope after claim.` }],
+  ['author', { ...FRESH_PREFLIGHT, user: { login: 'impostor' } }],
+  ['creation time', { ...FRESH_PREFLIGHT, createdAt: '2026-07-25T13:19:30Z' }],
+];
+
+for (const [name, conflicting] of conflictingDirectRowCases) {
+  test(`a direct row conflicting with the list row on ${name} fails closed`, async () => {
+    const { pinnedFetch } = pinnedExactReads({
+      list: UNCLAIMED_LIST,
+      exact: { [EXACT_PREFLIGHT_URL]: conflicting, [EXACT_RUNNER_STARTED_URL]: RUNNER_STARTED },
+    });
+    assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-current');
+  });
+}
+
+test('distinct duplicate authority markers fail closed without any exact read', async () => {
+  const list = [OLD_CONTINUE, FRESH_PREFLIGHT, RUNNER_STARTED, runnerStartedComment({ id: RUNNER_STARTED_COMMENT_ID + 1 })];
+  const { pinnedFetch, calls, delays } = pinnedExactReads({ list });
+  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-runner-start-duplicate');
+  assert.equal(calls.length, 1);
+  assert.deepEqual(delays, []);
+});
+
+test('distinct duplicate authority markers surviving the merge still fail closed', async () => {
+  const list = [OLD_CONTINUE, runnerStartedComment({ id: RUNNER_STARTED_COMMENT_ID + 1 })];
+  const { pinnedFetch, calls } = pinnedExactReads({
+    list,
+    exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT, [EXACT_RUNNER_STARTED_URL]: RUNNER_STARTED },
+  });
+  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
+  assert.equal(listReads(calls).length, 1);
+});
+
+// A foreign marker for this authority key makes this attempt's own runner-start comment
+// absent from the list, so the exact reads run — and the merged payload then carries two
+// distinct markers for one authority key, which fails closed exactly as before.
+test('a foreign runner-start marker still fails closed after the exact reads', async () => {
+  const { pinnedFetch, calls } = pinnedExactReads({
+    list: [OLD_CONTINUE, FRESH_PREFLIGHT, runnerStartedComment({ id: RUNNER_STARTED_COMMENT_ID + 7 })],
+    exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT, [EXACT_RUNNER_STARTED_URL]: RUNNER_STARTED },
+  });
+  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-runner-start-mismatch');
+  assert.equal(listReads(calls).length, 1);
+});
+
 const singlePassFailureCases = [
-  ['runner-start identity mismatch', {
-    comments: [OLD_CONTINUE, FRESH_PREFLIGHT, runnerStartedComment({ id: RUNNER_STARTED_COMMENT_ID + 7 })],
-    reason: 'pinned-child-runner-start-mismatch',
-  }],
   ['duplicate runner-start markers', {
     comments: [OLD_CONTINUE, FRESH_PREFLIGHT, RUNNER_STARTED, runnerStartedComment({ id: RUNNER_STARTED_COMMENT_ID + 1 })],
     reason: 'pinned-child-runner-start-duplicate',
@@ -654,27 +794,36 @@ const singlePassFailureCases = [
 ];
 
 for (const [name, fixture] of singlePassFailureCases) {
-  test(`${name} is never re-read`, async () => {
-    const { pinnedFetch, calls, delays } = pinnedFetchReads([fixture.comments, CLAIMED_COMMENTS]);
+  test(`${name} is never re-read and never triggers an exact read`, async () => {
+    const { pinnedFetch, calls, delays } = pinnedExactReads({
+      list: fixture.comments,
+      exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT, [EXACT_RUNNER_STARTED_URL]: RUNNER_STARTED },
+    });
     assert.equal(await pinnedFetchFailure(pinnedFetch), fixture.reason);
     assert.equal(calls.length, 1);
     assert.deepEqual(delays, []);
   });
 }
 
-test('a non-successful comments response is never re-read', async () => {
+test('a non-successful comments response is never followed by an exact read', async () => {
   const failed = () => new Response('[]', { status: 502, statusText: 'Bad Gateway', headers: { 'content-type': 'application/json' } });
-  const { pinnedFetch, calls, delays } = pinnedFetchReads([failed, CLAIMED_COMMENTS]);
+  const { pinnedFetch, calls, delays } = pinnedExactReads({
+    list: failed,
+    exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT, [EXACT_RUNNER_STARTED_URL]: RUNNER_STARTED },
+  });
   assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
   assert.equal(calls.length, 1);
   assert.deepEqual(delays, []);
 });
 
-test('a malformed retry response neither authorizes nor extends the retry window', async () => {
+test('a malformed comments list fails closed without any exact read', async () => {
   const malformed = () => new Response('not json', { status: 200, headers: { 'content-type': 'application/json' } });
-  const { pinnedFetch, calls } = pinnedFetchReads([REPLICATED_LATE, malformed, CLAIMED_COMMENTS]);
-  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-preflight-not-found');
-  assert.equal(calls.length, 2);
+  const { pinnedFetch, calls } = pinnedExactReads({
+    list: malformed,
+    exact: { [EXACT_PREFLIGHT_URL]: FRESH_PREFLIGHT, [EXACT_RUNNER_STARTED_URL]: RUNNER_STARTED },
+  });
+  assert.equal(await pinnedFetchFailure(pinnedFetch), 'pinned-child-comments-invalid');
+  assert.equal(calls.length, 1);
 });
 
 test('requests outside the pinned comments endpoint remain single-pass and unchanged', async () => {
@@ -689,5 +838,7 @@ test('requests outside the pinned comments endpoint remain single-pass and uncha
   assert.equal(issueResponse, original);
   const otherIssueResponse = await pinnedFetch(childCommentsUrl(ISSUE + 1));
   assert.equal(otherIssueResponse, original);
-  assert.equal(calls.length, 2);
+  const exactResponse = await pinnedFetch(EXACT_PREFLIGHT_URL);
+  assert.equal(exactResponse, original);
+  assert.equal(calls.length, 3);
 });
