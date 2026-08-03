@@ -21,6 +21,12 @@ ModelSpend is a configured project consumed by this runner. It is not the canoni
 
 New claims use one immutable ChatGPT manager packet revision and fingerprint. Legacy proceed/continue and local generated-preflight paths are retired. See [`docs/ops/AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md`](docs/ops/AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md).
 
+### Finding manager-packet code quickly
+
+Start with [`docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-CODE-MAP.md`](docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-CODE-MAP.md). It identifies the canonical parser, current-authority resolver, body-digest function, authority-key function and repository/branch dispatch boundary.
+
+The repository intentionally has no live manager-packet generator. The packet fingerprint is manager-supplied and format-validated; `packetBodyDigest(body)` is the separate SHA-256 value the runner computes over the complete comment body to detect edits.
+
 ## Validation
 
 ```bash
