@@ -8,6 +8,12 @@ This private repository is the canonical home of the reusable Agent Runner imple
 - `TheTekTeam/modelspend#686` governs the initial extraction and Dell cutover.
 - Project repositories provide configuration and optional policy hooks; they must not fork the runner implementation.
 
+## Fast task routing
+
+- For manager preflight packets, packet revision/fingerprint, body digest, authority keys, or repository/branch dispatch, read [`docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-CODE-MAP.md`](docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-CODE-MAP.md) before searching source.
+- There is intentionally no live manager-packet generator in this repository. The runner validates manager-authored packets and computes the full comment-body digest; it must not create or refresh manager authority.
+- For a known issue, fetch that issue and its comments directly. Do not scan the full queue or preload unrelated runner history.
+
 ## Assignment policy
 
 - `agent:codex-claude` is the one canonical shared-assignment label for work that may be completed by Codex Web or Claude Code CLI.
