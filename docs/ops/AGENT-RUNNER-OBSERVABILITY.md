@@ -2,7 +2,7 @@
 
 Issue: `TheTekTeam/agent-runner#1`
 
-The exporter exposes a bounded, read-only view of the canonical Agent Runner state for the Dell observability stack. It reuses the existing dashboard projection and never opens a writable control surface.
+The exporter exposes a bounded, read-only view of the canonical Agent Runner state for the Dell observability stack. It uses an exporter-specific SQLite projection that opens the database in read-only mode, enables SQLite query-only operation, requires the exact supported schema and selects only explicitly allowlisted columns.
 
 ## Endpoints
 
@@ -77,18 +77,23 @@ bash scripts/install-observability-exporter.sh disable
 bash scripts/install-observability-exporter.sh remove
 ```
 
-## Containerised Prometheus boundary
+## Prometheus boundary
 
-The exporter intentionally remains loopback-only. A containerised Prometheus must not cause the exporter to bind to `0.0.0.0` or the LAN. The infrastructure repository owns a separately restricted Docker-bridge relay or equivalent local collection seam. That relay may expose only `/metrics`, `/healthz` and the bounded event feed to the private observability network.
+The Dell Prometheus deployment uses host networking, so it can scrape `127.0.0.1:9914` directly. The exporter must not be rebound to `0.0.0.0`, a LAN address or a Docker bridge address merely to support collection.
 
 ## Security properties
 
 - loopback-only listener;
-- read-only dashboard/state projection;
+- `DatabaseSync(..., { readOnly: true })`;
+- SQLite `query_only` and `trusted_schema=OFF` safety pragmas;
+- exact schema-version compatibility;
+- fixed table and column allowlists;
 - no SQL or arbitrary query endpoint;
+- no use of the normal migrating/writable state store;
 - no GitHub mutation, claim, execution, model call or runner control;
 - fail-closed unsupported schema handling;
 - bounded history, event count and response size;
 - positive field and label allowlists;
 - hardened independent systemd user service;
+- database hash regression proving projection does not mutate the SQLite file;
 - legacy static dashboard retained until Grafana parity is field-proven.
