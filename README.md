@@ -27,6 +27,32 @@ Start with [`docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-CODE-MAP.md`](docs/ops/AGEN
 
 The repository intentionally has no live manager-packet generator. The packet fingerprint is manager-supplied and format-validated; `packetBodyDigest(body)` is the separate SHA-256 value the runner computes over the complete comment body to detect edits.
 
+## Read-only observability exporter
+
+The canonical dashboard projection is also available through a loopback-only exporter for Prometheus and typed event consumers:
+
+```bash
+npm run observability:exporter -- \
+  --config /home/gp/.config/agent-runner/modelspend.json
+```
+
+Install its independent hardened systemd user service on the Dell:
+
+```bash
+bash scripts/install-observability-exporter.sh install \
+  --config /home/gp/.config/agent-runner/modelspend.json
+```
+
+Endpoints are restricted to `127.0.0.1:9914`:
+
+```text
+GET /metrics
+GET /healthz
+GET /events.ndjson
+```
+
+See [`docs/ops/AGENT-RUNNER-OBSERVABILITY.md`](docs/ops/AGENT-RUNNER-OBSERVABILITY.md). The exporter is read-only, rejects non-loopback binding and write methods, and does not expose arbitrary SQL, raw payloads, paths, prompts, comments or provider responses.
+
 ## Validation
 
 ```bash
