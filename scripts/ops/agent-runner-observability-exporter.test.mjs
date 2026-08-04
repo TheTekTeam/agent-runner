@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { openRunnerStateStore } from './claude-runner-state.mjs';
 import {
   buildTypedEvents,
   createExporterServer,
   healthDocument,
   parseExporterArgs,
+  readRunnerProjection,
   renderPrometheusMetrics,
   renderTypedEvents,
 } from './agent-runner-observability-exporter.mjs';
@@ -114,6 +119,37 @@ function fakeDashboard(overrides = {}) {
     ...overrides,
   };
 }
+
+function sha256(path) {
+  return createHash('sha256').update(readFileSync(path)).digest('hex');
+}
+
+test('read-only projection does not mutate the SQLite database', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'agent-runner-observability-'));
+  const dbPath = join(directory, 'runner-state.sqlite');
+  try {
+    const store = openRunnerStateStore(dbPath, { now: () => '2026-08-04T15:00:00.000Z' });
+    store.close();
+    const before = sha256(dbPath);
+    const projection = readRunnerProjection(dbPath, {
+      config: {
+        projectId: 'modelspend',
+        displayName: 'ModelSpend',
+        githubRepo: 'TheTekTeam/modelspend',
+      },
+      historyLimit: 5,
+      now: () => '2026-08-04T15:01:00.000Z',
+    });
+    const after = sha256(dbPath);
+
+    assert.equal(projection.status, 'ok');
+    assert.equal(projection.schemaVersion, 16);
+    assert.equal(projection.project.project, 'modelspend');
+    assert.equal(after, before);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 
 test('Prometheus projection uses bounded labels and excludes raw fields', () => {
   const metrics = renderPrometheusMetrics(fakeDashboard(), { now: Date.parse('2026-08-04T15:01:00.000Z') });
