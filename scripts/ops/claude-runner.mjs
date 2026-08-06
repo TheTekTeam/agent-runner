@@ -134,6 +134,21 @@ export const DEFAULT_PROFILES = {
   }
 };
 
+// The bounded canonical model-identifier vocabulary this runner ever passes
+// to the `claude` CLI's `--model` flag: every `DEFAULT_PROFILES` entry's
+// `defaultModel`, plus `opus` (only reachable via an explicit machine-local
+// `CLAUDE_RUNNER_ALLOW_OPUS` opt-in, see `evaluateClaudeCostAdmission`
+// below). Membership is exact and case-sensitive -- a merely syntactically
+// safe token, or a differently-cased/trimmed alias, is not evidence a
+// captured or operator-supplied model is one this runner actually supports
+// (#148); historical-reconciliation and identity-guard callers must never
+// normalize a value before checking it against this list.
+export const SUPPORTED_MODEL_IDS = Object.freeze(['haiku', 'sonnet', 'opus']);
+
+export function isSupportedModelId(model) {
+  return typeof model === 'string' && SUPPORTED_MODEL_IDS.includes(model);
+}
+
 function truthy(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
 }

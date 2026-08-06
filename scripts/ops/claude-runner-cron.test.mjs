@@ -66,6 +66,7 @@ import { decideRecovery, normalizeTerminalOutcome } from './claude-runner-recove
 import { RUNNER_STATE_TABLES, openRunnerStateStore } from './claude-runner-state.mjs';
 import { createSyntheticNotificationTransport, reconcileNotifications } from './agent-runner-notifications.mjs';
 import { readRestrictedRecoveryHandle, restrictedHandleBindingDigest, restrictedRecoveryDir, writeRestrictedRecoveryHandle } from './claude-runner-recovery-adapter.mjs';
+import { withRecoveryIdentityGuard } from './agent-runner-recovery-identity-guard.mjs';
 
 const TEST_MANAGER_FINGERPRINT = `sha256:${'a'.repeat(64)}`;
 const TEST_BASE_COMMIT = '0'.repeat(40);
