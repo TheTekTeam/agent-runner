@@ -71,7 +71,8 @@ import {
 } from './claude-runner-recovery.mjs';
 import { inspectWorkspaceOwnership } from './agent-runner-workspace-ownership.mjs';
 import { withWorkspaceIdentitySupport } from './agent-runner-workspace-identity-store.mjs';
-import { EXECUTION_PHASE_IMPLEMENTATION, resolveImplementationDispatchIdentity } from './claude-runner.mjs';
+import { withRecoveryIdentityGuard } from './agent-runner-recovery-identity-guard.mjs';
+import { EXECUTION_PHASE_IMPLEMENTATION, isSupportedModelId, resolveImplementationDispatchIdentity, resolveProfile } from './claude-runner.mjs';
 import {
   decorateIssueWithMetadata,
   priorityRank as metadataPriorityRank,
@@ -356,7 +357,7 @@ export function evaluateChildRunResult({ execute, exitCode, childPayload }) {
   return { failed: false, reason: null };
 }
 
-export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeSessionId } = {}) {
+export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeSessionId, model } = {}) {
   const out = [CLAUDE_RUNNER_ENTRYPOINT];
   if (args.configPath) out.push('--config', args.configPath);
   out.push('--issue', String(issueNumber), '--output-dir', args.outputDir);
@@ -370,6 +371,13 @@ export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeS
   if (attemptId) out.push('--attempt-id', String(attemptId));
   if (recoveryMode) out.push('--recovery-mode', recoveryMode);
   if (resumeSessionId) out.push('--resume-session', String(resumeSessionId));
+  // `model` (#148) is the scheduler's own once-resolved canonical model for
+  // a fresh implementation dispatch, passed explicitly so the child's own
+  // independent `resolveProfile()` call uses this exact value (it takes
+  // priority over the child's own `executionMeta.model`) instead of
+  // possibly re-deriving a different one from a mutable local environment.
+  // Never set for a recovery re-invocation or a non-implementation dispatch.
+  if (model) out.push('--model', String(model));
   return out;
 }
 
@@ -438,6 +446,62 @@ function readIssueComments(repo, issueNumber, ghRunner = gh) {
 export function listOpenPullRequests(repo, ghRunner = gh) {
   const raw = ghRunner(['pr', 'list', '--repo', repo, '--state', 'open', '--limit', '100', '--json', 'number,title,body,url,headRefName']);
   return JSON.parse(raw || '[]').map((pr) => ({ ...pr, state: 'open' }));
+}
+
+// `gh pr list --limit N` paginates internally up to N results, so a fixed
+// `--limit 200` silently truncates a repository with more than 200 total
+// pull requests: a historical branch beyond the first page would read as
+// "no matching PR", which a remote-publication guard could then misread as
+// "unpublished" (#148). This starts at `PR_LIST_INITIAL_LIMIT` and, whenever
+// a response returns *exactly* that many results (ambiguous: could be the
+// true total, could be truncated), doubles the limit and re-fetches from
+// scratch, until a response returns fewer results than requested -- proof
+// `gh` itself has exhausted every page. `PR_LIST_MAX_LIMIT` bounds the loop
+// so a pathological/unbounded repository can never spin forever; hitting it
+// without ever seeing a non-full page fails closed (throws) rather than
+// silently returning a partial list.
+const PR_LIST_INITIAL_LIMIT = 200;
+const PR_LIST_MAX_LIMIT = 51200;
+
+function validatedPullRequestRecord(entry) {
+  return entry
+    && typeof entry === 'object'
+    && typeof entry.number === 'number'
+    && typeof entry.headRefName === 'string' && entry.headRefName.length > 0
+    && typeof entry.state === 'string' && entry.state.length > 0;
+}
+
+/**
+ * Every pull request for `repo` regardless of state (open, closed or
+ * merged) -- unlike `listOpenPullRequests()` above, which is only safe to
+ * use where "still open" is genuinely the only state that matters.
+ * Historical recovery-model reconciliation (#148) must detect any prior
+ * publication of an approved branch, not only a still-open one: a merged or
+ * closed PR is just as conclusive evidence that a checkpoint was already
+ * published as an open one is. Callers that treat "unpublished" as a repair
+ * precondition must fail closed on a thrown/malformed/empty read here, and
+ * on any individual malformed record, never silently treat it as "no PR
+ * exists".
+ */
+export function listAllPullRequests(repo, ghRunner = gh) {
+  for (let limit = PR_LIST_INITIAL_LIMIT; limit <= PR_LIST_MAX_LIMIT; limit *= 2) {
+    const raw = ghRunner(['pr', 'list', '--repo', repo, '--state', 'all', '--limit', String(limit), '--json', 'number,title,body,url,headRefName,state']);
+    if (typeof raw !== 'string' || raw.trim() === '') {
+      throw new Error('gh pr list --state all returned empty output');
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error('gh pr list --state all returned malformed JSON');
+    }
+    if (!Array.isArray(parsed)) throw new Error('gh pr list --state all returned a non-array result');
+    for (const entry of parsed) {
+      if (!validatedPullRequestRecord(entry)) throw new Error('gh pr list --state all returned a malformed PR record');
+    }
+    if (parsed.length < limit) return parsed;
+  }
+  throw new Error('gh pr list --state all did not converge within the bounded pagination ceiling');
 }
 
 function recoveryCommentTime(comment) {
@@ -731,7 +795,11 @@ export function createStateRecorder(args, openStore = openRunnerStateStore) {
   const taskErrors = [];
   let store = null;
   try {
-    store = withWorkspaceIdentitySupport(openStore(args.stateDbPath || defaultRunnerStateDbPath(args.outputDir)));
+    // withRecoveryIdentityGuard (#148) wraps the innermost store so its
+    // guarded BEGIN IMMEDIATE transaction around recordRecoveryAttempt() is
+    // the actual write that lands -- withWorkspaceIdentitySupport wraps
+    // that already-guarded store, not the other way around.
+    store = withWorkspaceIdentitySupport(withRecoveryIdentityGuard(openStore(args.stateDbPath || defaultRunnerStateDbPath(args.outputDir))));
   } catch (error) {
     errors.push({ stage: 'open', message: String(error?.message || error) });
   }
@@ -3251,12 +3319,6 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
 
     const startedAt = now();
     const attemptId = recoveryClaim?.attempt_id || `${args.repo}#${selected.issue.number}:${startedAt}`;
-    // Every invocation — the first attempt and every recovery re-invocation
-    // of the same attempt row — passes the same attemptId so the child can
-    // write its restricted recovery handle (session id, worktree/branch
-    // identity) keyed consistently for a later native_resume/
-    // same_agent_continuation to read back (#698 finding 2).
-    let nodeArgs = recoveryInvocation?.args || runnerArgs(selected.issue.number, args, { attemptId });
     // New attempts bind to the immutable manager authority key. The source
     // comment identity remains evidence only; it cannot substitute for the
     // manager-owned revision and fingerprint. Historical rows may still carry
@@ -3284,7 +3346,10 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     // durable `worktreeIdentity` (spec section 5) regardless of the
     // claimOnExecute flag — a future dispatch attributing a conflict to this
     // row must be able to find its exact branch/worktree identity, not just
-    // whether this scheduler pass happened to gate on it.
+    // whether this scheduler pass happened to gate on it. It must also be
+    // resolved before `resolvedProfile` below (#148): `resolvedProfile` reads
+    // `dispatchIdentity`, and both are declared with `const` in this same
+    // function scope.
     const dispatchIdentity = !recoveryClaim
       ? resolveImplementationDispatchIdentity({
         issue: selected.issue, command: selected.command, currentPreflight: selected.currentPreflight,
@@ -3295,6 +3360,38 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     const freshImplementationDispatch = Boolean(dispatchIdentity?.ok)
       && dispatchIdentity.executionAuthorization.phase === EXECUTION_PHASE_IMPLEMENTATION
       && dispatchIdentity.executionAuthorization.allowed === true;
+
+    // One canonical resolved model for this fresh (non-recovery)
+    // implementation attempt (#148): derived exactly once, here, from the
+    // same dispatch-authority-verified `profileName`/`executionMeta` the
+    // child's own independent `resolveProfile()` call (in
+    // `claude-runner.mjs`'s `main()`) derives from -- never inferred from
+    // the possibly-modelless `agentRunMetadata(agent, {})` profile
+    // `plan.agent` carries for a fresh dispatch (see below). Carried through
+    // the dispatch boundary explicitly via `--model` (see `runnerArgs()`) so
+    // the child, the restricted-handle capture, and the initial
+    // `recovery_attempts` row below can never resolve or persist a
+    // different model for the same attempt. Left `null` for every
+    // non-implementation dispatch (recovery, plan phase, unauthorized): this
+    // issue's forward-fix scope is limited to fresh implementation attempts,
+    // and those keep their prior `plan.agent?.model` behavior below.
+    const resolvedProfile = freshImplementationDispatch
+      ? resolveProfile(dispatchIdentity.profileName, {
+        model: dispatchIdentity.executionMeta?.model,
+        effort: dispatchIdentity.executionMeta?.effort,
+        maxBudgetUsd: dispatchIdentity.executionMeta?.max_budget_usd,
+      }, authEnv)
+      : null;
+    const resolvedModel = freshImplementationDispatch ? (resolvedProfile?.model ?? null) : null;
+    const modelResolutionValid = !freshImplementationDispatch || isSupportedModelId(resolvedModel);
+
+    // Every invocation — the first attempt and every recovery re-invocation
+    // of the same attempt row — passes the same attemptId so the child can
+    // write its restricted recovery handle (session id, worktree/branch
+    // identity) keyed consistently for a later native_resume/
+    // same_agent_continuation to read back (#698 finding 2).
+    let nodeArgs = recoveryInvocation?.args
+      || runnerArgs(selected.issue.number, args, { attemptId, model: resolvedModel });
 
     // Issue #50 review, requirement 7: this settings-revision check must run
     // before any new attempt/ownership row, claim, GitHub mutation,
@@ -3370,6 +3467,47 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         repo: args.repo, issueNumber: selected.issue.number, mode: 'dispatch-authority-rejected',
         exitCode: 1, logPath, payload, startedAt, finishedAt,
       })) return emitSystemicStatePause(args, state, 'dispatch-authority-result-persistence', { now, logger: dependencies.logger }).exitCode;
+      console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+      return 1;
+    }
+
+    // #148: a fresh implementation attempt's canonical model must be
+    // successfully resolved to one of this runner's bounded supported model
+    // identifiers before any attempt row, runner-start marker, claim
+    // mutation or child launch. `resolvedProfile`/`resolvedModel` above are
+    // only computed for `freshImplementationDispatch`, so this can only
+    // trip for that exact case -- a recovery re-invocation, a plan-phase
+    // dispatch, or an already-rejected dispatch authority never reach here
+    // with `modelResolutionValid === false`. Zero attempts, zero claims,
+    // zero GitHub/workspace mutations on rejection, mirroring the
+    // dispatch-authority-rejection pattern immediately above.
+    if (!recoveryClaim && freshImplementationDispatch && !modelResolutionValid) {
+      const finishedAt = now();
+      if (!state.record('recordQueueEvent', {
+        repo: args.repo, eventType: 'model-resolution-invalid', issueNumber: selected.issue.number,
+        statusLabel: selected.issue.statusLabel, reason: 'captured-model-invalid',
+        payload: { profileName: dispatchIdentity.profileName },
+      })) return emitSystemicStatePause(args, state, 'model-resolution-queue-event', { now, logger: dependencies.logger }).exitCode;
+      const payload = {
+        ...plan,
+        claim: null,
+        startedAt,
+        finishedAt,
+        exitCode: 1,
+        childLaunched: false,
+        markerPosted: false,
+        packetConsumed: false,
+        attemptCreated: false,
+        issueMutation: false,
+        workspaceMutation: false,
+        failureScope: 'issue_not_runnable',
+        terminalOutcome: 'captured-model-invalid',
+      };
+      const logPath = writeLog(args.outputDir, payload);
+      if (!state.record('recordRunResult', {
+        repo: args.repo, issueNumber: selected.issue.number, mode: 'model-resolution-invalid',
+        exitCode: 1, logPath, payload, startedAt, finishedAt,
+      })) return emitSystemicStatePause(args, state, 'model-resolution-result-persistence', { now, logger: dependencies.logger }).exitCode;
       console.log(JSON.stringify({ ...payload, logPath }, null, 2));
       return 1;
     }
@@ -3462,7 +3600,25 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         managerPreflightFingerprint: schedulerPreflightFingerprint,
         managerPreflightBodyDigest: schedulerPreflightBodyDigest,
         managerAuthorityKey: schedulerAuthorityKey,
-        phase: 'starting', agent: plan.agent?.agentId, model: plan.agent?.model, harness: plan.agent?.agentType,
+        // `resolvedModel` (resolved exactly once above, from the same
+        // dispatch-authority-verified profile/execution metadata the
+        // child's own independent profile resolution derives from) is
+        // authoritative over `plan.agent?.model` for a fresh implementation
+        // dispatch (#148): that `agentRunMetadata(agent, {})` profile
+        // carries no model at all for a fresh dispatch, so persisting it
+        // here would durably write a `NULL` model even though the
+        // attempt's actual dispatched/child model is already known and
+        // validated at this exact point. `modelResolutionValid` was already
+        // required true (or this dispatch is not a fresh implementation
+        // attempt) before this line can be reached, so there is
+        // deliberately no `|| plan.agent?.model` fallback on the fresh
+        // implementation path -- only a non-implementation dispatch
+        // (recovery already returns above; plan-phase/unauthorized) keeps
+        // the prior `plan.agent?.model` behavior, which is out of this
+        // issue's forward-fix scope.
+        phase: 'starting', agent: plan.agent?.agentId,
+        model: freshImplementationDispatch ? resolvedModel : (plan.agent?.model || null),
+        harness: plan.agent?.agentType,
         startedAt, ...processIdentity, resolutionState: 'active',
       })) return emitSystemicStatePause(args, state, 'attempt-start', { now, logger: dependencies.logger }).exitCode;
       // Durably bind this attempt to the exact deterministic worktree/branch
@@ -3599,7 +3755,26 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     const childEnded = result.status !== null || Boolean(result.signal) || Boolean(result.error);
     const conflictingLease = activeLeaseRows.some((row) => row.attempt_id !== attemptId && row.issue_number === selected.issue.number);
     const actualAgent = childPayload?.agent?.agentId || childPayload?.agentId || plan.agent?.agentId || null;
-    const actualModel = childPayload?.agent?.model || childPayload?.model || plan.agent?.model || null;
+    // `expectedModel` (#148) is the same canonical resolved model this exact
+    // attempt was claimed/dispatched with -- `resolvedModel` for a fresh
+    // implementation attempt (`plan.agent?.model` is always `null` there,
+    // since `agentRunMetadata(agent, {})` carries no model), or the
+    // recovery-claimed row's already-persisted `model` for a recovery
+    // re-invocation. Both the terminal fallback and the profile-compatible
+    // recovery-evidence check below must reference this exact same value,
+    // never the modelless `plan.agent?.model`.
+    const expectedModel = freshImplementationDispatch ? resolvedModel : (recoveryClaim?.model ?? plan.agent?.model ?? null);
+    const actualModel = childPayload?.agent?.model || childPayload?.model || expectedModel || null;
+    // A fresh implementation dispatch's actualModel must never silently
+    // disagree with resolvedModel -- the exact model this attempt was
+    // claimed/dispatched with (#148). A child that reports a conflicting
+    // model is a conflicting child identity, not a value to trust and
+    // persist: it must fail closed to unknown_failure instead.
+    const modelIdentityDisagreement = freshImplementationDispatch && resolvedModel != null && actualModel !== resolvedModel;
+    if (modelIdentityDisagreement && outcome === 'completed') {
+      outcome = 'unknown_failure';
+      if (effectiveExitCode === 0) effectiveExitCode = 1;
+    }
     const actualHarness = childPayload?.agent?.agentType || childPayload?.agentType || plan.agent?.agentType || null;
     const decision = decideRecovery({
       outcome,
@@ -3612,7 +3787,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         repositoryMutated: childPayload?.implementationEvidence?.repositoryMutated === false,
         checkpointAvailable: Boolean(childPayload?.checkpointAvailable), sessionAvailable: Boolean(childPayload?.sessionAvailable),
         profileCompatible: Boolean(actualAgent && actualModel && actualHarness && sameAgent(actualAgent, plan.agent?.agentId)
-          && actualModel === plan.agent?.model && actualHarness === plan.agent?.agentType),
+          && actualModel === (freshImplementationDispatch ? resolvedModel : expectedModel) && actualHarness === plan.agent?.agentType),
         sameProfileAvailable: childPayload?.recoveryEvidence?.sameProfileAvailable === true,
         quotaHeadroom: quotaPreflight.blocked === false && quotaPreflight.skipped === false,
         budgetHeadroom: childPayload?.costAdmission?.allowed === true,
