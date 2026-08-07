@@ -49,7 +49,13 @@ const REQUIRED_OPTIONS = Object.freeze([
   '--attempt-id', '--repo', '--agent', '--harness', '--model', '--branch', '--worktree',
   '--manager-revision', '--manager-fingerprint', '--manager-body-digest', '--repo-root',
 ]);
-const OPTIONAL_OPTIONS = Object.freeze(['--output-dir', '--state-db']);
+const OPTIONAL_OPTIONS = Object.freeze([
+  '--output-dir',
+  '--state-db',
+  '--claim-id',
+  '--claim-identity-json',
+  '--manager-authority-key',
+]);
 const KNOWN_OPTIONS = new Set([...REQUIRED_OPTIONS, ...OPTIONAL_OPTIONS]);
 
 const REPO_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._-]){0,99}\/[A-Za-z0-9](?:[A-Za-z0-9._-]){0,99}$/;
@@ -58,6 +64,8 @@ const AGENT_HARNESS_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const WORKTREE_NAME_PATTERN = /^[a-z0-9][a-z0-9-]{0,79}$/;
 const MANAGER_REVISION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
 const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/i;
+const CLAIM_ID_PATTERN = /^github-comment:database:[1-9][0-9]{0,19}$/;
+const IDENTITY_VALUE_MAX_LENGTH = 2048;
 const PATH_PATTERN_MAX_LENGTH = 4096;
 
 class CommandUsageError extends Error {
@@ -111,6 +119,46 @@ function matchOrThrow(value, pattern, name) {
   return value;
 }
 
+function boundedIdentityValue(value, name) {
+  if (
+    typeof value !== 'string'
+    || !value
+    || value.length > IDENTITY_VALUE_MAX_LENGTH
+    || value.includes('\\0')
+    || value.includes('\\n')
+    || value.includes('\\r')
+  ) {
+    throw new CommandUsageError(`${name} is invalid`);
+  }
+  return value;
+}
+
+function validatedClaimIdentityJson(value) {
+  const bounded = boundedIdentityValue(value, '--claim-identity-json');
+
+  let parsed;
+  try {
+    parsed = JSON.parse(bounded);
+  } catch {
+    throw new CommandUsageError('--claim-identity-json is invalid');
+  }
+
+  if (
+    !parsed
+    || typeof parsed !== 'object'
+    || Array.isArray(parsed)
+    || parsed.version !== 1
+    || typeof parsed.nodeId !== 'string'
+    || !parsed.nodeId
+    || !Number.isSafeInteger(parsed.databaseId)
+    || parsed.databaseId <= 0
+  ) {
+    throw new CommandUsageError('--claim-identity-json is invalid');
+  }
+
+  return bounded;
+}
+
 /**
  * Validate and bound every command input before any I/O (config read, SQLite
  * open, GitHub contact, or restricted-path access) is attempted -- every
@@ -136,6 +184,53 @@ export function parseRecoveryModelReconcileArgs(argv = []) {
   const managerFingerprint = matchOrThrow(requiredOption(argv, '--manager-fingerprint'), SHA256_DIGEST_PATTERN, '--manager-fingerprint');
   const managerBodyDigest = matchOrThrow(requiredOption(argv, '--manager-body-digest'), SHA256_DIGEST_PATTERN, '--manager-body-digest');
   const repoRoot = boundedPath(requiredOption(argv, '--repo-root'), '--repo-root');
+
+  const claimIdRaw = optionValue(argv, '--claim-id');
+  const claimIdentityJsonRaw = optionValue(argv, '--claim-identity-json');
+  const managerAuthorityKeyRaw = optionValue(argv, '--manager-authority-key');
+
+  const identityOptionCount = [
+    claimIdRaw,
+    claimIdentityJsonRaw,
+    managerAuthorityKeyRaw,
+  ].filter((value) => value !== undefined).length;
+
+  if (identityOptionCount !== 0 && identityOptionCount !== 3) {
+    throw new CommandUsageError(
+      'claim/manager authority identity options must be supplied together',
+    );
+  }
+
+  let claimId;
+  let claimIdentityJson;
+  let managerAuthorityKey;
+
+  if (identityOptionCount === 3) {
+    claimId = matchOrThrow(
+      claimIdRaw,
+      CLAIM_ID_PATTERN,
+      '--claim-id',
+    );
+
+    claimIdentityJson = validatedClaimIdentityJson(
+      claimIdentityJsonRaw,
+    );
+
+    managerAuthorityKey = boundedIdentityValue(
+      managerAuthorityKeyRaw,
+      '--manager-authority-key',
+    );
+
+    const expectedManagerAuthorityKey =
+      `manager-preflight:${managerRevision}:${managerFingerprint}`;
+
+    if (managerAuthorityKey !== expectedManagerAuthorityKey) {
+      throw new CommandUsageError(
+        '--manager-authority-key does not match manager revision/fingerprint',
+      );
+    }
+  }
+
   // Explicit-only: `--output-dir`/`--state-db` are never defaulted from
   // `process.env` -- an operator repairing one exact historical attempt
   // must name its exact database and restricted-recovery root, never
@@ -147,6 +242,7 @@ export function parseRecoveryModelReconcileArgs(argv = []) {
   return Object.freeze({
     attemptId, repo, agent, harness, model, branch, worktree,
     managerRevision, managerFingerprint, managerBodyDigest,
+    claimId, claimIdentityJson, managerAuthorityKey,
     repoRoot, outputDir, stateDbPath,
   });
 }
@@ -233,6 +329,9 @@ export function runRecoveryModelReconcileCommand({
       expectedManagerRevision: options.managerRevision,
       expectedManagerFingerprint: options.managerFingerprint,
       expectedManagerBodyDigest: options.managerBodyDigest,
+      expectedClaimId: options.claimId,
+      expectedClaimIdentityJson: options.claimIdentityJson,
+      expectedManagerAuthorityKey: options.managerAuthorityKey,
       remoteBranchPublishedProvider: () => remoteBranchPublished(options.repo, options.branch, ghRunner),
       remotePrPublishedProvider: () => remotePrPublished(options.repo, options.branch, ghRunner, listAllPullRequestsFn),
       restrictedHandleReader,
