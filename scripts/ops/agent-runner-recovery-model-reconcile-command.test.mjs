@@ -24,6 +24,10 @@ const MANAGER_REVISION = 'AR136-PR-CONTRACT-IMPLEMENTATION-2026-08-03.12';
 const MANAGER_FINGERPRINT = 'sha256:34f501b0588760165dbe22716b055c152c9d0cca737cfc3da5d63a4e984682e6';
 const MANAGER_BODY_DIGEST = 'sha256:1ee66684b548c31d31ee899af4309f5435168d5f486ee270d66c80a88af92ebf';
 const CHECKPOINT_HEAD = 'ec81d1adc41f31a51281fc4d4ad34f56c53535ed';
+const CLAIM_ID = 'github-comment:database:5169337958';
+const CLAIM_IDENTITY_JSON = '{"version":1,"nodeId":"IC_kwDOTcA1688AAAABNB3WZg","databaseId":5169337958}';
+const MANAGER_AUTHORITY_KEY =
+  `manager-preflight:${MANAGER_REVISION}:${MANAGER_FINGERPRINT}`;
 const CHECKPOINT_STATUS_FINGERPRINT = fingerprintGitStatus('').statusFingerprint;
 
 // The exact preserved #136 recovery-resolution shape, spread into every
@@ -102,7 +106,14 @@ function closeTrackingStore(store, onClose) {
   });
 }
 
-function baseArgv(overrides = {}, { outputDir = '.var/claude-runner', stateDb = '/tmp/does-not-matter-state.sqlite' } = {}) {
+function baseArgv(
+  overrides = {},
+  {
+    outputDir = '.var/claude-runner',
+    stateDb = '/tmp/does-not-matter-state.sqlite',
+    includeHistoricalIdentity = false,
+  } = {},
+) {
   const merged = {
     '--attempt-id': ATTEMPT_ID,
     '--repo': REPO,
@@ -117,6 +128,13 @@ function baseArgv(overrides = {}, { outputDir = '.var/claude-runner', stateDb = 
     '--repo-root': '/tmp/does-not-matter',
     '--output-dir': outputDir,
     '--state-db': stateDb,
+    ...(includeHistoricalIdentity
+      ? {
+          '--claim-id': CLAIM_ID,
+          '--claim-identity-json': CLAIM_IDENTITY_JSON,
+          '--manager-authority-key': MANAGER_AUTHORITY_KEY,
+        }
+      : {}),
     ...overrides,
   };
   const argv = [];
@@ -183,6 +201,96 @@ test('runRecoveryModelReconcileCommand: exact historical null-model reconciliati
     store.close();
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('runRecoveryModelReconcileCommand: exact #136 row with persisted claim and manager authority identity reconciles when the operator supplies matching evidence', () => {
+  const { dir, path, store } = tempStore();
+  try {
+    seedAttempt(store, {
+      model: null,
+      overrides: {
+        claimId: CLAIM_ID,
+        claimIdentity: JSON.parse(CLAIM_IDENTITY_JSON),
+        managerAuthorityKey: MANAGER_AUTHORITY_KEY,
+      },
+    });
+
+    const result = runRecoveryModelReconcileCommand({
+      argv: baseArgv(
+        {},
+        {
+          stateDb: path,
+          includeHistoricalIdentity: true,
+        },
+      ),
+      ...successDependencies({
+        openStore: () => openRunnerStateStore(path),
+      }),
+    });
+
+    assert.equal(
+      result.exitCode,
+      EXIT_OK,
+      JSON.stringify(result.output),
+    );
+    assert.equal(result.output.ok, true);
+    assert.equal(
+      result.output.code,
+      'reconciliation-complete',
+    );
+    assert.equal(result.output.model, MODEL);
+    assert.equal(
+      store.recoveryAttempt(ATTEMPT_ID).model,
+      MODEL,
+    );
+  } finally {
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('runRecoveryModelReconcileCommand: partial historical identity evidence is rejected before state access', () => {
+  for (const argv of [
+    baseArgv({ '--claim-id': CLAIM_ID }),
+    baseArgv({
+      '--claim-id': CLAIM_ID,
+      '--claim-identity-json': CLAIM_IDENTITY_JSON,
+    }),
+  ]) {
+    const result = runRecoveryModelReconcileCommand({
+      argv,
+      ...successDependencies({
+        openStore: () => {
+          throw new Error('must not open store on usage error');
+        },
+      }),
+    });
+
+    assert.equal(result.exitCode, EXIT_USAGE_ERROR);
+    assert.equal(result.output.code, 'usage-error');
+  }
+});
+
+test('runRecoveryModelReconcileCommand: manager authority key must match the supplied manager revision and fingerprint', () => {
+  const result = runRecoveryModelReconcileCommand({
+    argv: baseArgv(
+      {
+        '--manager-authority-key':
+          'manager-preflight:WRONG:sha256:' + 'a'.repeat(64),
+      },
+      {
+        includeHistoricalIdentity: true,
+      },
+    ),
+    ...successDependencies({
+      openStore: () => {
+        throw new Error('must not open store on usage error');
+      },
+    }),
+  });
+
+  assert.equal(result.exitCode, EXIT_USAGE_ERROR);
+  assert.equal(result.output.code, 'usage-error');
 });
 
 test('runRecoveryModelReconcileCommand: fails closed with attempt-shape-unsupported when the persisted row is not the exact #136 shape', () => {
