@@ -13,6 +13,7 @@ import {
   createLivenessFilteredStore,
   inspectDueRecoveryLiveness,
 } from './agent-runner-live-liveness.mjs';
+import { withRecoveryIdentityGuard } from './agent-runner-recovery-identity-guard.mjs';
 import { parseStructuredOutput, serviceExitCode } from './agent-runner-service-semantics.mjs';
 import { openRunnerStateStore } from './claude-runner-state.mjs';
 import { main as schedulerMain, parseArgs as schedulerParseArgs } from './claude-runner-cron.mjs';
@@ -44,6 +45,45 @@ export function createStableOutputCapture({ logger, originalConsoleLog, original
       baseLogger.error(...values);
     },
   };
+}
+
+/**
+ * The exact runner-state composition this production entrypoint hands to the
+ * imported scheduler. Exported so regressions exercise the real composition
+ * rather than a hand-rebuilt copy of it (#158).
+ *
+ * The #148 recovery-identity guard is attached to the concrete store instance
+ * that *owns* the SQLite connection, never to a delegating layer above it.
+ * `withRecoveryIdentityGuard()` installs its wrapper by assigning
+ * `store.recordRecoveryAttempt`, and the liveness/admission layers here are
+ * `Proxy` objects with no `set` trap, so that assignment passes straight
+ * through and lands as an own property on the innermost store -- while the
+ * `original` the guard captured is the outer proxy's own method, which
+ * re-resolves `recordRecoveryAttempt` by property lookup on its target and so
+ * lands back inside the guard. Guarding the *composed* store (which is what
+ * `createStateRecorder()` did to whatever `openStore` returned) therefore
+ * opened `BEGIN IMMEDIATE` twice on the one connection -- SQLite's "cannot
+ * start a transaction within a transaction" -- failing every implementation
+ * dispatch at `attempt-start` with `runner_state_unavailable`.
+ *
+ * Guarding here keeps exactly one transaction owner, and keeps the admission
+ * decision (which spawns a `gh`-calling revalidation subprocess) entirely
+ * outside that write transaction. `createStateRecorder()`'s own
+ * `withRecoveryIdentityGuard()` call reads the guard marker through these
+ * proxies and returns the store unchanged.
+ */
+export function openAtomicRunnerStateStore(dbPath, {
+  openStore = openRunnerStateStore,
+  livenessDecisions = [],
+  argv = [],
+  env = process.env,
+  pauseState = { result: null },
+  revalidate = runAtomicCandidateRevalidation,
+} = {}) {
+  return createAtomicAdmissionStore(
+    createLivenessFilteredStore(withRecoveryIdentityGuard(openStore(dbPath)), livenessDecisions),
+    { argv, env, pauseState, revalidate },
+  );
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env, dependencies = {}) {
@@ -83,15 +123,14 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     }
   }
 
-  const atomicOpenStore = (dbPath) => createAtomicAdmissionStore(
-    createLivenessFilteredStore(openStore(dbPath), livenessDecisions),
-    {
-      argv,
-      env,
-      pauseState,
-      revalidate,
-    },
-  );
+  const atomicOpenStore = (dbPath) => openAtomicRunnerStateStore(dbPath, {
+    openStore,
+    livenessDecisions,
+    argv,
+    env,
+    pauseState,
+    revalidate,
+  });
 
   console.log = capture.directLog;
   console.error = capture.directError;
