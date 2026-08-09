@@ -20,6 +20,7 @@
     "local:executor:handoff": "node scripts/ops/agent-runner-local-executor-handoff-command.mjs",
     "validation:profile": "node scripts/ops/agent-runner-validation-profile-command.mjs",
     "recovery:model:reconcile": "node scripts/ops/agent-runner-recovery-model-reconcile-command.mjs",
-    "pr:publish": "node scripts/ops/agent-runner-pr-publication-command.mjs"
+    "pr:publish": "node scripts/ops/agent-runner-pr-publication-command.mjs",
+    "pr:controller": "node scripts/ops/agent-runner-pr-controller-command.mjs"
   }
 }

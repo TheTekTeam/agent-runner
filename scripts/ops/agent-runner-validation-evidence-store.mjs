@@ -142,6 +142,43 @@ export class ValidationEvidenceStore {
     return row ? Object.freeze(JSON.parse(row.evidence_json)) : null;
   }
 
+  /**
+   * Newest unexpired successful evidence bound to one project, profile, profile
+   * contract and exact head SHA. Read-only: callers still re-check freshness
+   * through evaluateValidationFreshness before any publication decision.
+   */
+  findFreshSucceeded({
+    projectId,
+    repository,
+    profile,
+    profileContractSha256,
+    expectedSha,
+    now = new Date().toISOString(),
+  } = {}) {
+    const row = this.db.prepare(`
+      SELECT evidence_json FROM validation_runs
+      WHERE project_id = ?
+        AND repository = ?
+        AND profile = ?
+        AND profile_contract_sha256 = ?
+        AND expected_sha = ?
+        AND observed_sha = ?
+        AND state = 'succeeded'
+        AND expires_at > ?
+      ORDER BY finished_at DESC, validation_id DESC
+      LIMIT 1
+    `).get(
+      projectId,
+      repository,
+      profile,
+      profileContractSha256,
+      String(expectedSha ?? '').toLowerCase(),
+      String(expectedSha ?? '').toLowerCase(),
+      now,
+    );
+    return row ? Object.freeze(JSON.parse(row.evidence_json)) : null;
+  }
+
   recordAndSanitizeJob(job, evidence) {
     if (!VALIDATION_FINAL_STATES.has(evidence.state)) {
       throw new Error('validation evidence final state is invalid');
