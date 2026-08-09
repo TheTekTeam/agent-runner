@@ -22,6 +22,7 @@
     "recovery:model:reconcile": "node scripts/ops/agent-runner-recovery-model-reconcile-command.mjs",
     "pr:publish": "node scripts/ops/agent-runner-pr-publication-command.mjs",
     "pr:controller": "node scripts/ops/agent-runner-pr-controller-command.mjs",
-    "merge:execute": "node scripts/ops/agent-runner-merge-transaction-command.mjs"
+    "merge:execute": "node scripts/ops/agent-runner-merge-transaction-command.mjs",
+    "reconcile:issue": "node scripts/ops/agent-runner-issue-reconciliation-command.mjs"
   }
 }
