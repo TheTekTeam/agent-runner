@@ -138,6 +138,32 @@ export function emitSchedulerReentryEvent({
 }
 
 /**
+ * Pure classification of one production `claude-runner-cron.mjs` `main()`
+ * pass's own final durable-result payload (#157) into the `{ issue, skipped }`
+ * shape `classifySchedulerReentrySelection` expects. `payload.claim` is
+ * `main()`'s own atomic signal that `claimIssueForExecution` actually ran
+ * this pass -- set only on a genuine fresh (non-recovery) claim, `null` on
+ * every dry-run, quota-blocked, no-selection, or candidate-specific-blocker
+ * (dispatch-authority-rejected, model-resolution-invalid, workspace-
+ * ownership-conflict, settings-revision-changed) outcome. Using it (rather
+ * than the mere presence of `selectedIssue`) means a candidate that was
+ * inspected but never actually claimed/launched is classified `idle`, never
+ * misreported as `candidate_selected`. A due-recovery re-invocation (which
+ * never sets `claim`) is a known, documented under-count here: it is a rare
+ * concurrent-due-recovery edge case, not the primary reconciliation-to-
+ * reentry path, and under-counting it is safe (never a duplicate claim,
+ * never spins) even though it does not credit the recovery launch that
+ * actually happened.
+ */
+export function classifyProductionHandoffResult(payload = {}) {
+  const claimed = Boolean(payload && payload.claim) && typeof payload.selectedIssue === 'number';
+  return {
+    issue: claimed ? { number: payload.selectedIssue } : null,
+    skipped: Array.isArray(payload?.skipped) ? payload.skipped : [],
+  };
+}
+
+/**
  * Pure classification of whatever the injected selection function returns.
  * The expected shape is exactly `selectIssue()`'s result (also consumed by
  * `claude-runner-candidate-probe.mjs`): `{ issue, skipped }`. A first

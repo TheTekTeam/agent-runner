@@ -1,7 +1,44 @@
 #!/usr/bin/env node
 import process from 'node:process';
 import { IssueReconciliationStore } from './agent-runner-issue-reconciliation-store.mjs';
-import { SchedulerReentryStore, runSchedulerReentryCycle } from './agent-runner-scheduler-reentry.mjs';
+import {
+  classifyProductionHandoffResult,
+  runSchedulerReentryCycle,
+  SchedulerReentryStore,
+} from './agent-runner-scheduler-reentry.mjs';
+
+/**
+ * Hands one bounded pass off to the existing production scheduler entrypoint
+ * (`claude-runner-cron.mjs`'s `main()`) exactly as an operator or the
+ * systemd timer already invokes it -- same argv/env, same file lock, same
+ * atomic admission/claim/workspace/worker-launch code. This introduces no
+ * second claim, worker-launch or GitHub-mutation implementation: it only
+ * captures that one call's own terminal JSON result (`main()` prints exactly
+ * one `console.log(JSON.stringify(...))` line per pass, on every terminal
+ * branch) so the reentry cycle can classify what actually happened. Capture
+ * is local to this one call and always restored, even if `main()` throws.
+ */
+export async function runProductionCronPass(argv, env, { cronMain } = {}) {
+  const mainFn = cronMain || (await import('./claude-runner-cron.mjs')).main;
+  const captured = [];
+  const originalLog = console.log;
+  console.log = (...logArgs) => { captured.push(logArgs); };
+  try {
+    await mainFn(argv, env);
+  } finally {
+    console.log = originalLog;
+  }
+  for (let index = captured.length - 1; index >= 0; index -= 1) {
+    const [first] = captured[index];
+    if (typeof first !== 'string') continue;
+    try {
+      return JSON.parse(first);
+    } catch {
+      // Not the terminal JSON line -- keep scanning earlier captured calls.
+    }
+  }
+  return {};
+}
 
 function args(argv) {
   const parsed = {};
@@ -35,13 +72,18 @@ async function main() {
       reconciliationStore,
       reentryStore,
       transactionId: parsed['transaction-id'],
-      // Reuses the existing, already-tested selection contract exactly as
-      // `claude-runner-candidate-probe.mjs` invokes it: a dry-run, no-quota
-      // scan that never claims an issue, launches a worker or calls a model.
+      // Hands the bounded next-candidate pass to the existing production
+      // entrypoint (`claude-runner-cron.mjs`'s `main()`), driven by the
+      // exact same argv/env an operator or the systemd timer would supply
+      // (`rest`/`process.env`, unmodified -- no forced --dry-run). This is
+      // what actually closes the #157 loop: a completed reconciliation can
+      // now reach a real claim/workspace/worker-launch, not merely a probe.
+      // An explicit --dry-run in `rest`, or an unset CLAUDE_RUNNER_CRON_EXECUTE,
+      // still yields the same safe, zero-mutation pass `main()` already
+      // guarantees for that case.
       selectNextCandidate: async () => {
-        const { parseArgs, selectIssue } = await import('./claude-runner-cron.mjs');
-        const selectArgs = parseArgs([...rest, '--dry-run', '--skip-quota-preflight'], process.env);
-        return selectIssue(selectArgs);
+        const payload = await runProductionCronPass(rest, process.env);
+        return classifyProductionHandoffResult(payload);
       },
     });
     output({ schemaVersion: 1, ok: true, ...result });
@@ -51,7 +93,13 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  output({ schemaVersion: 1, ok: false, errorCode: typeof error?.code === 'string' ? error.code : 'scheduler-reentry-failed' });
-  process.exitCode = 1;
-});
+const invokedAsScript = process.argv[1]
+  ? import.meta.url === new URL(process.argv[1], `file://${process.cwd()}/`).href
+  : false;
+
+if (invokedAsScript) {
+  main().catch((error) => {
+    output({ schemaVersion: 1, ok: false, errorCode: typeof error?.code === 'string' ? error.code : 'scheduler-reentry-failed' });
+    process.exitCode = 1;
+  });
+}
