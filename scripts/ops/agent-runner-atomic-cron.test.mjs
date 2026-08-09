@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -178,6 +178,97 @@ test('atomic cron leaves a genuine candidate denial (not a revalidation-subproce
     const payload = JSON.parse(printed);
     assert.equal(payload.candidatePaused, true);
     assert.equal(payload.reason, 'candidate-preflight-revision-changed');
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('atomic cron reaches durable attempt-start persistence through the production wrapped store, with no nested transaction, no GitHub mutation and no child launch', async () => {
+  // #158: the production entrypoint (`bin/run-project.sh` ->
+  // `agent-runner-pinned-atomic-cron.mjs` -> this module) composes the
+  // runner-state store as admission-proxy(liveness-proxy(store)). Attaching
+  // the #148 recovery-identity guard *above* those delegating layers made
+  // its `original` resolve back into the guard itself, so `attempt-start`
+  // opened `BEGIN IMMEDIATE` twice on the one SQLite connection and every
+  // implementation dispatch failed with `runner_state_unavailable` /
+  // `cannot start a transaction within a transaction`. No existing test
+  // covered an *admitted* candidate all the way through this composition --
+  // the ones above all deny or break revalidation first -- which is exactly
+  // how the defect reached production. This is that missing path.
+  const dir = mkdtempSync(join(tmpdir(), 'atomic-cron-attempt-start-'));
+  const lockPath = join(dir, 'cron.lock');
+  const stateDbPath = join(dir, 'state.sqlite');
+  const comments = [managerPacket(10)];
+  const mutatingCalls = [];
+  const diagnostics = [];
+  const originalLog = console.log;
+  // Durable evidence read at the child-launch boundary: the attempt must
+  // already be persisted before the runner ever considers launching a child.
+  let attemptsAtChildBoundary = null;
+  let childLaunches = 0;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--no-claim', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
+      '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
+    ], { GH_TOKEN: 'test-token', CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true' }, {
+      ghRunner: readyIssueGhRunner({ number: 689, comments, mutatingCalls }),
+      inspectWorkspaceOwnership: async () => ({ allowed: true }),
+      revalidateCandidate: ({ expected }) => ({
+        admission: { allowed: true, reason: 'candidate-admitted' },
+        initial: expected,
+        current: expected,
+      }),
+      // Never spawns a real child: it only records the durable state that
+      // already existed when the scheduler reached the launch boundary.
+      runChild: async () => {
+        childLaunches += 1;
+        const probe = openRunnerStateStore(stateDbPath);
+        try { attemptsAtChildBoundary = probe.allRows('recovery_attempts'); } finally { probe.close(); }
+        return { status: 4, signal: null, error: null, stdout: '', stderr: '' };
+      },
+      logger: { error: (message) => diagnostics.push(message) },
+    });
+
+    // stderr deliberately redacts the raw store errors to
+    // `<restricted local log>` (#148), so the unredacted proof that no
+    // nested transaction was raised lives in the bounded local run logs.
+    const runLogs = readdirSync(dir).filter((name) => name.startsWith('cron-') && name.endsWith('.json'))
+      .map((name) => JSON.parse(readFileSync(join(dir, name), 'utf8')));
+    const nested = runLogs.flatMap((payload) => payload.restrictedStateErrors || [])
+      .filter((entry) => String(entry.message).includes('cannot start a transaction within a transaction'));
+    assert.deepEqual(nested, [], 'the nested recovery-attempt transaction must never occur through the production composition');
+    assert.equal(runLogs.some((payload) => payload.systemicPause === true), false,
+      'attempt-start must not raise a systemic state pause');
+    assert.equal(diagnostics.some((line) => String(line).includes('runner_state_unavailable')), false,
+      'attempt-start must not report the state store as unavailable');
+    assert.equal(typeof exitCode, 'number');
+
+    assert.equal(childLaunches, 1, 'the scheduler must reach the child-launch boundary');
+    assert.ok(Array.isArray(attemptsAtChildBoundary), 'attempt rows must be readable at the child-launch boundary');
+    assert.equal(attemptsAtChildBoundary.length, 1, 'exactly one attempt row must be durably persisted before any child launch');
+    const persisted = attemptsAtChildBoundary[0];
+    assert.equal(persisted.issue_number, 689);
+    assert.equal(persisted.agent, 'claude-code-cli');
+    assert.equal(persisted.harness, 'claude');
+    assert.equal(persisted.phase, 'starting');
+    assert.equal(persisted.resolution_state, 'active');
+    assert.equal(persisted.manager_preflight_revision, 'ATOMIC.10');
+    assert.equal(persisted.manager_preflight_fingerprint, TEST_FP);
+
+    assert.equal(mutatingCalls.length, 0, 'no GitHub label/comment mutation is needed to reach durable attempt persistence');
+
+    const state = openRunnerStateStore(stateDbPath);
+    try {
+      assert.equal(state.countRows('recovery_attempts'), 1, 'the attempt row must survive the pass');
+      assert.equal(state.countRows('claims'), 0, 'no claim is written on the --no-claim path');
+      const systemicPause = state.allRows('queue_events').find((row) => row.event_type === 'systemic-pause');
+      assert.equal(systemicPause, undefined, 'attempt-start must not raise a systemic state pause');
+      // A failed/rolled-back transaction (or a leaked open one) would make
+      // this probe throw; the connection must be usable and unlocked.
+      assert.equal(state.assertWritable(), true);
+    } finally { state.close(); }
   } finally {
     console.log = originalLog;
     rmSync(dir, { recursive: true, force: true });

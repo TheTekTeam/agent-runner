@@ -795,10 +795,17 @@ export function createStateRecorder(args, openStore = openRunnerStateStore) {
   const taskErrors = [];
   let store = null;
   try {
-    // withRecoveryIdentityGuard (#148) wraps the innermost store so its
-    // guarded BEGIN IMMEDIATE transaction around recordRecoveryAttempt() is
-    // the actual write that lands -- withWorkspaceIdentitySupport wraps
-    // that already-guarded store, not the other way around.
+    // withRecoveryIdentityGuard (#148) must wrap the innermost store -- the
+    // instance that owns the SQLite connection -- so its guarded BEGIN
+    // IMMEDIATE transaction around recordRecoveryAttempt() is the actual
+    // write that lands, and withWorkspaceIdentitySupport wraps that
+    // already-guarded store, not the other way around. When `openStore`
+    // itself composes delegating layers over the real store (the production
+    // `agent-runner-atomic-cron.mjs` liveness/admission proxies), that
+    // module attaches the guard to the concrete store before wrapping it,
+    // and the guard call here reads its marker through those layers and
+    // returns the store unchanged -- exactly one layer ever owns the
+    // recovery-attempt transaction (#158).
     store = withWorkspaceIdentitySupport(withRecoveryIdentityGuard(openStore(args.stateDbPath || defaultRunnerStateDbPath(args.outputDir))));
   } catch (error) {
     errors.push({ stage: 'open', message: String(error?.message || error) });
