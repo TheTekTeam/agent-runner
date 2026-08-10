@@ -12,6 +12,19 @@ export const MIN_QUOTA_BACKOFF_MS = 10 * 60 * 1000;
 export const DEFAULT_MAX_SESSION_USAGE_BEFORE_START_PERCENT = 50;
 const MAX_PLAUSIBLE_RESET_MS = 30 * 24 * 60 * 60 * 1000;
 
+// Closed task-profile vocabulary (#44). Mirrors claude-runner.mjs's PROFILE_NAMES;
+// duplicated (not imported) to avoid a circular dependency on this module.
+export const QUOTA_PROFILE_NAMES = Object.freeze(['docs', 'narrow', 'complex', 'critical']);
+
+// Conservative repository-default session-usage ceiling per profile (#44): a
+// cheaper profile can't be starved by a large in-flight critical candidate.
+export const DEFAULT_PROFILE_SESSION_USAGE_THRESHOLDS = Object.freeze({
+  docs: 90,
+  narrow: 75,
+  complex: 65,
+  critical: DEFAULT_MAX_SESSION_USAGE_BEFORE_START_PERCENT,
+});
+
 const MONTHS = new Map([
   ['jan', 0], ['january', 0],
   ['feb', 1], ['february', 1],
@@ -98,10 +111,57 @@ function parseClaudeUsageResetText(resetText = '', { now = new Date() } = {}) {
   return plausibleResetOrNull(parsed, { now });
 }
 
-function normalizeStartThreshold(value) {
-  const parsed = Number.parseInt(value ?? DEFAULT_MAX_SESSION_USAGE_BEFORE_START_PERCENT, 10);
-  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) return DEFAULT_MAX_SESSION_USAGE_BEFORE_START_PERCENT;
+function normalizeStartThreshold(value, fallback = DEFAULT_MAX_SESSION_USAGE_BEFORE_START_PERCENT) {
+  const parsed = Number.parseInt(value ?? fallback, 10);
+  if (!Number.isInteger(parsed) || parsed < 1 || parsed > 100) return fallback;
   return parsed;
+}
+
+// Machine-local-only ceiling override (#44): only an explicit
+// `CLAUDE_RUNNER_MAX_SESSION_USAGE_BEFORE_START_PERCENT_<PROFILE>` env var can
+// raise or lower a profile's repository-default ceiling; never issue/repo-derived.
+export function resolveProfileSessionUsageThreshold(profileName, env = process.env) {
+  const fallback = DEFAULT_PROFILE_SESSION_USAGE_THRESHOLDS[profileName] ?? DEFAULT_MAX_SESSION_USAGE_BEFORE_START_PERCENT;
+  const envKey = `CLAUDE_RUNNER_MAX_SESSION_USAGE_BEFORE_START_PERCENT_${String(profileName || '').toUpperCase()}`;
+  return normalizeStartThreshold(env?.[envKey], fallback);
+}
+
+// Profile-aware admission decision from already-fetched fresh quota evidence
+// (#44, scheduling only -- never spawns a process). Ambiguous/missing usage fails closed.
+export function evaluateProfileQuotaAdmission({ quotaUsage = null, status = null, profileName, env = process.env } = {}) {
+  const threshold = resolveProfileSessionUsageThreshold(profileName, env);
+  const sessionPercentUsed = quotaUsage?.session?.usedPercent;
+
+  if (!['available', 'exhausted'].includes(status)) {
+    return { allowed: false, profile: profileName, threshold, sessionPercentUsed: sessionPercentUsed ?? null, status: 'ambiguous', reason: 'quota-evidence-ambiguous' };
+  }
+  if (!Number.isInteger(sessionPercentUsed)) {
+    return { allowed: false, profile: profileName, threshold, sessionPercentUsed: null, status: 'unavailable', reason: 'quota-evidence-unavailable' };
+  }
+  if (sessionPercentUsed >= threshold) {
+    return { allowed: false, profile: profileName, threshold, sessionPercentUsed, status: 'exhausted', reason: 'profile-session-usage-threshold-exceeded' };
+  }
+  return { allowed: true, profile: profileName, threshold, sessionPercentUsed, status: 'available', reason: null };
+}
+
+// Whether at least one profile could still be admitted from this pass's fresh
+// evidence (#44) -- decides whether an over-threshold `critical` signal idles the
+// whole queue, or whether per-candidate admission keeps scanning for smaller work.
+export function anyProfileQuotaAdmissible({ quotaUsage = null, status = null, env = process.env, profileNames = QUOTA_PROFILE_NAMES } = {}) {
+  return profileNames.some((profileName) => evaluateProfileQuotaAdmission({ quotaUsage, status, profileName, env }).allowed);
+}
+
+// Translates a `runQuotaPreflight()` result into the `{ quotaUsage, status }` shape
+// both admission gates share (#44). `null` when skipped (opt-out); a missing/unparsed
+// payload normalizes to 'ambiguous', which fails closed for every profile.
+export function quotaAdmissionEvidenceFromPreflight(quotaPreflight) {
+  if (!quotaPreflight || quotaPreflight.skipped) return null;
+  const status = quotaPreflight.payload?.status;
+  if (quotaPreflight.exitCode !== 0 || quotaPreflight.signal || !['available', 'exhausted'].includes(status)) return { quotaUsage: null, status: 'ambiguous' };
+  return {
+    quotaUsage: quotaPreflight.payload?.state?.quotaUsage ?? null,
+    status,
+  };
 }
 
 function parsePercent(value) {

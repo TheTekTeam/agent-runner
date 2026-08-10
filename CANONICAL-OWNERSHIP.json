@@ -297,6 +297,24 @@
         "reason": "Issue #92 corrects a test-portability defect in this repository: the restricted-recovery permission test must be deterministic under both umask 022 and 077, so this test can no longer remain byte-locked to the historical ModelSpend import.",
         "reference": "https://github.com/TheTekTeam/agent-runner/pull/93"
       }
+    },
+    {
+      "path": "scripts/ops/claude-runner-quota.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-08-10T23:00:00.000Z",
+        "reason": "Issue #44 makes the canonical Agent Runner quota/headroom implementation and its regression coverage intentionally diverge from the historical ModelSpend import by adding profile-aware included-quota admission before claim/model launch.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/issues/44"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-quota.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-08-10T23:00:00.000Z",
+        "reason": "Issue #44 makes the canonical Agent Runner quota/headroom implementation and its regression coverage intentionally diverge from the historical ModelSpend import by adding profile-aware included-quota admission before claim/model launch.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/issues/44"
+      }
     }
   ]
 }

@@ -3656,6 +3656,62 @@ test('selectIssue reserves a runner-started task locally while continuing to eli
   assert.equal(selected.skipped[0].reason, 'active-runner-started-issue');
 });
 
+// #44: task-profile-aware quota admission, evaluated inside selectIssue()
+// against this pass's already-fetched fresh telemetry -- before any claim,
+// GitHub mutation, or worker launch is even reached for the offending issue.
+function quotaCandidatesGhRunner() {
+  const issues = [
+    { number: 910, title: 'Harden production security boundary', url: 'https://example.invalid/910', labels: [{ name: 'priority:P0' }], updatedAt: '2026-07-09T12:00:00Z' },
+    { number: 911, title: 'Update README documentation', url: 'https://example.invalid/911', labels: [{ name: 'priority:P0' }], updatedAt: '2026-07-09T10:00:00Z' },
+  ];
+  return (ghArgs) => {
+    if (ghArgs[0] === 'issue' && ghArgs[1] === 'list') {
+      return ghArgs.includes('status:ready') ? JSON.stringify(issues) : JSON.stringify([]);
+    }
+    if (ghArgs[0] === 'issue' && ghArgs[1] === 'view') {
+      const issueNumber = Number(ghArgs[2]);
+      return JSON.stringify({ comments: [canonicalPreflightComment(issueNumber, `TEST.${issueNumber}`)] });
+    }
+    throw new Error(`unexpected gh invocation: ${ghArgs.join(' ')}`);
+  };
+}
+
+const BASE_QUOTA_ARGS = { repo: 'TheTekTeam/modelspend', limit: 100, agentLabels: ['agent:claude-code-cli'], includeInProgress: false, requireManagerPreflight: true, execute: true, preflightDirectMode: true, autoPreflightMode: false };
+
+test('selectIssue skips an oversized (critical-profile) candidate for insufficient headroom before any claim, then selects a smaller independently eligible (docs-profile) candidate', async () => {
+  // 60% session usage clears docs' (90%) and narrow's (75%) ceilings but exceeds critical's (50%).
+  const quotaAdmissionEvidence = { quotaUsage: { session: { usedPercent: 60, resetAt: null, resetText: null } }, status: 'exhausted' };
+  const selected = await selectIssue(BASE_QUOTA_ARGS, withEmptyOpenPrInventory(quotaCandidatesGhRunner()), { quotaAdmissionEvidence });
+
+  assert.equal(selected.issue.number, 911, 'the smaller docs-profile candidate is reached once the oversized one is skipped');
+  assert.equal(selected.skipped.length, 1);
+  assert.deepEqual(selected.skipped[0], {
+    issue: 910, statusLabel: 'status:ready', reason: 'profile-quota-headroom-insufficient', profile: 'critical',
+    quotaAdmission: { allowed: false, profile: 'critical', threshold: 50, sessionPercentUsed: 60, status: 'exhausted', reason: 'profile-session-usage-threshold-exceeded' },
+  });
+});
+
+test('selectIssue fails closed for every profile (skips all candidates, selects none) on stale/ambiguous/unavailable quota evidence, regardless of apparent usage', async () => {
+  const ambiguousCases = [
+    { quotaUsage: null, status: 'ambiguous' },
+    { quotaUsage: null, status: 'available' },
+    { quotaUsage: { session: { usedPercent: 5, resetAt: null, resetText: null } }, status: 'ambiguous' },
+  ];
+  for (const quotaAdmissionEvidence of ambiguousCases) {
+    const selected = await selectIssue(BASE_QUOTA_ARGS, withEmptyOpenPrInventory(quotaCandidatesGhRunner()), { quotaAdmissionEvidence });
+    assert.equal(selected.issue, null, `no candidate ever admitted for ${JSON.stringify(quotaAdmissionEvidence)}`);
+    assert.equal(selected.skipped.length, 2);
+    assert.deepEqual(selected.skipped.map((skip) => skip.reason), ['profile-quota-headroom-insufficient', 'profile-quota-headroom-insufficient']);
+    assert.deepEqual(selected.skipped.map((skip) => skip.quotaAdmission.allowed), [false, false]);
+  }
+});
+
+test('selectIssue never gates on quota admission when no caller supplies quotaAdmissionEvidence (pre-#44 callers are unaffected)', async () => {
+  const selected = await selectIssue(BASE_QUOTA_ARGS, withEmptyOpenPrInventory(quotaCandidatesGhRunner()));
+  assert.equal(selected.issue.number, 910, 'the first (critical-profile) candidate is selected exactly as before -- no admission evidence means no gating');
+  assert.deepEqual(selected.skipped, []);
+});
+
 test('selectIssue selects a status:ready issue directly from its manager preflight packet when no proceed command exists (Agent Runner v2)', async () => {
   const fakeGhRunner = (ghArgs) => {
     assert.equal(ghArgs.includes('devplan'), false, 'no gh invocation in selection should reference devplan');
@@ -5170,6 +5226,94 @@ test('#53 review round 5: main() creates and synthetically delivers a quota_bloc
     quotaNotifications = store.allRows('notification_events').filter((row) => row.event_type === 'quota_blocked');
     store.close();
     assert.equal(quotaNotifications.length, 2);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// -- #44: task-profile-aware admission wired into the real main() pass ------
+
+test('#44: main() skips an oversized critical-profile candidate before any GitHub mutation, then claims a smaller independently eligible docs-profile candidate, from a single pass of fresh quota telemetry', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-quota-profile-continuation-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const mutations = [];
+  const ghRunner = quotaCandidatesGhRunner();
+  const mutatingGhRunner = (ghArgs) => {
+    if (ghArgs[0] === 'pr' && ghArgs[1] === 'list') return JSON.stringify([]);
+    if (ghArgs[0] === 'issue' && (ghArgs[1] === 'edit' || ghArgs[1] === 'comment')) { mutations.push(ghArgs); return ''; }
+    return ghRunner(ghArgs);
+  };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--no-continue', '--output-dir', dir, '--state-db', stateDbPath,
+      '--lock-path', join(dir, 'cron.lock'), '--agent-labels', 'agent:claude-code-cli',
+    ], { GH_TOKEN: 'test-token' }, {
+      ghRunner: mutatingGhRunner,
+      // 60% session usage: exceeds the critical-profile ceiling (50%) but clears docs' (90%).
+      quotaRunner: () => ({ status: 0, stdout: JSON.stringify({ status: 'exhausted', state: { quotaUsage: { session: { usedPercent: 60, resetAt: null, resetText: null } } } }), stderr: '' }),
+      runChild: async () => ({ status: 0, signal: null, stdout: JSON.stringify({ logPath: 'child.json', executionPhase: 'implementation', costAdmission: { allowed: true }, sourcePreflightCommentId: '911' }), stderr: '', error: null }),
+    });
+    assert.equal(exitCode, 0);
+    assert.equal(mutations.some((call) => call[2] === '910'), false, 'the oversized critical candidate must never be mutated');
+    assert.ok(mutations.some((call) => call[2] === '911' && call[1] === 'edit'), 'the smaller docs candidate is claimed via the normal status:ready -> status:in-progress edit');
+
+    const state = openRunnerStateStore(stateDbPath);
+    const claims = state.allRows('claims');
+    assert.equal(claims.length, 1);
+    assert.equal(claims[0].issue_number, 911);
+    const quotaSkip = state.allRows('queue_events').find((row) => row.event_type === 'skip' && row.issue_number === 910);
+    assert.equal(quotaSkip.reason, 'profile-quota-headroom-insufficient');
+    assert.equal(state.allRows('quota_history')[0].blocked, 1, 'the flat critical-ceiling accounting still records this pass as blocked');
+    state.close();
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#44: main() performs zero selection/claim/mutation and idles the whole queue when fresh telemetry leaves no profile admissible', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-quota-profile-full-block-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const ghRunnerNeverCalled = (args) => { throw new Error(`a fully-blocked pass must never inspect the queue: ${args.join(' ')}`); };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', join(dir, 'cron.lock'),
+    ], { GH_TOKEN: 'test-token' }, {
+      ghRunner: ghRunnerNeverCalled,
+      // 95% session usage exceeds even the widest (docs, 90%) profile ceiling.
+      quotaRunner: () => ({ status: 0, stdout: JSON.stringify({ status: 'exhausted', state: { quotaUsage: { session: { usedPercent: 95, resetAt: null, resetText: null } } } }), stderr: '' }),
+    });
+    assert.equal(exitCode, 0);
+    const state = openRunnerStateStore(stateDbPath);
+    assert.equal(state.allRows('claims').length, 0);
+    assert.equal(state.allRows('run_results').filter((row) => row.mode === 'quota-blocked').length, 1);
+    state.close();
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#44: main() fails closed before queue inspection when quota preflight exits non-zero despite plausible low-usage JSON', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-quota-profile-transport-failure-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main(['--execute', '--allow-root', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', join(dir, 'cron.lock')], { GH_TOKEN: 'test-token' }, {
+      ghRunner: (args) => { throw new Error(`failed quota evidence must stop before queue inspection: ${args.join(' ')}`); },
+      quotaRunner: () => ({ status: 1, signal: null, stdout: JSON.stringify({ status: 'available', state: { quotaUsage: { session: { usedPercent: 5, resetAt: null, resetText: null } } } }), stderr: 'synthetic quota-preflight failure' }),
+    });
+    assert.equal(exitCode, 0);
+    const state = openRunnerStateStore(stateDbPath);
+    assert.equal(state.allRows('claims').length, 0);
+    assert.equal(state.allRows('run_results').filter((row) => row.mode === 'quota-blocked').length, 1);
+    state.close();
   } finally {
     console.log = originalLog;
     rmSync(dir, { recursive: true, force: true });

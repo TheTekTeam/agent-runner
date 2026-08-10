@@ -558,3 +558,31 @@ test('dashboard API allowlists notification_events output and never exposes dedu
     store.close();
   }
 }));
+
+test('#44: dashboard API surfaces a bounded profile-quota-headroom-insufficient skip reason with no raw quota-preflight process evidence', () => withTempDir('modelspend-runner-dashboard-quota-profile-', (dir) => {
+  const dbPath = join(dir, 'state.sqlite');
+  const store = openRunnerStateStore(dbPath, { now: () => '2026-07-09T13:03:00.000Z' });
+  try {
+    store.recordQueueEvent({
+      repo: 'TheTekTeam/modelspend',
+      eventType: 'skip',
+      issueNumber: 910,
+      statusLabel: 'status:ready',
+      reason: 'profile-quota-headroom-insufficient',
+      payload: {
+        reason: 'profile-quota-headroom-insufficient',
+        profile: 'critical',
+        quotaAdmission: { allowed: false, profile: 'critical', threshold: 50, sessionPercentUsed: 60, status: 'exhausted', reason: 'profile-session-usage-threshold-exceeded' },
+      },
+      createdAt: '2026-07-09T13:03:01.000Z',
+    });
+  } finally {
+    store.close();
+  }
+
+  const dashboard = buildRunnerDashboard(dbPath, { now: () => '2026-07-09T13:04:00.000Z' });
+  assert.deepEqual(dashboard.aggregates.skippedQueueReasons, [{ reason: 'profile-quota-headroom-insufficient', count: 1, latestAt: '2026-07-09T13:03:01.000Z' }]);
+  assert.equal(dashboard.latest.queueEvents[0].payload.quotaAdmission.threshold, 50);
+  const serialized = JSON.stringify(dashboard);
+  assert.equal(/stdout|stderr|nodeArgs|payload_json/.test(serialized), false, 'no raw quota-preflight process evidence leaks into dashboard output');
+}));
