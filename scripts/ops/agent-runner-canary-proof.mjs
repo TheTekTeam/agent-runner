@@ -91,18 +91,10 @@ function currentFormatChangedCompletion(evidence) {
   return { kind: 'changed', changedFiles: null, commit: worktreeHead };
 }
 
-// Legacy fixture shape required for historical proof: changedFiles count
-// plus a commitSha/headSha.
-function legacyFormatChangedCompletion(evidence) {
-  const changedFiles = Number(evidence.changedFiles ?? evidence.changedFileCount ?? 0);
-  const commit = String(evidence.commitSha || evidence.headSha || evidence.commit || '');
-  return changedFiles > 0 && validCommitSha(commit) ? { kind: 'changed', changedFiles, commit } : null;
-}
-
 function implementationCompletion(payload = {}) {
   const evidence = payload.implementationEvidence || null;
   if (!evidence || typeof evidence !== 'object') return null;
-  const changed = currentFormatChangedCompletion(evidence) || legacyFormatChangedCompletion(evidence);
+  const changed = currentFormatChangedCompletion(evidence);
   if (changed) return changed;
   const changedFiles = Number(evidence.changedFiles ?? evidence.changedFileCount ?? 0);
   const explicitNoChange = payload.terminalOutcome === 'completed'

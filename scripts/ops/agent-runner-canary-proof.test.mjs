@@ -128,7 +128,7 @@ test('current-format draft publication correlates with the changed implementatio
   assert.equal(result.evidence.publication.draft, true);
 });
 
-test('historical legacy changed-evidence shape remains accepted where its previous contract is still intentionally supported', () => {
+test('legacy-only changed evidence (changedFiles/commitSha, no current-format flags) fails closed', () => {
   const input = completeEvidence();
   const payload = JSON.parse(input.runResults[0].payload_json);
   payload.implementationEvidence = { changedFiles: 3, commitSha: 'abcdef1234567890', repositoryMutated: true };
@@ -139,9 +139,68 @@ test('historical legacy changed-evidence shape remains accepted where its previo
   };
   input.runResults[0].payload_json = JSON.stringify(payload);
   const result = evaluateCanaryProof(input);
-  assert.equal(result.passed, true);
-  assert.equal(result.evidence.implementation.kind, 'changed');
-  assert.equal(result.evidence.implementation.changedFiles, 3);
+  assert.equal(result.passed, false);
+  assert.ok(result.failedChecks.includes('implementationEvidence'));
+  assert.equal(result.evidence.implementation, null);
+});
+
+test('valid-looking legacy changedFiles/commitSha/headSha fields do not rescue invalid current-format evidence', () => {
+  const input = withImplementationEvidence({
+    changed: false,
+    changedFiles: 3,
+    commitSha: WORKTREE_HEAD,
+    headSha: WORKTREE_HEAD,
+    repositoryMutated: true,
+  });
+  const result = evaluateCanaryProof(input);
+  assert.equal(result.passed, false);
+  assert.ok(result.failedChecks.includes('implementationEvidence'));
+  assert.ok(result.failedChecks.includes('draftPublication'));
+  assert.equal(result.evidence.implementation, null);
+});
+
+test('legacy-only changed evidence fails closed', () => {
+  const input = completeEvidence();
+  const payload = JSON.parse(input.runResults[0].payload_json);
+
+  payload.implementationEvidence = {
+    changedFiles: 3,
+    commitSha: 'abcdef1234567890',
+    repositoryMutated: true,
+  };
+
+  input.runResults[0].payload_json = JSON.stringify(payload);
+
+  const result = evaluateCanaryProof(input);
+
+  assert.equal(result.passed, false);
+  assert.equal(result.checks.implementationEvidence, false);
+  assert.ok(result.failedChecks.includes('implementationEvidence'));
+  assert.ok(result.failedChecks.includes('draftPublication'));
+  assert.equal(result.evidence.implementation, null);
+});
+
+test('invalid current-format evidence cannot fall back to legacy changed evidence', () => {
+  const input = completeEvidence();
+  const payload = JSON.parse(input.runResults[0].payload_json);
+
+  payload.implementationEvidence = {
+    ...currentFormatChangedEvidence({ valid: false }),
+    changedFiles: 3,
+    commitSha: 'abcdef1234567890',
+    headSha: WORKTREE_HEAD,
+    repositoryMutated: true,
+  };
+
+  input.runResults[0].payload_json = JSON.stringify(payload);
+
+  const result = evaluateCanaryProof(input);
+
+  assert.equal(result.passed, false);
+  assert.equal(result.checks.implementationEvidence, false);
+  assert.ok(result.failedChecks.includes('implementationEvidence'));
+  assert.ok(result.failedChecks.includes('draftPublication'));
+  assert.equal(result.evidence.implementation, null);
 });
 
 for (const field of ['valid', 'changed', 'committed', 'clean']) {
