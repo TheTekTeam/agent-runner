@@ -61,14 +61,42 @@ function draftPublication(payload = {}) {
     : null;
 }
 
+function validCommitSha(value) {
+  return typeof value === 'string' && /^[0-9a-f]{7,40}$/i.test(value);
+}
+
+// Production evaluateImplementationEvidence() proves "outside the owned
+// worktree, nothing moved" by comparing the outer-checkout root snapshot
+// taken before and after the run; canary proof re-checks that same pairing
+// rather than trusting the boolean flags alone.
+function unchangedRootEvidence(evidence) {
+  const before = evidence.rootBefore;
+  const after = evidence.rootAfter;
+  if (before == null && after == null) return true;
+  if (!before || typeof before !== 'object' || !after || typeof after !== 'object') return false;
+  return before.head === after.head && before.branch === after.branch && before.statusFingerprint === after.statusFingerprint;
+}
+
+// Current canonical shape (evaluateImplementationEvidence() /
+// collectImplementationEvidence()): valid/changed/committed/clean booleans
+// plus persisted baseHead and worktree.head commit SHAs.
+function currentFormatChangedCompletion(evidence) {
+  if (evidence.valid !== true || evidence.changed !== true || evidence.committed !== true || evidence.clean !== true) {
+    return null;
+  }
+  const baseHead = evidence.baseHead;
+  const worktreeHead = evidence.worktree && typeof evidence.worktree === 'object' ? evidence.worktree.head : null;
+  if (!validCommitSha(baseHead) || !validCommitSha(worktreeHead) || baseHead === worktreeHead) return null;
+  if (!unchangedRootEvidence(evidence)) return null;
+  return { kind: 'changed', changedFiles: null, commit: worktreeHead };
+}
+
 function implementationCompletion(payload = {}) {
   const evidence = payload.implementationEvidence || null;
   if (!evidence || typeof evidence !== 'object') return null;
+  const changed = currentFormatChangedCompletion(evidence);
+  if (changed) return changed;
   const changedFiles = Number(evidence.changedFiles ?? evidence.changedFileCount ?? 0);
-  const commit = String(evidence.commitSha || evidence.headSha || evidence.commit || '');
-  if (changedFiles > 0 && /^[0-9a-f]{7,40}$/i.test(commit)) {
-    return { kind: 'changed', changedFiles, commit };
-  }
   const explicitNoChange = payload.terminalOutcome === 'completed'
     && evidence.repositoryMutated === false
     && changedFiles === 0;
