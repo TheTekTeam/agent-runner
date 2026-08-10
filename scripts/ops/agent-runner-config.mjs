@@ -186,3 +186,96 @@ export function projectIdentity(config) {
     localRepoPath: config.localRepoPath,
   };
 }
+
+const XDG_STATE_NAMESPACE = 'agent-runner';
+
+function pathSegments(value) {
+  return String(value || '').split(/[\\/]/).filter(Boolean);
+}
+
+/**
+ * The documented machine-local state convention (docs/MIGRATION.md) places
+ * every configured project's own durable state under
+ * `.../agent-runner/<projectId>[/...]`. An env value that resolves a
+ * project's own relative config default (e.g. `.var/claude-runner`) into
+ * that same project's canonical absolute location under this convention is
+ * a legitimate same-project override, not a cross-project redirect, even
+ * though it disagrees textually with the config's raw field value (#169
+ * regression item C). Matching on the segment immediately following the
+ * shared `agent-runner` namespace folder (rather than "does projectId
+ * appear anywhere in the path") avoids a false match when a project's own
+ * id happens to equal that namespace folder's name.
+ */
+function envValueMatchesProjectStateConvention(envValue, projectId) {
+  if (!projectId) return false;
+  const segments = pathSegments(envValue);
+  const namespaceIndex = segments.indexOf(XDG_STATE_NAMESPACE);
+  return namespaceIndex !== -1 && segments[namespaceIndex + 1] === projectId;
+}
+
+/**
+ * A project config explicitly selected via --config/AGENT_RUNNER_CONFIG/
+ * CLAUDE_RUNNER_CONFIG owns this run's repo/output/state/lock identity.
+ * Shared machine environment (e.g. a `runner.env` written for a different
+ * configured project) must never silently redirect that identity into
+ * another project's durable state tree (#169). An env value that agrees
+ * with the selected config, or that resolves the selected project's own
+ * default into its own canonical machine-local location, is redundant but
+ * harmless; a value that cannot be attributed to the selected project
+ * cannot be proven safe and fails closed before candidate selection, claim
+ * or GitHub mutation. Without an explicit config selection there is no
+ * project identity to disagree with, so the legacy default-config env
+ * override contract (documented for the compiled-in ModelSpend default)
+ * is preserved unchanged.
+ */
+export function resolveProjectScopedEnvValue({ envValue, configValue, configPath, envVarName, configFieldName, projectId }) {
+  if (!envValue) return configValue;
+  if (!configPath) return envValue;
+  if (envValue === configValue) return envValue;
+  if (envValueMatchesProjectStateConvention(envValue, projectId)) return envValue;
+  throw new Error(
+    `${envVarName} ("${envValue}") disagrees with project "${projectId}" config ${configFieldName} ("${configValue}") from ${configPath}; refusing to let shared machine environment redirect this project's identity`,
+  );
+}
+
+// The exhaustive list of shared-machine-environment overrides that can steer
+// a run's repo/output/state/lock identity (#169). Every consumer that reads
+// one of these env vars -- the scheduler (`claude-runner-cron.mjs`'s
+// `parseArgs`) and, critically, standalone pre-scheduler gates that resolve
+// their own paths straight from `env` (e.g. the circuit breaker's state DB)
+// without ever calling `parseArgs` -- must agree with the explicitly
+// selected project config before any of them runs. Listing the fields once
+// here, rather than once per consumer, is what keeps that agreement a single
+// invariant instead of a set of call sites that can silently drift apart.
+export const PROJECT_SCOPED_ENV_FIELDS = Object.freeze([
+  { envVarName: 'GITHUB_REPOSITORY', configFieldName: 'githubRepo' },
+  { envVarName: 'CLAUDE_RUNNER_OUTPUT_DIR', configFieldName: 'outputDir' },
+  { envVarName: 'CLAUDE_RUNNER_STATE_DB', configFieldName: 'stateDbPath' },
+  { envVarName: 'CLAUDE_RUNNER_CRON_LOCK', configFieldName: 'runner.lockPath' },
+]);
+
+function configFieldValue(config, configFieldName) {
+  return configFieldName.split('.').reduce((value, key) => value?.[key], config);
+}
+
+/**
+ * Fail closed, before any candidate discovery, claim, attempt creation,
+ * GitHub mutation or model launch, if the shared machine environment
+ * disagrees with the explicitly selected project config on any
+ * repo/output/state/lock field (#169). Intended to run once, as early as
+ * possible in the outer entrypoint (`bin/run-project.sh`), so no downstream
+ * consumer -- including one that never itself validates project scope --
+ * can act on a mismatched identity.
+ */
+export function assertProjectScopedEnv({ config, configPath, env }) {
+  for (const { envVarName, configFieldName } of PROJECT_SCOPED_ENV_FIELDS) {
+    resolveProjectScopedEnvValue({
+      envValue: env[envVarName],
+      configValue: configFieldValue(config, configFieldName),
+      configPath,
+      envVarName,
+      configFieldName,
+      projectId: config.projectId,
+    });
+  }
+}

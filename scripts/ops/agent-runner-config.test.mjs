@@ -8,6 +8,7 @@ import {
   DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG,
   loadAgentRunnerConfig,
   resolveConfigPath,
+  resolveProjectScopedEnvValue,
   stripConfigArgs,
   validateAgentRunnerConfig,
 } from './agent-runner-config.mjs';
@@ -90,6 +91,116 @@ test('queue triage policy may tighten but cannot widen core limits or invent lab
     ...validConfig,
     queueTriage: { acceptedStatusLabels: ['status:unknown'] },
   }), /subset of configured status labels/);
+});
+
+// #169: reproduces the observed #44 boundary -- a shared machine-local
+// runner.env carrying ModelSpend's canonical output/state paths must never
+// silently override a different, explicitly selected project's identity.
+test('resolveProjectScopedEnvValue passes through an unset env value', () => {
+  assert.equal(
+    resolveProjectScopedEnvValue({
+      envValue: undefined,
+      configValue: '.var/agent-runner',
+      configPath: '/home/gp/.config/agent-runner/agent-runner.json',
+      envVarName: 'CLAUDE_RUNNER_OUTPUT_DIR',
+      configFieldName: 'outputDir',
+      projectId: 'agent-runner',
+    }),
+    '.var/agent-runner',
+  );
+});
+
+test('resolveProjectScopedEnvValue preserves the legacy default-config env override when no project config is explicitly selected', () => {
+  assert.equal(
+    resolveProjectScopedEnvValue({
+      envValue: '/home/gp/.local/state/agent-runner/modelspend',
+      configValue: '.var/claude-runner',
+      configPath: null,
+      envVarName: 'CLAUDE_RUNNER_OUTPUT_DIR',
+      configFieldName: 'outputDir',
+      projectId: 'modelspend',
+    }),
+    '/home/gp/.local/state/agent-runner/modelspend',
+  );
+});
+
+test('resolveProjectScopedEnvValue accepts an env value that agrees with the selected project config', () => {
+  assert.equal(
+    resolveProjectScopedEnvValue({
+      envValue: '/home/gp/.local/state/agent-runner/modelspend',
+      configValue: '/home/gp/.local/state/agent-runner/modelspend',
+      configPath: '/home/gp/.config/agent-runner/modelspend.json',
+      envVarName: 'CLAUDE_RUNNER_OUTPUT_DIR',
+      configFieldName: 'outputDir',
+      projectId: 'modelspend',
+    }),
+    '/home/gp/.local/state/agent-runner/modelspend',
+  );
+});
+
+test('resolveProjectScopedEnvValue fails closed when a shared env value disagrees with the explicitly selected project config (#44 reproduction)', () => {
+  assert.throws(
+    () => resolveProjectScopedEnvValue({
+      envValue: '/home/gp/.local/state/agent-runner/modelspend',
+      configValue: '.var/agent-runner',
+      configPath: '/home/gp/.config/agent-runner/agent-runner.json',
+      envVarName: 'CLAUDE_RUNNER_OUTPUT_DIR',
+      configFieldName: 'outputDir',
+      projectId: 'agent-runner',
+    }),
+    /CLAUDE_RUNNER_OUTPUT_DIR.*disagrees with project "agent-runner".*outputDir.*refusing to let shared machine environment redirect this project's identity/,
+  );
+});
+
+// #169 regression item C: a project's own relative config default (e.g.
+// `.var/claude-runner`) resolved by shared machine env into that same
+// project's documented canonical `.../agent-runner/<projectId>` location
+// (docs/MIGRATION.md) is a legitimate same-project override, not a
+// cross-project redirect, even though it disagrees textually with the raw
+// config field.
+test('resolveProjectScopedEnvValue accepts an env value that resolves the selected project\'s own relative default into its documented canonical machine-local location', () => {
+  assert.equal(
+    resolveProjectScopedEnvValue({
+      envValue: '/home/gp/.local/state/agent-runner/modelspend',
+      configValue: '.var/claude-runner',
+      configPath: '/home/gp/.config/agent-runner/modelspend.json',
+      envVarName: 'CLAUDE_RUNNER_OUTPUT_DIR',
+      configFieldName: 'outputDir',
+      projectId: 'modelspend',
+    }),
+    '/home/gp/.local/state/agent-runner/modelspend',
+  );
+});
+
+// A project whose own id happens to equal the shared `agent-runner`
+// namespace folder name (this repository's own self-hosted project) must
+// not confuse "is this the tool's namespace folder" with "is this the
+// selected project's own id segment" -- the same-project override still
+// resolves correctly, and a differently-named project's path is still
+// rejected.
+test('resolveProjectScopedEnvValue same-project convention match is unconfused when the selected project id equals the shared namespace folder name', () => {
+  assert.equal(
+    resolveProjectScopedEnvValue({
+      envValue: '/home/gp/.local/state/agent-runner/agent-runner/runner-state.sqlite',
+      configValue: '.var/agent-runner/runner-state.sqlite',
+      configPath: '/home/gp/.config/agent-runner/agent-runner.json',
+      envVarName: 'CLAUDE_RUNNER_STATE_DB',
+      configFieldName: 'stateDbPath',
+      projectId: 'agent-runner',
+    }),
+    '/home/gp/.local/state/agent-runner/agent-runner/runner-state.sqlite',
+  );
+  assert.throws(
+    () => resolveProjectScopedEnvValue({
+      envValue: '/home/gp/.local/state/agent-runner/modelspend/runner-state.sqlite',
+      configValue: '.var/agent-runner/runner-state.sqlite',
+      configPath: '/home/gp/.config/agent-runner/agent-runner.json',
+      envVarName: 'CLAUDE_RUNNER_STATE_DB',
+      configFieldName: 'stateDbPath',
+      projectId: 'agent-runner',
+    }),
+    /CLAUDE_RUNNER_STATE_DB.*disagrees with project "agent-runner"/,
+  );
 });
 
 test('loadAgentRunnerConfig supports the existing scaffold config shape', () => withTempConfig({

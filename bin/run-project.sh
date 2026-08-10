@@ -10,6 +10,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_FILE="${AGENT_RUNNER_CONFIG:-$HOME/.config/agent-runner/modelspend.json}"
 ENV_FILE="${AGENT_RUNNER_ENV_FILE:-$HOME/.config/agent-runner/runner.env}"
 RESULT_FILE="${AGENT_RUNNER_RUN_RESULT_FILE:-}"
+# #169: this outer invocation is the sole intended owner of RESULT_FILE.
+# Once captured, the env var is removed so no child process this script
+# spawns -- a test harness, a nested run-project.sh invocation, or anything
+# a launched worker later runs -- can inherit it and silently overwrite this
+# invocation's own result with an unrelated (and possibly false) one.
+unset AGENT_RUNNER_RUN_RESULT_FILE
 NODE_BIN="${AGENT_RUNNER_NODE_BIN:-node}"
 PINNED_CRON="$ROOT/scripts/ops/agent-runner-pinned-atomic-cron.mjs"
 
@@ -73,6 +79,12 @@ json_value() {
 }
 
 load_env_file "$ENV_FILE"
+# A shared runner.env is machine-local, operator-controlled config -- not a
+# result-reporting channel. Even if it declares AGENT_RUNNER_RUN_RESULT_FILE,
+# only this invocation's own already-captured $RESULT_FILE is honoured; the
+# env var itself must not reappear for any child process (see the #169 note
+# above RESULT_FILE's capture).
+unset AGENT_RUNNER_RUN_RESULT_FILE
 export PATH="/usr/local/bin:/opt/homebrew/bin:/opt/cpanel/ea-nodejs22/bin:$HOME/.local/bin:$HOME/bin:$PATH"
 export AGENT_RUNNER_CONFIG="$CONFIG_FILE"
 export CLAUDE_RUNNER_CONFIG="$CONFIG_FILE"
@@ -80,6 +92,30 @@ export CLAUDE_RUNNER_CONFIG="$CONFIG_FILE"
 PROJECT_DIR="$(json_value localRepoPath)"
 [ -d "$PROJECT_DIR/.git" ] || { echo "[agent-runner] ERROR: project checkout is not a git worktree: $PROJECT_DIR" >&2; exit 1; }
 cd "$PROJECT_DIR"
+
+# #169: some pre-scheduler gates (e.g. the circuit breaker) resolve their own
+# state paths straight from the shared environment and never call the
+# scheduler's own parseArgs, so a mismatched CLAUDE_RUNNER_OUTPUT_DIR/
+# CLAUDE_RUNNER_STATE_DB/GITHUB_REPOSITORY/CLAUDE_RUNNER_CRON_LOCK could
+# otherwise reach them before parseArgs ever runs. Validating project-scoped
+# identity here, before any child process is spawned, closes that gap for
+# every consumer at once instead of requiring each one to opt in.
+set +e
+PROJECT_SCOPED_ENV_ERROR="$("$NODE_BIN" -e '
+import("file://'"$ROOT"'/scripts/ops/agent-runner-config.mjs").then(({ assertProjectScopedEnv, loadAgentRunnerConfig, resolveConfigPath }) => {
+  const configPath = resolveConfigPath([], process.env);
+  const config = loadAgentRunnerConfig({ argv: [], env: process.env, configPath });
+  assertProjectScopedEnv({ config, configPath, env: process.env });
+}).catch((error) => { console.error(error.message); process.exitCode = 1; });
+' 2>&1 >/dev/null)"
+PROJECT_SCOPED_ENV_STATUS=$?
+set -e
+if [ "$PROJECT_SCOPED_ENV_STATUS" -ne 0 ]; then
+  printf '%s\n' "$PROJECT_SCOPED_ENV_ERROR" >&2
+  write_run_result wrapper_failure project-scoped-env-mismatch 1
+  echo "[agent-runner] ERROR: shared machine environment disagrees with the selected project config; refusing before any candidate/claim/model work" >&2
+  exit 1
+fi
 
 ARGS=()
 EXECUTE_REQUESTED=0
