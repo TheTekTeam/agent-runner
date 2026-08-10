@@ -3,18 +3,28 @@ import test from 'node:test';
 
 import {
   DEFAULT_MAX_SESSION_USAGE_BEFORE_START_PERCENT,
+  DEFAULT_PROFILE_SESSION_USAGE_THRESHOLDS,
   MIN_QUOTA_BACKOFF_MS,
+  QUOTA_PROFILE_NAMES,
+  anyProfileQuotaAdmissible,
   buildQuotaCheckArgs,
   computeQuotaBackoffMs,
   detectQuotaExhaustion,
+  evaluateProfileQuotaAdmission,
   evaluateQuotaPauseState,
   formatQuotaUsage,
   parseClaudeUsageOutput,
   parseClaudeUsageSession,
   parseQuotaCheckOutput,
   parseQuotaResetTime,
+  quotaAdmissionEvidenceFromPreflight,
   recordQuotaPause,
+  resolveProfileSessionUsageThreshold,
 } from './claude-runner-quota.mjs';
+
+function usageOf(percent) {
+  return percent === null ? null : { session: { usedPercent: percent, resetAt: null, resetText: null } };
+}
 
 const SAMPLE_USAGE_OUTPUT = `You are currently using your subscription to power your Claude Code usage
 
@@ -245,4 +255,74 @@ test('parseQuotaCheckOutput recognises exhausted and available signals', () => {
 test('buildQuotaCheckArgs builds a conservative print-mode usage query', () => {
   const args = buildQuotaCheckArgs({});
   assert.deepEqual(args, ['-p', '--output-format', 'text', '--permission-mode', 'plan', '/usage']);
+});
+
+// #44: task-profile-aware admission -- each profile keeps its own
+// conservative repository-default ceiling, narrower profiles clear a
+// smaller headroom bar than `critical` (which keeps the pre-existing 50%).
+test('evaluateProfileQuotaAdmission: profile-specific thresholds gate admission from fresh session-usage telemetry', () => {
+  const cases = [
+    ['docs', 89, true], ['docs', 90, false],
+    ['narrow', 74, true], ['narrow', 75, false],
+    ['complex', 64, true], ['complex', 65, false],
+    ['critical', 49, true], ['critical', 50, false],
+  ];
+  for (const [profile, percent, allowed] of cases) {
+    const result = evaluateProfileQuotaAdmission({ quotaUsage: usageOf(percent), status: 'available', profileName: profile, env: {} });
+    assert.equal(result.allowed, allowed, `${profile} at ${percent}%`);
+    assert.equal(result.threshold, DEFAULT_PROFILE_SESSION_USAGE_THRESHOLDS[profile]);
+  }
+});
+
+test('evaluateProfileQuotaAdmission fails closed for every profile on ambiguous, unavailable or malformed telemetry', () => {
+  const badEvidence = [
+    { quotaUsage: null, status: 'ambiguous' },
+    { quotaUsage: null, status: 'available' },
+    { quotaUsage: { session: { usedPercent: 'not-a-number' } }, status: 'available' },
+    { quotaUsage: { session: null }, status: 'exhausted' },
+  ];
+  for (const evidence of badEvidence) {
+    for (const profile of QUOTA_PROFILE_NAMES) {
+      const result = evaluateProfileQuotaAdmission({ ...evidence, profileName: profile, env: {} });
+      assert.equal(result.allowed, false);
+      assert.notEqual(result.status, 'available');
+    }
+  }
+});
+
+test('resolveProfileSessionUsageThreshold: repository-default ceiling per profile, tightened only by a machine-local env override', () => {
+  for (const [profile, expected] of Object.entries(DEFAULT_PROFILE_SESSION_USAGE_THRESHOLDS)) {
+    assert.equal(resolveProfileSessionUsageThreshold(profile, {}), expected);
+  }
+  assert.equal(resolveProfileSessionUsageThreshold('docs', { CLAUDE_RUNNER_MAX_SESSION_USAGE_BEFORE_START_PERCENT_DOCS: '30' }), 30);
+  // Out-of-range or malformed machine overrides never widen or corrupt admission -- they fall back to the safe repository default.
+  assert.equal(resolveProfileSessionUsageThreshold('docs', { CLAUDE_RUNNER_MAX_SESSION_USAGE_BEFORE_START_PERCENT_DOCS: '999' }), DEFAULT_PROFILE_SESSION_USAGE_THRESHOLDS.docs);
+  assert.equal(resolveProfileSessionUsageThreshold('docs', { CLAUDE_RUNNER_MAX_SESSION_USAGE_BEFORE_START_PERCENT_DOCS: 'nope' }), DEFAULT_PROFILE_SESSION_USAGE_THRESHOLDS.docs);
+  assert.equal(resolveProfileSessionUsageThreshold('unknown-profile', {}), DEFAULT_MAX_SESSION_USAGE_BEFORE_START_PERCENT);
+});
+
+test('evaluateProfileQuotaAdmission: a machine-local env override tightens one profile ceiling, never derived from repository/issue content', () => {
+  const tightened = evaluateProfileQuotaAdmission({
+    quotaUsage: usageOf(40), status: 'available', profileName: 'docs',
+    env: { CLAUDE_RUNNER_MAX_SESSION_USAGE_BEFORE_START_PERCENT_DOCS: '30' },
+  });
+  assert.equal(tightened.allowed, false);
+  assert.equal(tightened.threshold, 30);
+});
+
+test('anyProfileQuotaAdmissible: true while at least one profile has trusted headroom, false once even the widest profile is exceeded or telemetry is untrustworthy', () => {
+  assert.equal(anyProfileQuotaAdmissible({ quotaUsage: usageOf(60), status: 'exhausted', env: {} }), true);
+  assert.equal(anyProfileQuotaAdmissible({ quotaUsage: usageOf(95), status: 'exhausted', env: {} }), false);
+  assert.equal(anyProfileQuotaAdmissible({ quotaUsage: null, status: 'ambiguous', env: {} }), false);
+});
+
+test('quotaAdmissionEvidenceFromPreflight: translates a quota preflight result into admission-evaluable evidence, or opts out entirely when skipped', () => {
+  assert.equal(quotaAdmissionEvidenceFromPreflight(null), null);
+  assert.equal(quotaAdmissionEvidenceFromPreflight({ skipped: true, blocked: false }), null);
+  assert.deepEqual(
+    quotaAdmissionEvidenceFromPreflight({ skipped: false, blocked: true, payload: { status: 'exhausted', state: { quotaUsage: usageOf(60) } } }),
+    { quotaUsage: usageOf(60), status: 'exhausted' },
+  );
+  // A missing/unparsed payload (stale, malformed, or a non-zero exit before any JSON could be produced) fails closed to 'ambiguous' rather than assuming availability.
+  assert.deepEqual(quotaAdmissionEvidenceFromPreflight({ skipped: false, blocked: true, payload: null }), { quotaUsage: null, status: 'ambiguous' });
 });

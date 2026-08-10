@@ -72,7 +72,8 @@ import {
 import { inspectWorkspaceOwnership } from './agent-runner-workspace-ownership.mjs';
 import { withWorkspaceIdentitySupport } from './agent-runner-workspace-identity-store.mjs';
 import { withRecoveryIdentityGuard } from './agent-runner-recovery-identity-guard.mjs';
-import { EXECUTION_PHASE_IMPLEMENTATION, isSupportedModelId, resolveImplementationDispatchIdentity, resolveProfile } from './claude-runner.mjs';
+import { EXECUTION_PHASE_IMPLEMENTATION, inferProfile, isSupportedModelId, parseKeyValueBlock, resolveImplementationDispatchIdentity, resolveProfile } from './claude-runner.mjs';
+import { anyProfileQuotaAdmissible, evaluateProfileQuotaAdmission, quotaAdmissionEvidenceFromPreflight } from './claude-runner-quota.mjs';
 import {
   decorateIssueWithMetadata,
   priorityRank as metadataPriorityRank,
@@ -2062,6 +2063,8 @@ export async function selectIssue(args, ghRunner = gh, {
   claudeResourceState = null,
   classifyIssue = classifyIssueTaskRisk,
   readinessByAgentId = {},
+  quotaAdmissionEvidence = null,
+  env = process.env,
 } = {}) {
   const skipped = [];
   let candidates;
@@ -2351,6 +2354,33 @@ export async function selectIssue(args, ghRunner = gh, {
         approvedAgent: selection.managerAuthority?.approvedAgent || null,
       });
       continue;
+    }
+
+    // #44: profile-aware quota admission against this pass's fresh evidence, opt-in
+    // via `quotaAdmissionEvidence` so existing selectIssue() callers are unaffected.
+    if (quotaAdmissionEvidence) {
+      const executionMeta = parseKeyValueBlock(selection.preflight?.body || '');
+      const candidateProfile = inferProfile({
+        explicitProfile: executionMeta.profile,
+        commandText: selection.preflight?.body || '',
+        issue,
+      });
+      const admission = evaluateProfileQuotaAdmission({
+        quotaUsage: quotaAdmissionEvidence.quotaUsage,
+        status: quotaAdmissionEvidence.status,
+        profileName: candidateProfile,
+        env,
+      });
+      if (!admission.allowed) {
+        skipped.push({
+          issue: issue.number,
+          statusLabel: issue.statusLabel,
+          reason: 'profile-quota-headroom-insufficient',
+          profile: candidateProfile,
+          quotaAdmission: admission,
+        });
+        continue;
+      }
     }
     return {
       issue,
@@ -2996,6 +3026,9 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     if (!state.record('recordQuotaHistory', { repo: args.repo, quotaPreflight })) {
       return emitSystemicStatePause(args, state, 'quota-history', { now, logger: dependencies.logger }).exitCode;
     }
+    // #44: this pass's fresh quota telemetry, shared unchanged by the full-queue
+    // gate below and by per-candidate admission inside selectIssue().
+    const quotaAdmissionEvidence = quotaAdmissionEvidenceFromPreflight(quotaPreflight);
     // #53 review round 5: exactly one bounded notification-reconciliation
     // budget per execute pass, placed here -- after the current
     // quota_history row is durably recorded, but before the quota-blocked
@@ -3068,15 +3101,18 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       ? computeReadinessByAgentId({ computeReadiness, env })
       : {};
 
-    if (quotaPreflight.blocked && !hasImplementedRoutableAlternative(settingsSnapshot)) {
+    if (
+      quotaPreflight.blocked
+      && !hasImplementedRoutableAlternative(settingsSnapshot)
+      // #44: a flat critical-ceiling block no longer idles the whole queue by itself --
+      // only when NO profile is admissible (fails closed on untrustworthy telemetry).
+      && !anyProfileQuotaAdmissible({ ...(quotaAdmissionEvidence || {}), env })
+    ) {
       // Claude is the only implemented agent in every real deployment
-      // today, so a Claude quota block is structurally a full-queue block
-      // and this idle is unchanged from before issue #50. Once a real
-      // alternative adapter is implemented, enabled, and qualified, this
-      // condition is false and the pass instead falls through to per-issue
-      // selection below, where Claude alone is excluded by its own quota
-      // block (requirement 6) while an independently eligible alternative
-      // is still assessed.
+      // today, so a block leaving no profile admissible is structurally a
+      // full-queue block, unchanged from before issue #50. A smaller
+      // admissible profile instead falls through to per-candidate
+      // admission inside selectIssue() rather than idling here (#44).
       const payload = {
         dryRun: !args.execute,
         quotaBlocked: true,
@@ -3231,6 +3267,8 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       settingsSnapshot: multiAgentSelectorEngaged ? settingsSnapshot : null,
       claudeResourceState,
       readinessByAgentId,
+      quotaAdmissionEvidence,
+      env,
     });
     const selectedSourceCommentIdentity = selected.command?.sourceCommentIdentity || null;
     const selectedPreflightCommentIdentity = selected.currentPreflight
