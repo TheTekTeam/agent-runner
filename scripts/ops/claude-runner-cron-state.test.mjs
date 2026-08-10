@@ -8,6 +8,81 @@ import { fileURLToPath } from 'node:url';
 
 import { createStateRecorder, parseArgs } from './claude-runner-cron.mjs';
 
+function withTempConfigFile(payload, fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'claude-runner-cron-state-config-'));
+  const configPath = join(dir, 'config.json');
+  try {
+    writeFileSync(configPath, JSON.stringify(payload, null, 2));
+    return fn(configPath);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function projectConfig(id, overrides = {}) {
+  return {
+    projectId: id,
+    displayName: id,
+    githubRepo: `TheTekTeam/${id}`,
+    localRepoPath: `/workspace/${id}`,
+    outputDir: `/home/gp/.local/state/agent-runner/${id}`,
+    stateDbPath: `/home/gp/.local/state/agent-runner/${id}/runner-state.sqlite`,
+    acceptedAgentLabels: ['agent:claude'],
+    statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress' },
+    priorityLabelRanking: ['priority:P0'],
+    safeDefaultValidationCommands: [],
+    systemd: { serviceName: `${id}.service`, timerName: `${id}.timer` },
+    ...overrides,
+  };
+}
+
+const MODELSPEND_LIKE_CONFIG = projectConfig('modelspend', { displayName: 'ModelSpend' });
+const SELF_PROJECT_LIKE_CONFIG = projectConfig('agent-runner', {
+  displayName: 'Agent Runner',
+  localRepoPath: '/home/gp/projects/agent-runner',
+  outputDir: '.var/agent-runner',
+  stateDbPath: '.var/agent-runner/runner-state.sqlite',
+  acceptedAgentLabels: ['agent:claude-code-cli'],
+});
+
+// #169 (both directions of the #44 boundary): a shared runner.env carrying
+// one configured project's paths must fail closed rather than redirect a
+// different, explicitly selected project's run.
+test('parseArgs fails closed when a shared environment carries a different configured project\'s output/state paths (#44 reproduction)', () => withTempConfigFile(SELF_PROJECT_LIKE_CONFIG, (configPath) => {
+  const sharedEnv = {
+    AGENT_RUNNER_CONFIG: configPath,
+    CLAUDE_RUNNER_OUTPUT_DIR: MODELSPEND_LIKE_CONFIG.outputDir,
+    CLAUDE_RUNNER_STATE_DB: MODELSPEND_LIKE_CONFIG.stateDbPath,
+  };
+  assert.throws(() => parseArgs([], sharedEnv), /CLAUDE_RUNNER_OUTPUT_DIR.*disagrees with project "agent-runner"/);
+}));
+
+test('parseArgs resolves the Agent Runner self-project config\'s own state/output identity even while the shared environment holds ModelSpend paths, once those keys are absent', () => withTempConfigFile(SELF_PROJECT_LIKE_CONFIG, (configPath) => {
+  const args = parseArgs([], { AGENT_RUNNER_CONFIG: configPath });
+  assert.equal(args.outputDir, '.var/agent-runner');
+  assert.equal(args.stateDbPath, '.var/agent-runner/runner-state.sqlite');
+}));
+
+test('parseArgs still resolves ModelSpend\'s own canonical output/state paths when the shared environment agrees with the selected ModelSpend config', () => withTempConfigFile(MODELSPEND_LIKE_CONFIG, (configPath) => {
+  const sharedEnv = {
+    AGENT_RUNNER_CONFIG: configPath,
+    CLAUDE_RUNNER_OUTPUT_DIR: MODELSPEND_LIKE_CONFIG.outputDir,
+    CLAUDE_RUNNER_STATE_DB: MODELSPEND_LIKE_CONFIG.stateDbPath,
+  };
+  const args = parseArgs([], sharedEnv);
+  assert.equal(args.outputDir, MODELSPEND_LIKE_CONFIG.outputDir);
+  assert.equal(args.stateDbPath, MODELSPEND_LIKE_CONFIG.stateDbPath);
+}));
+
+test('parseArgs fails closed when a shared environment carries the Agent Runner self-project\'s output/state paths while ModelSpend is the selected config', () => withTempConfigFile(MODELSPEND_LIKE_CONFIG, (configPath) => {
+  const sharedEnv = {
+    AGENT_RUNNER_CONFIG: configPath,
+    CLAUDE_RUNNER_OUTPUT_DIR: SELF_PROJECT_LIKE_CONFIG.outputDir,
+    CLAUDE_RUNNER_STATE_DB: SELF_PROJECT_LIKE_CONFIG.stateDbPath,
+  };
+  assert.throws(() => parseArgs([], sharedEnv), /CLAUDE_RUNNER_OUTPUT_DIR.*disagrees with project "modelspend"/);
+}));
+
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(TEST_DIR, '../..');
 const RUNNER_WRAPPER = join(REPO_ROOT, 'scripts/ops/jobs/run-claude-runner.sh');

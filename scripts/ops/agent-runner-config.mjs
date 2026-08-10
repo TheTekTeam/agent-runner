@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { homedir } from 'node:os';
+import { isAbsolute, relative, resolve } from 'node:path';
 
 import { normalizeQueueTriagePolicy } from './agent-runner-queue-triage.mjs';
 
@@ -185,4 +186,55 @@ export function projectIdentity(config) {
     githubRepo: config.githubRepo,
     localRepoPath: config.localRepoPath,
   };
+}
+
+// Path fields only: env value must resolve under $HOME/.local/state/agent-runner/<projectId> (docs/MIGRATION.md), not merely contain matching segments anywhere.
+// Both sides are resolved (lexically normalized, `..`/`.` collapsed) before containment is checked, so
+// traversal escapes (modelspend/../agent-runner) and prefix collisions (modelspend-other) are rejected.
+function envValueMatchesProjectStateConvention(envValue, projectId, env) {
+  if (!projectId) return false;
+  const home = String(env.HOME || homedir());
+  const root = resolve(home, '.local', 'state', 'agent-runner', projectId);
+  const candidate = resolve(String(envValue || ''));
+  const rel = relative(root, candidate);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+}
+
+// Selected project config owns repo/output/state/lock identity; shared env must never redirect it.
+// No config selected => legacy default-config override unchanged. 'path' fields accept the
+// canonical-state-root exception; 'identity' fields (e.g. GITHUB_REPOSITORY) require exact agreement.
+export function resolveProjectScopedEnvValue({ envValue, configValue, configPath, envVarName, configFieldName, projectId, env = process.env, fieldKind = 'path' }) {
+  if (!envValue) return configValue;
+  if (!configPath) return envValue;
+  if (envValue === configValue) return envValue;
+  if (fieldKind === 'path' && envValueMatchesProjectStateConvention(envValue, projectId, env)) return envValue;
+  throw new Error(`${envVarName} ("${envValue}") disagrees with project "${projectId}" config ${configFieldName} ("${configValue}") from ${configPath}; refusing to let shared machine environment redirect this project's identity`);
+}
+
+// Env vars steering repo/output/state/lock identity; read from `env` by parseArgs and pre-scheduler gates.
+export const PROJECT_SCOPED_ENV_FIELDS = Object.freeze([
+  { envVarName: 'GITHUB_REPOSITORY', configFieldName: 'githubRepo', fieldKind: 'identity' },
+  { envVarName: 'CLAUDE_RUNNER_OUTPUT_DIR', configFieldName: 'outputDir', fieldKind: 'path' },
+  { envVarName: 'CLAUDE_RUNNER_STATE_DB', configFieldName: 'stateDbPath', fieldKind: 'path' },
+  { envVarName: 'CLAUDE_RUNNER_CRON_LOCK', configFieldName: 'runner.lockPath', fieldKind: 'path' },
+]);
+
+function configFieldValue(config, configFieldName) {
+  return configFieldName.split('.').reduce((value, key) => value?.[key], config);
+}
+
+// Fail closed, as early as possible in the outer entrypoint, before candidate discovery, claim, GitHub mutation, or model launch.
+export function assertProjectScopedEnv({ config, configPath, env }) {
+  for (const { envVarName, configFieldName, fieldKind } of PROJECT_SCOPED_ENV_FIELDS) {
+    resolveProjectScopedEnvValue({
+      envValue: env[envVarName],
+      configValue: configFieldValue(config, configFieldName),
+      configPath,
+      envVarName,
+      configFieldName,
+      projectId: config.projectId,
+      env,
+      fieldKind,
+    });
+  }
 }

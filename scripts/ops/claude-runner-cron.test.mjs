@@ -158,6 +158,52 @@ test('parseArgs can load reusable project defaults from explicit config', () => 
   }
 });
 
+// #169: a shared machine-local runner.env is a legitimate transport for the
+// currently selected project's own repo/output/state/lock paths, but must
+// never silently redirect an explicitly selected, materially different
+// project's identity (the observed #44 boundary).
+test('parseArgs fails closed when shared environment repo/output/state/lock values disagree with the explicitly selected project config', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cron-config-scoped-env-'));
+  try {
+    const configPath = join(dir, 'config.json');
+    writeFileSync(configPath, JSON.stringify({
+      projectId: 'example', displayName: 'Example Project', githubRepo: 'owner/repo', localRepoPath: '/srv/example',
+      outputDir: '.var/example-runner', stateDbPath: '.var/example-runner/state.sqlite',
+      acceptedAgentLabels: ['agent:example'],
+      statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress' },
+      priorityLabelRanking: ['priority:P0'], safeDefaultValidationCommands: ['npm test'],
+      systemd: { serviceName: 'example.service', timerName: 'example.timer' },
+      runner: { lockPath: '.var/example-runner/cron.lock', candidateLimit: 42 },
+    }));
+
+    for (const [envVarName, mismatchedValue] of [
+      ['GITHUB_REPOSITORY', 'TheTekTeam/modelspend'],
+      ['CLAUDE_RUNNER_OUTPUT_DIR', '/home/gp/.local/state/agent-runner/modelspend'],
+      ['CLAUDE_RUNNER_STATE_DB', '/home/gp/.local/state/agent-runner/modelspend/runner-state.sqlite'],
+      ['CLAUDE_RUNNER_CRON_LOCK', '/home/gp/.local/state/agent-runner/modelspend/cron.lock'],
+    ]) {
+      assert.throws(
+        () => parseArgs(['--config', configPath], { [envVarName]: mismatchedValue }),
+        new RegExp(`${envVarName}.*disagrees with project "example"`),
+      );
+    }
+
+    // Agreeing shared-environment values remain harmless.
+    const agreeing = parseArgs(['--config', configPath], {
+      GITHUB_REPOSITORY: 'owner/repo',
+      CLAUDE_RUNNER_OUTPUT_DIR: '.var/example-runner',
+      CLAUDE_RUNNER_STATE_DB: '.var/example-runner/state.sqlite',
+      CLAUDE_RUNNER_CRON_LOCK: '.var/example-runner/cron.lock',
+    });
+    assert.equal(agreeing.repo, 'owner/repo');
+    assert.equal(agreeing.outputDir, '.var/example-runner');
+    assert.equal(agreeing.stateDbPath, '.var/example-runner/state.sqlite');
+    assert.equal(agreeing.lockPath, '.var/example-runner/cron.lock');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('parseArgs fails closed when an explicit child config path is unreadable', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cron-config-missing-'));
   try {

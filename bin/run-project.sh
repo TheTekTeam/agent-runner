@@ -10,6 +10,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_FILE="${AGENT_RUNNER_CONFIG:-$HOME/.config/agent-runner/modelspend.json}"
 ENV_FILE="${AGENT_RUNNER_ENV_FILE:-$HOME/.config/agent-runner/runner.env}"
 RESULT_FILE="${AGENT_RUNNER_RUN_RESULT_FILE:-}"
+# This invocation is the sole owner of RESULT_FILE; scrub the env var so no
+# child (nested run, worker, test harness) can overwrite it (#169).
+unset AGENT_RUNNER_RUN_RESULT_FILE
 NODE_BIN="${AGENT_RUNNER_NODE_BIN:-node}"
 PINNED_CRON="$ROOT/scripts/ops/agent-runner-pinned-atomic-cron.mjs"
 
@@ -73,6 +76,8 @@ json_value() {
 }
 
 load_env_file "$ENV_FILE"
+# runner.env is config, not a result channel; re-scrub in case it declared it.
+unset AGENT_RUNNER_RUN_RESULT_FILE
 export PATH="/usr/local/bin:/opt/homebrew/bin:/opt/cpanel/ea-nodejs22/bin:$HOME/.local/bin:$HOME/bin:$PATH"
 export AGENT_RUNNER_CONFIG="$CONFIG_FILE"
 export CLAUDE_RUNNER_CONFIG="$CONFIG_FILE"
@@ -80,6 +85,25 @@ export CLAUDE_RUNNER_CONFIG="$CONFIG_FILE"
 PROJECT_DIR="$(json_value localRepoPath)"
 [ -d "$PROJECT_DIR/.git" ] || { echo "[agent-runner] ERROR: project checkout is not a git worktree: $PROJECT_DIR" >&2; exit 1; }
 cd "$PROJECT_DIR"
+
+# Pre-scheduler gates (e.g. the circuit breaker) read state paths straight
+# from the environment before parseArgs runs; validate identity here first (#169).
+set +e
+PROJECT_SCOPED_ENV_ERROR="$("$NODE_BIN" -e '
+import("file://'"$ROOT"'/scripts/ops/agent-runner-config.mjs").then(({ assertProjectScopedEnv, loadAgentRunnerConfig, resolveConfigPath }) => {
+  const configPath = resolveConfigPath([], process.env);
+  const config = loadAgentRunnerConfig({ argv: [], env: process.env, configPath });
+  assertProjectScopedEnv({ config, configPath, env: process.env });
+}).catch((error) => { console.error(error.message); process.exitCode = 1; });
+' 2>&1 >/dev/null)"
+PROJECT_SCOPED_ENV_STATUS=$?
+set -e
+if [ "$PROJECT_SCOPED_ENV_STATUS" -ne 0 ]; then
+  printf '%s\n' "$PROJECT_SCOPED_ENV_ERROR" >&2
+  write_run_result wrapper_failure project-scoped-env-mismatch 1
+  echo "[agent-runner] ERROR: shared machine environment disagrees with the selected project config; refusing before any candidate/claim/model work" >&2
+  exit 1
+fi
 
 ARGS=()
 EXECUTE_REQUESTED=0

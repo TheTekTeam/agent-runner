@@ -6,7 +6,7 @@ import { mkdirSync, openSync, closeSync, readFileSync, rmSync, writeFileSync } f
 import { dirname, join as joinPath } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { loadAgentRunnerConfig, resolveConfigPath, stripConfigArgs } from './agent-runner-config.mjs';
+import { assertProjectScopedEnv, loadAgentRunnerConfig, resolveConfigPath, stripConfigArgs } from './agent-runner-config.mjs';
 import {
   AGENT_ADAPTERS,
   agentRunMetadata,
@@ -200,6 +200,9 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
   const configPath = resolveConfigPath(argv, env);
   const config = loadAgentRunnerConfig({ argv, env, configPath });
   argv = stripConfigArgs(argv);
+  // Shared machine environment must never silently redirect this run's
+  // identity into a different configured project's state tree (#169).
+  assertProjectScopedEnv({ config, configPath, env });
   const outputDir = env.CLAUDE_RUNNER_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT;
   const args = {
     configPath,
