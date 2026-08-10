@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { resolve } from 'node:path';
+import { isAbsolute, relative, resolve } from 'node:path';
 
 import { normalizeQueueTriagePolicy } from './agent-runner-queue-triage.mjs';
 
@@ -188,17 +188,16 @@ export function projectIdentity(config) {
   };
 }
 
-function pathSegments(value) {
-  return String(value || '').split(/[\\/]/).filter(Boolean);
-}
-
 // Path fields only: env value must resolve under $HOME/.local/state/agent-runner/<projectId> (docs/MIGRATION.md), not merely contain matching segments anywhere.
+// Both sides are resolved (lexically normalized, `..`/`.` collapsed) before containment is checked, so
+// traversal escapes (modelspend/../agent-runner) and prefix collisions (modelspend-other) are rejected.
 function envValueMatchesProjectStateConvention(envValue, projectId, env) {
   if (!projectId) return false;
   const home = String(env.HOME || homedir());
-  const rootSegments = [...pathSegments(home), '.local', 'state', 'agent-runner', projectId];
-  const segments = pathSegments(envValue);
-  return rootSegments.every((segment, index) => segments[index] === segment);
+  const root = resolve(home, '.local', 'state', 'agent-runner', projectId);
+  const candidate = resolve(String(envValue || ''));
+  const rel = relative(root, candidate);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
 // Selected project config owns repo/output/state/lock identity; shared env must never redirect it.
