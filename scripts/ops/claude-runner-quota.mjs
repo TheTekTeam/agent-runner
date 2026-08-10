@@ -132,7 +132,7 @@ export function evaluateProfileQuotaAdmission({ quotaUsage = null, status = null
   const threshold = resolveProfileSessionUsageThreshold(profileName, env);
   const sessionPercentUsed = quotaUsage?.session?.usedPercent;
 
-  if (status === 'ambiguous') {
+  if (!['available', 'exhausted'].includes(status)) {
     return { allowed: false, profile: profileName, threshold, sessionPercentUsed: sessionPercentUsed ?? null, status: 'ambiguous', reason: 'quota-evidence-ambiguous' };
   }
   if (!Number.isInteger(sessionPercentUsed)) {
@@ -156,9 +156,11 @@ export function anyProfileQuotaAdmissible({ quotaUsage = null, status = null, en
 // payload normalizes to 'ambiguous', which fails closed for every profile.
 export function quotaAdmissionEvidenceFromPreflight(quotaPreflight) {
   if (!quotaPreflight || quotaPreflight.skipped) return null;
+  const status = quotaPreflight.payload?.status;
+  if (quotaPreflight.exitCode !== 0 || quotaPreflight.signal || !['available', 'exhausted'].includes(status)) return { quotaUsage: null, status: 'ambiguous' };
   return {
     quotaUsage: quotaPreflight.payload?.state?.quotaUsage ?? null,
-    status: quotaPreflight.payload?.status ?? 'ambiguous',
+    status,
   };
 }
 

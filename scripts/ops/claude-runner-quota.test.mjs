@@ -279,6 +279,7 @@ test('evaluateProfileQuotaAdmission fails closed for every profile on ambiguous,
     { quotaUsage: null, status: 'ambiguous' },
     { quotaUsage: null, status: 'available' },
     { quotaUsage: { session: { usedPercent: 'not-a-number' } }, status: 'available' },
+    { quotaUsage: usageOf(5), status: 'stale' },
     { quotaUsage: { session: null }, status: 'exhausted' },
   ];
   for (const evidence of badEvidence) {
@@ -320,9 +321,11 @@ test('quotaAdmissionEvidenceFromPreflight: translates a quota preflight result i
   assert.equal(quotaAdmissionEvidenceFromPreflight(null), null);
   assert.equal(quotaAdmissionEvidenceFromPreflight({ skipped: true, blocked: false }), null);
   assert.deepEqual(
-    quotaAdmissionEvidenceFromPreflight({ skipped: false, blocked: true, payload: { status: 'exhausted', state: { quotaUsage: usageOf(60) } } }),
+    quotaAdmissionEvidenceFromPreflight({ skipped: false, blocked: true, exitCode: 0, signal: null, payload: { status: 'exhausted', state: { quotaUsage: usageOf(60) } } }),
     { quotaUsage: usageOf(60), status: 'exhausted' },
   );
+  assert.deepEqual(quotaAdmissionEvidenceFromPreflight({ skipped: false, blocked: true, exitCode: 1, signal: null, payload: { status: 'available', state: { quotaUsage: usageOf(5) } } }), { quotaUsage: null, status: 'ambiguous' });
+  assert.deepEqual(quotaAdmissionEvidenceFromPreflight({ skipped: false, blocked: true, exitCode: 0, signal: null, payload: { status: 'stale', state: { quotaUsage: usageOf(5) } } }), { quotaUsage: null, status: 'ambiguous' });
   // A missing/unparsed payload (stale, malformed, or a non-zero exit before any JSON could be produced) fails closed to 'ambiguous' rather than assuming availability.
   assert.deepEqual(quotaAdmissionEvidenceFromPreflight({ skipped: false, blocked: true, payload: null }), { quotaUsage: null, status: 'ambiguous' });
 });

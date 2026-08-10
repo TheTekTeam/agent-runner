@@ -5299,6 +5299,27 @@ test('#44: main() performs zero selection/claim/mutation and idles the whole que
   }
 });
 
+test('#44: main() fails closed before queue inspection when quota preflight exits non-zero despite plausible low-usage JSON', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-quota-profile-transport-failure-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main(['--execute', '--allow-root', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', join(dir, 'cron.lock')], { GH_TOKEN: 'test-token' }, {
+      ghRunner: (args) => { throw new Error(`failed quota evidence must stop before queue inspection: ${args.join(' ')}`); },
+      quotaRunner: () => ({ status: 1, signal: null, stdout: JSON.stringify({ status: 'available', state: { quotaUsage: { session: { usedPercent: 5, resetAt: null, resetText: null } } } }), stderr: 'synthetic quota-preflight failure' }),
+    });
+    assert.equal(exitCode, 0);
+    const state = openRunnerStateStore(stateDbPath);
+    assert.equal(state.allRows('claims').length, 0);
+    assert.equal(state.allRows('run_results').filter((row) => row.mode === 'quota-blocked').length, 1);
+    state.close();
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('#53 review round 5: a systemic_pause opened by a prior pass is notified before this pass resolves it, and the next pass resolves the notification once the condition clears', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'runner-notifications-systemic-pause-order-'));
   const stateDbPath = join(dir, 'state.sqlite');
