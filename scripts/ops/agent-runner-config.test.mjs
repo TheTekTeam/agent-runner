@@ -7,6 +7,7 @@ import test from 'node:test';
 import {
   DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG,
   loadAgentRunnerConfig,
+  PROJECT_SCOPED_ENV_FIELDS,
   resolveConfigPath,
   resolveProjectScopedEnvValue,
   stripConfigArgs,
@@ -93,11 +94,10 @@ test('queue triage policy may tighten but cannot widen core limits or invent lab
   }), /subset of configured status labels/);
 });
 
-// #169 (#44 reproduction): a shared runner.env must never redirect a
-// different project's identity. A same-project canonical override
-// ($HOME/.local/state/agent-runner/<projectId>, docs/MIGRATION.md) remains
-// legitimate; a path merely containing matching segments elsewhere fails closed.
+// Shared runner.env must never redirect a different project's identity. A same-project canonical
+// override ($HOME/.local/state/agent-runner/<projectId>) is legitimate for path fields only; identity fields require exact agreement.
 const SCOPED_ENV_BASE = { envVarName: 'CLAUDE_RUNNER_OUTPUT_DIR', configFieldName: 'outputDir' };
+const IDENTITY_ENV_BASE = { envVarName: 'GITHUB_REPOSITORY', configFieldName: 'githubRepo', fieldKind: 'identity' };
 const HOME = { HOME: '/home/gp' };
 
 for (const [name, overrides, expected] of [
@@ -110,9 +110,12 @@ for (const [name, overrides, expected] of [
   ['accepts an env value that agrees with the selected project config',
     { envValue: '/home/gp/.local/state/agent-runner/modelspend', configValue: '/home/gp/.local/state/agent-runner/modelspend', configPath: '/cfg/modelspend.json', projectId: 'modelspend' },
     '/home/gp/.local/state/agent-runner/modelspend'],
-  ['accepts a same-project canonical override of the project\'s own relative default (#169 item C)',
+  ['accepts a same-project canonical override of the project\'s own relative default',
     { envValue: '/home/gp/.local/state/agent-runner/modelspend', configValue: '.var/claude-runner', configPath: '/cfg/modelspend.json', projectId: 'modelspend', env: HOME },
     '/home/gp/.local/state/agent-runner/modelspend'],
+  ['identity fields accept only exact agreement with the project config',
+    { ...IDENTITY_ENV_BASE, envValue: 'TheTekTeam/modelspend', configValue: 'TheTekTeam/modelspend', configPath: '/cfg/modelspend.json', projectId: 'modelspend' },
+    'TheTekTeam/modelspend'],
 ]) {
   test(`resolveProjectScopedEnvValue ${name}`, () => {
     assert.equal(resolveProjectScopedEnvValue({ ...SCOPED_ENV_BASE, ...overrides }), expected);
@@ -126,14 +129,19 @@ for (const [name, overrides, pattern] of [
   ['rejects a path that merely contains matching segments outside the project\'s own canonical state root',
     { envValue: '/tmp/untrusted/agent-runner/modelspend/anything', configValue: '.var/claude-runner', configPath: '/cfg/modelspend.json', projectId: 'modelspend', env: HOME },
     /CLAUDE_RUNNER_OUTPUT_DIR.*disagrees with project "modelspend"/],
+  ['identity fields reject a value that merely looks like the project\'s canonical state-root path',
+    { ...IDENTITY_ENV_BASE, envValue: '/home/gp/.local/state/agent-runner/modelspend', configValue: 'TheTekTeam/modelspend', configPath: '/cfg/modelspend.json', projectId: 'modelspend', env: HOME },
+    /GITHUB_REPOSITORY.*disagrees with project "modelspend".*githubRepo.*refusing to let shared machine environment redirect this project's identity/],
+  ['identity fields fail closed on a differing repo even for the selected project',
+    { ...IDENTITY_ENV_BASE, envValue: 'TheTekTeam/agent-runner', configValue: 'TheTekTeam/modelspend', configPath: '/cfg/modelspend.json', projectId: 'modelspend' },
+    /GITHUB_REPOSITORY.*disagrees with project "modelspend"/],
 ]) {
   test(`resolveProjectScopedEnvValue ${name}`, () => {
     assert.throws(() => resolveProjectScopedEnvValue({ ...SCOPED_ENV_BASE, ...overrides }), pattern);
   });
 }
 
-// A project whose own id equals the shared `agent-runner` namespace folder
-// name must not confuse that folder with the project's own id segment.
+// A project id equal to the shared `agent-runner` namespace folder must not be confused with it.
 test('resolveProjectScopedEnvValue same-project convention match is unconfused when the selected project id equals the shared namespace folder name', () => {
   const base = { envVarName: 'CLAUDE_RUNNER_STATE_DB', configFieldName: 'stateDbPath', configValue: '.var/agent-runner/runner-state.sqlite', configPath: '/cfg/agent-runner.json', projectId: 'agent-runner', env: HOME };
   assert.equal(
@@ -144,6 +152,14 @@ test('resolveProjectScopedEnvValue same-project convention match is unconfused w
     () => resolveProjectScopedEnvValue({ ...base, envValue: '/home/gp/.local/state/agent-runner/modelspend/runner-state.sqlite' }),
     /CLAUDE_RUNNER_STATE_DB.*disagrees with project "agent-runner"/,
   );
+});
+
+test('PROJECT_SCOPED_ENV_FIELDS marks GITHUB_REPOSITORY as an identity field and the path env vars as path fields', () => {
+  const byName = Object.fromEntries(PROJECT_SCOPED_ENV_FIELDS.map((field) => [field.envVarName, field.fieldKind]));
+  assert.equal(byName.GITHUB_REPOSITORY, 'identity');
+  assert.equal(byName.CLAUDE_RUNNER_OUTPUT_DIR, 'path');
+  assert.equal(byName.CLAUDE_RUNNER_STATE_DB, 'path');
+  assert.equal(byName.CLAUDE_RUNNER_CRON_LOCK, 'path');
 });
 
 test('loadAgentRunnerConfig supports the existing scaffold config shape', () => withTempConfig({

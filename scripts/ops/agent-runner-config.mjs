@@ -192,10 +192,7 @@ function pathSegments(value) {
   return String(value || '').split(/[\\/]/).filter(Boolean);
 }
 
-// Same-project override proof (#169): the env value must resolve under this
-// project's own canonical state root, $HOME/.local/state/agent-runner/<projectId>
-// (docs/MIGRATION.md) -- not merely contain matching segments anywhere, which
-// would wrongly accept e.g. /tmp/untrusted/agent-runner/<projectId>/anything.
+// Path fields only: env value must resolve under $HOME/.local/state/agent-runner/<projectId> (docs/MIGRATION.md), not merely contain matching segments anywhere.
 function envValueMatchesProjectStateConvention(envValue, projectId, env) {
   if (!projectId) return false;
   const home = String(env.HOME || homedir());
@@ -204,40 +201,32 @@ function envValueMatchesProjectStateConvention(envValue, projectId, env) {
   return rootSegments.every((segment, index) => segments[index] === segment);
 }
 
-// A selected project config owns this run's repo/output/state/lock identity
-// (#169); shared machine environment must never silently redirect it into
-// another project's durable state tree. Without an explicit config
-// selection there is no identity to disagree with, so the legacy
-// default-config env override contract is preserved unchanged.
-export function resolveProjectScopedEnvValue({ envValue, configValue, configPath, envVarName, configFieldName, projectId, env = process.env }) {
+// Selected project config owns repo/output/state/lock identity; shared env must never redirect it.
+// No config selected => legacy default-config override unchanged. 'path' fields accept the
+// canonical-state-root exception; 'identity' fields (e.g. GITHUB_REPOSITORY) require exact agreement.
+export function resolveProjectScopedEnvValue({ envValue, configValue, configPath, envVarName, configFieldName, projectId, env = process.env, fieldKind = 'path' }) {
   if (!envValue) return configValue;
   if (!configPath) return envValue;
   if (envValue === configValue) return envValue;
-  if (envValueMatchesProjectStateConvention(envValue, projectId, env)) return envValue;
-  throw new Error(
-    `${envVarName} ("${envValue}") disagrees with project "${projectId}" config ${configFieldName} ("${configValue}") from ${configPath}; refusing to let shared machine environment redirect this project's identity`,
-  );
+  if (fieldKind === 'path' && envValueMatchesProjectStateConvention(envValue, projectId, env)) return envValue;
+  throw new Error(`${envVarName} ("${envValue}") disagrees with project "${projectId}" config ${configFieldName} ("${configValue}") from ${configPath}; refusing to let shared machine environment redirect this project's identity`);
 }
 
-// Env vars that can steer a run's repo/output/state/lock identity (#169):
-// both parseArgs and standalone pre-scheduler gates read these from `env`.
+// Env vars steering repo/output/state/lock identity; read from `env` by parseArgs and pre-scheduler gates.
 export const PROJECT_SCOPED_ENV_FIELDS = Object.freeze([
-  { envVarName: 'GITHUB_REPOSITORY', configFieldName: 'githubRepo' },
-  { envVarName: 'CLAUDE_RUNNER_OUTPUT_DIR', configFieldName: 'outputDir' },
-  { envVarName: 'CLAUDE_RUNNER_STATE_DB', configFieldName: 'stateDbPath' },
-  { envVarName: 'CLAUDE_RUNNER_CRON_LOCK', configFieldName: 'runner.lockPath' },
+  { envVarName: 'GITHUB_REPOSITORY', configFieldName: 'githubRepo', fieldKind: 'identity' },
+  { envVarName: 'CLAUDE_RUNNER_OUTPUT_DIR', configFieldName: 'outputDir', fieldKind: 'path' },
+  { envVarName: 'CLAUDE_RUNNER_STATE_DB', configFieldName: 'stateDbPath', fieldKind: 'path' },
+  { envVarName: 'CLAUDE_RUNNER_CRON_LOCK', configFieldName: 'runner.lockPath', fieldKind: 'path' },
 ]);
 
 function configFieldValue(config, configFieldName) {
   return configFieldName.split('.').reduce((value, key) => value?.[key], config);
 }
 
-// Fail closed, before any candidate discovery, claim, attempt creation,
-// GitHub mutation or model launch, if shared machine environment disagrees
-// with the selected project config on any repo/output/state/lock field
-// (#169). Run once, as early as possible, in the outer entrypoint.
+// Fail closed, as early as possible in the outer entrypoint, before candidate discovery, claim, GitHub mutation, or model launch.
 export function assertProjectScopedEnv({ config, configPath, env }) {
-  for (const { envVarName, configFieldName } of PROJECT_SCOPED_ENV_FIELDS) {
+  for (const { envVarName, configFieldName, fieldKind } of PROJECT_SCOPED_ENV_FIELDS) {
     resolveProjectScopedEnvValue({
       envValue: env[envVarName],
       configValue: configFieldValue(config, configFieldName),
@@ -246,6 +235,7 @@ export function assertProjectScopedEnv({ config, configPath, env }) {
       configFieldName,
       projectId: config.projectId,
       env,
+      fieldKind,
     });
   }
 }
