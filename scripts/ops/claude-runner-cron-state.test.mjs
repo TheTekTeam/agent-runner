@@ -19,39 +19,35 @@ function withTempConfigFile(payload, fn) {
   }
 }
 
-const MODELSPEND_LIKE_CONFIG = {
-  projectId: 'modelspend',
-  displayName: 'ModelSpend',
-  githubRepo: 'TheTekTeam/modelspend',
-  localRepoPath: '/workspace/modelspend',
-  outputDir: '/home/gp/.local/state/agent-runner/modelspend',
-  stateDbPath: '/home/gp/.local/state/agent-runner/modelspend/runner-state.sqlite',
-  acceptedAgentLabels: ['agent:claude'],
-  statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress' },
-  priorityLabelRanking: ['priority:P0'],
-  safeDefaultValidationCommands: [],
-  systemd: { serviceName: 'modelspend.service', timerName: 'modelspend.timer' },
-};
+function projectConfig(id, overrides = {}) {
+  return {
+    projectId: id,
+    displayName: id,
+    githubRepo: `TheTekTeam/${id}`,
+    localRepoPath: `/workspace/${id}`,
+    outputDir: `/home/gp/.local/state/agent-runner/${id}`,
+    stateDbPath: `/home/gp/.local/state/agent-runner/${id}/runner-state.sqlite`,
+    acceptedAgentLabels: ['agent:claude'],
+    statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress' },
+    priorityLabelRanking: ['priority:P0'],
+    safeDefaultValidationCommands: [],
+    systemd: { serviceName: `${id}.service`, timerName: `${id}.timer` },
+    ...overrides,
+  };
+}
 
-const SELF_PROJECT_LIKE_CONFIG = {
-  projectId: 'agent-runner',
+const MODELSPEND_LIKE_CONFIG = projectConfig('modelspend', { displayName: 'ModelSpend' });
+const SELF_PROJECT_LIKE_CONFIG = projectConfig('agent-runner', {
   displayName: 'Agent Runner',
-  githubRepo: 'TheTekTeam/agent-runner',
   localRepoPath: '/home/gp/projects/agent-runner',
   outputDir: '.var/agent-runner',
   stateDbPath: '.var/agent-runner/runner-state.sqlite',
   acceptedAgentLabels: ['agent:claude-code-cli'],
-  statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress' },
-  priorityLabelRanking: ['priority:P0'],
-  safeDefaultValidationCommands: [],
-  systemd: { serviceName: 'agent-runner.service', timerName: 'agent-runner.timer' },
-};
+});
 
-// #169: reproduces the observed #44 boundary -- the shared machine-local
-// runner.env carried ModelSpend's CLAUDE_RUNNER_OUTPUT_DIR/CLAUDE_RUNNER_STATE_DB
-// while AGENT_RUNNER_CONFIG named the Agent Runner self-project. That must
-// fail closed before candidate selection instead of silently redirecting the
-// self-project run into ModelSpend's durable state tree.
+// #169 (both directions of the #44 boundary): a shared runner.env carrying
+// one configured project's paths must fail closed rather than redirect a
+// different, explicitly selected project's run.
 test('parseArgs fails closed when a shared environment carries a different configured project\'s output/state paths (#44 reproduction)', () => withTempConfigFile(SELF_PROJECT_LIKE_CONFIG, (configPath) => {
   const sharedEnv = {
     AGENT_RUNNER_CONFIG: configPath,
@@ -78,10 +74,6 @@ test('parseArgs still resolves ModelSpend\'s own canonical output/state paths wh
   assert.equal(args.stateDbPath, MODELSPEND_LIKE_CONFIG.stateDbPath);
 }));
 
-// #169 regression item B (the reverse of the #44 reproduction above): a
-// shared machine-local runner.env carrying the Agent Runner self-project's
-// output/state paths must not silently redirect a ModelSpend-selected run
-// into the Agent Runner project's durable state tree either.
 test('parseArgs fails closed when a shared environment carries the Agent Runner self-project\'s output/state paths while ModelSpend is the selected config', () => withTempConfigFile(MODELSPEND_LIKE_CONFIG, (configPath) => {
   const sharedEnv = {
     AGENT_RUNNER_CONFIG: configPath,

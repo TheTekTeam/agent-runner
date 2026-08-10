@@ -200,11 +200,8 @@ export function parseArgs(argv = process.argv.slice(2), env = process.env) {
   const configPath = resolveConfigPath(argv, env);
   const config = loadAgentRunnerConfig({ argv, env, configPath });
   argv = stripConfigArgs(argv);
-  // #169: a selected project config owns this run's repo/output/state/lock
-  // identity. A shared machine environment file may legitimately carry
-  // another configured project's canonical paths (e.g. ModelSpend's
-  // runner.env), so a disagreeing env value here is never silently
-  // preferred -- it fails closed instead of guessing.
+  // Shared machine environment must never silently redirect this run's
+  // identity into a different configured project's state tree (#169).
   assertProjectScopedEnv({ config, configPath, env });
   const outputDir = env.CLAUDE_RUNNER_OUTPUT_DIR || config.outputDir || DEFAULT_OUTPUT;
   const args = {

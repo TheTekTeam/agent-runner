@@ -167,36 +167,26 @@ test('parseArgs fails closed when shared environment repo/output/state/lock valu
   try {
     const configPath = join(dir, 'config.json');
     writeFileSync(configPath, JSON.stringify({
-      projectId: 'example',
-      displayName: 'Example Project',
-      githubRepo: 'owner/repo',
-      localRepoPath: '/srv/example',
-      outputDir: '.var/example-runner',
-      stateDbPath: '.var/example-runner/state.sqlite',
+      projectId: 'example', displayName: 'Example Project', githubRepo: 'owner/repo', localRepoPath: '/srv/example',
+      outputDir: '.var/example-runner', stateDbPath: '.var/example-runner/state.sqlite',
       acceptedAgentLabels: ['agent:example'],
       statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress' },
-      priorityLabelRanking: ['priority:P0'],
-      safeDefaultValidationCommands: ['npm test'],
+      priorityLabelRanking: ['priority:P0'], safeDefaultValidationCommands: ['npm test'],
       systemd: { serviceName: 'example.service', timerName: 'example.timer' },
       runner: { lockPath: '.var/example-runner/cron.lock', candidateLimit: 42 },
     }));
 
-    assert.throws(
-      () => parseArgs(['--config', configPath], { GITHUB_REPOSITORY: 'TheTekTeam/modelspend' }),
-      /GITHUB_REPOSITORY.*disagrees with project "example"/,
-    );
-    assert.throws(
-      () => parseArgs(['--config', configPath], { CLAUDE_RUNNER_OUTPUT_DIR: '/home/gp/.local/state/agent-runner/modelspend' }),
-      /CLAUDE_RUNNER_OUTPUT_DIR.*disagrees with project "example"/,
-    );
-    assert.throws(
-      () => parseArgs(['--config', configPath], { CLAUDE_RUNNER_STATE_DB: '/home/gp/.local/state/agent-runner/modelspend/runner-state.sqlite' }),
-      /CLAUDE_RUNNER_STATE_DB.*disagrees with project "example"/,
-    );
-    assert.throws(
-      () => parseArgs(['--config', configPath], { CLAUDE_RUNNER_CRON_LOCK: '/home/gp/.local/state/agent-runner/modelspend/cron.lock' }),
-      /CLAUDE_RUNNER_CRON_LOCK.*disagrees with project "example"/,
-    );
+    for (const [envVarName, mismatchedValue] of [
+      ['GITHUB_REPOSITORY', 'TheTekTeam/modelspend'],
+      ['CLAUDE_RUNNER_OUTPUT_DIR', '/home/gp/.local/state/agent-runner/modelspend'],
+      ['CLAUDE_RUNNER_STATE_DB', '/home/gp/.local/state/agent-runner/modelspend/runner-state.sqlite'],
+      ['CLAUDE_RUNNER_CRON_LOCK', '/home/gp/.local/state/agent-runner/modelspend/cron.lock'],
+    ]) {
+      assert.throws(
+        () => parseArgs(['--config', configPath], { [envVarName]: mismatchedValue }),
+        new RegExp(`${envVarName}.*disagrees with project "example"`),
+      );
+    }
 
     // Agreeing shared-environment values remain harmless.
     const agreeing = parseArgs(['--config', configPath], {

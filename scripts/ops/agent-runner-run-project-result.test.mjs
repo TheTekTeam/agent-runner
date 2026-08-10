@@ -7,6 +7,24 @@ import test from 'node:test';
 
 const ROOT = resolve(import.meta.dirname, '../..');
 
+// The project-scoped-env gate loads this for real, so it must satisfy the
+// full config schema even when subprocess calls are stubbed out below.
+function projectConfig(id, overrides = {}) {
+  return {
+    projectId: id,
+    displayName: id,
+    githubRepo: `TheTekTeam/${id}`,
+    outputDir: `.var/${id}`,
+    stateDbPath: `.var/${id}/runner-state.sqlite`,
+    acceptedAgentLabels: ['agent:claude'],
+    statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress' },
+    priorityLabelRanking: ['priority:P0'],
+    safeDefaultValidationCommands: [],
+    systemd: { serviceName: `${id}.service`, timerName: `${id}.timer` },
+    ...overrides,
+  };
+}
+
 test('run-project records handled no-op reason while preserving shell exit zero', (t) => {
   if (typeof process.getuid === 'function' && process.getuid() === 0) {
     t.skip('run-project intentionally refuses root');
@@ -19,22 +37,7 @@ test('run-project records handled no-op reason while preserving shell exit zero'
   const fakeNode = join(root, 'node');
   const resultFile = join(root, 'run-result.json');
   mkdirSync(join(project, '.git'), { recursive: true });
-  // #169: the project-scoped-env gate now loads this config for real (rather
-  // than only reading localRepoPath), so it must satisfy the full schema even
-  // though every downstream subprocess call in this test is stubbed out below.
-  writeFileSync(config, JSON.stringify({
-    projectId: 'modelspend',
-    displayName: 'ModelSpend',
-    githubRepo: 'TheTekTeam/modelspend',
-    localRepoPath: project,
-    outputDir: '.var/claude-runner',
-    stateDbPath: '.var/claude-runner/runner-state.sqlite',
-    acceptedAgentLabels: ['agent:claude'],
-    statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress' },
-    priorityLabelRanking: ['priority:P0'],
-    safeDefaultValidationCommands: [],
-    systemd: { serviceName: 'modelspend.service', timerName: 'modelspend.timer' },
-  }));
+  writeFileSync(config, JSON.stringify(projectConfig('modelspend', { localRepoPath: project })));
   writeFileSync(fakeNode, `#!/usr/bin/env bash
 set -euo pipefail
 if [ "$#" -eq 0 ] || [ "\${1:-}" = "-e" ]; then exec "$REAL_NODE" "$@"; fi
@@ -68,12 +71,9 @@ exit 99
   assert.match(recorded.recordedAt, /^\d{4}-\d{2}-\d{2}T/);
 });
 
-// #169: reproduces the observed #44 boundary through the real bin/run-project.sh
-// entrypoint -- a machine-local runner.env carrying ModelSpend's canonical
-// output/state paths must not be silently inherited by a different,
-// explicitly selected project's dry run. The pinned scheduler must fail
-// closed before any candidate/claim/model work rather than write into
-// ModelSpend's durable state tree.
+// #169 (#44 reproduction) through the real entrypoint: a runner.env carrying
+// ModelSpend's canonical paths must not be inherited by a different,
+// explicitly selected project's dry run.
 test('run-project dry run fails closed instead of inheriting a different configured project\'s output/state paths from shared machine environment', (t) => {
   if (typeof process.getuid === 'function' && process.getuid() === 0) {
     t.skip('run-project intentionally refuses root');
@@ -85,19 +85,10 @@ test('run-project dry run fails closed instead of inheriting a different configu
   const configPath = join(root, 'agent-runner.json');
   const envFile = join(root, 'runner.env');
   mkdirSync(join(project, '.git'), { recursive: true });
-  writeFileSync(configPath, JSON.stringify({
-    projectId: 'agent-runner',
-    displayName: 'Agent Runner',
-    githubRepo: 'TheTekTeam/agent-runner',
+  writeFileSync(configPath, JSON.stringify(projectConfig('agent-runner', {
     localRepoPath: project,
-    outputDir: '.var/agent-runner',
-    stateDbPath: '.var/agent-runner/runner-state.sqlite',
     acceptedAgentLabels: ['agent:claude-code-cli'],
-    statusLabels: { ready: 'status:ready', inProgress: 'status:in-progress' },
-    priorityLabelRanking: ['priority:P0'],
-    safeDefaultValidationCommands: [],
-    systemd: { serviceName: 'agent-runner.service', timerName: 'agent-runner.timer' },
-  }));
+  })));
   // A shared machine-local runner.env carrying a materially different
   // project's (ModelSpend's) canonical output/state identity.
   writeFileSync(envFile, [
@@ -118,4 +109,54 @@ test('run-project dry run fails closed instead of inheriting a different configu
 
   assert.notEqual(run.status, 0, `wrapper unexpectedly inherited a mismatched project identity\nstdout:\n${run.stdout || ''}\nstderr:\n${run.stderr || ''}`);
   assert.match(run.stderr, /CLAUDE_RUNNER_OUTPUT_DIR.*disagrees with project "agent-runner"/);
+});
+
+// #169: a nested re-entry must not inherit AGENT_RUNNER_RUN_RESULT_FILE and
+// overwrite this outer genuine execute run's recorded result with a false
+// dry-run one.
+test('run-project scrubs AGENT_RUNNER_RUN_RESULT_FILE from every child so a nested re-entry cannot overwrite the outer execute result with a false dry-run result', (t) => {
+  if (typeof process.getuid === 'function' && process.getuid() === 0) {
+    t.skip('run-project intentionally refuses root');
+    return;
+  }
+
+  const root = mkdtempSync(join(tmpdir(), 'agent-runner-result-ownership-'));
+  const project = join(root, 'project');
+  const config = join(root, 'modelspend.json');
+  const fakeNode = join(root, 'node');
+  const resultFile = join(root, 'run-result.json');
+  mkdirSync(join(project, '.git'), { recursive: true });
+  writeFileSync(config, JSON.stringify(projectConfig('modelspend', { localRepoPath: project })));
+  writeFileSync(fakeNode, `#!/usr/bin/env bash
+set -euo pipefail
+if [ "$#" -eq 0 ] || [ "\${1:-}" = "-e" ]; then exec "$REAL_NODE" "$@"; fi
+case "\${1:-}" in
+  *agent-runner-pinned-atomic-cron.mjs)
+    [ -z "\${AGENT_RUNNER_RUN_RESULT_FILE:-}" ] || { echo "child inherited AGENT_RUNNER_RUN_RESULT_FILE" >&2; exit 1; }
+    [ -n "\${NESTED_REENTRY:-}" ] || NESTED_REENTRY=1 AGENT_RUNNER_EXECUTE=false bash "$NESTED_ROOT/bin/run-project.sh"
+    ;;
+esac
+exit 0
+`);
+  chmodSync(fakeNode, 0o755);
+
+  const run = spawnSync('bash', [join(ROOT, 'bin/run-project.sh')], {
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      REAL_NODE: process.execPath,
+      AGENT_RUNNER_NODE_BIN: fakeNode,
+      AGENT_RUNNER_CONFIG: config,
+      AGENT_RUNNER_ENV_FILE: join(root, 'missing.env'),
+      AGENT_RUNNER_EXECUTE: 'true',
+      AGENT_RUNNER_RUN_RESULT_FILE: resultFile,
+      NESTED_ROOT: ROOT,
+    },
+  });
+
+  assert.equal(run.status, 0, `stdout:\n${run.stdout || ''}\nstderr:\n${run.stderr || ''}`);
+  const recorded = JSON.parse(readFileSync(resultFile, 'utf8'));
+  assert.equal(recorded.state, 'canonical_runner_invoked');
+  assert.equal(recorded.reason, 'canonical-runner-executed');
+  assert.equal(recorded.exitCode, 0);
 });
