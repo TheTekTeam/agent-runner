@@ -441,7 +441,8 @@ export function buildRunnerActivity(latest = baseLatest()) {
   let activeClaim = null;
   for (const claim of sortedClaims) {
     const claimAt = rowTimestamp(claim);
-    const terminal = runs.some((run) => run.issue_number === claim.issue_number
+    const terminal = runs.some((run) => run.repo === claim.repo
+      && run.issue_number === claim.issue_number
       && rowTimestamp(run) !== null
       && claimAt !== null
       && rowTimestamp(run) >= claimAt);

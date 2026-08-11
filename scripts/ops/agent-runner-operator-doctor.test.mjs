@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync,
@@ -310,6 +310,144 @@ test('readOnlyRunnerStateSnapshot is genuinely read-only: DB byte digest, schema
     assert.deepEqual(after, before);
     assert.deepEqual(afterSchema, beforeSchema);
     assert.equal(after.dirEntries.some((name) => name.endsWith('-wal') || name.endsWith('-shm')), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Absolute file:// URL, so the writer child process (spawned with an
+// unrelated cwd) can import the real, canonical claude-runner-state.mjs
+// regardless of where node is invoked from.
+const STATE_MODULE_URL = new URL('./claude-runner-state.mjs', import.meta.url).href;
+
+/**
+ * Spawns a real second OS process that opens its own writable connection
+ * to `dbPath` (WAL mode) and commits `total` separate run_results rows one
+ * at a time with a short delay between commits, so a caller polling
+ * readOnlyRunnerStateSnapshot()/openReadOnly() against the same path
+ * observes genuine concurrent WAL mutation, not merely two connections in
+ * the same event loop. Resolves once the writer's `-wal` sidecar is
+ * guaranteed to exist (its first commit has landed).
+ */
+function spawnConcurrentWriter(dbPath, total) {
+  const script = `
+    import { openRunnerStateStore } from '${STATE_MODULE_URL}';
+    const [dbPath, totalArg] = process.argv.slice(1);
+    const total = Number(totalArg);
+    const store = openRunnerStateStore(dbPath);
+    for (let i = 1; i <= total; i += 1) {
+      store.recordRunResult({ repo: 'TheTekTeam/modelspend', issueNumber: i, mode: 'issue-run', exitCode: 0, payload: { selectedIssue: i } });
+      process.stdout.write('wrote:' + i + '\\n');
+      await new Promise((resolve) => { setTimeout(resolve, 8); });
+    }
+    store.close();
+    process.stdout.write('done\\n');
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '--no-warnings', '-e', script, '--', dbPath, String(total)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let buffered = '';
+  const firstWriteSeen = new Promise((resolve, reject) => {
+    child.stdout.on('data', (chunk) => {
+      buffered += chunk.toString('utf8');
+      if (buffered.includes('wrote:1\n')) resolve();
+    });
+    child.on('error', reject);
+    child.on('exit', (code) => {
+      if (code !== 0) reject(new Error(`concurrent writer exited ${code}`));
+    });
+  });
+  const exited = new Promise((resolve) => { child.on('exit', () => resolve()); });
+  return { firstWriteSeen, exited };
+}
+
+
+test('readOnlyRunnerStateSnapshot fails closed on an incomplete live WAL coordination pair without creating the missing sidecar', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'doctor-snapshot-incomplete-wal-pair-'));
+  try {
+    const dbPath = join(dir, 'state.sqlite');
+    const store = openRunnerStateStore(dbPath);
+    store.recordRunResult({
+      repo: 'TheTekTeam/modelspend',
+      issueNumber: 1,
+      mode: 'issue-run',
+      exitCode: 0,
+    });
+    store.close();
+
+    // A clean last-close removes WAL coordination files. Seed only a -wal
+    // marker to model a transient/incomplete pair. The read-only operator
+    // must fail closed and must never manufacture the missing -shm file.
+    assert.equal(existsSync(`${dbPath}-wal`), false);
+    assert.equal(existsSync(`${dbPath}-shm`), false);
+    writeFileSync(`${dbPath}-wal`, Buffer.alloc(0));
+    const before = readdirSync(dir).sort();
+
+    const snapshot = readOnlyRunnerStateSnapshot(dbPath, { includeLatest: true });
+    assert.equal(snapshot.ok, false);
+    assert.equal(snapshot.status, 'error');
+    assert.equal(snapshot.reason, 'state-db-unreadable');
+    assert.equal(existsSync(`${dbPath}-shm`), false);
+    assert.deepEqual(readdirSync(dir).sort(), before);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('readOnlyRunnerStateSnapshot and openReadOnly stay internally coherent while another real connection commits concurrently under actual WAL mutation', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'doctor-snapshot-concurrent-'));
+  try {
+    const dbPath = join(dir, 'state.sqlite');
+    const total = 45;
+    const writer = spawnConcurrentWriter(dbPath, total);
+    await writer.firstWriteSeen;
+
+    // -wal must exist by now (the writer's first commit already landed),
+    // so every poll below exercises the Online Backup API branch of
+    // snapshotSourceForReadOnly(), not the quiescent-copy branch.
+    assert.equal(existsSync(`${dbPath}-wal`), true);
+
+    const observedCounts = [];
+    for (let poll = 0; poll < 6; poll += 1) {
+      const snapshot = readOnlyRunnerStateSnapshot(dbPath, { includeLatest: true, historyLimit: 50 });
+      assert.equal(snapshot.ok, true, JSON.stringify(snapshot));
+      const { counts, latest } = snapshot;
+      observedCounts.push(counts.run_results);
+
+      // The single strongest coherence check: counts.run_results comes
+      // from one query (COUNT(*)) and latest.runResults[0] comes from a
+      // second, separate query (ORDER BY id DESC LIMIT) against the *same*
+      // snapshot connection. Ids are a gapless 1..N sequence written by a
+      // single writer, so if -- and only if -- both queries observed the
+      // exact same committed state, the newest row's id must equal the
+      // total count exactly. A torn/racy copy that let the two queries see
+      // different underlying WAL states would break this equality.
+      if (counts.run_results > 0) {
+        assert.equal(latest.runResults[0].id, counts.run_results);
+      }
+      // Every returned row must be a genuine, uncorrupted committed row:
+      // a torn read spanning two different WAL states could otherwise
+      // hand back null/garbage fields instead of failing outright.
+      for (const row of latest.runResults) {
+        assert.equal(row.repo, 'TheTekTeam/modelspend');
+        assert.equal(row.mode, 'issue-run');
+        assert.equal(row.exit_code, 0);
+        assert.equal(Number.isInteger(row.issue_number), true);
+        assert.equal(row.issue_number, row.id);
+      }
+      assert.equal(counts.run_results <= total, true);
+    }
+
+    await writer.exited;
+
+    // A final poll after the writer has fully finished must see every
+    // committed row, proving the mechanism never silently drops commits.
+    const finalSnapshot = readOnlyRunnerStateSnapshot(dbPath, { includeLatest: true, historyLimit: 50 });
+    assert.equal(finalSnapshot.ok, true);
+    assert.equal(finalSnapshot.counts.run_results, total);
+    assert.equal(finalSnapshot.latest.runResults[0].id, total);
+
+    // And the concurrency window was real, not vacuous: at least one poll
+    // observed a state strictly before the writer finished.
+    assert.equal(observedCounts.some((count) => count < total), true, `observed counts never showed an in-progress state: ${JSON.stringify(observedCounts)}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

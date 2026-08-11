@@ -15,25 +15,67 @@
 // constructor unconditionally creates the parent directory, opens SQLite
 // writable, and runs its full migration path (PRAGMA journal_mode=WAL,
 // CREATE TABLE/schema-version writes) even when every table already
-// exists. Instead this opens the database with node:sqlite's DatabaseSync
-// via a `file:...?mode=ro&immutable=1` URI, which SQLite guarantees never
-// creates a directory, database file, WAL/SHM file, table, index, or
-// schema row -- `immutable=1` additionally skips the WAL-index (-shm) file
-// that a plain `mode=ro` connection still creates to coordinate with a
-// concurrently-written WAL-mode database (verified empirically: a bare
-// `mode=ro` open of a live WAL database creates -shm/-wal; `immutable=1`
-// does not). The tradeoff, made deliberately: SQLite makes no promise about
-// what an immutable connection sees if the file changes underneath it
-// mid-read; for a short-lived, single-pass diagnostic snapshot against a
-// database that is at most append/update-only between commits, this is an
-// acceptable point-in-time read, not a hard consistency requirement.
+// exists.
+//
+// Two SQLite realities must both be honored against the *live* runner state
+// database, which is a WAL-mode file that is genuinely being written to
+// concurrently by the runner service:
+//   1. `immutable=1` tells SQLite the file will never change for the life of
+//      the connection, and SQLite trusts that promise -- it skips locking
+//      and change detection entirely. Asserting that against a database that
+//      really is changing underneath the connection is simply false, and can
+//      hand back an inconsistent read spanning two different WAL states.
+//   2. A bare `mode=ro` connection is honest about mutability, but WAL mode
+//      requires a reader to create/open a `-shm` (and sometimes `-wal`)
+//      sidecar file next to the database purely to coordinate with
+//      concurrent writers -- a side effect this command must never have on
+//      the live state directory.
+//
+// The fix used here reconciles both by taking one of two SQLite-defined
+// snapshot paths, chosen by whether the live `-wal` sidecar currently
+// exists -- i.e. whether WAL machinery is actually active against the
+// source right now:
+//
+//   * If `-wal` exists, a writer may commit concurrently at any moment, so
+//     `snapshotSourceForReadOnly()` uses SQLite's own Online Backup API
+//     (`node:sqlite`'s `backup()`, https://sqlite.org/backup.html) to page-
+//     copy the live database into a private temp file. The backup API is
+//     SQLite's purpose-built mechanism for exactly this: reading a
+//     consistent snapshot of a database while other connections keep
+//     writing to it, automatically restarting the copy if a concurrent
+//     writer commits mid-backup, rather than trusting an ordinary
+//     byte-level file copy to not race a writer. Because `-wal` already
+//     exists, opening a read-only connection against the live path touches
+//     only files a concurrent writer already created -- it creates nothing
+//     new in the live state directory. `backup()` is asynchronous, so it
+//     runs in a short-lived child process (`spawnSync`, the same primitive
+//     already used for git/systemctl inspection in this file) so every
+//     exported function here stays synchronous.
+//   * If `-wal` does not exist, no writer can be mid-transaction: in WAL
+//     mode, a writer must create/open `-wal` before it writes anything, so
+//     the main database file is provably quiescent for as long as `-wal`
+//     stays absent. In that state a plain `copyFileSync` of the main file
+//     alone is copying an immobile file, verified by re-checking that
+//     `-wal` still doesn't exist and the file's stat(size, mtime) is
+//     unchanged once the copy completes, retrying a bounded number of
+//     times and failing closed if a writer starts mid-copy.
+//
+// Either way, the live state directory is only ever read from, never
+// written to, and the private temp files genuinely cannot change
+// underneath the connection once produced -- nothing else has a path to
+// them -- so opening that private copy with `mode=ro&immutable=1` is an
+// honest assertion, not a false one, and any WAL sidecar SQLite creates
+// while reading it lives only in the temp directory, removed on close().
 //
 // Every table and column read is drawn from a fixed local allowlist (never
 // `SELECT *`), and every SQL-side limit is bounded before use.
 
-import { existsSync } from 'node:fs';
+import {
+  copyFileSync, existsSync, mkdtempSync, rmSync, statSync,
+} from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { resolve as resolvePath } from 'node:path';
+import { tmpdir } from 'node:os';
+import { resolve as resolvePath, join as joinPath } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -193,21 +235,187 @@ function clampLimit(limit, fallback = 10) {
   return Math.min(limit, 50);
 }
 
+const SNAPSHOT_MAX_ATTEMPTS = 5;
+const SNAPSHOT_BACKUP_TIMEOUT_MS = 30000;
+
+function statOrNull(path) {
+  try {
+    const info = statSync(path);
+    return { size: info.size, mtimeMs: info.mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+function sameStat(left, right) {
+  if (left === null || right === null) return left === right;
+  return left.size === right.size && left.mtimeMs === right.mtimeMs;
+}
+
+// Runs in a short-lived child process (module header explains why): opens
+// the live database read-only -- safe here because the caller only takes
+// this path when `-wal` already exists, so no file this creates is new to
+// the live directory -- and hands it to node:sqlite's backup(), which reads
+// SQLite's Online Backup API to page-copy a consistent snapshot into
+// `destPath`, transparently restarting if a concurrent writer commits
+// mid-copy.
+const ONLINE_BACKUP_CHILD_SCRIPT = `
+import { existsSync } from 'node:fs';
+import * as sqlite from 'node:sqlite';
+const [srcPath, destPath] = process.argv.slice(1);
+const source = new sqlite.DatabaseSync(srcPath, { readOnly: true });
+try {
+  // Opening DatabaseSync itself does not access WAL pages. Re-check both
+  // coordination files after the handle is open and before backup() performs
+  // the first database read. If either vanished during dispatch, fail closed
+  // rather than giving SQLite permission to create a missing live sidecar.
+  if (!existsSync(srcPath + '-wal') || !existsSync(srcPath + '-shm')) {
+    throw new Error('live-wal-coordination-missing');
+  }
+  await sqlite.backup(source, destPath);
+} finally {
+  source.close();
+}
+`;
+
+/**
+ * Performs the Online Backup API copy (see module header) in a child
+ * process so this stays synchronous, since node:sqlite's backup() is
+ * promise-based. Returns whether the destination file was produced.
+ */
+function backupLiveDatabaseViaOnlineBackup(resolvedPath, tempDbPath, spawn) {
+  const result = spawn(
+    process.execPath,
+    ['--input-type=module', '--no-warnings', '-e', ONLINE_BACKUP_CHILD_SCRIPT, '--', resolvedPath, tempDbPath],
+    { encoding: 'utf8', timeout: SNAPSHOT_BACKUP_TIMEOUT_MS },
+  );
+  return result.status === 0 && existsSync(tempDbPath);
+}
+
+/**
+ * Produces a private, caller-owned temp-directory copy of the live
+ * database that is genuinely internally consistent even though the source
+ * may be written to concurrently -- see the module header for the two
+ * SQLite-defined mechanisms chosen between (Online Backup API vs. a
+ * WAL-absence-provable quiescent copy) and why. Retries a bounded number
+ * of times and throws (fails closed) if a coherent snapshot is never
+ * obtained. Returns the temp directory path and the path to the snapshot
+ * database file; the caller owns cleanup.
+ */
+function snapshotSourceForReadOnly(dbPath, { spawn = spawnSync } = {}) {
+  const resolvedPath = resolvePath(dbPath);
+  const walPath = `${resolvedPath}-wal`;
+  const shmPath = `${resolvedPath}-shm`;
+  for (let attempt = 0; attempt < SNAPSHOT_MAX_ATTEMPTS; attempt += 1) {
+    const tempDir = mkdtempSync(joinPath(tmpdir(), 'agent-runner-state-snapshot-'));
+    const tempDbPath = joinPath(tempDir, 'state.sqlite');
+    try {
+      const walExists = existsSync(walPath);
+      const shmExists = existsSync(shmPath);
+      if (walExists || shmExists) {
+        // Read-only WAL access is allowed to rely on pre-existing
+        // coordination files, but this command must never create a missing
+        // counterpart. An incomplete/transient pair therefore fails this
+        // attempt closed and is retried.
+        if (walExists && shmExists
+          && backupLiveDatabaseViaOnlineBackup(resolvedPath, tempDbPath, spawn)) {
+          return { tempDir, tempDbPath };
+        }
+      } else {
+        const before = statOrNull(resolvedPath);
+        copyFileSync(resolvedPath, tempDbPath);
+        const after = statOrNull(resolvedPath);
+        // A writer can only ever begin modifying the source by first
+        // creating WAL coordination state (module header): re-checking that
+        // BOTH coordination files remain absent here, alongside the
+        // unchanged main-file stat, keeps this branch bounded to the
+        // quiescent main-file case. It never copies a live WAL.
+        if (!existsSync(walPath) && !existsSync(shmPath) && sameStat(before, after)) {
+          return { tempDir, tempDbPath };
+        }
+      }
+    } catch {
+      // Source disappeared, a sidecar appeared/vanished mid-copy, or the
+      // backup child process failed: treat exactly like a detected race
+      // below and retry.
+    }
+    rmSync(tempDir, { recursive: true, force: true });
+  }
+  throw new Error('state-db-snapshot-unstable');
+}
+
 /**
  * Shared by agent-runner-operator-status.mjs for its own SQLite reads (the
  * admission circuit-breaker database) so every read-only SQLite open in
- * this operator CLI goes through the same immutable-URI path -- see the
- * module header for why immutable=1 is required, not just mode=ro.
+ * this operator CLI goes through the same private-snapshot path -- see the
+ * module header for why a bare `mode=ro&immutable=1` open of the *live*
+ * database is unsafe, and why copying first makes that assertion honest.
+ * Returns a DatabaseSync-shaped handle: `prepare()` unchanged, `close()`
+ * additionally removes the private temp directory.
  */
 export function openReadOnly(dbPath) {
-  const url = pathToFileURL(resolvePath(dbPath));
-  url.searchParams.set('mode', 'ro');
-  url.searchParams.set('immutable', '1');
-  return new DatabaseSync(url.href, { readOnly: true });
+  const { tempDir, tempDbPath } = snapshotSourceForReadOnly(dbPath);
+  let db;
+  try {
+    const url = pathToFileURL(tempDbPath);
+    url.searchParams.set('mode', 'ro');
+    url.searchParams.set('immutable', '1');
+    db = new DatabaseSync(url.href, { readOnly: true });
+  } catch (error) {
+    rmSync(tempDir, { recursive: true, force: true });
+    throw error;
+  }
+  return {
+    prepare: (...args) => db.prepare(...args),
+    close: () => {
+      try {
+        db.close();
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+    },
+  };
 }
 
 function fetchLatest(db, table, columns, limit) {
   return db.prepare(`SELECT ${columns.join(', ')} FROM ${table} ORDER BY id DESC LIMIT ?`).all(limit);
+}
+
+/**
+ * Current-task truth must never depend on two independently truncated
+ * history windows coinciding (#172): a claim's terminal `run_results` row
+ * can legitimately fall outside the bounded `historyLimit` window used for
+ * presentation. For every distinct (repo, issue_number) pair among the
+ * bounded candidate claims, this runs one direct, unbounded, repo-and-issue
+ * scoped query for that issue's single latest run result and merges it into
+ * the presentation-bounded `run_results` rows (deduped by id) before
+ * current-task correlation runs. The set of *candidate claims* stays
+ * bounded (a reasonable presentation-layer limit, not the defect); what
+ * changes is that whether a given candidate claim has a later terminal
+ * result is now answered authoritatively, not by coincidence of two
+ * unrelated LIMIT clauses.
+ */
+function fetchAuthoritativeTerminalResults(db, claims) {
+  const stmt = db.prepare(`SELECT ${RUN_RESULTS_COLUMNS.join(', ')} FROM run_results WHERE repo = ? AND issue_number = ? ORDER BY id DESC LIMIT 1`);
+  const seen = new Set();
+  const rows = [];
+  for (const claim of claims) {
+    if (typeof claim.repo !== 'string' || !Number.isInteger(claim.issue_number)) continue;
+    const key = `${claim.repo} ${claim.issue_number}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const row = stmt.get(claim.repo, claim.issue_number);
+    if (row) rows.push(row);
+  }
+  return rows;
+}
+
+function mergeRunResultsById(bounded, authoritative) {
+  const byId = new Map(bounded.map((row) => [row.id, row]));
+  for (const row of authoritative) {
+    if (!byId.has(row.id)) byId.set(row.id, row);
+  }
+  return [...byId.values()].sort((left, right) => right.id - left.id);
 }
 
 function extractPayloadReason(payloadJson) {
@@ -313,11 +521,13 @@ export function readOnlyRunnerStateSnapshot(dbPath, { historyLimit = 10, include
     let latest = null;
     if (includeLatest) {
       const limit = clampLimit(historyLimit);
+      const claims = fetchLatest(db, 'claims', CLAIMS_COLUMNS, limit);
+      const boundedRunResults = fetchLatest(db, 'run_results', RUN_RESULTS_COLUMNS, limit);
       latest = {
-        runResults: fetchLatest(db, 'run_results', RUN_RESULTS_COLUMNS, limit),
+        runResults: mergeRunResultsById(boundedRunResults, fetchAuthoritativeTerminalResults(db, claims)),
         attentionEvents: fetchLatest(db, 'attention_events', ATTENTION_EVENTS_COLUMNS, limit),
         notifications: fetchLatest(db, 'notification_events', NOTIFICATION_EVENTS_COLUMNS, limit),
-        claims: fetchLatest(db, 'claims', CLAIMS_COLUMNS, limit),
+        claims,
         selections: fetchIssueSelections(db, limit),
         queueEvents: fetchQueueEvents(db, limit),
         quota: fetchLatest(db, 'quota_history', QUOTA_HISTORY_COLUMNS, limit),

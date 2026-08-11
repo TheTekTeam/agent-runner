@@ -423,6 +423,25 @@ test('current-attempt projection shows the shared assignment as Codex / Claude a
   ]);
 });
 
+test('buildRunnerActivity correlates a claim\'s terminal result by repo AND issue number, not issue number alone (#172)', () => {
+  const latest = {
+    claims: [{ repo: 'TheTekTeam/modelspend', issue_number: 757, action: 'claim-ready-issue', status_label: 'status:in-progress', created_at: '2026-07-28T21:23:13.615Z' }],
+    // A terminal run result for the SAME issue number under a DIFFERENT
+    // repo must never be mistaken for this claim's own terminal result.
+    runResults: [{ repo: 'TheTekTeam/other-project', issue_number: 757, finished_at: '2026-07-28T21:26:31.556Z', exit_code: 1 }],
+    selections: [], queueEvents: [], quota: [], preflights: [], recoveryAttempts: [], attentionEvents: [], runs: [],
+  };
+  const activity = buildRunnerActivity(latest);
+  assert.equal(activity.status, 'active-or-unresolved');
+  assert.equal(activity.activeIssue.repo, 'TheTekTeam/modelspend');
+
+  // The genuine terminal result, once correctly scoped to the same repo,
+  // resolves the claim.
+  latest.runResults.push({ repo: 'TheTekTeam/modelspend', issue_number: 757, finished_at: '2026-07-28T21:26:31.556Z', exit_code: 1 });
+  const resolved = buildRunnerActivity(latest);
+  assert.equal(resolved.status, 'idle');
+});
+
 test('assignment projection preserves non-shared labels, fails closed on unknown label/agent text and never invents evidence (#97)', () => {
   const nonShared = buildRunnerActivity({
     claims: [{ repo: 'TheTekTeam/modelspend', issue_number: 11, action: 'claim-ready-issue', created_at: '2026-07-28T12:00:00.000Z' }],

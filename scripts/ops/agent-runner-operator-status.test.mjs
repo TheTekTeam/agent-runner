@@ -11,6 +11,7 @@ import test from 'node:test';
 import { redactSensitiveText } from './lib/redact.mjs';
 import { openReadOnly } from './agent-runner-operator-doctor.mjs';
 import { openRunnerStateStore, RUNNER_STATE_SCHEMA_VERSION } from './claude-runner-state.mjs';
+import { buildAttentionEvent } from './claude-runner-recovery.mjs';
 import {
   buildOperatorStatus,
   exitCodeForStatus,
@@ -359,6 +360,154 @@ test('operator status shows the shared assignment as Codex / Claude and the actu
     assert.equal(redactSensitiveText(serialized), serialized);
     assert.equal(report.issueMutation, false);
     assert.equal(report.stateMutation, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#172: a claim with a later terminal run result outside the presentation history window is never reported active-or-unresolved', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'status-window-truncation-'));
+  try {
+    const { config } = writeConfig(dir);
+    mkdirSync(config.outputDir, { recursive: true });
+    const store = openRunnerStateStore(config.stateDbPath);
+    try {
+      store.recordClaim({
+        repo: 'TheTekTeam/modelspend',
+        issueNumber: 757,
+        claim: { action: 'claim-ready-issue', statusLabel: 'status:in-progress', selectionMode: 'preflight-direct' },
+        createdAt: '2026-07-28T21:23:13.615Z',
+      });
+      // The genuine terminal result for #757, recorded right after the
+      // claim...
+      store.recordRunResult({
+        repo: 'TheTekTeam/modelspend', issueNumber: 757, mode: 'issue-run', exitCode: 1,
+        startedAt: '2026-07-28T21:23:05.572Z', finishedAt: '2026-07-28T21:26:31.556Z',
+        createdAt: '2026-07-28T21:26:31.556Z',
+      });
+      // ...then pushed outside the default historyLimit=10 presentation
+      // window by 10 unrelated later run results for other issues.
+      for (let index = 0; index < 10; index += 1) {
+        store.recordRunResult({
+          repo: 'TheTekTeam/modelspend', issueNumber: 900 + index, mode: 'issue-run', exitCode: 0,
+          startedAt: '2026-07-29T00:00:00.000Z', finishedAt: '2026-07-29T00:01:00.000Z',
+          createdAt: '2026-07-29T00:01:00.000Z',
+        });
+      }
+    } finally {
+      store.close();
+    }
+
+    const report = buildOperatorStatus(config, {}, { spawn: installedSpawn(config) });
+    assert.equal(report.ok, true);
+    assert.equal(report.currentTask.status, 'idle');
+    assert.equal(report.currentTask.activeIssue, null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#172: a genuinely unmatched claim (no run result at all) still fails closed as active-or-unresolved', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'status-unmatched-claim-'));
+  try {
+    const { config } = writeConfig(dir);
+    mkdirSync(config.outputDir, { recursive: true });
+    const store = openRunnerStateStore(config.stateDbPath);
+    try {
+      store.recordClaim({
+        repo: 'TheTekTeam/modelspend',
+        issueNumber: 42,
+        claim: { action: 'claim-ready-issue', statusLabel: 'status:in-progress', selectionMode: 'preflight-direct' },
+        createdAt: '2026-08-01T00:00:00.000Z',
+      });
+    } finally {
+      store.close();
+    }
+
+    const report = buildOperatorStatus(config, {}, { spawn: installedSpawn(config) });
+    assert.equal(report.ok, true);
+    assert.equal(report.currentTask.status, 'active-or-unresolved');
+    assert.equal(report.currentTask.activeIssue.issue_number, 42);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#172: a terminal result for the same issue number under a different repo never resolves this repo\'s claim', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'status-overlapping-issue-numbers-'));
+  try {
+    const { config } = writeConfig(dir);
+    mkdirSync(config.outputDir, { recursive: true });
+    const store = openRunnerStateStore(config.stateDbPath);
+    try {
+      store.recordClaim({
+        repo: 'TheTekTeam/modelspend',
+        issueNumber: 757,
+        claim: { action: 'claim-ready-issue', statusLabel: 'status:in-progress', selectionMode: 'preflight-direct' },
+        createdAt: '2026-08-01T00:00:00.000Z',
+      });
+      store.recordRunResult({
+        repo: 'TheTekTeam/other-project', issueNumber: 757, mode: 'issue-run', exitCode: 0,
+        startedAt: '2026-08-01T00:01:00.000Z', finishedAt: '2026-08-01T00:02:00.000Z',
+        createdAt: '2026-08-01T00:02:00.000Z',
+      });
+    } finally {
+      store.close();
+    }
+
+    const report = buildOperatorStatus(config, {}, { spawn: installedSpawn(config) });
+    assert.equal(report.ok, true);
+    assert.equal(report.currentTask.status, 'active-or-unresolved');
+    assert.equal(report.currentTask.activeIssue.repo, 'TheTekTeam/modelspend');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#172: task-local unresolved attention with no current claim stays attention_required/idle, not a global stop', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'status-task-local-attention-'));
+  try {
+    const { config } = writeConfig(dir);
+    mkdirSync(config.outputDir, { recursive: true });
+    const store = openRunnerStateStore(config.stateDbPath);
+    try {
+      const event = buildAttentionEvent({
+        repository: 'TheTekTeam/modelspend',
+        project: 'modelspend',
+        issueNumber: 757,
+        attemptId: 'TheTekTeam/modelspend#757:historical-attention',
+        reason: 'unknown_failure',
+        agent: 'claude-code-cli',
+        startedAt: '2026-07-28T21:23:13.615Z',
+        finishedAt: '2026-07-28T21:26:31.556Z',
+        recoveryStatus: 'forbidden',
+        nextAction: 'Manager review.',
+      });
+      store.upsertAttentionEvent(event);
+      // Historical terminal issue activity is essential to this fixture:
+      // buildRunnerActivity() deliberately reports `empty` when there has
+      // never been any selection/claim/run activity at all. The preserved
+      // #757 condition has a terminal run result, so with no current claim
+      // its correct current-task state is `idle` while unresolved task-local
+      // attention remains `attention_required`.
+      store.recordRunResult({
+        repo: 'TheTekTeam/modelspend',
+        issueNumber: 757,
+        mode: 'issue-run',
+        exitCode: 1,
+        startedAt: '2026-07-28T21:23:05.572Z',
+        finishedAt: '2026-07-28T21:26:31.556Z',
+        createdAt: '2026-07-28T21:26:31.556Z',
+      });
+    } finally {
+      store.close();
+    }
+
+    const report = buildOperatorStatus(config, {}, { spawn: installedSpawn(config) });
+    assert.equal(report.ok, true);
+    assert.equal(report.currentTask.status, 'idle');
+    assert.equal(report.operatorStatus.code, 'attention_required');
+    assert.notEqual(report.operatorStatus.code, 'global_systemic_pause');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
