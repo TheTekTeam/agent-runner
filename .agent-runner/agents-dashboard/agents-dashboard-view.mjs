@@ -200,6 +200,57 @@ export const EDITABLE_SETTINGS_FIELDS = Object.freeze(['model', 'profile', 'endp
 
 export const LIFECYCLE_STATES = LIFECYCLE_TARGETS;
 
+/**
+ * Maps an agent's lifecycle state onto the one shared status vocabulary
+ * (issue #175), so a fleet row and the Overview's operational status badges
+ * speak the same language. `enabled` is deliberately NOT reported as
+ * `healthy` on its own — an enabled adapter whose readiness probe is
+ * failing is `unavailable`, never a green tick.
+ */
+export function mapAgentStateToStatusCode(instance) {
+  const state = instance?.state;
+  if (state === 'unsupported') return 'unsupported';
+  if (state === 'disabled') return 'disabled';
+  if (state === 'paused') return 'paused';
+  if (state === 'draining') return 'draining';
+  if (state === 'unavailable') return 'unavailable';
+  if (state === 'enabled') return instance?.readiness?.ok === true ? 'healthy' : 'unavailable';
+  return 'unknown';
+}
+
+/**
+ * The compact fleet-row summary for the Agents view: every field #175
+ * requires "where available", each already present in the authenticated
+ * instance snapshot. Returns honest placeholders rather than blanks, and
+ * never touches a credential value — only the separately fetched
+ * write-only credential *status*.
+ */
+export function summariseAgentRow(instance, { auditEntries = [], currentRevision = null } = {}) {
+  return {
+    agentId: instance?.agentId || '—',
+    displayName: instance?.displayName || instance?.agentId || '—',
+    statusCode: mapAgentStateToStatusCode(instance),
+    state: instance?.state || 'unknown',
+    stateExplanation: describeState(instance?.state),
+    created: Boolean(instance?.created),
+    implemented: Boolean(instance?.implemented),
+    qualification: instance?.implemented ? 'Implemented & qualified' : 'Foundation-only — not yet qualified',
+    readiness: describeReadiness(instance?.readiness),
+    readinessOk: instance?.readiness?.ok === true,
+    modelProfile: `${instance?.model || '—'} / ${instance?.profile || '—'}`,
+    executionSurface: classifyExecutionSurface(instance?.adapterType),
+    costClass: describeCostClass(instance?.quota?.costClass),
+    paid: instance?.quota?.paid === true,
+    quotaText: instance?.quota?.quota
+      ? `Session ${formatPercent(instance.quota.quota.latestSessionUsagePercent)} · weekly ${formatPercent(instance.quota.quota.latestWeeklyUsagePercent)}`
+      : 'Not tracked for this adapter.',
+    loadText: describeCurrentSlot(instance?.load),
+    slotBusy: Number(instance?.load?.active) > 0,
+    lastStateChangeAt: findLastStateChange(auditEntries, instance?.agentId),
+    revision: currentRevision,
+  };
+}
+
 export function secretStatusLabel(status) {
   switch (status) {
     case 'configured': return 'Configured';

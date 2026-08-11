@@ -77,17 +77,73 @@ touches:
    only;
 4. the operator-credential verifier — a scrypt hash comparison only.
 
-Nothing here opens the runner SQLite state DB for writing. The only SQLite
-*read* is `computeInstanceLoad()`'s reuse of the existing, already-exported
-`buildRunnerDashboard()` — the same read-only summary the static dashboard
-already renders — to report whether `claude-code-cli` currently has an
-outstanding claim. This is the concrete, structural reason a secret value
+Nothing here opens the runner SQLite state DB for writing. There are two
+SQLite *reads*: `computeInstanceLoad()`'s reuse of the existing,
+already-exported `buildRunnerDashboard()` — the same read-only summary the
+static dashboard already renders — to report whether `claude-code-cli`
+currently has an outstanding claim; and `GET /api/overview`'s
+`readControlOverview()` (issue #175), which goes through the operator CLI's
+`readOnlyRunnerStateSnapshot()` private-snapshot path and therefore cannot
+create, migrate or write the live database — not even a `-wal`/`-shm`
+sidecar. This is the concrete, structural reason a secret value
 can never reach SQLite, dashboard payloads, or a snapshot: there is no code
 path from a secret value to any of those three.
 
 No route logs a request body. A validation failure on a bad secret value
 reports a bounded reason code (`secret-value-required`,
 `secret-create-failed`, …), never an echo of what was submitted.
+
+## `GET /api/overview` — the read-only operational projection (#175)
+
+One authenticated, read-only route backs the operations console's Overview
+and Activity views. It is deliberately the *smallest* positive-allowlist
+read surface that renders those views, and it is canonical by construction
+rather than by imitation: `agent-runner-control-overview.mjs` composes the
+same read path (`readOnlyRunnerStateSnapshot()`) and the same pure
+derivations (`buildRunnerActivity()`, `buildRunnerMetrics()`,
+`buildRunnerOperatorStatus()`) that `agent-runner-operator-status.mjs`
+already composes for the `status` CLI. A test asserts field-for-field
+parity against `buildOperatorStatus()` for the same database, so the
+standalone dashboard and the CLI cannot silently disagree.
+
+Response shape (fixed allowlist): `ok`, `schemaVersion`, `generatedAt`,
+`project` (`projectId`/`displayName`/`githubRepo` only), `links`,
+`stateAvailable`, `runner`, `operatorStatusCode`, `scheduler`,
+`currentTask`, `queue`, `runs`, `quota`, `health`, `attention`,
+`notifications`, `circuit`, `activity`.
+
+Never included, at any nesting depth: any filesystem path (including
+`projectIdentity().localRepoPath` and the state `dbPath`), raw `latest.*`
+state rows, `payload_json`, `attention_events.dashboard_reference`,
+prompts, provider output, raw errors, manager packet or comment bodies,
+tokens, credentials or session handles. Every string that does reach the
+wire passes through a `boundedText`/`boundedReason`/`boundedCount`/
+`boundedTimestamp` narrowing, and `boundedReason()` additionally replaces
+anything path-shaped with `[path-redacted]`.
+
+Other properties:
+
+- authenticated, origin/Referer-checked, GET-only — `POST`/`PATCH`/`DELETE`
+  on this path are not routable at all;
+- no mutation caused by a read, proven with before/after durable-state
+  evidence over the whole state directory and the whole control-service
+  directory;
+- a missing or unreadable state database fails closed to
+  `runner.code = "unavailable"` with an explanation and a safe next action
+  — never to `healthy`;
+- bounded payload (activity capped at 40 events, lists at 12, strings at
+  160–200 characters) and short-TTL server-side memoisation so a polling
+  browser tab cannot cause one systemd spawn plus one SQLite snapshot copy
+  per request.
+
+Grafana must **not** consume this route; it continues to use the read-only
+exporter from `#1`. Optional operator-configured companion links are read
+from `AGENT_RUNNER_GRAFANA_RUNNER_URL`,
+`AGENT_RUNNER_GRAFANA_OPERATIONS_URL` and
+`AGENT_RUNNER_LEGACY_DASHBOARD_URL`; each must be an absolute `http(s)` URL
+with no userinfo component or it is dropped. The page renders them as
+anchors and never fetches them, so an unavailable Grafana cannot affect the
+console.
 
 ## Loopback-only binding
 

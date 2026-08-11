@@ -10,6 +10,17 @@ agent-lifecycle settings contract, `#45` for the protected secret store,
 and `#46` for the control API this dashboard is a client of and nothing
 more.
 
+> **Extended by issue #175.** The shell described here has since been
+> raised into the four-section operations console (Overview / Agents /
+> Activity / Settings & audit) documented in
+> [`AGENT-RUNNER-OPERATIONS-CONSOLE.md`](AGENT-RUNNER-OPERATIONS-CONSOLE.md).
+> Every security property below still holds and is still regression-tested;
+> what changed is the information architecture, one added read-only route
+> (`GET /api/overview`), and one added asset (`agents-overview-view.mjs`,
+> so the static allowlist now holds five literal filenames rather than
+> four). The per-agent required-view coverage below now renders in the
+> Agents fleet table and its detail drawer rather than in a wall of cards.
+
 ## What this adds
 
 - `.agent-runner/agents-dashboard/index.html`, `agents-dashboard.css`,

@@ -3,107 +3,372 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Agent Runner — Agents</title>
+  <meta name="color-scheme" content="light dark">
+  <title>Agent Runner — Operations</title>
   <link rel="stylesheet" href="./agents-dashboard.css">
 </head>
 <body>
-  <header class="hero">
-    <div>
-      <p class="eyebrow">Agent Runner — authenticated</p>
-      <h1>Agents</h1>
-      <p class="subtitle">Approved agent catalogue, lifecycle control and credential management. Machine-local, loopback-only. The existing static read-only operational dashboard (scheduler/quota history) remains available separately as a fallback.</p>
+<a class="skip-link" href="#main-content">Skip to main content</a>
+
+<!--
+  Repository-local inline icon sprite. No third-party CDN, no external font
+  and no network request of any kind: every glyph the console draws is
+  defined here. Icons are decorative only — every control they appear on
+  also carries a real text label, so nothing depends on the icon rendering.
+-->
+<svg width="0" height="0" aria-hidden="true" focusable="false" class="icon-sprite">
+  <symbol id="icon-overview" viewBox="0 0 24 24"><path d="M4 4h7v6H4zM13 4h7v10h-7zM4 12h7v8H4zM13 16h7v4h-7z"/></symbol>
+  <symbol id="icon-agents" viewBox="0 0 24 24"><path d="M7 3h10a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zm1 4v2h8V7zm0 4v2h8v-2zm0 4v2h5v-2z"/></symbol>
+  <symbol id="icon-activity" viewBox="0 0 24 24"><path d="M3 12h4l2.5-7 4 14L16 12h5v2h-4l-3.2 8.5L9.4 8.9 8.4 14H3z"/></symbol>
+  <symbol id="icon-settings" viewBox="0 0 24 24"><path d="M4 6h9v2H4zm11 0h5v2h-5zM4 11h4v2H4zm6 0h10v2H10zM4 16h11v2H4zm13 0h3v2h-3z"/><path d="M13 4h2v6h-2zM8 9h2v6H8zm7 5h2v6h-2z"/></symbol>
+  <symbol id="icon-external" viewBox="0 0 24 24"><path d="M14 3h7v7h-2V6.4l-8.3 8.3-1.4-1.4L17.6 5H14zM5 5h5v2H6v11h11v-4h2v6H5z"/></symbol>
+  <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M12 5V2L7 6l5 4V7a5 5 0 1 1-5 5H5a7 7 0 1 0 7-7z"/></symbol>
+  <symbol id="icon-theme" viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9 7 7 0 0 1-9-9z"/></symbol>
+  <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12 19 17.6 17.6 19 12 13.4 6.4 19 5 17.6 10.6 12 5 6.4z"/></symbol>
+</svg>
+
+<!-- ── sign-in ─────────────────────────────────────────────────────── -->
+<div class="login-view" id="login-view">
+  <main class="login-card">
+    <p class="brand-mark">Agent Runner</p>
+    <h1>Operations console</h1>
+    <p class="muted">Machine-local and loopback-only. This session lives in memory on both sides: it is never written to browser storage and never survives a service restart or a page reload.</p>
+    <form class="stacked" id="login-form" aria-labelledby="login-heading">
+      <h2 id="login-heading" class="visually-hidden">Operator sign-in</h2>
+      <label for="login-username">Username</label>
+      <input type="text" id="login-username" name="username" autocomplete="username" required>
+      <label for="login-password">Password</label>
+      <input type="password" id="login-password" name="password" autocomplete="current-password" required>
+      <button type="submit" class="primary">Sign in</button>
+      <p class="error-text" id="login-error" role="alert" hidden></p>
+    </form>
+  </main>
+</div>
+
+<!-- ── console shell ───────────────────────────────────────────────── -->
+<div class="shell" id="shell" hidden>
+  <header class="topbar" role="banner">
+    <div class="topbar-identity">
+      <span class="brand-mark">Agent Runner</span>
+      <span class="project-name" id="project-name">—</span>
     </div>
-    <div class="button-row" id="session-controls" hidden>
-      <span class="muted" id="session-identity"></span>
+
+    <!--
+      The persistent operational state strip. Compact by design: four
+      values that stay true in every section, so an operator never has to
+      navigate back to Overview to see whether something broke.
+    -->
+    <div class="state-strip" id="state-strip" aria-label="Live operational state">
+      <span class="strip-item">
+        <span class="strip-label">Runner</span>
+        <span class="badge" id="strip-runner"><span class="badge-glyph" aria-hidden="true">–</span><span class="badge-text">Unknown</span></span>
+      </span>
+      <span class="strip-item">
+        <span class="strip-label">Scheduler</span>
+        <span class="badge" id="strip-scheduler"><span class="badge-glyph" aria-hidden="true">–</span><span class="badge-text">Unknown</span></span>
+      </span>
+      <span class="strip-item">
+        <span class="strip-label">Task</span>
+        <span class="badge" id="strip-task"><span class="badge-glyph" aria-hidden="true">–</span><span class="badge-text">Unknown</span></span>
+      </span>
+      <span class="strip-item">
+        <span class="strip-label">Attention</span>
+        <span class="badge" id="strip-attention"><span class="badge-glyph" aria-hidden="true">–</span><span class="badge-text">—</span></span>
+      </span>
+    </div>
+
+    <div class="topbar-actions">
+      <span class="muted small" id="last-updated" title="">Not yet loaded</span>
+      <button type="button" class="icon-button" id="refresh-button" title="Refresh now">
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-refresh"></use></svg>
+        <span class="visually-hidden">Refresh now</span>
+      </button>
+      <button type="button" class="icon-button" id="theme-button" aria-pressed="false" title="Theme: follow system">
+        <svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-theme"></use></svg>
+        <span class="visually-hidden">Theme: follow system</span>
+      </button>
+      <span class="muted small" id="session-identity"></span>
       <button type="button" class="secondary" id="logout-button">Log out</button>
     </div>
   </header>
 
-  <main>
-    <section class="login-wrap" id="login-section">
-      <form class="panel login-panel stacked" id="login-form" aria-labelledby="login-heading">
-        <h2 id="login-heading">Operator sign-in</h2>
-        <p class="muted">This session is loopback-only and never persists across a service restart.</p>
-        <label>Username
-          <input type="text" name="username" autocomplete="username" required>
-        </label>
-        <label>Password
-          <input type="password" name="password" autocomplete="current-password" required>
-        </label>
-        <button type="submit">Sign in</button>
-        <p class="error-text" id="login-error" role="alert" hidden></p>
-      </form>
+  <nav class="sidenav" id="sidenav" aria-label="Primary">
+    <ul id="nav-list"></ul>
+  </nav>
+
+  <main id="main-content" tabindex="-1">
+    <p class="banner error-text" id="global-error" role="alert" hidden></p>
+    <p class="visually-hidden" id="live-region" role="status" aria-live="polite"></p>
+
+    <!-- ── Overview ────────────────────────────────────────────────── -->
+    <section class="panel-view" id="panel-overview" aria-labelledby="overview-heading">
+      <div class="view-head">
+        <h1 id="overview-heading">Overview</h1>
+        <p class="muted" id="overview-generated">—</p>
+      </div>
+
+      <section class="card current-task" aria-labelledby="current-task-heading">
+        <div class="card-head">
+          <h2 id="current-task-heading">Current task</h2>
+          <span class="badge" id="task-posture"><span class="badge-glyph" aria-hidden="true">–</span><span class="badge-text">—</span></span>
+        </div>
+        <p class="headline" id="task-headline">—</p>
+        <p class="muted" id="task-detail">—</p>
+        <dl class="fact-row" id="task-facts">
+          <div><dt>Agent</dt><dd id="task-agent">—</dd></div>
+          <div><dt>Assignment</dt><dd id="task-assignment">—</dd></div>
+          <div><dt>Phase</dt><dd id="task-phase">—</dd></div>
+          <div><dt>Status</dt><dd id="task-status-label">—</dd></div>
+          <div><dt>Started</dt><dd id="task-started">—</dd></div>
+          <div><dt>Elapsed</dt><dd id="task-elapsed">—</dd></div>
+        </dl>
+        <p><a class="link-out" id="task-issue-link" href="#" hidden>Open issue on GitHub<svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-external"></use></svg></a></p>
+      </section>
+
+      <div class="tile-grid" id="overview-tiles">
+        <section class="card tile" aria-labelledby="tile-scheduler-heading">
+          <h2 id="tile-scheduler-heading" class="tile-title">Unattended scheduler</h2>
+          <span class="badge" id="tile-scheduler-badge"><span class="badge-glyph" aria-hidden="true">–</span><span class="badge-text">Unknown</span></span>
+          <p class="muted small" id="tile-scheduler-note">—</p>
+        </section>
+
+        <section class="card tile" aria-labelledby="tile-quota-heading">
+          <h2 id="tile-quota-heading" class="tile-title">Included quota</h2>
+          <p class="tile-value" id="tile-quota-value">—</p>
+          <p class="muted small" id="tile-quota-note">—</p>
+          <div class="meter" id="tile-quota-meter" role="img" aria-label="Included quota usage not tracked">
+            <span class="meter-fill" id="tile-quota-fill"></span>
+          </div>
+          <p class="muted small" id="tile-quota-cost">—</p>
+        </section>
+
+        <section class="card tile" aria-labelledby="tile-queue-heading">
+          <h2 id="tile-queue-heading" class="tile-title">Queue &amp; admission</h2>
+          <p class="tile-value" id="tile-queue-value">—</p>
+          <p class="muted small" id="tile-queue-note">—</p>
+          <ul class="reason-list" id="tile-queue-reasons"></ul>
+        </section>
+
+        <section class="card tile" aria-labelledby="tile-fleet-heading">
+          <h2 id="tile-fleet-heading" class="tile-title">Agent fleet</h2>
+          <p class="tile-value" id="tile-fleet-value">—</p>
+          <p class="muted small" id="tile-fleet-note">—</p>
+        </section>
+
+        <section class="card tile" aria-labelledby="tile-attention-heading">
+          <h2 id="tile-attention-heading" class="tile-title">Health &amp; attention</h2>
+          <p class="tile-value" id="tile-attention-value">—</p>
+          <p class="muted small" id="tile-attention-note">—</p>
+        </section>
+
+        <section class="card tile" aria-labelledby="tile-runs-heading">
+          <h2 id="tile-runs-heading" class="tile-title">Recent runs</h2>
+          <p class="tile-value" id="tile-runs-value">—</p>
+          <p class="muted small" id="tile-runs-note">—</p>
+        </section>
+      </div>
+
+      <section class="card" aria-labelledby="attention-list-heading">
+        <div class="card-head">
+          <h2 id="attention-list-heading">Requires operator action</h2>
+        </div>
+        <ul class="event-list" id="attention-list"></ul>
+      </section>
+
+      <section class="card" aria-labelledby="recent-activity-heading">
+        <div class="card-head">
+          <h2 id="recent-activity-heading">Recent activity</h2>
+          <a class="link-quiet" href="#activity" data-nav="activity">See all activity</a>
+        </div>
+        <ul class="event-list" id="recent-activity"></ul>
+      </section>
+
+      <section class="card" aria-labelledby="links-heading">
+        <div class="card-head">
+          <h2 id="links-heading">Companion surfaces</h2>
+        </div>
+        <p class="muted small">Grafana is read-only observability and never a second control authority. These are plain links; this page never contacts them, so an unavailable Grafana cannot affect this console.</p>
+        <ul class="link-list" id="companion-links"></ul>
+      </section>
     </section>
 
-    <section id="dashboard-section" hidden>
-      <section class="panel" aria-labelledby="add-instance-heading">
-        <h2 id="add-instance-heading">Add instance</h2>
-        <p class="muted">Restricted to the approved adapter catalogue below — there is no path to register an arbitrary adapter id.</p>
-        <form class="stacked" id="add-instance-form">
-          <label>Adapter
-            <select name="agentId" id="add-instance-select" required></select>
-          </label>
-          <button type="submit">Add instance</button>
-          <p class="status-text" id="add-instance-status" role="status"></p>
+    <!-- ── Agents ──────────────────────────────────────────────────── -->
+    <section class="panel-view" id="panel-agents" aria-labelledby="agents-heading" hidden>
+      <div class="view-head">
+        <h1 id="agents-heading">Agents</h1>
+        <p class="muted">Approved adapter catalogue and registered instances. This runner has one global serial execution slot — no adapter can run in parallel with another until that is changed by separate authority.</p>
+      </div>
+
+      <section class="card" aria-labelledby="add-instance-heading">
+        <h2 id="add-instance-heading" class="tile-title">Add instance</h2>
+        <form class="inline-form" id="add-instance-form">
+          <label for="add-instance-select">Adapter</label>
+          <select name="agentId" id="add-instance-select" required></select>
+          <button type="submit" class="primary">Add instance</button>
+          <span class="status-text" id="add-instance-status" role="status"></span>
         </form>
+        <p class="muted small">Restricted to the approved catalogue — there is no path to register an arbitrary adapter id.</p>
       </section>
 
-      <section aria-labelledby="instances-heading">
-        <h2 id="instances-heading">Approved agent catalogue &amp; registered instances</h2>
-        <div class="grid instances-grid" id="instances-grid"></div>
+      <div class="table-wrap">
+        <table class="fleet-table">
+          <caption class="visually-hidden">Agent fleet: lifecycle state, readiness, model, cost class, quota and load</caption>
+          <thead>
+            <tr>
+              <th scope="col">Agent</th>
+              <th scope="col">State</th>
+              <th scope="col">Readiness</th>
+              <th scope="col">Model / profile</th>
+              <th scope="col">Surface</th>
+              <th scope="col">Cost</th>
+              <th scope="col">Load</th>
+              <th scope="col">Last change</th>
+              <th scope="col"><span class="visually-hidden">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody id="fleet-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── Activity ────────────────────────────────────────────────── -->
+    <section class="panel-view" id="panel-activity" aria-labelledby="activity-heading" hidden>
+      <div class="view-head">
+        <h1 id="activity-heading">Activity</h1>
+        <p class="muted">Bounded, redacted operator timeline: scheduler outcomes, issue runs, attention/health events and operator configuration changes. It never contains provider output, prompts, raw errors or private comment bodies — those are not sent to this page at all.</p>
+      </div>
+
+      <form class="inline-form" id="activity-filter-form" role="search">
+        <label for="activity-query">Filter</label>
+        <input type="search" id="activity-query" name="query" placeholder="issue, repo, reason, actor…" autocomplete="off">
+        <label for="activity-source">Source</label>
+        <select id="activity-source" name="source">
+          <option value="all">All</option>
+          <option value="runner">Runner activity</option>
+          <option value="operator">Operator changes</option>
+        </select>
+        <span class="muted small" id="activity-count">—</span>
+      </form>
+      <p class="muted small">Filtering happens entirely over the already-loaded bounded fields on this page — it never sends a query anywhere.</p>
+
+      <div class="table-wrap">
+        <table class="timeline-table">
+          <caption class="visually-hidden">Runner activity and operator configuration changes, most recent first</caption>
+          <thead>
+            <tr>
+              <th scope="col">Time</th>
+              <th scope="col">Source</th>
+              <th scope="col">Event</th>
+              <th scope="col">Issue</th>
+              <th scope="col">Detail</th>
+            </tr>
+          </thead>
+          <tbody id="timeline-rows"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ── Settings & audit ────────────────────────────────────────── -->
+    <section class="panel-view" id="panel-settings" aria-labelledby="settings-heading" hidden>
+      <div class="view-head">
+        <h1 id="settings-heading">Settings &amp; audit</h1>
+        <p class="muted">Operator-safe service status, the settings revision history and the control audit trail. No secret value is ever readable here — credentials are write-only by construction.</p>
+      </div>
+
+      <section class="card" aria-labelledby="service-status-heading">
+        <h2 id="service-status-heading" class="tile-title">Service status</h2>
+        <dl class="fact-row">
+          <div><dt>Project</dt><dd id="settings-project">—</dd></div>
+          <div><dt>Repository</dt><dd id="settings-repo">—</dd></div>
+          <div><dt>Overview schema</dt><dd id="settings-schema">—</dd></div>
+          <div><dt>Runner state</dt><dd id="settings-state">—</dd></div>
+          <div><dt>Admission circuit</dt><dd id="settings-circuit">—</dd></div>
+          <div><dt>Current settings revision</dt><dd id="current-revision">—</dd></div>
+        </dl>
       </section>
 
-      <section class="panel" aria-labelledby="audit-heading">
-        <h2 id="audit-heading">Audit / history &amp; rollback</h2>
-        <p class="muted">Actor, source, time, revision and changed <em>field names</em> only — never a changed value.</p>
-        <div class="two-col grid">
-          <div>
-            <h3>Recent audit entries</h3>
-            <div class="table-wrap"><table>
-              <thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Revision</th><th>Changed fields</th></tr></thead>
-              <tbody id="audit-rows"></tbody>
-            </table></div>
-          </div>
-          <div>
-            <h3>Settings revisions</h3>
-            <p>Current revision: <strong id="current-revision">—</strong></p>
-            <div class="table-wrap"><table>
-              <thead><tr><th>Revision</th><th></th></tr></thead>
-              <tbody id="revision-rows"></tbody>
-            </table></div>
-          </div>
+      <section class="card" aria-labelledby="audit-heading">
+        <h2 id="audit-heading" class="tile-title">Control audit trail</h2>
+        <p class="muted small">Actor, source, time, revision and changed <em>field names</em> only — never a changed value.</p>
+        <div class="table-wrap">
+          <table>
+            <caption class="visually-hidden">Recent control audit entries</caption>
+            <thead><tr><th scope="col">Time</th><th scope="col">Actor</th><th scope="col">Action</th><th scope="col">Revision</th><th scope="col">Changed fields</th></tr></thead>
+            <tbody id="audit-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card advanced" aria-labelledby="revisions-heading">
+        <h2 id="revisions-heading" class="tile-title">Advanced — settings revisions &amp; rollback</h2>
+        <p class="muted small">Rolling back replaces the whole current agent settings document with a retained revision. Deliberate confirmation is required.</p>
+        <div class="table-wrap">
+          <table>
+            <caption class="visually-hidden">Retained settings revisions</caption>
+            <thead><tr><th scope="col">Revision</th><th scope="col">State</th><th scope="col"><span class="visually-hidden">Action</span></th></tr></thead>
+            <tbody id="revision-rows"></tbody>
+          </table>
         </div>
       </section>
     </section>
-
-    <section class="panel" id="fatal-error" role="alert" hidden></section>
   </main>
+</div>
 
-  <template id="instance-card-template">
-    <article class="panel instance-card">
-      <div class="button-row" style="justify-content: space-between; align-items: baseline;">
-        <h3 class="instance-title"></h3>
-        <span class="badge state-badge"></span>
-      </div>
-      <p class="muted state-explanation"></p>
-      <dl class="fact-grid">
-        <dt>Adapter / runtime</dt><dd class="fact-adapter"></dd>
-        <dt>Execution surface</dt><dd class="fact-surface"></dd>
-        <dt>Version policy</dt><dd class="fact-version"></dd>
-        <dt>Capability classes</dt><dd class="fact-capabilities"></dd>
-        <dt>Model / profile</dt><dd class="fact-model"></dd>
-        <dt>Context / output limits</dt><dd class="fact-limits"></dd>
-        <dt>Authentication status</dt><dd class="fact-auth"></dd>
-        <dt>Cost class</dt><dd class="fact-cost"></dd>
-        <dt>Budget / cap</dt><dd class="fact-budget"></dd>
-        <dt>Quota / resource state</dt><dd class="fact-quota"></dd>
-        <dt>Current task/slot</dt><dd class="fact-slot"></dd>
-        <dt>Readiness</dt><dd class="fact-readiness"></dd>
-        <dt>Last readiness check</dt><dd class="fact-readiness-time"></dd>
-        <dt>Settings revision</dt><dd class="fact-revision"></dd>
-        <dt>Last state change</dt><dd class="fact-last-change"></dd>
-      </dl>
+<!-- ── agent detail drawer (focus-managed dialog) ──────────────────── -->
+<div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+<aside class="drawer" id="agent-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden tabindex="-1">
+  <div class="drawer-head">
+    <h2 id="drawer-title">Agent</h2>
+    <button type="button" class="icon-button" id="drawer-close">
+      <svg class="icon" aria-hidden="true" focusable="false"><use href="#icon-close"></use></svg>
+      <span class="visually-hidden">Close agent details</span>
+    </button>
+  </div>
+  <div class="drawer-body" id="drawer-body"></div>
+</aside>
 
+<template id="fleet-row-template">
+  <tr>
+    <th scope="row" class="cell-agent">
+      <span class="agent-name"></span>
+      <span class="muted small agent-qualification"></span>
+    </th>
+    <td class="cell-state"><span class="badge"><span class="badge-glyph" aria-hidden="true">–</span><span class="badge-text"></span></span></td>
+    <td class="cell-readiness"></td>
+    <td class="cell-model"></td>
+    <td class="cell-surface"></td>
+    <td class="cell-cost"></td>
+    <td class="cell-load"></td>
+    <td class="cell-change"></td>
+    <td class="cell-actions"><button type="button" class="secondary details-button">Details</button></td>
+  </tr>
+</template>
+
+<template id="agent-detail-template">
+  <div class="detail">
+    <p class="badge detail-state"><span class="badge-glyph" aria-hidden="true">–</span><span class="badge-text"></span></p>
+    <p class="muted detail-explanation"></p>
+
+    <dl class="fact-row detail-facts">
+      <div><dt>Adapter id</dt><dd class="fact-adapter"></dd></div>
+      <div><dt>Execution surface</dt><dd class="fact-surface"></dd></div>
+      <div><dt>Implementation</dt><dd class="fact-qualification"></dd></div>
+      <div><dt>Version policy</dt><dd class="fact-version"></dd></div>
+      <div><dt>Capability classes</dt><dd class="fact-capabilities"></dd></div>
+      <div><dt>Model / profile</dt><dd class="fact-model"></dd></div>
+      <div><dt>Context / output limits</dt><dd class="fact-limits"></dd></div>
+      <div><dt>Cost class</dt><dd class="fact-cost"></dd></div>
+      <div><dt>Budget / approval</dt><dd class="fact-budget"></dd></div>
+      <div><dt>Quota / resource state</dt><dd class="fact-quota"></dd></div>
+      <div><dt>Current slot</dt><dd class="fact-slot"></dd></div>
+      <div><dt>Readiness</dt><dd class="fact-readiness"></dd></div>
+      <div><dt>Credential status</dt><dd class="fact-auth"></dd></div>
+      <div><dt>Settings revision</dt><dd class="fact-revision"></dd></div>
+      <div><dt>Last state change</dt><dd class="fact-last-change"></dd></div>
+    </dl>
+
+    <section aria-labelledby="lifecycle-heading-slot">
+      <h3 id="lifecycle-heading-slot" class="detail-heading">Lifecycle</h3>
       <div class="confirm-panel paid-confirm" role="alertdialog" aria-label="Confirm paid-agent enablement" hidden>
         <p class="paid-confirm-copy"></p>
         <div class="button-row">
@@ -111,61 +376,60 @@
           <button type="button" class="secondary cancel-enable-button">Cancel</button>
         </div>
       </div>
-
       <div class="button-row lifecycle-actions">
         <button type="button" class="secondary" data-action="enabled">Enable</button>
         <button type="button" class="secondary" data-action="paused">Pause</button>
         <button type="button" class="secondary" data-action="draining">Drain</button>
         <button type="button" class="secondary" data-action="disabled">Disable</button>
       </div>
-      <p class="action-note lifecycle-note"></p>
+      <ul class="action-notes lifecycle-notes"></ul>
+    </section>
 
-      <details>
-        <summary>Non-secret settings</summary>
-        <form class="stacked settings-form">
-          <label>Model <span class="hint">(free text; validated server-side)</span>
-            <input type="text" name="model">
-          </label>
-          <label>Profile
-            <input type="text" name="profile">
-          </label>
-          <label>Endpoint <span class="hint">(loopback http(s) only)</span>
-            <input type="text" name="endpoint">
-          </label>
-          <label>Timeout (ms)
-            <input type="number" name="timeout" min="1000" max="3600000">
-          </label>
-          <label>
-            <input type="checkbox" name="requireHumanApproval" style="width:auto">
-            Require human approval
-          </label>
-          <label>Notes <span class="hint">(max 256 characters)</span>
-            <input type="text" name="notes" maxlength="256">
-          </label>
-          <button type="submit">Save settings</button>
-          <p class="status-text settings-status" role="status"></p>
-        </form>
-      </details>
+    <section aria-labelledby="settings-heading-slot">
+      <h3 id="settings-heading-slot" class="detail-heading">Non-secret settings</h3>
+      <form class="stacked settings-form">
+        <label>Model <span class="hint">(free text; validated server-side)</span>
+          <input type="text" name="model">
+        </label>
+        <label>Profile
+          <input type="text" name="profile">
+        </label>
+        <label>Endpoint <span class="hint">(loopback http(s) only)</span>
+          <input type="text" name="endpoint">
+        </label>
+        <label>Timeout (ms)
+          <input type="number" name="timeout" min="1000" max="3600000">
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" name="requireHumanApproval">
+          Require human approval
+        </label>
+        <label>Notes <span class="hint">(max 256 characters)</span>
+          <input type="text" name="notes" maxlength="256">
+        </label>
+        <button type="submit" class="primary">Save settings</button>
+        <p class="status-text settings-status" role="status"></p>
+      </form>
+    </section>
 
-      <details>
-        <summary>Credential (write-only)</summary>
-        <p class="muted">Values are write-only: they are sent once, cleared from this form immediately, and never read back.</p>
-        <p>Status: <strong class="secret-status"></strong></p>
-        <form class="stacked secret-form">
-          <label>New credential value
-            <input type="password" name="value" autocomplete="new-password">
-          </label>
-          <div class="button-row">
-            <button type="submit" data-secret-action="create">Create</button>
-            <button type="submit" data-secret-action="rotate">Rotate</button>
-            <button type="button" data-secret-action="remove" class="danger">Remove</button>
-          </div>
-          <p class="status-text secret-status-message" role="status"></p>
-        </form>
-      </details>
-    </article>
-  </template>
+    <section aria-labelledby="credential-heading-slot">
+      <h3 id="credential-heading-slot" class="detail-heading">Credential (write-only)</h3>
+      <p class="muted small">Values are write-only: sent once, cleared from this form immediately, and never read back by anything.</p>
+      <form class="stacked secret-form">
+        <label>New credential value
+          <input type="password" name="value" autocomplete="new-password">
+        </label>
+        <div class="button-row">
+          <button type="submit" class="primary" data-secret-action="create">Create</button>
+          <button type="submit" class="secondary" data-secret-action="rotate">Rotate</button>
+          <button type="button" data-secret-action="remove" class="danger">Remove</button>
+        </div>
+        <p class="status-text secret-status-message" role="status"></p>
+      </form>
+    </section>
+  </div>
+</template>
 
-  <script type="module" src="./agents-dashboard.js"></script>
+<script type="module" src="./agents-dashboard.js"></script>
 </body>
 </html>
