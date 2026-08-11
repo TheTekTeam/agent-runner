@@ -418,6 +418,96 @@ test('GET /api/audit returns actor/source/time/revision/changed-field-names only
   }
 }));
 
+// -- read-only operational overview (issue #175) ------------------------
+
+test('GET /api/overview is refused without a session, and refused cross-origin even with one', () => withServer(async ({ baseUrl }) => {
+  const anonymous = await apiRequest(baseUrl, '/api/overview');
+  assert.equal(anonymous.status, 401);
+  assert.equal(anonymous.json.reason, 'session-invalid-or-expired');
+
+  const { cookie } = await login(baseUrl);
+  const foreign = await apiRequest(baseUrl, '/api/overview', { cookie, headers: { Origin: 'http://evil.example' } });
+  assert.equal(foreign.status, 403);
+
+  const response = await fetch(`${baseUrl}/api/overview`, { headers: { Cookie: cookie } });
+  assert.equal(response.status, 403, 'a GET with no Origin/Referer at all stays refused');
+}));
+
+test('GET /api/overview returns only the positive-allowlist projection, with no restricted field', () => withServer(async ({ baseUrl }) => {
+  const { cookie } = await login(baseUrl);
+  const result = await apiRequest(baseUrl, '/api/overview', { cookie });
+  assert.equal(result.status, 200);
+  assert.equal(result.json.ok, true);
+  assert.equal(result.json.schemaVersion, 'agent-runner-control-overview/v1');
+
+  assert.deepEqual(Object.keys(result.json).sort(), [
+    'activity', 'attention', 'circuit', 'currentTask', 'generatedAt', 'health', 'links', 'notifications',
+    'ok', 'project', 'queue', 'quota', 'runner', 'runs', 'scheduler', 'schemaVersion', 'stateAvailable',
+  ], 'the wire shape is a fixed allowlist');
+
+  const serialized = JSON.stringify(result.json);
+  for (const forbidden of ['dbPath', 'localRepoPath', 'payload_json', 'prompt', 'stdout', 'stderr', 'csrfToken', 'sessionId', 'password', 'secretref:', 'dashboard_reference']) {
+    assert.ok(!serialized.includes(forbidden), `overview must never serialize ${forbidden}`);
+  }
+  // No absolute filesystem path of any shape.
+  assert.ok(!/"[^"]*\/(home|var|etc|tmp|root)\//.test(serialized), 'overview must never serialize a filesystem path');
+  assert.ok(serialized.length < 128 * 1024, 'the overview response must stay bounded');
+}));
+
+test('with no runner state database present, GET /api/overview fails closed rather than reporting healthy', () => withServer(async ({ baseUrl, dbPath }) => {
+  assert.equal(existsSync(dbPath), false);
+  const { cookie } = await login(baseUrl);
+  const result = await apiRequest(baseUrl, '/api/overview', { cookie });
+  assert.equal(result.status, 200);
+  assert.equal(result.json.stateAvailable, false);
+  assert.equal(result.json.runner.code, 'unavailable');
+  assert.notEqual(result.json.runner.code, 'healthy');
+  assert.ok(result.json.runner.explanation.length > 0);
+  assert.equal(result.json.currentTask.active, false);
+  assert.equal(existsSync(dbPath), false, 'reading the overview must never create the state database');
+  assert.equal(existsSync(`${dbPath}-wal`), false);
+  assert.equal(existsSync(`${dbPath}-shm`), false);
+}));
+
+test('GET /api/overview mutates no durable control-service state: identical file tree before and after', () => withServer(async ({ baseUrl, dir }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
+
+  const fingerprint = () => walkFiles(dir)
+    .map((file) => `${relative(dir, file)}:${statSync(file).size}:${readFileSync(file, 'utf8').length}`)
+    .sort();
+
+  const before = fingerprint();
+  for (let i = 0; i < 3; i += 1) {
+    const result = await apiRequest(baseUrl, '/api/overview', { cookie });
+    assert.equal(result.status, 200);
+  }
+  assert.deepEqual(fingerprint(), before, 'no settings write, no audit entry, no secret touch, no state file created');
+}));
+
+test('a read of the overview never appends to the control audit log', () => withServer(async ({ baseUrl, auditPath }) => {
+  const { cookie } = await login(baseUrl);
+  await apiRequest(baseUrl, '/api/overview', { cookie });
+  const auditAfterRead = await apiRequest(baseUrl, '/api/audit', { cookie });
+  assert.equal(auditAfterRead.json.entries.length, 0);
+  assert.equal(existsSync(auditPath), false, 'a pure read must not even create the audit file');
+}));
+
+test('the overview route is GET-only — it exposes no mutating verb', () => withServer(async ({ baseUrl }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  for (const method of ['POST', 'PATCH', 'DELETE']) {
+    const result = await apiRequest(baseUrl, '/api/overview', { method, cookie, csrfToken, body: {} });
+    assert.equal(result.status, 404, `${method} /api/overview must not be routable`);
+  }
+}));
+
+test('an expired session cannot read the overview after logout', () => withServer(async ({ baseUrl }) => {
+  const { cookie, csrfToken } = await login(baseUrl);
+  assert.equal((await apiRequest(baseUrl, '/api/overview', { cookie })).status, 200);
+  await apiRequest(baseUrl, '/api/session/logout', { method: 'POST', cookie, csrfToken });
+  assert.equal((await apiRequest(baseUrl, '/api/overview', { cookie })).status, 401);
+}));
+
 // -- Agents dashboard static shell (issue #47) --------------------------
 
 test('GET / serves the dashboard shell with no session, no Origin header and no CSRF token required', async () => {

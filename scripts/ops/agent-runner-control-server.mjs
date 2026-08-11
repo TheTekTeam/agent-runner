@@ -25,6 +25,7 @@ import {
   transitionInstanceLifecycle,
   updateInstanceSettings,
 } from './agent-runner-control-instances.mjs';
+import { createOverviewReader } from './agent-runner-control-overview.mjs';
 import { computeInstanceLoad, computeInstanceQuota, computeInstanceReadiness } from './agent-runner-control-readiness.mjs';
 import { readStaticAsset, STATIC_CSP_HEADER } from './agent-runner-control-static.mjs';
 import {
@@ -60,7 +61,11 @@ import {
  * module opens the runner SQLite state DB for writing; the only SQLite
  * *reads* are `computeInstanceLoad()`'s and `computeInstanceQuota()`'s
  * reuse of the existing dashboard summary, read-only, exactly as the
- * static dashboard already uses it.
+ * static dashboard already uses it, plus `GET /api/overview`'s
+ * `readControlOverview()` — which reads a private snapshot copy of the
+ * runner state DB through the operator CLI's existing read-only path and
+ * so cannot create, migrate or write the live database at all (issue
+ * #175).
  *
  * `tryServeStaticAsset()` is a separate, non-API concern: it serves a fixed
  * set of repository-shipped HTML/CSS/JS shell files (see
@@ -305,6 +310,21 @@ async function handleRollback(ctx) {
   }
 }
 
+/**
+ * The authenticated read-only operational overview (issue #175). Not a
+ * fifth sink: it opens no control-service state at all, and its only
+ * SQLite contact is `readOnlyRunnerStateSnapshot()`'s private snapshot copy
+ * of the runner state DB — the same genuinely read-only path the operator
+ * CLI already uses, which cannot create, migrate or write the live database
+ * (see `agent-runner-control-overview.mjs`). The response body is a fixed
+ * positive allowlist built by `buildOverviewProjection()`; nothing derived
+ * from request input selects a field, so this route cannot be steered into
+ * returning anything the projection does not already permit.
+ */
+async function handleOverview(ctx) {
+  return sendJson(ctx.res, 200, ctx.overviewReader.get({ env: ctx.env, dbPath: ctx.dbPath }));
+}
+
 async function handleAudit(ctx) {
   const limitParam = ctx.query.get('limit');
   const limit = limitParam ? Number.parseInt(limitParam, 10) : 50;
@@ -377,6 +397,7 @@ const ROUTES = [
   { method: 'POST', pattern: new RegExp(`^/api/instances/${INSTANCE_ID_SEGMENT}/lifecycle$`), handler: handleTransitionLifecycle, requiresAuth: true, mutating: true },
   { method: 'GET', pattern: /^\/api\/settings\/revisions$/, handler: handleListRevisions, requiresAuth: true, mutating: false },
   { method: 'POST', pattern: /^\/api\/settings\/rollback$/, handler: handleRollback, requiresAuth: true, mutating: true },
+  { method: 'GET', pattern: /^\/api\/overview$/, handler: handleOverview, requiresAuth: true, mutating: false },
   { method: 'GET', pattern: /^\/api\/audit$/, handler: handleAudit, requiresAuth: true, mutating: false },
   { method: 'GET', pattern: new RegExp(`^/api/secrets/${INSTANCE_ID_SEGMENT}$`), handler: handleGetSecretStatus, requiresAuth: true, mutating: false },
   { method: 'POST', pattern: new RegExp(`^/api/secrets/${INSTANCE_ID_SEGMENT}$`), handler: handleCreateSecret, requiresAuth: true, mutating: true },
@@ -482,6 +503,7 @@ async function handleRequest(req, res, server, config) {
     operatorCredentialPath: config.operatorCredentialPath,
     dbPath: config.dbPath,
     env: config.env,
+    overviewReader: config.overviewReader,
     sessionStore: config.sessionStore,
     actor: session?.username || 'anonymous',
     source: 'control-api',
@@ -505,9 +527,12 @@ export function createControlServer({
   auditPath = resolveControlAuditPath(env),
   dbPath,
   sessionStore = createControlSessionStore(),
+  // Short-TTL memoisation for `GET /api/overview` so a polling tab cannot
+  // turn into one systemd spawn plus one SQLite snapshot copy per request.
+  overviewReader = createOverviewReader(),
 } = {}) {
   const boundHost = resolveBindHost(host);
-  const config = { env, settingsPath, secretStoreDir, operatorCredentialPath, auditPath, dbPath, sessionStore };
+  const config = { env, settingsPath, secretStoreDir, operatorCredentialPath, auditPath, dbPath, sessionStore, overviewReader };
   const server = createServer((req, res) => {
     handleRequest(req, res, server, config).catch(() => {
       if (!res.headersSent) sendJson(res, 500, { ok: false, reason: 'internal-error' });

@@ -35,6 +35,7 @@ const STATIC_ASSETS = Object.freeze({
   '/agents-dashboard.css': Object.freeze({ file: 'agents-dashboard.css', contentType: 'text/css; charset=utf-8' }),
   '/agents-dashboard.js': Object.freeze({ file: 'agents-dashboard.js', contentType: 'text/javascript; charset=utf-8' }),
   '/agents-dashboard-view.mjs': Object.freeze({ file: 'agents-dashboard-view.mjs', contentType: 'text/javascript; charset=utf-8' }),
+  '/agents-overview-view.mjs': Object.freeze({ file: 'agents-overview-view.mjs', contentType: 'text/javascript; charset=utf-8' }),
 });
 
 /** A strict Content-Security-Policy: the dashboard never needs a third-party origin for anything. */
