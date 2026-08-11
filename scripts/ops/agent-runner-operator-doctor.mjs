@@ -31,18 +31,41 @@
 //      concurrent writers -- a side effect this command must never have on
 //      the live state directory.
 //
-// The fix used here reconciles both: `openReadOnly()` first copies the
-// database file and, if present, its `-wal` sidecar into a private temp
-// directory (never the live state directory), verifying via stat(size,
-// mtime) before and after the copy that nothing wrote to the source files
-// during the copy window, retrying a bounded number of times and failing
-// closed if the source never holds still. Once copied, the private temp
-// files genuinely cannot change underneath the connection -- nothing else
-// has a path to them -- so opening *that* private copy with `mode=ro
-// &immutable=1` is now an honest assertion, not a false one, and the WAL
-// sidecar SQLite creates while reading it lives only in the temp directory,
-// which is removed on close(). The live state directory is only ever read
-// from (fs.statSync/copyFileSync), never written to.
+// The fix used here reconciles both by taking one of two SQLite-defined
+// snapshot paths, chosen by whether the live `-wal` sidecar currently
+// exists -- i.e. whether WAL machinery is actually active against the
+// source right now:
+//
+//   * If `-wal` exists, a writer may commit concurrently at any moment, so
+//     `snapshotSourceForReadOnly()` uses SQLite's own Online Backup API
+//     (`node:sqlite`'s `backup()`, https://sqlite.org/backup.html) to page-
+//     copy the live database into a private temp file. The backup API is
+//     SQLite's purpose-built mechanism for exactly this: reading a
+//     consistent snapshot of a database while other connections keep
+//     writing to it, automatically restarting the copy if a concurrent
+//     writer commits mid-backup, rather than trusting an ordinary
+//     byte-level file copy to not race a writer. Because `-wal` already
+//     exists, opening a read-only connection against the live path touches
+//     only files a concurrent writer already created -- it creates nothing
+//     new in the live state directory. `backup()` is asynchronous, so it
+//     runs in a short-lived child process (`spawnSync`, the same primitive
+//     already used for git/systemctl inspection in this file) so every
+//     exported function here stays synchronous.
+//   * If `-wal` does not exist, no writer can be mid-transaction: in WAL
+//     mode, a writer must create/open `-wal` before it writes anything, so
+//     the main database file is provably quiescent for as long as `-wal`
+//     stays absent. In that state a plain `copyFileSync` of the main file
+//     alone is copying an immobile file, verified by re-checking that
+//     `-wal` still doesn't exist and the file's stat(size, mtime) is
+//     unchanged once the copy completes, retrying a bounded number of
+//     times and failing closed if a writer starts mid-copy.
+//
+// Either way, the live state directory is only ever read from, never
+// written to, and the private temp files genuinely cannot change
+// underneath the connection once produced -- nothing else has a path to
+// them -- so opening that private copy with `mode=ro&immutable=1` is an
+// honest assertion, not a false one, and any WAL sidecar SQLite creates
+// while reading it lives only in the temp directory, removed on close().
 //
 // Every table and column read is drawn from a fixed local allowlist (never
 // `SELECT *`), and every SQL-side limit is bounded before use.
@@ -213,6 +236,7 @@ function clampLimit(limit, fallback = 10) {
 }
 
 const SNAPSHOT_MAX_ATTEMPTS = 5;
+const SNAPSHOT_BACKUP_TIMEOUT_MS = 30000;
 
 function statOrNull(path) {
   try {
@@ -228,34 +252,92 @@ function sameStat(left, right) {
   return left.size === right.size && left.mtimeMs === right.mtimeMs;
 }
 
+// Runs in a short-lived child process (module header explains why): opens
+// the live database read-only -- safe here because the caller only takes
+// this path when `-wal` already exists, so no file this creates is new to
+// the live directory -- and hands it to node:sqlite's backup(), which reads
+// SQLite's Online Backup API to page-copy a consistent snapshot into
+// `destPath`, transparently restarting if a concurrent writer commits
+// mid-copy.
+const ONLINE_BACKUP_CHILD_SCRIPT = `
+import { existsSync } from 'node:fs';
+import * as sqlite from 'node:sqlite';
+const [srcPath, destPath] = process.argv.slice(1);
+const source = new sqlite.DatabaseSync(srcPath, { readOnly: true });
+try {
+  // Opening DatabaseSync itself does not access WAL pages. Re-check both
+  // coordination files after the handle is open and before backup() performs
+  // the first database read. If either vanished during dispatch, fail closed
+  // rather than giving SQLite permission to create a missing live sidecar.
+  if (!existsSync(srcPath + '-wal') || !existsSync(srcPath + '-shm')) {
+    throw new Error('live-wal-coordination-missing');
+  }
+  await sqlite.backup(source, destPath);
+} finally {
+  source.close();
+}
+`;
+
 /**
- * Copies the live database file plus its `-wal` sidecar (if present) into a
- * private, caller-owned temp directory, verifying via stat that neither
- * changed between the "before" and "after" snapshots of that copy -- i.e.
- * that no concurrent writer touched the source while the copy was made.
- * Retries a bounded number of times on an observed race and throws (fail
- * closed) if the source never holds still. Returns the temp directory path
- * and the path to the copied main database file; the caller owns cleanup.
+ * Performs the Online Backup API copy (see module header) in a child
+ * process so this stays synchronous, since node:sqlite's backup() is
+ * promise-based. Returns whether the destination file was produced.
  */
-function snapshotSourceForReadOnly(dbPath) {
+function backupLiveDatabaseViaOnlineBackup(resolvedPath, tempDbPath, spawn) {
+  const result = spawn(
+    process.execPath,
+    ['--input-type=module', '--no-warnings', '-e', ONLINE_BACKUP_CHILD_SCRIPT, '--', resolvedPath, tempDbPath],
+    { encoding: 'utf8', timeout: SNAPSHOT_BACKUP_TIMEOUT_MS },
+  );
+  return result.status === 0 && existsSync(tempDbPath);
+}
+
+/**
+ * Produces a private, caller-owned temp-directory copy of the live
+ * database that is genuinely internally consistent even though the source
+ * may be written to concurrently -- see the module header for the two
+ * SQLite-defined mechanisms chosen between (Online Backup API vs. a
+ * WAL-absence-provable quiescent copy) and why. Retries a bounded number
+ * of times and throws (fails closed) if a coherent snapshot is never
+ * obtained. Returns the temp directory path and the path to the snapshot
+ * database file; the caller owns cleanup.
+ */
+function snapshotSourceForReadOnly(dbPath, { spawn = spawnSync } = {}) {
   const resolvedPath = resolvePath(dbPath);
   const walPath = `${resolvedPath}-wal`;
-  let lastTempDir = null;
+  const shmPath = `${resolvedPath}-shm`;
   for (let attempt = 0; attempt < SNAPSHOT_MAX_ATTEMPTS; attempt += 1) {
-    const before = [statOrNull(resolvedPath), statOrNull(walPath)];
     const tempDir = mkdtempSync(joinPath(tmpdir(), 'agent-runner-state-snapshot-'));
-    lastTempDir = tempDir;
     const tempDbPath = joinPath(tempDir, 'state.sqlite');
     try {
-      copyFileSync(resolvedPath, tempDbPath);
-      if (before[1] !== null) copyFileSync(walPath, `${tempDbPath}-wal`);
-      const after = [statOrNull(resolvedPath), statOrNull(walPath)];
-      if (sameStat(before[0], after[0]) && sameStat(before[1], after[1])) {
-        return { tempDir, tempDbPath };
+      const walExists = existsSync(walPath);
+      const shmExists = existsSync(shmPath);
+      if (walExists || shmExists) {
+        // Read-only WAL access is allowed to rely on pre-existing
+        // coordination files, but this command must never create a missing
+        // counterpart. An incomplete/transient pair therefore fails this
+        // attempt closed and is retried.
+        if (walExists && shmExists
+          && backupLiveDatabaseViaOnlineBackup(resolvedPath, tempDbPath, spawn)) {
+          return { tempDir, tempDbPath };
+        }
+      } else {
+        const before = statOrNull(resolvedPath);
+        copyFileSync(resolvedPath, tempDbPath);
+        const after = statOrNull(resolvedPath);
+        // A writer can only ever begin modifying the source by first
+        // creating WAL coordination state (module header): re-checking that
+        // BOTH coordination files remain absent here, alongside the
+        // unchanged main-file stat, keeps this branch bounded to the
+        // quiescent main-file case. It never copies a live WAL.
+        if (!existsSync(walPath) && !existsSync(shmPath) && sameStat(before, after)) {
+          return { tempDir, tempDbPath };
+        }
       }
     } catch {
-      // Source disappeared or a sidecar appeared/vanished mid-copy: treat
-      // exactly like a detected race below and retry.
+      // Source disappeared, a sidecar appeared/vanished mid-copy, or the
+      // backup child process failed: treat exactly like a detected race
+      // below and retry.
     }
     rmSync(tempDir, { recursive: true, force: true });
   }
