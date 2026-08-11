@@ -114,7 +114,15 @@ function assertUniqueProjects(entries) {
   }
 }
 
-export function loadProjectRegistry({
+/**
+ * Read every registry entry — including disabled ones — with its project
+ * config already loaded through the canonical `validateAgentRunnerConfig`
+ * contract. Uniqueness and enabled/default admission rules are *not* applied
+ * here; `resolveProjectRegistrySelection()` owns those so the same rules can
+ * also be run against a proposed in-memory registry state before anything is
+ * written to disk (issue #177).
+ */
+export function readProjectRegistryEntries({
   argv = [],
   env = process.env,
   registryPath = resolveProjectRegistryPath(argv, env),
@@ -132,11 +140,21 @@ export function loadProjectRegistry({
     const configPath = resolve(registryDir, entry.configPath);
     return {
       configPath,
+      relativeConfigPath: entry.configPath,
       enabled: entry.enabled,
       config: loadAgentRunnerConfig({ argv: [], env: {}, configPath }),
     };
   });
 
+  return { registryPath: absoluteRegistryPath, registryDir, manifest, entries };
+}
+
+/**
+ * Apply the canonical duplicate-ownership, enabled-project and default-project
+ * admission rules to a set of loaded entries. Pure: the entries may come from
+ * disk or from a proposed mutation held only in memory.
+ */
+export function resolveProjectRegistrySelection({ manifest, entries }) {
   assertUniqueProjects(entries);
 
   const projects = entries.filter((entry) => entry.enabled).map((entry) => entry.config);
@@ -155,13 +173,20 @@ export function loadProjectRegistry({
     );
   }
 
+  return { defaultProjectId, projects, projectsById, projectsByRepository };
+}
+
+export function loadProjectRegistry(options = {}) {
+  const { registryPath, manifest, entries } = readProjectRegistryEntries(options);
+  const selection = resolveProjectRegistrySelection({ manifest, entries });
+
   return Object.freeze({
     schemaVersion: 1,
-    registryPath: absoluteRegistryPath,
-    defaultProjectId,
-    projects: Object.freeze([...projects]),
-    projectsById: Object.freeze(projectsById),
-    projectsByRepository: Object.freeze(projectsByRepository),
+    registryPath,
+    defaultProjectId: selection.defaultProjectId,
+    projects: Object.freeze([...selection.projects]),
+    projectsById: Object.freeze(selection.projectsById),
+    projectsByRepository: Object.freeze(selection.projectsByRepository),
   });
 }
 

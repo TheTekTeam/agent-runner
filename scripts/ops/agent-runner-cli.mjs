@@ -10,11 +10,16 @@
 //                    deterministic incident-repair implementation, called
 //                    verbatim; dry-run remains its own default)
 //   status        -> agent-runner-operator-status.mjs
+//   projects      -> agent-runner-projects-command.mjs (issue #177 project
+//                    registry management; read-only by default, every
+//                    mutation is lock-protected, validated and rollback-safe
+//                    inside agent-runner-project-registry-store.mjs)
 
 import { pathToFileURL } from 'node:url';
 
 import { main as doctorMain } from './agent-runner-operator-doctor.mjs';
 import { main as explainMain } from './agent-runner-queue-explain.mjs';
+import { main as projectsMain } from './agent-runner-projects-command.mjs';
 import { main as repairMain } from './agent-runner-queue-repair.mjs';
 import { main as statusMain } from './agent-runner-operator-status.mjs';
 
@@ -29,10 +34,14 @@ export function usageText() {
     '  queue explain --project <id>',
     '  queue repair --incident <id> [--dry-run|--execute]',
     '  status --json',
+    '  projects <list|show|add|enable|disable|remove|set-default|validate>',
     '',
     'All commands accept --config <path> to select a project config file.',
     'doctor, queue explain and status are read-only. queue repair is',
     'dry-run by default; mutation requires the explicit --execute flag.',
+    'projects list/show/validate are read-only; projects add/enable/disable/',
+    'remove/set-default mutate the machine-local registry atomically and',
+    'never delete a checkout, worktree, branch, state database or evidence.',
     '',
   ].join('\n');
 }
@@ -62,6 +71,10 @@ export async function main(
 
     if (command === 'status') {
       return await (dependencies.statusMain || statusMain)(rest, env, io);
+    }
+
+    if (command === 'projects') {
+      return await (dependencies.projectsMain || projectsMain)(rest, env, io, dependencies.projectsDependencies || {});
     }
 
     if (command === 'queue') {
