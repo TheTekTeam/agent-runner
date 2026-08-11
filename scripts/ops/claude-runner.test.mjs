@@ -37,6 +37,7 @@ import {
   removedClaudeProviderAuthKeys,
   resolveProfile,
   runOrPlanClaude,
+  runPrFollowUp,
   shouldUseClear,
   writeQuotaPauseState,
 } from './claude-runner.mjs';
@@ -498,6 +499,14 @@ test('findBlockingPrFollowUp finds an open PR linked by branch suffix with unres
     if (url.includes('/pulls/42')) {
       return { ok: true, json: async () => ({ number: 42 }) };
     }
+    if (url.includes('/graphql')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes: [] } } } },
+        }),
+      };
+    }
     throw new Error(`unexpected fetch: ${url}`);
   };
 
@@ -505,6 +514,462 @@ test('findBlockingPrFollowUp finds an open PR linked by branch suffix with unres
   assert.ok(blocking);
   assert.equal(blocking.pr.number, 42);
   assert.equal(blocking.unresolved.hasUnresolvedFollowUp, true);
+});
+
+test('findBlockingPrFollowUp treats an unresolved review thread as a trigger even with zero CHANGES_REQUESTED reviews', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  global.fetch = async (url) => {
+    if (url.includes('/pulls?state=open')) {
+      return {
+        ok: true,
+        json: async () => [
+          { number: 42, title: 'Adapt runner', body: 'no keyword', head: { ref: 'claude/ops-claude-runner-dell-queue-629' } },
+        ],
+      };
+    }
+    if (url.includes('/pulls/42/reviews')) {
+      return { ok: true, json: async () => [{ user: { login: 'reviewer' }, state: 'COMMENTED', body: 'fyi', submitted_at: '2026-07-02T10:00:00Z' }] };
+    }
+    if (url.includes('/issues/42/comments')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/pulls/42')) {
+      return { ok: true, json: async () => ({ number: 42 }) };
+    }
+    if (url.includes('/graphql')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false, endCursor: null },
+                  nodes: [
+                    {
+                      id: 'thread-1',
+                      isResolved: false,
+                      comments: { nodes: [{ author: { login: 'reviewer' }, body: 'this needs a fix', createdAt: '2026-07-02T10:05:00Z' }] },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  const blocking = await findBlockingPrFollowUp({ repo: 'TheTekTeam/modelspend', issue: 629, token: 'placeholder-token' });
+  assert.ok(blocking);
+  assert.equal(blocking.unresolved.hasUnresolvedFollowUp, true);
+  assert.ok(blocking.unresolved.reasons.some((r) => r.startsWith('unresolved-review-threads')));
+  assert.equal(blocking.unresolved.unresolvedComments[0].body, 'this needs a fix');
+});
+
+test('findBlockingPrFollowUp fails closed when the review-thread GraphQL query fails, without returning null', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  global.fetch = async (url) => {
+    if (url.includes('/pulls?state=open')) {
+      return {
+        ok: true,
+        json: async () => [
+          { number: 42, title: 'Adapt runner', body: 'no keyword', head: { ref: 'claude/ops-claude-runner-dell-queue-629' } },
+        ],
+      };
+    }
+    if (url.includes('/pulls/42/reviews')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/issues/42/comments')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/pulls/42')) {
+      return { ok: true, json: async () => ({ number: 42 }) };
+    }
+    if (url.includes('/graphql')) {
+      return { ok: false, status: 502, statusText: 'Bad Gateway', text: async () => 'upstream error' };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  await assert.rejects(
+    () => findBlockingPrFollowUp({ repo: 'TheTekTeam/modelspend', issue: 629, token: 'placeholder-token' }),
+    /GitHub GraphQL request failed/,
+  );
+});
+
+test('findBlockingPrFollowUp fails closed when GitHub reports more review-thread pages than the hard bounded-fetch limit', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  global.fetch = async (url) => {
+    if (url.includes('/pulls?state=open')) {
+      return {
+        ok: true,
+        json: async () => [
+          { number: 42, title: 'Adapt runner', body: 'no keyword', head: { ref: 'claude/ops-claude-runner-dell-queue-629' } },
+        ],
+      };
+    }
+    if (url.includes('/pulls/42/reviews')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/issues/42/comments')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/pulls/42')) {
+      return { ok: true, json: async () => ({ number: 42 }) };
+    }
+    if (url.includes('/graphql')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: true }, nodes: [] } } } },
+        }),
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  await assert.rejects(
+    () => findBlockingPrFollowUp({ repo: 'TheTekTeam/modelspend', issue: 629, token: 'placeholder-token' }),
+    /exceeding the hard bounded-fetch limit/,
+  );
+});
+
+test('findBlockingPrFollowUp does not trigger on resolved-only threads with no CHANGES_REQUESTED review', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  global.fetch = async (url) => {
+    if (url.includes('/pulls?state=open')) {
+      return {
+        ok: true,
+        json: async () => [
+          { number: 42, title: 'Adapt runner', body: 'no keyword', head: { ref: 'claude/ops-claude-runner-dell-queue-629' } },
+        ],
+      };
+    }
+    if (url.includes('/pulls/42/reviews')) {
+      return { ok: true, json: async () => [{ user: { login: 'reviewer' }, state: 'APPROVED', submitted_at: '2026-07-02T10:00:00Z' }] };
+    }
+    if (url.includes('/issues/42/comments')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/pulls/42')) {
+      return { ok: true, json: async () => ({ number: 42 }) };
+    }
+    if (url.includes('/graphql')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [
+                    { id: 'thread-1', isResolved: true, comments: { nodes: [{ author: { login: 'reviewer' }, body: 'was fine', createdAt: '2026-07-01T10:00:00Z' }] } },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  const blocking = await findBlockingPrFollowUp({ repo: 'TheTekTeam/modelspend', issue: 629, token: 'placeholder-token' });
+  assert.equal(blocking, null);
+});
+
+test('findBlockingPrFollowUp does not trigger on a COMMENTED review alone with no unresolved threads', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  global.fetch = async (url) => {
+    if (url.includes('/pulls?state=open')) {
+      return {
+        ok: true,
+        json: async () => [
+          { number: 42, title: 'Adapt runner', body: 'no keyword', head: { ref: 'claude/ops-claude-runner-dell-queue-629' } },
+        ],
+      };
+    }
+    if (url.includes('/pulls/42/reviews')) {
+      return { ok: true, json: async () => [{ user: { login: 'reviewer' }, state: 'COMMENTED', body: 'fyi', submitted_at: '2026-07-02T10:00:00Z' }] };
+    }
+    if (url.includes('/issues/42/comments')) {
+      return { ok: true, json: async () => [{ user: { login: 'someone' }, body: 'just chatting', created_at: '2026-07-02T10:01:00Z' }] };
+    }
+    if (url.includes('/pulls/42')) {
+      return { ok: true, json: async () => ({ number: 42 }) };
+    }
+    if (url.includes('/graphql')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false }, nodes: [] } } } },
+        }),
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  const blocking = await findBlockingPrFollowUp({ repo: 'TheTekTeam/modelspend', issue: 629, token: 'placeholder-token' });
+  assert.equal(blocking, null);
+});
+
+test('findBlockingPrFollowUp bounds every review-thread comment body to a fixed character limit across multiple threads', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  const oversizedBody = 'x'.repeat(5000);
+
+  global.fetch = async (url) => {
+    if (url.includes('/pulls?state=open')) {
+      return {
+        ok: true,
+        json: async () => [
+          { number: 42, title: 'Adapt runner', body: 'no keyword', head: { ref: 'claude/ops-claude-runner-dell-queue-629' } },
+        ],
+      };
+    }
+    if (url.includes('/pulls/42/reviews')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/issues/42/comments')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/pulls/42')) {
+      return { ok: true, json: async () => ({ number: 42 }) };
+    }
+    if (url.includes('/graphql')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [
+                    { id: 'thread-1', isResolved: false, comments: { nodes: [{ author: { login: 'reviewer-a' }, body: oversizedBody, createdAt: '2026-07-01T10:00:00Z' }] } },
+                    { id: 'thread-2', isResolved: false, comments: { nodes: [{ author: { login: 'reviewer-b' }, body: 'short and unresolved', createdAt: '2026-07-01T11:00:00Z' }] } },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  const blocking = await findBlockingPrFollowUp({ repo: 'TheTekTeam/modelspend', issue: 629, token: 'placeholder-token' });
+  assert.ok(blocking);
+  assert.equal(blocking.unresolved.reasons.some((r) => r.startsWith('unresolved-review-threads:2')), true);
+  const bodies = blocking.unresolved.unresolvedComments.map((c) => c.body);
+  assert.ok(bodies.every((body) => body.length <= 2000));
+  assert.ok(bodies.some((body) => body.includes('[truncated]')));
+  assert.ok(bodies.some((body) => body === 'short and unresolved'));
+});
+
+test('runPrFollowUp triggers a direct --pr follow-up plan from an unresolved review thread', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  const dir = mkdtempSync(join(tmpdir(), 'claude-runner-pr-followup-'));
+  t.after(() => { rmSync(dir, { recursive: true, force: true }); });
+
+  global.fetch = async (url) => {
+    if (url.includes('/pulls/42/reviews')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/issues/42/comments')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/pulls/42')) {
+      return {
+        ok: true,
+        json: async () => ({
+          number: 42,
+          title: 'Adapt runner',
+          body: 'Fixes #629',
+          html_url: 'https://github.com/TheTekTeam/modelspend/pull/42',
+          head: { ref: 'claude/ops-claude-runner-dell-queue-629' },
+        }),
+      };
+    }
+    if (url.includes('/graphql')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [
+                    { id: 'thread-1', isResolved: false, comments: { nodes: [{ author: { login: 'reviewer' }, body: 'this needs a fix', createdAt: '2026-07-02T10:05:00Z' }] } },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  const originalLog = console.log;
+  let loggedOutput = '';
+  console.log = (text) => { loggedOutput = text; };
+  t.after(() => { console.log = originalLog; });
+
+  const args = parseArgs(['--pr', '42', '--output-dir', dir]);
+  const exitCode = await runPrFollowUp(args, {}, 'placeholder-token');
+  assert.equal(exitCode, 0);
+
+  const logged = JSON.parse(loggedOutput);
+  assert.equal(logged.mode, 'pr-review-followup');
+  assert.equal(logged.dryRun, true);
+  assert.equal(logged.branch, 'claude/ops-claude-runner-dell-queue-629');
+  assert.ok(logged.reasons.some((r) => r.startsWith('unresolved-review-threads')));
+  assert.ok(existsSync(logged.logPath));
+});
+
+
+test('findBlockingPrFollowUp fails closed when bounded review-thread state is structurally incomplete', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  global.fetch = async (url, options = {}) => {
+    if (url.includes('/pulls?state=open')) {
+      return {
+        ok: true,
+        json: async () => [
+          { number: 42, title: 'Adapt runner', body: 'no keyword', head: { ref: 'claude/ops-claude-runner-dell-queue-629' } },
+        ],
+      };
+    }
+    if (url.includes('/pulls/42/reviews')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/issues/42/comments')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/pulls/42')) {
+      return { ok: true, json: async () => ({ number: 42 }) };
+    }
+    if (url.includes('/graphql')) {
+      const request = JSON.parse(options.body);
+      assert.match(request.query, /reviewThreads\(first: 50\)/);
+      assert.match(request.query, /comments\(last: 20\)/);
+      return {
+        ok: true,
+        json: async () => ({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false },
+                  // nodes intentionally absent: this is not reliable
+                  // evidence that the PR has zero review threads.
+                },
+              },
+            },
+          },
+        }),
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  await assert.rejects(
+    () => findBlockingPrFollowUp({
+      repo: 'TheTekTeam/modelspend',
+      issue: 629,
+      token: 'placeholder-token',
+    }),
+    /missing bounded reviewThreads state/,
+  );
+});
+
+test('findBlockingPrFollowUp fails closed when a review thread lacks explicit resolution state', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+
+  global.fetch = async (url) => {
+    if (url.includes('/pulls?state=open')) {
+      return {
+        ok: true,
+        json: async () => [
+          { number: 42, title: 'Adapt runner', body: 'no keyword', head: { ref: 'claude/ops-claude-runner-dell-queue-629' } },
+        ],
+      };
+    }
+    if (url.includes('/pulls/42/reviews')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/issues/42/comments')) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes('/pulls/42')) {
+      return { ok: true, json: async () => ({ number: 42 }) };
+    }
+    if (url.includes('/graphql')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [
+                    {
+                      id: 'thread-1',
+                      // isResolved intentionally absent.
+                      comments: {
+                        nodes: [
+                          {
+                            author: { login: 'reviewer' },
+                            body: 'action required',
+                            createdAt: '2026-07-02T10:05:00Z',
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+        }),
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+
+  await assert.rejects(
+    () => findBlockingPrFollowUp({
+      repo: 'TheTekTeam/modelspend',
+      issue: 629,
+      token: 'placeholder-token',
+    }),
+    /malformed review thread/,
+  );
 });
 
 test('detectExecutionNoop is a no-op only in --execute mode', () => {
