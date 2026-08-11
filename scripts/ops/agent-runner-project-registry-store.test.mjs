@@ -848,6 +848,88 @@ test('recovery never touches a committed config, an uninterpretable record or an
   assert.equal(readFileSync(outside, 'utf8'), 'operator-owned');
 }));
 
+test('recovery preserves unsafe archive destinations without external filesystem mutation', () => {
+  const scenarios = [
+    {
+      name: 'absolute external destination',
+      destination: (sandbox) => ({
+        path: join(sandbox.home, 'operator-owned-absolute', 'agent-runner.json'),
+        outsideDir: join(sandbox.home, 'operator-owned-absolute'),
+      }),
+    },
+    {
+      name: 'traversal destination outside archive',
+      destination: (sandbox) => ({
+        path: `${sandbox.registryDir}/archived-projects/../../operator-traversal/agent-runner.json`,
+        outsideDir: join(sandbox.home, '.config', 'operator-traversal'),
+      }),
+    },
+    {
+      name: 'nested traversal destination outside archive',
+      destination: (sandbox) => ({
+        path: `${sandbox.registryDir}/archived-projects/nested/../../../operator-nested/agent-runner.json`,
+        outsideDir: join(sandbox.home, '.config', 'operator-nested'),
+      }),
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    withSandbox((sandbox) => {
+      addAgentRunner(sandbox, { enable: true });
+      const configPath = join(sandbox.registryDir, 'projects', 'agent-runner.json');
+      const configBytes = readFileSync(configPath, 'utf8');
+      const intentPath = join(sandbox.registryDir, '.projects.registry.intent');
+
+      crashMutationAfterRename(sandbox, 'remove', sandbox.registryPath);
+
+      const intent = JSON.parse(readFileSync(intentPath, 'utf8'));
+      assert.equal(intent.moves.length, 1, scenario.name);
+      const originalDestination = intent.moves[0].to;
+      const unsafe = scenario.destination(sandbox);
+      intent.moves[0].to = unsafe.path;
+      writeFileSync(intentPath, `${JSON.stringify(intent, null, 2)}\n`);
+
+      const recovered = recoverInterruptedRegistryMutation({ env: sandbox.env });
+
+      assert.equal(recovered.intentFound, true, scenario.name);
+      assert.equal(recovered.reconciled, false, scenario.name);
+      assert.deepEqual(recovered.completedMoves, [], scenario.name);
+      assert.equal(existsSync(intentPath), true, `${scenario.name}: unsafe intent must be preserved`);
+      assert.equal(readFileSync(configPath, 'utf8'), configBytes, `${scenario.name}: source config must remain untouched`);
+      assert.equal(existsSync(originalDestination), false, `${scenario.name}: valid archive target must not be substituted`);
+      assert.equal(existsSync(unsafe.outsideDir), false, `${scenario.name}: no external directory may be created`);
+    });
+  }
+});
+
+test('recovery preserves an intent whose move source escapes the projects boundary', () => withSandbox((sandbox) => {
+  addAgentRunner(sandbox, { enable: true });
+  const configPath = join(sandbox.registryDir, 'projects', 'agent-runner.json');
+  const configBytes = readFileSync(configPath, 'utf8');
+  const intentPath = join(sandbox.registryDir, '.projects.registry.intent');
+
+  crashMutationAfterRename(sandbox, 'remove', sandbox.registryPath);
+
+  const intent = JSON.parse(readFileSync(intentPath, 'utf8'));
+  assert.equal(intent.moves.length, 1);
+  const safeDestination = intent.moves[0].to;
+
+  const outsideSource = join(sandbox.home, 'operator-owned-source.json');
+  writeFileSync(outsideSource, 'operator-owned');
+  intent.moves[0].from = outsideSource;
+  writeFileSync(intentPath, `${JSON.stringify(intent, null, 2)}\n`);
+
+  const recovered = recoverInterruptedRegistryMutation({ env: sandbox.env });
+
+  assert.equal(recovered.intentFound, true);
+  assert.equal(recovered.reconciled, false);
+  assert.deepEqual(recovered.completedMoves, []);
+  assert.equal(existsSync(intentPath), true, 'unsafe source keeps the durable intent for inspection');
+  assert.equal(readFileSync(outsideSource, 'utf8'), 'operator-owned', 'operator-owned source is untouched');
+  assert.equal(readFileSync(configPath, 'utf8'), configBytes, 'real managed source is untouched');
+  assert.equal(existsSync(safeDestination), false, 'no archive move is completed from a substituted source');
+}));
+
 test('generated project config and checkout inspection helpers behave deterministically', () => {
   const config = buildManagedProjectConfig({
     projectId: 'demo',

@@ -412,10 +412,22 @@ function manifestReferencedConfigPaths(paths, fs) {
   return referenced;
 }
 
+function isPathInsideOwnedDir(path, ownedDir) {
+  if (typeof path !== 'string' || path.length === 0 || !isAbsolute(path)) return false;
+  const within = relative(resolve(ownedDir), resolve(path));
+  const normalizedWithin = within.split('\\\\').join('/');
+  return normalizedWithin !== ''
+    && normalizedWithin !== '..'
+    && !normalizedWithin.startsWith('../')
+    && !isAbsolute(within);
+}
+
 function isInsideProjectsDir(path, paths) {
-  if (typeof path !== 'string' || path.length === 0) return false;
-  const within = relative(paths.projectsDir, path);
-  return within !== '' && !within.startsWith('..') && !isAbsolute(within);
+  return isPathInsideOwnedDir(path, paths.projectsDir);
+}
+
+function isInsideArchiveDir(path, paths) {
+  return isPathInsideOwnedDir(path, paths.archiveDir);
 }
 
 /**
@@ -452,14 +464,17 @@ export function recoverInterruptedRegistryMutation({
   const fs = defaultRegistryStoreDeps(deps);
   const resolved = paths ?? resolveManagedRegistryPaths({ env, registryPath });
   const outcome = {
-    swept: sweepStaleRegistryTempFiles(resolved, deps),
+    swept: [],
     intentFound: false,
     reconciled: false,
     archivedConfigs: [],
     completedMoves: [],
   };
 
-  if (!fs.existsFn(resolved.intentPath)) return outcome;
+  if (!fs.existsFn(resolved.intentPath)) {
+    outcome.swept = sweepStaleRegistryTempFiles(resolved, deps);
+    return outcome;
+  }
   outcome.intentFound = true;
 
   let intent;
@@ -474,6 +489,19 @@ export function recoverInterruptedRegistryMutation({
     return outcome;
   }
 
+  // A durable intent is recovery authority. Validate its complete path surface
+  // before sweeping or touching anything: a malformed/tampered record is
+  // preserved exactly for operator inspection or a later compatible build.
+  if (!Array.isArray(intent.creates) || !Array.isArray(intent.moves)) return outcome;
+  if (intent.creates.some((created) => !isInsideProjectsDir(created, resolved))) return outcome;
+  if (intent.moves.some((move) => (
+    !move
+    || !isInsideProjectsDir(move.from, resolved)
+    || !isInsideArchiveDir(move.to, resolved)
+  ))) return outcome;
+
+  outcome.swept = sweepStaleRegistryTempFiles(resolved, deps);
+
   const referenced = manifestReferencedConfigPaths(resolved, fs);
   if (referenced === null) {
     // "Did that transaction commit?" has no safe answer while the manifest is
@@ -482,8 +510,7 @@ export function recoverInterruptedRegistryMutation({
     return outcome;
   }
 
-  for (const created of Array.isArray(intent.creates) ? intent.creates : []) {
-    if (!isInsideProjectsDir(created, resolved)) continue;
+  for (const created of intent.creates) {
     if (!fs.existsFn(created) || referenced.has(created)) continue;
     const archived = nextArchivePath(resolved, isNonEmptyString(intent.projectId) ? intent.projectId : 'interrupted', fs);
     fs.mkdirFn(dirname(archived), { recursive: true, mode: DIR_MODE });
@@ -491,8 +518,7 @@ export function recoverInterruptedRegistryMutation({
     outcome.archivedConfigs.push(archived);
   }
 
-  for (const move of Array.isArray(intent.moves) ? intent.moves : []) {
-    if (!move || !isInsideProjectsDir(move.from, resolved) || !isNonEmptyString(move.to)) continue;
+  for (const move of intent.moves) {
     if (!fs.existsFn(move.from) || referenced.has(move.from) || fs.existsFn(move.to)) continue;
     fs.mkdirFn(dirname(move.to), { recursive: true, mode: DIR_MODE });
     fs.renameFn(move.from, move.to);
