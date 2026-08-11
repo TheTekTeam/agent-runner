@@ -115,6 +115,28 @@ test('prints usage for no subcommand and rejects unknown subcommands and argumen
   assert.equal(JSON.parse(missingValue.stderr).reason, '--project-id requires a value');
 }));
 
+test('the CLI exposes no override for where a project config is written', () => withSandbox(async (sandbox) => {
+  const registryBefore = readFileSync(sandbox.registryPath, 'utf8');
+  const escapeTarget = join(sandbox.home, 'escaped.json');
+
+  for (const argv of [
+    [...ADD_ARGS(sandbox), '--config-path', escapeTarget],
+    [...ADD_ARGS(sandbox), `--config-path=${escapeTarget}`],
+    [...ADD_ARGS(sandbox), '--config-path', '../../escaped.json'],
+  ]) {
+    const result = await run(sandbox, argv);
+    assert.equal(result.code, 2, 'an out-of-directory config path is not even a valid argument');
+    assert.equal(JSON.parse(result.stderr).reason, 'Unknown argument: --config-path');
+    assert.equal(result.stdout, '');
+  }
+
+  assert.match(usageText(), /registry-owned project/);
+  assert.equal(usageText().includes('--config-path'), false);
+  assert.equal(existsSync(escapeTarget), false);
+  assert.equal(existsSync(join(sandbox.registryDir, 'projects', 'agent-runner.json')), false);
+  assert.equal(readFileSync(sandbox.registryPath, 'utf8'), registryBefore);
+}));
+
 test('parses positional ids, valued flags and --flag=value forms', () => {
   assert.deepEqual(parseProjectsArgs(['enable', 'alpha', '--json']), {
     subcommand: 'enable',

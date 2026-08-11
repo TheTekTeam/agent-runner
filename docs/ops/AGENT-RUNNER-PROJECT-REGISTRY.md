@@ -76,7 +76,7 @@ agent-runner projects list [--json] [--verbose]
 agent-runner projects show <project-id> [--json] [--verbose]
 agent-runner projects add --project-id <id> --repo <owner/name> \
   --local-path <absolute checkout path> [--display-name <name>] \
-  [--enable] [--allow-missing-checkout] [--config-path <path>]
+  [--enable] [--allow-missing-checkout]
 agent-runner projects enable <project-id>
 agent-runner projects disable <project-id>
 agent-runner projects remove <project-id>
@@ -115,6 +115,17 @@ and performs no GitHub call at all. A checkout whose `origin` disagrees with
 **Additions are disabled by default.** A project is admitted only when the
 operator passes `--enable`, or later runs `projects enable`.
 
+The generated config is written into the registry-owned project configuration
+directory (`<registry dir>/projects/`) and nowhere else. The CLI exposes no
+override for that location, and the typed library is the boundary that
+enforces it rather than the CLI: `addProject()` resolves any caller-supplied
+config path against `<registry dir>/projects/` and refuses
+(`config-path-outside-registry`) anything that is absolute outside it, escapes
+it through `..`, names a nested directory or names the directory itself. A
+name that is not a bounded lowercase `.json` file name is refused as
+`config-path-invalid`. Both refusals are raised before the mutation lock is
+taken, so no file is created anywhere.
+
 ### Atomic mutation and rollback
 
 Every mutation runs the same sequence:
@@ -122,22 +133,58 @@ Every mutation runs the same sequence:
 1. acquire the machine-local registry mutation lock
    (`<registry dir>/.projects.registry.lock`, reusing the existing recoverable
    lock implementation);
-2. sweep inert staging files left by any interrupted earlier mutation;
+2. sweep inert staging files, then reconcile any mutation an earlier process
+   death interrupted (see below);
 3. load and validate current state through the canonical loader;
 4. build the complete proposed config and registry state in memory;
 5. validate the proposal, including every duplicate-ownership constraint;
-6. stage each file to a restricted temporary file, fsync and atomically
+6. record the mutation's intent durably, before the first rename, whenever it
+   creates or moves a file;
+7. stage each file to a restricted temporary file, fsync and atomically
    rename — project configs first, then the manifest, then any archive move;
-7. re-load and validate the entire resulting registry through
+8. re-load and validate the entire resulting registry through
    `loadProjectRegistry()`;
-8. on any failure, restore the exact prior bytes of every touched file (and
+9. on any failure, restore the exact prior bytes of every touched file (and
    remove files that did not previously exist);
-9. append bounded audit evidence and release the lock.
+10. clear the intent record once the mutation has fully committed or been
+    fully rolled back;
+11. append bounded audit evidence and release the lock.
+
+### Crash and restart recovery
 
 A crash at any point leaves the previous valid registry intact: temporary
 files are never referenced by the manifest, and the manifest is only replaced
 after the config it references is already committed. A scheduler or poller
 therefore never observes a half-added project.
+
+Steps 9 and 10 above only run in a process that survives its own failure. A
+hard process death — SIGKILL, OOM kill, power loss — executes no rollback at
+all, so a mutation that creates or moves a file writes an intent record to
+`<registry dir>/.projects.registry.intent` *before* its first rename. That
+record is the durable evidence the next mutation uses to reconcile, deciding
+against the manifest actually on disk, which is the only admission record any
+reader trusts:
+
+- a recorded project config that reached its final path but that the manifest
+  does not reference is an **uncommitted orphan**. It is moved into
+  `archived-projects/` — never deleted, because this contract owns no
+  destructive path — which preserves the bytes and frees the slot, so it can
+  no longer block a later `add` with `config-path-exists`;
+- a recorded config the manifest *does* reference means the transaction
+  committed before dying, so nothing is reconciled;
+- a recorded archive move whose source the manifest has already dropped is
+  completed, finishing a `remove` that died between its manifest commit and
+  its archive move.
+
+Reconciliation is bounded to paths the record itself names inside
+`<registry dir>/projects/`, is skipped entirely while the manifest is
+unreadable (that question has no safe answer yet), and leaves a record it
+cannot interpret exactly as it is rather than guessing. It runs automatically
+under the mutation lock at the start of every mutation, and is exported as
+`recoverInterruptedRegistryMutation()` for an operator or control service that
+wants to reconcile explicitly. Reads (`list`, `show`, `validate`) never
+reconcile and never mutate. A reconciliation that changed something appends
+one bounded `recover` audit entry.
 
 ### Enable / disable / remove
 

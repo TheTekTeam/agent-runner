@@ -38,7 +38,6 @@ const VALUE_FLAGS = new Map([
   ['--repo', 'githubRepo'],
   ['--local-path', 'localRepoPath'],
   ['--display-name', 'displayName'],
-  ['--config-path', 'configPath'],
 ]);
 
 const BOOLEAN_FLAGS = new Map([
@@ -76,7 +75,10 @@ export function usageText() {
     '  --enable                   add: admit the project immediately',
     '  --allow-missing-checkout   add: register before the checkout exists',
     '  --display-name <name>      add: human-readable project name',
-    '  --config-path <path>       add: explicit project config location',
+    '',
+    'add writes the generated project config into the registry-owned project',
+    'configuration directory (<registry dir>/projects/) and nowhere else;',
+    'there is no operator override for that location.',
     '',
     'add never clones a repository and no subcommand performs any GitHub',
     'mutation. remove is non-destructive: repository checkouts, worktrees,',
@@ -241,7 +243,6 @@ export async function main(
         githubRepo: options.githubRepo,
         localRepoPath: options.localRepoPath,
         displayName: options.displayName ?? null,
-        configPath: options.configPath ?? null,
         enable: options.enable === true,
         allowMissingCheckout: options.allowMissingCheckout === true,
         actor,

@@ -54,14 +54,17 @@ import {
 
 export const PROJECT_REGISTRY_VIEW_SCHEMA_VERSION = 'agent-runner-project-registry-view/v1';
 export const PROJECT_REGISTRY_AUDIT_SCHEMA_VERSION = 'agent-runner-project-registry-audit/v1';
+export const PROJECT_REGISTRY_INTENT_SCHEMA_VERSION = 'agent-runner-project-registry-intent/v1';
 
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
 const TEMP_PREFIX = '.agent-runner-registry-';
 const TEMP_SUFFIX = '.tmp';
+const INTENT_RELATIVE = '.projects.registry.intent';
 const DEFAULT_REGISTRY_RELATIVE = '.config/agent-runner/projects.json';
 const DEFAULT_AUDIT_RELATIVE = '.local/state/agent-runner/project-registry-audit.jsonl';
 const PROJECT_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const PROJECT_CONFIG_FILE_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}\.json$/;
 const GITHUB_REPO_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const MAX_REASON_LENGTH = 256;
 const SCHEDULER_PENDING_REASON = 'scheduler-registry-adoption-pending';
@@ -141,8 +144,59 @@ export function resolveManagedRegistryPaths({ env = process.env, registryPath = 
     projectsDir: join(registryDir, 'projects'),
     archiveDir: join(registryDir, 'archived-projects'),
     lockPath: join(registryDir, '.projects.registry.lock'),
+    intentPath: join(registryDir, INTENT_RELATIVE),
     auditPath: resolveProjectRegistryAuditPath(env),
   });
+}
+
+/**
+ * Resolve where a managed project config is allowed to live.
+ *
+ * The registry owns exactly one directory of project configs
+ * (`<registry dir>/projects/`), and this contract may never create a config
+ * anywhere else. An operator-supplied override is therefore a *file name
+ * inside that directory*, never a path that can reach out of it: absolute
+ * paths, `..` traversal, nested directories and the directory itself are all
+ * refused.
+ *
+ * The check lives here, in the typed library, so the CLI is not the security
+ * boundary — every caller, including a later authenticated control service,
+ * gets the same refusal, and it is raised before any file is created.
+ *
+ * Containment is decided lexically after `resolve()`, which collapses `..`
+ * segments, and the surviving name must be a single `.json` path segment. A
+ * pre-existing symlink at that name cannot redirect the write either: the
+ * atomic writer renames over the name itself rather than opening through it.
+ */
+export function resolveManagedProjectConfigPath({ paths, projectId, configPath = null }) {
+  if (configPath === null || configPath === undefined) {
+    return join(paths.projectsDir, `${projectId}.json`);
+  }
+  if (!isNonEmptyString(configPath)) {
+    throw new ProjectRegistryManagementError(
+      'config-path-invalid',
+      'a supplied project config path must be a non-empty project config file name',
+      { projectId },
+    );
+  }
+
+  const target = resolve(paths.projectsDir, String(configPath));
+  const within = relative(paths.projectsDir, target);
+  if (within === '' || within.startsWith('..') || isAbsolute(within) || within.includes('/') || within.includes('\\')) {
+    throw new ProjectRegistryManagementError(
+      'config-path-outside-registry',
+      'refusing a project config path outside the registry-owned project configuration directory',
+      { projectId },
+    );
+  }
+  if (!PROJECT_CONFIG_FILE_PATTERN.test(within)) {
+    throw new ProjectRegistryManagementError(
+      'config-path-invalid',
+      'a project config file name must be a bounded lowercase .json file name',
+      { projectId },
+    );
+  }
+  return target;
 }
 
 // ---------------------------------------------------------------------------
@@ -271,6 +325,10 @@ function atomicWriteJson(path, value, fs) {
  * files are never referenced by the manifest, so a crash between staging
  * and rename leaves the previous valid registry fully intact; this sweep
  * only reclaims the inert remains on the next mutation.
+ *
+ * The intent record below is deliberately *not* swept here: it is the
+ * durable evidence that lets the next mutation reconcile a transaction that
+ * died after a rename had already landed.
  */
 export function sweepStaleRegistryTempFiles(paths, deps = {}) {
   const fs = defaultRegistryStoreDeps(deps);
@@ -287,6 +345,176 @@ export function sweepStaleRegistryTempFiles(paths, deps = {}) {
     }
   }
   return swept;
+}
+
+// ---------------------------------------------------------------------------
+// Durable interrupted-transaction recovery
+//
+// Atomic rename plus in-process rollback only covers failures the mutating
+// process survives. A hard process death (SIGKILL, power loss, OOM kill)
+// between two renames executes no rollback at all, so a mutation that creates
+// or moves a file records its intent durably *before* the first rename and
+// clears it only once the transaction has fully committed or been fully
+// rolled back. A surviving record is the sole evidence the next mutation
+// needs to decide, from the manifest actually on disk, whether that
+// transaction committed — and to reconcile it if it did not.
+// ---------------------------------------------------------------------------
+
+function buildMutationIntent({ action, projectId, plan, snapshot }) {
+  const existedBefore = new Map(snapshot.map((entry) => [entry.path, entry.existed]));
+  return {
+    schemaVersion: PROJECT_REGISTRY_INTENT_SCHEMA_VERSION,
+    action,
+    projectId: projectId ?? null,
+    // Only genuine creations are reclaimable: a path that already existed
+    // belongs to the prior committed state and is never reclaimed here.
+    creates: plan.configWrites
+      .map((write) => write.path)
+      .filter((path) => existedBefore.get(path) === false),
+    moves: plan.archiveMoves.map((move) => ({ from: move.from, to: move.to })),
+  };
+}
+
+function writeMutationIntent(paths, intent, fs) {
+  // Admission-only mutations (enable/disable/set-default) create and move
+  // nothing, so a single atomic manifest replacement already covers them and
+  // no record is written.
+  if (intent.creates.length === 0 && intent.moves.length === 0) return false;
+  atomicWriteJson(paths.intentPath, intent, fs);
+  return true;
+}
+
+function clearMutationIntent(paths, fs) {
+  try {
+    if (fs.existsFn(paths.intentPath)) fs.unlinkFn(paths.intentPath);
+  } catch { /* a surviving record is reconciled by the next mutation */ }
+}
+
+/**
+ * Config paths the manifest *currently on disk* admits, resolved absolutely.
+ * `null` means the question cannot be answered safely right now (unreadable
+ * or malformed manifest), which is never treated as "nothing is committed".
+ */
+function manifestReferencedConfigPaths(paths, fs) {
+  if (!fs.existsFn(paths.registryPath)) return new Set();
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFn(paths.registryPath, 'utf8'));
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object' || !Array.isArray(parsed.projects)) return null;
+  const referenced = new Set();
+  for (const entry of parsed.projects) {
+    if (!entry || !isNonEmptyString(entry.configPath)) return null;
+    referenced.add(resolve(paths.registryDir, entry.configPath));
+  }
+  return referenced;
+}
+
+function isInsideProjectsDir(path, paths) {
+  if (typeof path !== 'string' || path.length === 0) return false;
+  const within = relative(paths.projectsDir, path);
+  return within !== '' && !within.startsWith('..') && !isAbsolute(within);
+}
+
+/**
+ * Reconcile a mutation that a process death interrupted, then clear its
+ * record. Runs under the registry mutation lock at the start of every
+ * mutation, and is exported so an operator or control service can reconcile
+ * explicitly after a crash.
+ *
+ * The decision is made against the manifest on disk, which is the only
+ * admission record any reader trusts:
+ *
+ * - a recorded config that reached its final path but that the manifest does
+ *   not reference is an *uncommitted orphan*. It is archived — never deleted,
+ *   because this contract owns no destructive path — which both preserves the
+ *   bytes and frees the slot, so it can no longer block a later `add` with
+ *   `config-path-exists`;
+ * - a recorded config the manifest *does* reference means the transaction
+ *   committed before dying, so nothing is reconciled;
+ * - a recorded archive move whose source the manifest has already dropped is
+ *   completed, finishing a `remove` that died between the manifest commit and
+ *   its archive move.
+ *
+ * Every action is bounded to paths the record itself names inside the
+ * registry-owned project config directory.
+ */
+export function recoverInterruptedRegistryMutation({
+  env = process.env,
+  registryPath = null,
+  paths = null,
+  actor = null,
+  source = 'operator-cli',
+  deps = {},
+} = {}) {
+  const fs = defaultRegistryStoreDeps(deps);
+  const resolved = paths ?? resolveManagedRegistryPaths({ env, registryPath });
+  const outcome = {
+    swept: sweepStaleRegistryTempFiles(resolved, deps),
+    intentFound: false,
+    reconciled: false,
+    archivedConfigs: [],
+    completedMoves: [],
+  };
+
+  if (!fs.existsFn(resolved.intentPath)) return outcome;
+  outcome.intentFound = true;
+
+  let intent;
+  try {
+    intent = JSON.parse(fs.readFn(resolved.intentPath, 'utf8'));
+  } catch {
+    intent = null;
+  }
+  if (!intent || intent.schemaVersion !== PROJECT_REGISTRY_INTENT_SCHEMA_VERSION) {
+    // A record this build cannot interpret is left exactly as it is: acting
+    // on a transaction of unknown shape could destroy operator data.
+    return outcome;
+  }
+
+  const referenced = manifestReferencedConfigPaths(resolved, fs);
+  if (referenced === null) {
+    // "Did that transaction commit?" has no safe answer while the manifest is
+    // unreadable. The record is kept for the next attempt, and the mutation
+    // about to run refuses with a bounded registry reason anyway.
+    return outcome;
+  }
+
+  for (const created of Array.isArray(intent.creates) ? intent.creates : []) {
+    if (!isInsideProjectsDir(created, resolved)) continue;
+    if (!fs.existsFn(created) || referenced.has(created)) continue;
+    const archived = nextArchivePath(resolved, isNonEmptyString(intent.projectId) ? intent.projectId : 'interrupted', fs);
+    fs.mkdirFn(dirname(archived), { recursive: true, mode: DIR_MODE });
+    fs.renameFn(created, archived);
+    outcome.archivedConfigs.push(archived);
+  }
+
+  for (const move of Array.isArray(intent.moves) ? intent.moves : []) {
+    if (!move || !isInsideProjectsDir(move.from, resolved) || !isNonEmptyString(move.to)) continue;
+    if (!fs.existsFn(move.from) || referenced.has(move.from) || fs.existsFn(move.to)) continue;
+    fs.mkdirFn(dirname(move.to), { recursive: true, mode: DIR_MODE });
+    fs.renameFn(move.from, move.to);
+    outcome.completedMoves.push(move.to);
+  }
+
+  outcome.reconciled = outcome.archivedConfigs.length > 0 || outcome.completedMoves.length > 0;
+  clearMutationIntent(resolved, fs);
+
+  if (outcome.reconciled) {
+    appendProjectRegistryAuditEntry({
+      action: 'recover',
+      projectId: isNonEmptyString(intent.projectId) ? intent.projectId : null,
+      actor: actor ?? resolveOperatorActor(env),
+      source,
+      outcome: 'ok',
+      reason: 'interrupted-mutation-reconciled',
+      path: resolved.auditPath,
+      deps,
+    });
+  }
+  return outcome;
 }
 
 // ---------------------------------------------------------------------------
@@ -614,7 +842,10 @@ function withRegistryMutation({ paths, action, actor, source, subjectProjectId =
   let beforeDigest = null;
 
   try {
-    sweepStaleRegistryTempFiles(paths, deps);
+    // Before anything is read or planned, finish or discard whatever an
+    // interrupted earlier mutation left behind, so this mutation plans
+    // against a reconciled filesystem.
+    recoverInterruptedRegistryMutation({ paths, actor, source, deps });
     const current = readCurrentRegistryState(paths, fs);
     beforeDigest = current.digest;
 
@@ -638,6 +869,13 @@ function withRegistryMutation({ paths, action, actor, source, subjectProjectId =
     proposedSelectionCheck({ manifest: plan.proposedManifest, entries: plan.proposedEntries });
 
     const journal = snapshotTargets(plan, paths, fs);
+    // Durable intent first: after this point a process death is reconcilable
+    // by the next mutation even though no rollback can run.
+    const intentWritten = writeMutationIntent(
+      paths,
+      buildMutationIntent({ action, projectId, plan, snapshot: journal }),
+      fs,
+    );
     try {
       applyPlan(plan, paths, fs);
       // Full canonical re-load of the resulting registry, exactly as the
@@ -645,6 +883,9 @@ function withRegistryMutation({ paths, action, actor, source, subjectProjectId =
       fs.loadRegistry({ registryPath: paths.registryPath });
     } catch (error) {
       const failures = restoreSnapshot(journal, fs);
+      // A complete rollback leaves nothing to reconcile. A partial one keeps
+      // its record so the next mutation can still finish the job.
+      if (intentWritten && failures.length === 0) clearMutationIntent(paths, fs);
       const reason = resolveApplyFailureReason(error);
       appendProjectRegistryAuditEntry({
         action, projectId, githubRepo, actor, source, beforeDigest,
@@ -667,6 +908,9 @@ function withRegistryMutation({ paths, action, actor, source, subjectProjectId =
         { rolledBack: true },
       );
     }
+
+    // Committed and revalidated: the record has no further job to do.
+    if (intentWritten) clearMutationIntent(paths, fs);
 
     const afterDigest = digestOfFile(paths.registryPath, fs);
     appendProjectRegistryAuditEntry({
@@ -855,6 +1099,10 @@ export function addProject({
   const fs = defaultRegistryStoreDeps(deps);
   const resolvedActor = actor ?? resolveOperatorActor(env);
 
+  // Containment is settled before anything is inspected, staged or written, so
+  // an out-of-directory config path can never reach the filesystem.
+  const targetConfigPath = resolveManagedProjectConfigPath({ paths, projectId, configPath });
+
   const checkout = inspectLocalCheckout({ localRepoPath, githubRepo, allowMissingCheckout, deps });
 
   const proposedConfigRaw = buildManagedProjectConfig({ projectId, displayName, githubRepo, localRepoPath, env });
@@ -867,8 +1115,6 @@ export function addProject({
       `generated project config is incomplete: ${error.message}`,
     );
   }
-
-  const targetConfigPath = configPath ? resolve(configPath) : join(paths.projectsDir, `${projectId}.json`);
 
   return withRegistryMutation({ paths, action: 'add', actor: resolvedActor, source, subjectProjectId: projectId, deps }, (current) => {
     if (current.entries.some((entry) => entry.config.projectId === projectId)) {

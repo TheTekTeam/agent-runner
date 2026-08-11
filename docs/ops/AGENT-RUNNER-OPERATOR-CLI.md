@@ -235,9 +235,17 @@ mutation, rollback, remove and audit semantics.
 
 `list`, `show` and `validate` are read-only. `add`, `enable`, `disable`,
 `remove` and `set-default` mutate the registry atomically under one machine-
-local lock. Every subcommand refuses to run as root (`root-not-permitted`),
-never clones a repository, never performs a GitHub mutation, and never
-starts, stops, installs or alters a systemd unit, timer or service.
+local lock, and reconcile any mutation a previous process death interrupted
+before they plan their own. Every subcommand refuses to run as root
+(`root-not-permitted`), never clones a repository, never performs a GitHub
+mutation, and never starts, stops, installs or alters a systemd unit, timer
+or service.
+
+`add` writes the generated project config into the registry-owned project
+configuration directory (`<registry dir>/projects/`). There is no CLI flag
+for that location, and the containment rule is enforced by the typed library
+rather than by this command, so no caller can place a project config
+elsewhere.
 
 | Exit | Meaning |
 | --- | --- |

@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -20,6 +22,7 @@ import {
   inspectLocalCheckout,
   listProjects,
   parseGitRemoteRepository,
+  recoverInterruptedRegistryMutation,
   removeProject,
   setDefaultProject,
   setProjectEnabled,
@@ -602,6 +605,248 @@ test('enable can repair a registry that currently admits no project', () => with
   setProjectEnabled({ env: sandbox.env, projectId: 'modelspend', enabled: true });
   assert.equal(loadProjectRegistry({ registryPath: sandbox.registryPath }).projects.length, 1);
 }, { seedEnabled: false, defaultProjectId: null }));
+
+// ---------------------------------------------------------------------------
+// Project config containment.
+//
+// The registry owns exactly one project config directory. These cases prove
+// the *typed library* refuses every way of naming a target outside it, and
+// that a refusal creates nothing anywhere.
+// ---------------------------------------------------------------------------
+
+test('the typed contract refuses every project config path outside the registry-owned directory without creating anything', () => withSandbox((sandbox) => {
+  const projectsDir = join(sandbox.registryDir, 'projects');
+  const registryBefore = readFileSync(sandbox.registryPath, 'utf8');
+  const escapeTarget = join(tmpdir(), `agent-runner-registry-escape-${process.pid}.json`);
+
+  const refusals = [
+    // Absolute paths, entirely outside the registry.
+    [escapeTarget, 'config-path-outside-registry'],
+    [join(sandbox.home, 'escaped.json'), 'config-path-outside-registry'],
+    ['/etc/agent-runner-escaped.json', 'config-path-outside-registry'],
+    // Absolute paths inside the registry directory but outside the config
+    // directory -- including the manifest itself.
+    [join(sandbox.registryDir, 'escaped.json'), 'config-path-outside-registry'],
+    [sandbox.registryPath, 'config-path-outside-registry'],
+    // Path traversal out of the config directory.
+    ['../escaped.json', 'config-path-outside-registry'],
+    ['../../../escaped.json', 'config-path-outside-registry'],
+    ['./../projects.json', 'config-path-outside-registry'],
+    ['sub/../../escaped.json', 'config-path-outside-registry'],
+    ['../archived-projects/escaped.json', 'config-path-outside-registry'],
+    // The config directory itself, and nested locations inside it.
+    ['.', 'config-path-outside-registry'],
+    ['', 'config-path-invalid'],
+    ['nested/escaped.json', 'config-path-outside-registry'],
+    // Anything that is not a bounded project config file name.
+    ['   ', 'config-path-invalid'],
+    ['UPPER.json', 'config-path-invalid'],
+    ['escaped.txt', 'config-path-invalid'],
+    ['.hidden.json', 'config-path-invalid'],
+    [42, 'config-path-invalid'],
+  ];
+
+  for (const [configPath, expected] of refusals) {
+    assert.throws(
+      () => addAgentRunner(sandbox, { configPath }),
+      (error) => error instanceof ProjectRegistryManagementError && error.code === expected,
+      `expected ${expected} for ${JSON.stringify(configPath)}`,
+    );
+  }
+
+  // Nothing was created at any refused target, inside or outside the registry.
+  assert.equal(existsSync(escapeTarget), false);
+  assert.equal(existsSync('/etc/agent-runner-escaped.json'), false);
+  assert.equal(existsSync(join(sandbox.home, 'escaped.json')), false);
+  assert.equal(existsSync(join(sandbox.registryDir, 'escaped.json')), false);
+  assert.deepEqual(readdirSync(projectsDir), ['modelspend.json'], 'the config directory gained no file');
+  assert.deepEqual(readdirSync(sandbox.registryDir).sort(), ['projects', 'projects.json']);
+  assert.equal(readFileSync(sandbox.registryPath, 'utf8'), registryBefore, 'the manifest is byte-identical');
+  assert.equal(
+    existsSync(sandbox.auditPath),
+    false,
+    'a refusal raised before the mutation lock records no mutation at all',
+  );
+}));
+
+test('an explicitly supplied project config file name is accepted only because it stays inside the registry-owned directory', () => {
+  withSandbox((sandbox) => {
+    assert.equal(addAgentRunner(sandbox, { configPath: 'agent-runner-alt.json', enable: true }).changed, true);
+    assert.equal(existsSync(join(sandbox.registryDir, 'projects', 'agent-runner-alt.json')), true);
+    const manifest = JSON.parse(readFileSync(sandbox.registryPath, 'utf8'));
+    assert.equal(manifest.projects.at(-1).configPath, 'projects/agent-runner-alt.json');
+    assert.equal(loadProjectRegistry({ registryPath: sandbox.registryPath }).projects.length, 2);
+  });
+
+  // The same target named by its absolute canonical path is the same
+  // contained file, and is accepted for exactly that reason.
+  withSandbox((sandbox) => {
+    const absolute = join(sandbox.registryDir, 'projects', 'agent-runner-alt.json');
+    assert.equal(addAgentRunner(sandbox, { configPath: absolute }).changed, true);
+    assert.equal(existsSync(absolute), true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Crash/restart recovery.
+//
+// These tests kill a real mutation process with SIGKILL, which no handler can
+// catch: no exception is thrown, so no rollback, no `finally` and no lock
+// release runs. Recovery therefore has to happen on the *next* run against
+// whatever the dead process left on disk.
+// ---------------------------------------------------------------------------
+
+const STORE_MODULE_URL = new URL('./agent-runner-project-registry-store.mjs', import.meta.url).href;
+
+const CRASHING_MUTATION_SCRIPT = `import { renameSync } from 'node:fs';
+
+const [moduleUrl, home, action, checkout, killAfterPath] = process.argv.slice(2);
+const store = await import(moduleUrl);
+const deps = {
+  runGit: (args) => (args.includes('--is-inside-work-tree') ? 'true' : 'git@github.com:TheTekTeam/agent-runner.git'),
+  renameFn: (from, to) => {
+    renameSync(from, to);
+    if (to === killAfterPath) process.kill(process.pid, 'SIGKILL');
+  },
+};
+
+if (action === 'add') {
+  store.addProject({
+    env: { HOME: home },
+    projectId: 'agent-runner',
+    githubRepo: 'TheTekTeam/agent-runner',
+    localRepoPath: checkout,
+    enable: true,
+    deps,
+  });
+} else {
+  store.removeProject({ env: { HOME: home }, projectId: 'agent-runner', deps });
+}
+`;
+
+/** Run a real mutation in a separate process and kill it dead mid-transaction. */
+function crashMutationAfterRename(sandbox, action, killAfterPath) {
+  const scriptPath = join(sandbox.home, 'crashing-mutation.mjs');
+  writeFileSync(scriptPath, CRASHING_MUTATION_SCRIPT);
+  const child = spawnSync(
+    process.execPath,
+    [scriptPath, STORE_MODULE_URL, sandbox.home, action, sandbox.agentRunnerCheckout, killAfterPath],
+    { encoding: 'utf8' },
+  );
+  assert.equal(child.signal, 'SIGKILL', `the mutation process was expected to die outright: ${child.stderr}`);
+  rmSync(scriptPath);
+  return child;
+}
+
+test('a process killed after the new project config reached its final path is recovered on restart', () => withSandbox((sandbox) => {
+  const configPath = join(sandbox.registryDir, 'projects', 'agent-runner.json');
+  const intentPath = join(sandbox.registryDir, '.projects.registry.intent');
+  const registryBefore = readFileSync(sandbox.registryPath, 'utf8');
+
+  crashMutationAfterRename(sandbox, 'add', configPath);
+
+  // The state a hard crash actually leaves: the config is committed at its
+  // final path, the manifest never admitted it, and nothing was rolled back.
+  const orphanBytes = readFileSync(configPath, 'utf8');
+  assert.equal(readFileSync(sandbox.registryPath, 'utf8'), registryBefore, 'the manifest never admitted the project');
+  assert.equal(existsSync(intentPath), true, 'the interrupted mutation left its durable record behind');
+  assert.deepEqual(
+    loadProjectRegistry({ registryPath: sandbox.registryPath }).projects.map((project) => project.projectId),
+    ['modelspend'],
+    'the registry a scheduler reads is unchanged and still valid',
+  );
+  assert.equal(listProjects({ env: sandbox.env }).projects.length, 1, 'the orphan is invisible to readers');
+
+  // Restart. Onboarding the same project must not be blocked by the orphan,
+  // and the dead process's lock must not block it either.
+  const result = addAgentRunner(sandbox, { enable: true });
+  assert.equal(result.ok, true);
+  assert.equal(result.changed, true);
+
+  assert.equal(existsSync(intentPath), false, 'the record is cleared once it has been reconciled');
+  assert.equal(
+    readFileSync(join(sandbox.registryDir, 'archived-projects', 'agent-runner.json'), 'utf8'),
+    orphanBytes,
+    'the uncommitted orphan was archived, never deleted',
+  );
+  assert.deepEqual(
+    loadProjectRegistry({ registryPath: sandbox.registryPath }).projects.map((project) => project.projectId).sort(),
+    ['agent-runner', 'modelspend'],
+  );
+  assert.equal(validateRegistry({ env: sandbox.env }).ok, true);
+
+  const recovered = readAudit(sandbox.auditPath).filter((entry) => entry.action === 'recover');
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].outcome, 'ok');
+  assert.equal(recovered[0].reason, 'interrupted-mutation-reconciled');
+  assert.equal(recovered[0].projectId, 'agent-runner');
+}));
+
+test('a process killed between the manifest commit and the archive move it still owed is reconciled on restart', () => withSandbox((sandbox) => {
+  addAgentRunner(sandbox, { enable: true });
+  const configPath = join(sandbox.registryDir, 'projects', 'agent-runner.json');
+  const configBytes = readFileSync(configPath, 'utf8');
+  const intentPath = join(sandbox.registryDir, '.projects.registry.intent');
+
+  crashMutationAfterRename(sandbox, 'remove', sandbox.registryPath);
+
+  // The manifest commit landed; the archive move it still owed did not.
+  assert.deepEqual(
+    loadProjectRegistry({ registryPath: sandbox.registryPath }).projects.map((project) => project.projectId),
+    ['modelspend'],
+  );
+  assert.equal(existsSync(configPath), true, 'the withdrawn config still occupies its slot');
+  assert.equal(existsSync(intentPath), true);
+
+  // Restart: re-onboarding the same project completes the owed move first.
+  assert.equal(addAgentRunner(sandbox, { enable: true }).changed, true);
+  assert.equal(existsSync(intentPath), false);
+  assert.equal(
+    readFileSync(join(sandbox.registryDir, 'archived-projects', 'agent-runner.json'), 'utf8'),
+    configBytes,
+    'the owed archive move was completed instead of the config being lost or overwritten',
+  );
+  assert.equal(validateRegistry({ env: sandbox.env }).ok, true);
+}));
+
+test('recovery never touches a committed config, an uninterpretable record or anything outside the registry', () => withSandbox((sandbox) => {
+  addAgentRunner(sandbox, { enable: true });
+  const configPath = join(sandbox.registryDir, 'projects', 'agent-runner.json');
+  const configBytes = readFileSync(configPath, 'utf8');
+  const intentPath = join(sandbox.registryDir, '.projects.registry.intent');
+  const writeIntent = (creates) => writeFileSync(intentPath, `${JSON.stringify({
+    schemaVersion: 'agent-runner-project-registry-intent/v1',
+    action: 'add',
+    projectId: 'agent-runner',
+    creates,
+    moves: [],
+  })}\n`);
+
+  // A config the manifest already admits means the transaction committed
+  // before dying, so there is nothing to reclaim.
+  writeIntent([configPath]);
+  const committed = recoverInterruptedRegistryMutation({ env: sandbox.env });
+  assert.equal(committed.intentFound, true);
+  assert.equal(committed.reconciled, false);
+  assert.deepEqual(committed.archivedConfigs, []);
+  assert.equal(readFileSync(configPath, 'utf8'), configBytes);
+  assert.equal(existsSync(intentPath), false);
+  assert.equal(loadProjectRegistry({ registryPath: sandbox.registryPath }).projects.length, 2);
+
+  // An unreadable record is left exactly as it is rather than guessed at.
+  writeFileSync(intentPath, '{not json');
+  assert.equal(recoverInterruptedRegistryMutation({ env: sandbox.env }).reconciled, false);
+  assert.equal(existsSync(intentPath), true, 'an uninterpretable record is never acted on');
+  rmSync(intentPath);
+
+  // A record naming a path outside the registry-owned config directory is
+  // ignored: recovery is bounded to the directory this contract owns.
+  const outside = join(sandbox.home, 'operator-owned.json');
+  writeFileSync(outside, 'operator-owned');
+  writeIntent([outside]);
+  assert.deepEqual(recoverInterruptedRegistryMutation({ env: sandbox.env }).archivedConfigs, []);
+  assert.equal(readFileSync(outside, 'utf8'), 'operator-owned');
+}));
 
 test('generated project config and checkout inspection helpers behave deterministically', () => {
   const config = buildManagedProjectConfig({
