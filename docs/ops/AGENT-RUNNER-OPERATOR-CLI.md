@@ -13,6 +13,7 @@ agent-runner doctor --project modelspend
 agent-runner queue explain --project modelspend
 agent-runner queue repair --incident <id> [--dry-run|--execute]
 agent-runner status --json
+agent-runner projects <list|show|add|enable|disable|remove|set-default|validate>
 ```
 
 All commands accept `--config <path>` to select a project config file
@@ -213,6 +214,7 @@ whatever exit code the dispatched command module returns.
 ```
 bin/agent-runner
 scripts/ops/agent-runner-cli.mjs               (+ .test.mjs)
+scripts/ops/agent-runner-projects-command.mjs   (+ .test.mjs)
 scripts/ops/agent-runner-operator-doctor.mjs    (+ .test.mjs)
 scripts/ops/agent-runner-queue-explain.mjs      (+ .test.mjs)
 scripts/ops/agent-runner-operator-status.mjs    (+ .test.mjs)
@@ -221,3 +223,29 @@ docs/ops/AGENT-RUNNER-OPERATOR-CLI.md
 
 No canonical scheduler, admission, queue-repair, state, or dashboard module
 was edited to implement this issue.
+
+## `projects` (issue #177)
+
+`agent-runner projects` is the machine-local project registry management
+surface. It dispatches to `agent-runner-projects-command.mjs`, which holds no
+registry policy of its own and calls only the typed contract in
+`agent-runner-project-registry-store.mjs`. See
+[`AGENT-RUNNER-PROJECT-REGISTRY.md`](AGENT-RUNNER-PROJECT-REGISTRY.md) for the
+mutation, rollback, remove and audit semantics.
+
+`list`, `show` and `validate` are read-only. `add`, `enable`, `disable`,
+`remove` and `set-default` mutate the registry atomically under one machine-
+local lock. Every subcommand refuses to run as root (`root-not-permitted`),
+never clones a repository, never performs a GitHub mutation, and never
+starts, stops, installs or alters a systemd unit, timer or service.
+
+| Exit | Meaning |
+| --- | --- |
+| `0` | Command succeeded (including an idempotent no-change enable/disable) |
+| `1` | Fail-closed refusal or mutation failure; stderr carries a bounded `reason` code |
+| `2` | Usage error, or a root execution refusal |
+
+`validate` returns `1` when the registry is invalid, so it is usable as a
+gate. Failure output is a bounded `{ "ok": false, "reason": "<code>" }`
+envelope; raw validator text (which can embed absolute machine paths) is only
+added under an explicit local `--verbose`.
