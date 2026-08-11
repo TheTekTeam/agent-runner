@@ -896,13 +896,144 @@ async function fetchOpenPullRequests({ repo, token }) {
   return githubJson('/pulls?state=open&per_page=50', token, repo);
 }
 
+async function githubGraphQL(query, variables, token) {
+  const response = await fetch('https://api.github.com/graphql', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'modelspend-claude-runner',
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`GitHub GraphQL request failed ${response.status} ${response.statusText}: ${body.slice(0, 500)}`);
+  }
+  const payload = await response.json();
+  if (Array.isArray(payload.errors) && payload.errors.length > 0) {
+    throw new Error(`GitHub GraphQL request returned errors: ${JSON.stringify(payload.errors).slice(0, 500)}`);
+  }
+  return payload.data;
+}
+
+// Hard bounds on review-thread fetching, enforced fail-closed: a single
+// fixed page of threads and comments per thread, with every comment body
+// truncated before it enters detector/prompt context. There is no
+// cursor-progress loop — if GitHub reports more pages than this bound
+// allows, fetchPullRequestReviewThreads() throws rather than truncating
+// silently or paginating indefinitely.
+const REVIEW_THREADS_PAGE_LIMIT = 50;
+const REVIEW_THREAD_COMMENTS_LIMIT = 20;
+const REVIEW_THREAD_COMMENT_BODY_MAX_CHARS = 2000;
+
+// Fixed, bounded GraphQL query: positively selects only the review-thread
+// resolution state and bounded comment context the follow-up detector/prompt
+// needs. No arbitrary/parameterized query surface is exposed to callers.
+const REVIEW_THREADS_QUERY = `
+query($owner: String!, $name: String!, $pr: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: ${REVIEW_THREADS_PAGE_LIMIT}) {
+        pageInfo { hasNextPage }
+        nodes {
+          id
+          isResolved
+          comments(last: ${REVIEW_THREAD_COMMENTS_LIMIT}) {
+            nodes {
+              author { login }
+              body
+              createdAt
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+function boundCommentBody(body) {
+  const text = String(body || '');
+  if (text.length <= REVIEW_THREAD_COMMENT_BODY_MAX_CHARS) return text;
+  const marker = '… [truncated]';
+  const retainedChars = Math.max(0, REVIEW_THREAD_COMMENT_BODY_MAX_CHARS - marker.length);
+  return `${text.slice(0, retainedChars)}${marker}`;
+}
+
+/**
+ * Fetch review-thread resolution state via a single fixed, bounded GraphQL
+ * page. Throws on any failure (network, HTTP, GraphQL errors, a missing
+ * reviewThreads field, or a PR reporting more threads than the single
+ * allowed page can hold) so callers fail closed rather than silently
+ * treating an unavailable or truncated thread query as "no unresolved
+ * threads".
+ */
+async function fetchPullRequestReviewThreads({ repo, pr, token }) {
+  const [owner, name] = String(repo).split('/');
+  if (!owner || !name) throw new Error(`Invalid repo "${repo}" for review-thread query`);
+  const data = await githubGraphQL(REVIEW_THREADS_QUERY, { owner, name, pr }, token);
+  const reviewThreads = data?.repository?.pullRequest?.reviewThreads;
+  if (
+    !reviewThreads
+    || !Array.isArray(reviewThreads.nodes)
+    || typeof reviewThreads.pageInfo?.hasNextPage !== 'boolean'
+  ) {
+    throw new Error(`GitHub GraphQL response missing bounded reviewThreads state for ${repo}#${pr}`);
+  }
+  if (reviewThreads.pageInfo.hasNextPage) {
+    throw new Error(
+      `GitHub reports more than ${REVIEW_THREADS_PAGE_LIMIT} review threads for ${repo}#${pr}, exceeding the hard bounded-fetch limit; refusing to paginate`,
+    );
+  }
+
+  return reviewThreads.nodes.map((node, threadIndex) => {
+    if (
+      !node
+      || typeof node.id !== 'string'
+      || node.id.length === 0
+      || typeof node.isResolved !== 'boolean'
+      || !Array.isArray(node.comments?.nodes)
+    ) {
+      throw new Error(
+        `GitHub GraphQL response contains malformed review thread at index ${threadIndex} for ${repo}#${pr}`,
+      );
+    }
+
+    const comments = node.comments.nodes.map((comment, commentIndex) => {
+      if (
+        !comment
+        || typeof comment.body !== 'string'
+        || typeof comment.createdAt !== 'string'
+        || (comment.author !== null && typeof comment.author !== 'object')
+      ) {
+        throw new Error(
+          `GitHub GraphQL response contains malformed review-thread comment at thread ${threadIndex}, comment ${commentIndex} for ${repo}#${pr}`,
+        );
+      }
+
+      return {
+        author: { login: comment.author?.login || 'unknown' },
+        body: boundCommentBody(comment.body),
+        createdAt: comment.createdAt,
+      };
+    });
+
+    return {
+      id: node.id,
+      isResolved: node.isResolved,
+      comments,
+    };
+  });
+}
+
 async function fetchPullRequestReviewContext({ repo, pr, token }) {
-  const [pullRequest, reviews, comments] = await Promise.all([
+  const [pullRequest, reviews, comments, reviewThreads] = await Promise.all([
     githubJson(`/pulls/${pr}`, token, repo),
     githubJson(`/pulls/${pr}/reviews?per_page=100`, token, repo),
     githubJson(`/issues/${pr}/comments?per_page=100`, token, repo),
+    fetchPullRequestReviewThreads({ repo, pr, token }),
   ]);
-  return { pullRequest, reviews, comments };
+  return { pullRequest, reviews, comments, reviewThreads };
 }
 
 /**
@@ -918,8 +1049,8 @@ export async function findBlockingPrFollowUp({ repo, issue, token }) {
   });
 
   for (const candidate of candidates) {
-    const { reviews, comments } = await fetchPullRequestReviewContext({ repo, pr: candidate.number, token });
-    const unresolved = detectUnresolvedReviewFollowUp({ reviews, reviewThreads: [], comments });
+    const { reviews, comments, reviewThreads } = await fetchPullRequestReviewContext({ repo, pr: candidate.number, token });
+    const unresolved = detectUnresolvedReviewFollowUp({ reviews, reviewThreads, comments });
     if (unresolved.hasUnresolvedFollowUp) {
       return { pr: candidate, unresolved };
     }
@@ -1533,9 +1664,9 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
   return result.status === null ? 1 : result.status;
 }
 
-async function runPrFollowUp(args, env, token) {
-  const { pullRequest, reviews, comments } = await fetchPullRequestReviewContext({ repo: args.repo, pr: args.pr, token });
-  const unresolved = detectUnresolvedReviewFollowUp({ reviews, reviewThreads: [], comments });
+export async function runPrFollowUp(args, env, token) {
+  const { pullRequest, reviews, comments, reviewThreads } = await fetchPullRequestReviewContext({ repo: args.repo, pr: args.pr, token });
+  const unresolved = detectUnresolvedReviewFollowUp({ reviews, reviewThreads, comments });
   const branch = pullRequest.head?.ref || '(unknown branch)';
   const linkedIssue = linkedIssueNumberFromPr({ body: pullRequest.body, title: pullRequest.title });
 
