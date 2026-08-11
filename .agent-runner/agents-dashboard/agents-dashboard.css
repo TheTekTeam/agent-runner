@@ -123,6 +123,13 @@
 /* ── base ────────────────────────────────────────────────────────── */
 * { box-sizing: border-box; }
 
+/*
+ * `hidden` is application state, not a styling suggestion.
+ * Component display rules must never make a logically hidden login view,
+ * shell, panel, drawer, backdrop, error or link visible.
+ */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;

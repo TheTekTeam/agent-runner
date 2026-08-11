@@ -171,6 +171,7 @@
       <section class="card" aria-labelledby="attention-list-heading">
         <div class="card-head">
           <h2 id="attention-list-heading">Requires operator action</h2>
+          <a class="link-quiet" href="#activity" data-nav="activity">Review in Activity</a>
         </div>
         <ul class="event-list" id="attention-list"></ul>
       </section>
@@ -204,7 +205,7 @@
         <form class="inline-form" id="add-instance-form">
           <label for="add-instance-select">Adapter</label>
           <select name="agentId" id="add-instance-select" required></select>
-          <button type="submit" class="primary">Add instance</button>
+          <button type="submit" class="primary" id="add-instance-button">Add instance</button>
           <span class="status-text" id="add-instance-status" role="status"></span>
         </form>
         <p class="muted small">Restricted to the approved catalogue — there is no path to register an arbitrary adapter id.</p>

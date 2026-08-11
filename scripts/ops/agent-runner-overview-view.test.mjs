@@ -169,17 +169,19 @@ test('quota is described as included-quota headroom with paid routing visibly of
   assert.match(untracked.costNote, /OFF/);
 });
 
-test('the fleet roll-up counts every lifecycle state and only calls a probed adapter ready', () => {
+test('the fleet roll-up separates implemented readiness from foundation-only catalogue entries', () => {
   const summary = summariseFleet([
-    { state: 'enabled', readiness: { ok: true } },
-    { state: 'enabled', readiness: { ok: false } },
-    { state: 'paused' },
-    { state: 'draining' },
-    { state: 'disabled' },
-    { state: 'unsupported' },
-    { state: 'unavailable' },
+    { implemented: true, state: 'enabled', readiness: { ok: true } },
+    { implemented: true, state: 'enabled', readiness: { ok: false } },
+    { implemented: true, state: 'paused' },
+    { implemented: true, state: 'draining' },
+    { implemented: true, state: 'disabled' },
+    { implemented: false, state: 'unsupported' },
+    { implemented: true, state: 'unavailable' },
   ]);
   assert.equal(summary.total, 7);
+  assert.equal(summary.implemented, 6);
+  assert.equal(summary.planned, 1);
   assert.equal(summary.ready, 1);
   assert.equal(summary.counts.enabled, 2);
   assert.equal(summary.constrained, 3);

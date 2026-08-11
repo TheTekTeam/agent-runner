@@ -183,3 +183,36 @@ test('no decorative animation competes with live state: nothing loops', () => {
   assert.ok(!/animation-iteration-count:\s*infinite/.test(css), 'no infinite animation may run for a healthy idle runner');
   assert.ok(!/\binfinite\b/.test(css.replace(/animation-iteration-count: 1 !important;/g, '')), 'no infinite animation anywhere');
 });
+
+
+test('hidden application state always wins over component display rules', () => {
+  const css = readStaticAsset('/agents-dashboard.css').body;
+  const html = readStaticAsset('/index.html').body;
+
+  assert.match(
+    css,
+    /\[hidden\]\s*\{\s*display:\s*none\s*!important;\s*\}/,
+    'author CSS must guarantee that the hidden attribute suppresses component display rules',
+  );
+
+  for (const id of ['shell', 'drawer-backdrop', 'agent-drawer']) {
+    assert.match(
+      html,
+      new RegExp(`id="${id}"[^>]*hidden|hidden[^>]*id="${id}"`),
+      `${id} must start hidden`,
+    );
+  }
+});
+
+
+test('field acceptance keeps idle metadata, attention density and exhausted catalogue truthful', () => {
+  const js = readStaticAsset('/agents-dashboard.js').body;
+  const html = readStaticAsset('/index.html').body;
+
+  assert.match(js, /task\.active && current\.issueUrl/, 'an idle task must not retain a stale current issue link');
+  assert.match(js, /task\.active \? current\.startedAt : null/, 'an idle task must not retain a stale current start time');
+  assert.match(js, /const visibleRows = rows\.slice\(0, 6\)/, 'Overview attention list must be bounded');
+  assert.match(js, /button\.disabled = true/, 'the exhausted adapter catalogue must disable Add instance');
+  assert.match(html, /id="add-instance-button"/, 'Add instance needs a stable control id for disabled-state rendering');
+  assert.match(html, />Review in Activity<\/a>/, 'bounded Overview attention must link to the full Activity surface');
+});

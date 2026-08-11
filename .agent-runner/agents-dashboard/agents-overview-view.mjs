@@ -253,9 +253,12 @@ export function summariseFleet(instances = []) {
     const state = instance?.state;
     if (state && Object.prototype.hasOwnProperty.call(counts, state)) counts[state] += 1;
   }
-  const ready = instances.filter((instance) => instance?.state === 'enabled' && instance?.readiness?.ok === true).length;
+  const implemented = instances.filter((instance) => instance?.implemented === true);
+  const ready = implemented.filter((instance) => instance?.state === 'enabled' && instance?.readiness?.ok === true).length;
   return {
     total: instances.length,
+    implemented: implemented.length,
+    planned: instances.length - implemented.length,
     ready,
     counts,
     constrained: counts.paused + counts.draining + counts.unavailable,

@@ -202,16 +202,16 @@ function renderOverview(overview) {
   setText(byId('task-detail'), task.detail);
 
   const current = overview.currentTask || {};
-  setText(byId('task-agent'), current.agent || (task.active ? 'Not recorded for this attempt' : '—'));
-  setText(byId('task-assignment'), current.assignmentDisplayName || current.assignmentLabel || '—');
-  setText(byId('task-phase'), current.phase || '—');
-  setText(byId('task-status-label'), current.statusLabel || '—');
-  setTimeCell(byId('task-started'), current.startedAt);
+  setText(byId('task-agent'), task.active ? (current.agent || 'Not recorded for this attempt') : '—');
+  setText(byId('task-assignment'), task.active ? (current.assignmentDisplayName || current.assignmentLabel || '—') : '—');
+  setText(byId('task-phase'), task.active ? (current.phase || '—') : '—');
+  setText(byId('task-status-label'), task.active ? (current.statusLabel || '—') : '—');
+  setTimeCell(byId('task-started'), task.active ? current.startedAt : null);
   setText(byId('task-elapsed'), task.elapsedText);
 
   const issueLink = byId('task-issue-link');
   if (issueLink) {
-    if (current.issueUrl) {
+    if (task.active && current.issueUrl) {
       issueLink.href = current.issueUrl;
       issueLink.rel = 'noreferrer noopener';
       issueLink.target = '_blank';
@@ -260,8 +260,8 @@ function renderOverview(overview) {
   }
 
   const fleet = ops.summariseFleet(state.instances);
-  setText(byId('tile-fleet-value'), `${fleet.ready} / ${fleet.total} ready`);
-  setText(byId('tile-fleet-note'), `${fleet.counts.enabled} enabled, ${fleet.counts.paused} paused, ${fleet.counts.draining} draining, ${fleet.counts.disabled} disabled, ${fleet.counts.unavailable} unavailable, ${fleet.counts.unsupported} unsupported.`);
+  setText(byId('tile-fleet-value'), `${fleet.ready} ready / ${fleet.implemented} implemented`);
+  setText(byId('tile-fleet-note'), `${fleet.planned} foundation-only planned; ${fleet.counts.enabled} enabled, ${fleet.counts.paused} paused, ${fleet.counts.draining} draining, ${fleet.counts.disabled} disabled, ${fleet.counts.unavailable} unavailable.`);
 
   setText(byId('tile-attention-value'), outstanding > 0 ? String(outstanding) : 'None');
   setText(byId('tile-attention-note'), outstanding > 0
@@ -311,7 +311,8 @@ function renderAttentionList(overview) {
     list.appendChild(createElement('li', 'event-empty', 'Nothing requires operator action.'));
     return;
   }
-  for (const row of rows) {
+  const visibleRows = rows.slice(0, 6);
+  for (const row of visibleRows) {
     const item = document.createElement('li');
     const time = createElement('span', 'event-time', row.at ? ops.formatClock(row.at) : '—');
     time.title = ops.formatUtc(row.at);
@@ -327,6 +328,13 @@ function renderAttentionList(overview) {
       item.appendChild(link);
     }
     list.appendChild(item);
+  }
+  if (rows.length > visibleRows.length) {
+    list.appendChild(createElement(
+      'li',
+      'event-empty',
+      `${rows.length - visibleRows.length} more unresolved record(s) are available in Activity.`,
+    ));
   }
 }
 
@@ -401,6 +409,8 @@ function renderServiceStatus(overview) {
 
 function renderAddInstanceOptions(instances) {
   const select = byId('add-instance-select');
+  const button = byId('add-instance-button');
+  const status = byId('add-instance-status');
   if (!select) return;
   const creatable = instances.filter((instance) => !instance.created);
   const signature = creatable.map((instance) => instance.agentId).join(',');
@@ -413,9 +423,13 @@ function renderAddInstanceOptions(instances) {
     option.disabled = true;
     select.appendChild(option);
     select.disabled = true;
+    if (button) button.disabled = true;
+    if (status) status.textContent = 'All approved adapters are already registered.';
     return;
   }
   select.disabled = false;
+  if (button) button.disabled = false;
+  if (status?.textContent === 'All approved adapters are already registered.') status.textContent = '';
   for (const instance of creatable) {
     const option = document.createElement('option');
     option.value = instance.agentId;
