@@ -27,12 +27,25 @@ export const WORKSPACE_OWNERSHIP_OUTCOMES = Object.freeze([
   'stale_unresolved_claim',
 ]);
 
+/**
+ * A successful model invocation (`exitCode=0`, no crash, no provider/auth/
+ * quota failure) that nonetheless produced zero commit and zero worktree
+ * change (#204). This is not a workspace-ownership/claim-bookkeeping finding
+ * — the workspace is clean and correctly owned — it is a bounded
+ * implementation outcome: the agent ran to completion but made no
+ * repository change. Before this outcome existed, `normalizeTerminalOutcome()`
+ * collapsed it into `unknown_failure`, the same information-loss pattern
+ * `WORKSPACE_OWNERSHIP_OUTCOMES` above already fixed for a different cause.
+ */
+export const IMPLEMENTATION_NO_REPOSITORY_CHANGE = 'implementation_no_repository_change';
+
 export const TERMINAL_OUTCOMES = Object.freeze([
   'completed', 'plan_only_awaiting_approval', 'provider_execution_limit', 'quota_paused',
   'rate_limited', 'transient_provider_or_network_failure', 'validation_failed',
   'permission_or_auth_failure', 'process_crash_or_signal', 'checkpoint_incompatible',
   'unknown_failure', 'orphaned_active_claim',
   ...WORKSPACE_OWNERSHIP_OUTCOMES,
+  IMPLEMENTATION_NO_REPOSITORY_CHANGE,
 ]);
 
 /**
@@ -198,6 +211,14 @@ export function decideRecovery(input, policyOverrides = {}) {
   // below — it *is* the ownership finding. Use its own specific next action
   // (#686) instead of falling through to the generic unknown-failure message.
   if (WORKSPACE_OWNERSHIP_POLICY[reason]) return forbidden(reason, WORKSPACE_OWNERSHIP_POLICY[reason].nextAction);
+  // A successful model session that produced no repository change is never
+  // automatic-retry eligible (#204): a session/checkpoint may still exist,
+  // but native-resume/fresh-retry would just re-run the same already-
+  // successful, already-exhausted session. It requires an explicit manager
+  // decision on scope or approach, not a mechanical retry.
+  if (reason === IMPLEMENTATION_NO_REPOSITORY_CHANGE) {
+    return forbidden(reason, 'The model session completed successfully but made no repository change. Review the run log and issue scope, then provide an explicit manager decision before any further dispatch; do not automatically resume or retry.');
+  }
   if (!ownershipProven(evidence)) return forbidden(reason, 'Resolve ambiguous process, claim, or lease ownership before recovery.');
   if (reason === 'rate_limited') return retry(reason, 'fresh_retry', attempts, policy.rateLimitAttemptCap, nowMs, policy, 'Retry after bounded provider backoff and a fresh quota preflight.');
   if (reason === 'transient_provider_or_network_failure') {

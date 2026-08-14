@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  attentionDedupeKey,
   buildAttentionEvent,
   decideRecovery,
   dispatchRecoveryAction,
@@ -9,6 +10,7 @@ import {
   reconcileActiveAttempts,
   WORKSPACE_OWNERSHIP_POLICY,
 } from './claude-runner-recovery.mjs';
+import { deriveTerminalOutcome, evaluateChildRunResult } from './claude-runner-cron.mjs';
 
 const exclusive = { processOwner: false, conflictingLease: false, ownershipAmbiguous: false };
 const headroom = { sameProfileAvailable: true, quotaHeadroom: true, budgetHeadroom: true, continuationHeadroom: true };
@@ -38,6 +40,37 @@ test('#686 root cause: normalizeTerminalOutcome preserves the child-reported wor
     assert.equal(decision.action, 'attention_required');
     assert.equal(decision.nextAction, WORKSPACE_OWNERSHIP_POLICY[normalized].nextAction);
   }
+});
+
+test('#204: normalizeTerminalOutcome preserves implementation-no-repository-change instead of collapsing it to unknown_failure', () => {
+  assert.equal(normalizeTerminalOutcome('implementation-no-repository-change'), 'implementation_no_repository_change');
+  assert.notEqual(normalizeTerminalOutcome('implementation-no-repository-change'), 'unknown_failure');
+  assert.equal(normalizeTerminalOutcome('totally-unrecognized-future-reason'), 'unknown_failure');
+});
+
+test('#204: a successful child exit with failureReason implementation-no-repository-change yields an effective failure and the exact canonical no-change outcome', () => {
+  const childPayload = { logPath: 'x.json', executionNoop: false, failureReason: 'implementation-no-repository-change' };
+  const childCheck = evaluateChildRunResult({ execute: true, exitCode: 0, childPayload });
+  assert.equal(childCheck.failed, true);
+  assert.equal(childCheck.reason, 'implementation-no-repository-change');
+  const outcome = deriveTerminalOutcome({ effectiveExitCode: 1, childPayload, childReason: childCheck.reason });
+  assert.equal(outcome, 'implementation_no_repository_change');
+  assert.notEqual(outcome, 'unknown_failure');
+});
+
+test('#204: decideRecovery forbids automatic retry/resume for implementation_no_repository_change even with proven ownership and headroom', () => {
+  const decision = decideRecovery({ outcome: 'implementation-no-repository-change', evidence: { ...exclusive, ...headroom, checkpointAvailable: true, sessionAvailable: true, profileCompatible: true } });
+  assert.equal(decision.eligible, false);
+  assert.equal(decision.action, 'attention_required');
+  assert.equal(decision.status, 'forbidden');
+  assert.equal(decision.reason, 'implementation_no_repository_change');
+  assert.match(decision.nextAction, /no repository change/);
+});
+
+test('#204: attention event and dedupe key retain the exact canonical no-change reason', () => {
+  const event = buildAttentionEvent({ repository: 'o/r', project: 'p', issueNumber: 204, reason: 'implementation-no-repository-change', attemptId: 'a', agent: 'claude' });
+  assert.equal(event.reason, 'implementation_no_repository_change');
+  assert.equal(event.dedupeKey, attentionDedupeKey({ repository: 'o/r', issueNumber: 204, attemptId: 'a', reason: 'implementation-no-repository-change' }));
 });
 
 test('normalizes legacy max-turn outcome and refuses resume without checkpoint', () => {
