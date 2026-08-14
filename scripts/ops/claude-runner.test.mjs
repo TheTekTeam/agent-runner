@@ -17,6 +17,7 @@ import {
   detectExecutionNoop,
   detectPlanOnlyResult,
   evaluateClaudeCostAdmission,
+  assertConfiguredRepositoryIdentity,
   findBlockingPrFollowUp,
   findLatestClaudeCommand,
   findLatestClaudeContinueCommand,
@@ -1496,4 +1497,45 @@ test('findBlockingPrFollowUp returns null when no open PR is linked to the issue
 
   const blocking = await findBlockingPrFollowUp({ repo: 'TheTekTeam/modelspend', issue: 629, token: 'placeholder-token' });
   assert.equal(blocking, null);
+});
+
+
+test('#180: configured repository identity is authoritative over explicit --repo', () => {
+  const config = { githubRepo: 'TheTekTeam/agent-runner' };
+
+  assert.doesNotThrow(() => assertConfiguredRepositoryIdentity({
+    configPath: '/tmp/agent-runner.json',
+    config,
+    repo: 'TheTekTeam/agent-runner',
+  }));
+
+  assert.throws(
+    () => assertConfiguredRepositoryIdentity({
+      configPath: '/tmp/agent-runner.json',
+      config,
+      repo: 'TheTekTeam/modelspend',
+    }),
+    /does not match configured repository/,
+  );
+
+  // Direct CLI compatibility without --config remains unchanged.
+  assert.doesNotThrow(() => assertConfiguredRepositoryIdentity({
+    configPath: null,
+    config,
+    repo: 'TheTekTeam/modelspend',
+  }));
+});
+
+test('#180: parseArgs uses configured repository as its default without disabling direct CLI --repo parsing', () => {
+  assert.equal(
+    parseArgs([], { defaultRepo: 'TheTekTeam/agent-runner' }).repo,
+    'TheTekTeam/agent-runner',
+  );
+  assert.equal(
+    parseArgs(
+      ['--repo', 'TheTekTeam/modelspend'],
+      { defaultRepo: 'TheTekTeam/agent-runner' },
+    ).repo,
+    'TheTekTeam/modelspend',
+  );
 });
