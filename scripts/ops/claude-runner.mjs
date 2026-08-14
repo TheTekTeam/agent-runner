@@ -4,7 +4,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
-import { loadAgentRunnerConfig, stripConfigArgs } from './agent-runner-config.mjs';
+import { assertProjectScopedEnv, loadAgentRunnerConfig, resolveConfigPath, stripConfigArgs } from './agent-runner-config.mjs';
 import {
   DEFAULT_PROJECT_REPOSITORY_INSTRUCTIONS,
   resolveRepositoryContext,
@@ -197,9 +197,9 @@ export function evaluateClaudeCostAdmission(profile = {}, env = process.env) {
   };
 }
 
-export function parseArgs(argv = process.argv.slice(2)) {
+export function parseArgs(argv = process.argv.slice(2), { defaultRepo = process.env.GITHUB_REPOSITORY || DEFAULT_REPO } = {}) {
   const args = {
-    repo: process.env.GITHUB_REPOSITORY || DEFAULT_REPO,
+    repo: defaultRepo,
     outputDir: DEFAULT_OUTPUT_DIR,
     execute: false,
     noClear: false,
@@ -1716,9 +1716,30 @@ export async function runPrFollowUp(args, env, token) {
   return runOrPlanClaude({ args, env, label: `pr-${args.pr}`, runPlan, prompt, claudeArgs });
 }
 
+export function assertConfiguredRepositoryIdentity({ configPath, config, repo }) {
+  if (!configPath) return;
+  if (repo !== config.githubRepo) {
+    throw new Error(
+      `Repository override ${repo} does not match configured repository ${config.githubRepo}`,
+    );
+  }
+}
+
 export async function main(argv = process.argv.slice(2), env = process.env) {
-  const config = loadAgentRunnerConfig({ argv, env });
-  const args = parseArgs(stripConfigArgs(argv));
+  const configPath = resolveConfigPath(argv, env);
+  const config = loadAgentRunnerConfig({ argv, env, configPath });
+  // Fails closed before any GitHub/model/repository mutation when ambient
+  // GITHUB_REPOSITORY disagrees with the selected project config (#169).
+  assertProjectScopedEnv({ config, configPath, env });
+  // A selected project config owns repository identity; an explicit --repo
+  // still wins, but the default must never fall back to the ModelSpend
+  // DEFAULT_REPO when a non-ModelSpend config was supplied (#180).
+  const args = parseArgs(stripConfigArgs(argv), {
+    defaultRepo: configPath ? config.githubRepo : (env.GITHUB_REPOSITORY || DEFAULT_REPO),
+  });
+  // A selected project config is authoritative. An explicit --repo may
+  // restate that exact identity but must never redirect configured execution.
+  assertConfiguredRepositoryIdentity({ configPath, config, repo: args.repo });
   if (args.help) {
     printHelp();
     return 0;
