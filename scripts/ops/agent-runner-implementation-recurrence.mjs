@@ -17,6 +17,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { acquireRecoverableCronLock } from './agent-runner-cron-lock.mjs';
+import { PROJECT_SCOPED_ENV_FIELDS } from './agent-runner-config.mjs';
 import {
   readProjectRegistryEntries,
   resolveProjectRegistrySelection,
@@ -60,10 +61,31 @@ export function loadEnabledProjectsWithConfigPaths({ argv = [], env = process.en
   return { registryPath: resolvedPath, projects };
 }
 
+/**
+ * Env vars that steer a *previously selected* project's repo/output/state/lock
+ * identity (see PROJECT_SCOPED_ENV_FIELDS / assertProjectScopedEnv in
+ * agent-runner-config.mjs) must never be forwarded into a probe or invocation
+ * bound to a *different* project's config. The recurrence process's own
+ * environment can carry these left over from an unrelated machine-level
+ * export (e.g. a ModelSpend-scoped GITHUB_REPOSITORY set for manual runner
+ * use); scrub them before rebinding to the selected project's exact config so
+ * a different project can never inherit another project's identity and trip
+ * the wrapper's own project-scoped-env-mismatch refusal (#210 requirement 1).
+ */
+export function buildProjectScopedInvocationEnv(env, configPath) {
+  const scrubbed = { ...env };
+  for (const { envVarName } of PROJECT_SCOPED_ENV_FIELDS) {
+    delete scrubbed[envVarName];
+  }
+  scrubbed.AGENT_RUNNER_CONFIG = configPath;
+  scrubbed.CLAUDE_RUNNER_CONFIG = configPath;
+  return scrubbed;
+}
+
 function defaultProbeProject({ config, configPath }, { argv = [], env = process.env, nodeBin = process.execPath } = {}) {
   const result = spawnSync(nodeBin, [CANDIDATE_PROBE_SCRIPT, ...argv], {
     cwd: config.localRepoPath,
-    env: { ...env, AGENT_RUNNER_CONFIG: configPath, CLAUDE_RUNNER_CONFIG: configPath },
+    env: buildProjectScopedInvocationEnv(env, configPath),
     encoding: 'utf8',
   });
   let payload = null;
@@ -76,7 +98,7 @@ function defaultProbeProject({ config, configPath }, { argv = [], env = process.
 
 function defaultInvokeProject({ configPath }, { argv = [], env = process.env } = {}) {
   const result = spawnSync(RUN_PROJECT_WRAPPER, argv, {
-    env: { ...env, AGENT_RUNNER_CONFIG: configPath },
+    env: buildProjectScopedInvocationEnv(env, configPath),
     stdio: 'inherit',
   });
   return { status: result.status };

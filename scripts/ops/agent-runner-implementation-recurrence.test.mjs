@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 
+import { assertProjectScopedEnv } from './agent-runner-config.mjs';
 import {
+  buildProjectScopedInvocationEnv,
   classifyProbeOutcome,
   loadEnabledProjectsWithConfigPaths,
   NO_RUNNABLE_CANDIDATE_EXIT_CODE,
@@ -286,4 +288,63 @@ test('resolveEvidenceDir defaults under the shared XDG state root and is overrid
   assert.equal(defaultDir, '/home/op/.local/state/agent-runner/implementation-recurrence');
   const overridden = resolveEvidenceDir({ HOME: '/home/op', AGENT_RUNNER_IMPLEMENTATION_EVIDENCE_DIR: '/tmp/evidence' });
   assert.equal(overridden, '/tmp/evidence');
+});
+
+// #210 requirement 1: project-neutral environment handoff. A machine
+// environment scoped to one project (e.g. ModelSpend's GITHUB_REPOSITORY,
+// CLAUDE_RUNNER_OUTPUT_DIR, CLAUDE_RUNNER_STATE_DB, CLAUDE_RUNNER_CRON_LOCK)
+// must never leak into a probe/invocation bound to a different project.
+
+test('buildProjectScopedInvocationEnv strips all inherited project-scoped identity/path vars and binds the selected config', () => {
+  const inheritedEnv = {
+    HOME: '/home/op',
+    PATH: '/usr/bin',
+    GITHUB_REPOSITORY: 'TheTekTeam/modelspend',
+    CLAUDE_RUNNER_OUTPUT_DIR: '/srv/modelspend/.var/claude-runner',
+    CLAUDE_RUNNER_STATE_DB: '/srv/modelspend/.var/claude-runner/runner-state.sqlite',
+    CLAUDE_RUNNER_CRON_LOCK: '/srv/modelspend/.var/claude-runner/cron.lock',
+    AGENT_RUNNER_CONFIG: '/srv/modelspend/config.json',
+    CLAUDE_RUNNER_CONFIG: '/srv/modelspend/config.json',
+    UNRELATED_MACHINE_POLICY: 'kept',
+  };
+  const result = buildProjectScopedInvocationEnv(inheritedEnv, '/srv/agent-runner/config.json');
+  assert.equal(result.GITHUB_REPOSITORY, undefined);
+  assert.equal(result.CLAUDE_RUNNER_OUTPUT_DIR, undefined);
+  assert.equal(result.CLAUDE_RUNNER_STATE_DB, undefined);
+  assert.equal(result.CLAUDE_RUNNER_CRON_LOCK, undefined);
+  assert.equal(result.AGENT_RUNNER_CONFIG, '/srv/agent-runner/config.json');
+  assert.equal(result.CLAUDE_RUNNER_CONFIG, '/srv/agent-runner/config.json');
+  assert.equal(result.HOME, '/home/op');
+  assert.equal(result.PATH, '/usr/bin');
+  assert.equal(result.UNRELATED_MACHINE_POLICY, 'kept');
+  // inherited env object itself is untouched
+  assert.equal(inheritedEnv.GITHUB_REPOSITORY, 'TheTekTeam/modelspend');
+});
+
+test('selecting Agent Runner while the machine environment carries ModelSpend-scoped values succeeds through project binding instead of reproducing the identity-mismatch refusal', () => {
+  const modelspendScopedEnv = {
+    HOME: '/home/op',
+    GITHUB_REPOSITORY: 'TheTekTeam/modelspend',
+    CLAUDE_RUNNER_OUTPUT_DIR: '/srv/modelspend/.var/claude-runner',
+    CLAUDE_RUNNER_STATE_DB: '/srv/modelspend/.var/claude-runner/runner-state.sqlite',
+    CLAUDE_RUNNER_CRON_LOCK: '/srv/modelspend/.var/claude-runner/cron.lock',
+  };
+  const agentRunnerConfig = projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner');
+  const agentRunnerConfigPath = '/home/op/.config/agent-runner/agent-runner.json';
+
+  // Reproduce the exact failure mode first: the raw inherited environment
+  // disagrees with the selected project's identity and the wrapper's own
+  // pre-scheduler gate refuses it.
+  assert.throws(
+    () => assertProjectScopedEnv({ config: agentRunnerConfig, configPath: agentRunnerConfigPath, env: modelspendScopedEnv }),
+    /disagrees with project "agent-runner"/,
+  );
+
+  // The recurrence's project-neutral handoff scrubs those inherited values
+  // before binding the selected project's exact config, so the same gate
+  // succeeds through project binding rather than refusing.
+  const scrubbedEnv = buildProjectScopedInvocationEnv(modelspendScopedEnv, agentRunnerConfigPath);
+  assert.doesNotThrow(
+    () => assertProjectScopedEnv({ config: agentRunnerConfig, configPath: agentRunnerConfigPath, env: scrubbedEnv }),
+  );
 });
