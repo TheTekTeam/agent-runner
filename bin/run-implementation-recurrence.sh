@@ -14,6 +14,20 @@ if [ "$(id -u)" -eq 0 ]; then
   exit 1
 fi
 
+# The generic implementation service is itself the operator-approved execution
+# authority. Accept only its explicit --execute opt-in at this wrapper boundary;
+# do not silently turn arbitrary systemd/CLI arguments into runner arguments.
+REQUESTED_EXECUTE=0
+for arg in "$@"; do
+  case "$arg" in
+    --execute) REQUESTED_EXECUTE=1 ;;
+    *)
+      echo "[agent-runner] ERROR: unsupported implementation recurrence argument: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${AGENT_RUNNER_ENV_FILE:-$HOME/.config/agent-runner/runner.env}"
 NODE_BIN="${AGENT_RUNNER_NODE_BIN:-node}"
@@ -56,7 +70,7 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:/opt/cpanel/ea-nodejs22/bin:$HOME/
 }
 
 ARGS=()
-if [ "${AGENT_RUNNER_EXECUTE:-false}" = "true" ]; then
+if [ "$REQUESTED_EXECUTE" -eq 1 ] || [ "${AGENT_RUNNER_EXECUTE:-false}" = "true" ]; then
   ARGS+=(--execute)
 fi
 if [ -n "${AGENT_RUNNER_ARGS:-}" ]; then
