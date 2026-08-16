@@ -61,7 +61,19 @@ load_env_file() {
   done < "$file"
 }
 
+# Load shared machine policy exactly once at the generic scheduler boundary.
+# The accepted historical runner.env may still contain ModelSpend-scoped
+# compatibility values. Those must not survive into another selected project,
+# and selected bin/run-project.sh must not reload runner.env and reintroduce
+# them after agent-runner-implementation-recurrence.mjs has rebound the exact
+# project config. Global policy/provider/quota values remain inherited.
 load_env_file "$ENV_FILE"
+unset GITHUB_REPOSITORY
+unset CLAUDE_RUNNER_OUTPUT_DIR
+unset CLAUDE_RUNNER_STATE_DB
+unset CLAUDE_RUNNER_CRON_LOCK
+export AGENT_RUNNER_ENV_FILE=/dev/null
+
 export PATH="/usr/local/bin:/opt/homebrew/bin:/opt/cpanel/ea-nodejs22/bin:$HOME/.local/bin:$HOME/bin:$PATH"
 
 [ -n "${AGENT_RUNNER_PROJECT_REGISTRY:-}" ] || {
@@ -71,6 +83,10 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:/opt/cpanel/ea-nodejs22/bin:$HOME/
 
 ARGS=()
 if [ "$REQUESTED_EXECUTE" -eq 1 ] || [ "${AGENT_RUNNER_EXECUTE:-false}" = "true" ]; then
+  # Preserve the recurrence argv contract for its read-only probe semantics,
+  # and also export the existing project-wrapper execution contract so the
+  # single selected bin/run-project.sh actually executes rather than dry-runs.
+  export AGENT_RUNNER_EXECUTE=true
   ARGS+=(--execute)
 fi
 if [ -n "${AGENT_RUNNER_ARGS:-}" ]; then
