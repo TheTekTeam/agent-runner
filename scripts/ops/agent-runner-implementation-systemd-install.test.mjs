@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const installer = path.join(repoRoot, 'scripts/install-agent-runner-implementation-systemd.sh');
 const GENERIC_TIMER = 'agent-runner-implementation.timer';
-const LEGACY_TIMER = 'modelspend-claude-runner.timer';
+const LEGACY_TIMER = 'agent-runner-modelspend.timer';
 
 async function createHarness({ legacyInstalled = false } = {}) {
   const root = await mkdtemp(path.join(tmpdir(), 'agent-runner-implementation-systemd-install-'));
