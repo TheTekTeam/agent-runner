@@ -5,7 +5,7 @@ Documentation=https://github.com/TheTekTeam/agent-runner/blob/main/docs/ops/AGEN
 [Service]
 Type=oneshot
 EnvironmentFile=%h/.config/agent-runner/implementation-recurrence.env
-ExecStart=/bin/bash ${AGENT_RUNNER_HOME}/bin/run-implementation-recurrence.sh
+ExecStart=/bin/bash ${AGENT_RUNNER_HOME}/bin/run-implementation-recurrence.sh --execute
 Nice=5
 
 [Install]
