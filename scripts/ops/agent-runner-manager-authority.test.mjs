@@ -11,6 +11,7 @@ import {
   packetBodyDigest,
   parseManagerPreflightPacket,
   resolveCurrentManagerAuthority,
+  resolveManagerPreflightExecutionMetadata,
 } from './agent-runner-manager-authority.mjs';
 
 const FINGERPRINT_A = `sha256:${'a'.repeat(64)}`;
@@ -125,4 +126,64 @@ test('managerAuthorityApprovesAgent fails closed on a missing authority or a mis
   assert.equal(managerAuthorityApprovesAgent(authority, null), false);
   assert.equal(managerAuthorityApprovesAgent(authority, ''), false);
   assert.equal(managerAuthorityApprovesAgent({}, 'claude-code-cli'), false);
+});
+
+function packetWithExecutionScalars(extraYaml = '') {
+  return {
+    id: 1,
+    createdAt: '2026-07-23T19:01:00Z',
+    user: { login: 'gpcola' },
+    body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: AR221.1\nfingerprint: ${FINGERPRINT_A}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nprofile: complex\nmodel: sonnet\neffort: medium\n${extraYaml}scope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`\n`,
+  };
+}
+
+test('resolveManagerPreflightExecutionMetadata extracts profile, model and effort scalars', () => {
+  const metadata = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: 0.75\n'));
+  assert.equal(metadata.profile, 'complex');
+  assert.equal(metadata.model, 'sonnet');
+  assert.equal(metadata.effort, 'medium');
+});
+
+test('resolveManagerPreflightExecutionMetadata normalizes quoted and unquoted budgets identically', () => {
+  const quoted = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: "1.00"\n'));
+  const unquoted = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: 1.00\n'));
+  assert.deepEqual(quoted.maxBudgetUsd, unquoted.maxBudgetUsd);
+  assert.equal(quoted.maxBudgetUsd.present, true);
+  assert.equal(quoted.maxBudgetUsd.valid, true);
+  assert.equal(quoted.maxBudgetUsd.value, 1);
+});
+
+test('resolveManagerPreflightExecutionMetadata distinguishes an absent budget from an invalid one', () => {
+  const absent = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars());
+  assert.equal(absent.maxBudgetUsd.present, false);
+  assert.equal(absent.maxBudgetUsd.valid, false);
+  assert.equal(absent.maxBudgetUsd.value, null);
+
+  const empty = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: ""\n'));
+  assert.equal(empty.maxBudgetUsd.present, true);
+  assert.equal(empty.maxBudgetUsd.valid, false);
+  assert.equal(empty.maxBudgetUsd.value, null);
+});
+
+test('resolveManagerPreflightExecutionMetadata fails closed on malformed, zero and negative explicit budgets', () => {
+  const malformed = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: not-a-number\n'));
+  assert.equal(malformed.maxBudgetUsd.present, true);
+  assert.equal(malformed.maxBudgetUsd.valid, false);
+  assert.equal(malformed.maxBudgetUsd.value, null);
+
+  const zero = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: 0\n'));
+  assert.equal(zero.maxBudgetUsd.present, true);
+  assert.equal(zero.maxBudgetUsd.valid, false);
+  assert.equal(zero.maxBudgetUsd.value, null);
+
+  const negative = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: -0.50\n'));
+  assert.equal(negative.maxBudgetUsd.present, true);
+  assert.equal(negative.maxBudgetUsd.valid, false);
+  assert.equal(negative.maxBudgetUsd.value, null);
+});
+
+test('resolveManagerPreflightExecutionMetadata never lets an invalid explicit budget masquerade as valid or absent', () => {
+  const malformed = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: NaN\n'));
+  assert.notEqual(malformed.maxBudgetUsd.valid, true);
+  assert.notEqual(malformed.maxBudgetUsd.present, false);
 });

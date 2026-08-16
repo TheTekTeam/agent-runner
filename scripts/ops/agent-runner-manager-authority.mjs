@@ -215,3 +215,44 @@ export function managerAuthorityApprovesAgent(authority, agentId) {
   const candidate = String(agentId || '').trim();
   return Boolean(approvedAgent && candidate && approvedAgent === candidate);
 }
+
+/**
+ * Issue #221: a canonical, quote-safe budget normalizer built on the
+ * existing `scalarFromYamlBlock` quote-stripping path (so `"1.00"` and
+ * `1.00` resolve identically). An explicit empty/malformed/nonnumeric/
+ * zero/negative value must fail closed rather than silently becoming an
+ * absent value that a caller could default.
+ */
+function normalizeManagerPreflightBudget(raw) {
+  if (raw === null || raw === undefined) {
+    return Object.freeze({ present: false, valid: false, value: null, raw: null });
+  }
+  const trimmed = String(raw).trim();
+  if (trimmed === '') {
+    return Object.freeze({ present: true, valid: false, value: null, raw: trimmed });
+  }
+  const numeric = Number(trimmed);
+  const valid = Number.isFinite(numeric) && numeric > 0;
+  return Object.freeze({ present: true, valid, value: valid ? numeric : null, raw: trimmed });
+}
+
+/**
+ * Issue #221: single canonical resolver for the manager-preflight
+ * `profile`/`model`/`effort`/`max_budget_usd` execution scalars. Reuses the
+ * existing quote-safe `scalarFromYamlBlock` path rather than adding a
+ * second free-form YAML parser, so it stays a bounded/non-secret seam that
+ * #208 candidate admission and child-defense can reuse without re-solving
+ * scalar normalization.
+ */
+export function resolveManagerPreflightExecutionMetadata(commentOrBody) {
+  const comment = typeof commentOrBody === 'string'
+    ? { body: commentOrBody }
+    : (commentOrBody || {});
+  const body = String(comment.body || '');
+  return Object.freeze({
+    profile: scalarFromYamlBlock(body, 'profile') || null,
+    model: scalarFromYamlBlock(body, 'model') || null,
+    effort: scalarFromYamlBlock(body, 'effort') || null,
+    maxBudgetUsd: normalizeManagerPreflightBudget(scalarFromYamlBlock(body, 'max_budget_usd')),
+  });
+}
