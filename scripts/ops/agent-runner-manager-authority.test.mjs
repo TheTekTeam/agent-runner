@@ -187,3 +187,18 @@ test('resolveManagerPreflightExecutionMetadata never lets an invalid explicit bu
   assert.notEqual(malformed.maxBudgetUsd.valid, true);
   assert.notEqual(malformed.maxBudgetUsd.present, false);
 });
+
+test('resolveManagerPreflightExecutionMetadata fails closed on one-sided/mismatched quoted budgets', () => {
+  const cases = [
+    'max_budget_usd: "1.00\n',
+    'max_budget_usd: 1.00"\n',
+    "max_budget_usd: '1.00\n",
+    "max_budget_usd: 1.00'\n",
+  ];
+  for (const yaml of cases) {
+    const result = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars(yaml));
+    assert.equal(result.maxBudgetUsd.present, true, yaml);
+    assert.equal(result.maxBudgetUsd.valid, false, yaml);
+    assert.equal(result.maxBudgetUsd.value, null, yaml);
+  }
+});

@@ -31,13 +31,18 @@ function yamlBlocks(body = '') {
   return [...String(body || '').matchAll(/```ya?ml\s*\n([\s\S]*?)```/gi)].map((match) => match[1]);
 }
 
-function scalarFromYamlBlock(body, key) {
+function rawScalarFromYamlBlock(body, key) {
   const escaped = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   for (const block of yamlBlocks(body)) {
     const value = block.match(new RegExp(`^\\s*${escaped}\\s*:\\s*(.*?)\\s*$`, 'mi'))?.[1];
-    if (value !== undefined) return String(value).trim().replace(/^["']|["']$/g, '');
+    if (value !== undefined) return String(value).trim();
   }
   return null;
+}
+
+function scalarFromYamlBlock(body, key) {
+  const raw = rawScalarFromYamlBlock(body, key);
+  return raw === null ? null : raw.replace(/^["']|["']$/g, '');
 }
 
 function yamlListHasValues(body, keys = []) {
@@ -217,9 +222,12 @@ export function managerAuthorityApprovesAgent(authority, agentId) {
 }
 
 /**
- * Issue #221: a canonical, quote-safe budget normalizer built on the
- * existing `scalarFromYamlBlock` quote-stripping path (so `"1.00"` and
- * `1.00` resolve identically). An explicit empty/malformed/nonnumeric/
+ * Issue #221: a canonical, quote-safe budget normalizer that consumes the
+ * *raw* (quote-preserved) scalar text so it can detect one-sided/mismatched
+ * quoting (e.g. `"1.00`, `1.00"`, `'1.00`, `1.00'`) and fail closed instead
+ * of silently dropping the unmatched quote and treating the remainder as a
+ * valid number. Balanced quotes (`"1.00"`, `'1.00'`) and unquoted values
+ * still resolve identically. An explicit empty/malformed/nonnumeric/
  * zero/negative value must fail closed rather than silently becoming an
  * absent value that a caller could default.
  */
@@ -231,9 +239,16 @@ function normalizeManagerPreflightBudget(raw) {
   if (trimmed === '') {
     return Object.freeze({ present: true, valid: false, value: null, raw: trimmed });
   }
-  const numeric = Number(trimmed);
+  const leadingQuote = /^["']/.test(trimmed);
+  const trailingQuote = /["']$/.test(trimmed);
+  const matchedPair = trimmed.length >= 2 && trimmed[0] === trimmed[trimmed.length - 1];
+  if (leadingQuote !== trailingQuote || (leadingQuote && trailingQuote && !matchedPair)) {
+    return Object.freeze({ present: true, valid: false, value: null, raw: trimmed });
+  }
+  const unquoted = leadingQuote && trailingQuote ? trimmed.slice(1, -1) : trimmed;
+  const numeric = Number(unquoted);
   const valid = Number.isFinite(numeric) && numeric > 0;
-  return Object.freeze({ present: true, valid, value: valid ? numeric : null, raw: trimmed });
+  return Object.freeze({ present: true, valid, value: valid ? numeric : null, raw: unquoted });
 }
 
 /**
@@ -253,6 +268,6 @@ export function resolveManagerPreflightExecutionMetadata(commentOrBody) {
     profile: scalarFromYamlBlock(body, 'profile') || null,
     model: scalarFromYamlBlock(body, 'model') || null,
     effort: scalarFromYamlBlock(body, 'effort') || null,
-    maxBudgetUsd: normalizeManagerPreflightBudget(scalarFromYamlBlock(body, 'max_budget_usd')),
+    maxBudgetUsd: normalizeManagerPreflightBudget(rawScalarFromYamlBlock(body, 'max_budget_usd')),
   });
 }
