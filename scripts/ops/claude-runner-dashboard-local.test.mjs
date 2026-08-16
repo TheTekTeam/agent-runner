@@ -38,6 +38,10 @@ test('writeLocalDashboard emits static assets and embedded missing-state data', 
   assert.equal(existsSync(join(outDir, 'index.html')), true);
   assert.equal(existsSync(join(outDir, 'dashboard.js')), true);
   assert.equal(existsSync(join(outDir, 'styles.css')), true);
+  assert.equal(existsSync(join(outDir, 'favicon.ico')), true);
+
+  const html = readFileSync(join(outDir, 'index.html'), 'utf8');
+  assert.match(html, /href="\.\/favicon\.ico"/);
 
   const data = readFileSync(join(outDir, 'dashboard-data.js'), 'utf8');
   assert.match(data, /^window\.RUNNER_DASHBOARD_DATA = /);
@@ -90,4 +94,5 @@ test('local dashboard CLI writes files and reports diagnostics', () => withTempD
   assert.match(io.read().stdout, /Wrote Agent Runner dashboard/);
   assert.match(io.read().stdout, /state-db-missing/);
   assert.equal(existsSync(join(outDir, 'index.html')), true);
+  assert.equal(existsSync(join(outDir, 'favicon.ico')), true);
 }));

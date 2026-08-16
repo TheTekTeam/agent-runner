@@ -47,7 +47,7 @@ function helpText() {
 export function writeLocalDashboard({ dbPath, outDir = DEFAULT_OUTPUT_DIR, historyLimit = 20, strict = false } = {}) {
   const dashboard = buildRunnerDashboard(dbPath, { historyLimit, strict });
   mkdirSync(outDir, { recursive: true });
-  for (const file of ['index.html', 'dashboard.js', 'styles.css']) {
+  for (const file of ['index.html', 'dashboard.js', 'styles.css', 'favicon.ico']) {
     const source = join(DEFAULT_SOURCE_DIR, file);
     const target = join(outDir, file);
     if (resolve(source) !== resolve(target)) copyFileSync(source, target);
