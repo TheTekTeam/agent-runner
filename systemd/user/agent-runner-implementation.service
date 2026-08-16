@@ -1,0 +1,12 @@
+[Unit]
+Description=Agent Runner generic serial implementation recurrence selector (#210)
+Documentation=https://github.com/TheTekTeam/agent-runner/blob/main/docs/ops/AGENT-RUNNER-IMPLEMENTATION-RECURRENCE-MIGRATION.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/agent-runner/implementation-recurrence.env
+ExecStart=/bin/bash ${AGENT_RUNNER_HOME}/bin/run-implementation-recurrence.sh
+Nice=5
+
+[Install]
+WantedBy=default.target
