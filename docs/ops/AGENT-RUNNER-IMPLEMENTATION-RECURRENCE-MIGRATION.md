@@ -50,20 +50,20 @@ the registry correctly selected it.
 
 ## Migration and rollback
 
-The legacy `modelspend-claude-runner.timer` (installed by
-`scripts/ops/install-claude-runner-systemd.sh`) and the generic
+The accepted Dell ModelSpend-only scheduler from #167 is
+`agent-runner-modelspend.timer`. That legacy timer and the generic
 `agent-runner-implementation.timer` must never both be live scheduling
 authorities at once -- the generic recurrence already probes the
 ModelSpend project through the managed registry, so running both would let
 two schedulers select and invoke work concurrently.
 
-- `--enable` refuses if the legacy timer is still enabled or active.
-- `--migrate-from-modelspend-only` atomically disables the legacy timer
+- `--enable` refuses if `agent-runner-modelspend.timer` is still enabled or active.
+- `--migrate-from-modelspend-only` atomically disables the accepted legacy timer
   and then enables+starts the generic timer.
 - `--rollback-to-modelspend-only` is the exact inverse: atomically disables
-  the generic timer and re-enables+starts the legacy timer. It requires the
-  legacy unit files to still be installed (this script never removes them)
-  and fails closed if they are not.
+  the generic timer and re-enables+starts `agent-runner-modelspend.timer`. It
+  requires the legacy unit files to still be installed (this script never
+  removes them) and fails closed if they are not.
 - `--dry-run` changes no file and issues no `systemctl` call, for any
   action.
 
