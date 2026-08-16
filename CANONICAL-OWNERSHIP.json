@@ -38,6 +38,15 @@
       }
     },
     {
+      "path": ".agent-runner/dashboard/index.html",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-08-16T18:30:00.000Z",
+        "reason": "Issue #218 makes the accepted Runner dashboard favicon a canonical repository-owned UX asset, so the dashboard HTML must intentionally diverge from the historical ModelSpend import.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/219"
+      }
+    },
+    {
       "path": "docs/ops/AGENT-RUNNER-DASHBOARD.md",
       "ownership": {
         "canonicalRepository": "TheTekTeam/agent-runner",
@@ -269,6 +278,24 @@
         "transferredAt": "2026-07-24T00:00:00.000Z",
         "reason": "Issue #53 adds regression coverage for the notification_events dashboard/API allowlist.",
         "reference": "https://github.com/TheTekTeam/agent-runner/pull/66"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-dashboard-local.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-08-16T18:30:00.000Z",
+        "reason": "Issue #218 makes the accepted Runner dashboard favicon survive canonical static dashboard generation, so the local publisher intentionally diverges from the historical ModelSpend import.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/219"
+      }
+    },
+    {
+      "path": "scripts/ops/claude-runner-dashboard-local.test.mjs",
+      "ownership": {
+        "canonicalRepository": "TheTekTeam/agent-runner",
+        "transferredAt": "2026-08-16T18:30:00.000Z",
+        "reason": "Issue #218 adds canonical regression coverage proving the Runner favicon is emitted and referenced during dashboard generation.",
+        "reference": "https://github.com/TheTekTeam/agent-runner/pull/219"
       }
     },
     {
