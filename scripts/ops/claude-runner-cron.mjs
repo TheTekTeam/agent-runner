@@ -3833,6 +3833,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
         conflictingLease,
         ownershipAmbiguous: !childEnded,
         repositoryMutated: childPayload?.implementationEvidence?.repositoryMutated === false,
+        implementationEvidenceValid: childPayload?.implementationEvidence?.valid === true,
         checkpointAvailable: Boolean(childPayload?.checkpointAvailable), sessionAvailable: Boolean(childPayload?.sessionAvailable),
         profileCompatible: Boolean(actualAgent && actualModel && actualHarness && sameAgent(actualAgent, plan.agent?.agentId)
           && actualModel === (freshImplementationDispatch ? resolvedModel : expectedModel) && actualHarness === plan.agent?.agentType),

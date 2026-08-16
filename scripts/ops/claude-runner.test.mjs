@@ -1102,6 +1102,12 @@ test('#658 captured array selects the terminal result and classifies max turns',
   assert.equal(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'provider-execution-limit');
 });
 
+test('#206: error_max_budget_usd result envelope classifies as the exact structured budget reason, distinct from quota/max-turns', () => {
+  const envelope = { subtype: 'error_max_budget_usd', isError: true };
+  assert.equal(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'budget-limit-exhausted');
+  assert.notEqual(classifyClaudeRunFailure({ status: 1, resultEnvelope: envelope }), 'unknown_failure');
+});
+
 test('single-object JSON, JSONL and JSON-array envelopes select the terminal result', () => {
   const result = { type: 'result', subtype: 'success', is_error: false, result: 'done', num_turns: 2 };
   const intermediate = { type: 'assistant', message: { content: [{ type: 'text', text: 'not terminal' }] } };
