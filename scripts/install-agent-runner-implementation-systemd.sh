@@ -29,13 +29,13 @@ enables, starts, disables or stops any unit.
 
   --enable
       Additionally enable+start agent-runner-implementation.timer. Refuses
-      if the legacy modelspend-claude-runner.timer is still enabled or
-      active, since the generic recurrence already probes the ModelSpend
+      if the accepted legacy agent-runner-modelspend.timer is still enabled
+      or active, since the generic recurrence already probes the ModelSpend
       project through the managed registry and running both timers would
       let two schedulers select and invoke work concurrently.
 
   --migrate-from-modelspend-only
-      Atomically disable the legacy modelspend-claude-runner.timer and
+      Atomically disable the accepted legacy agent-runner-modelspend.timer and
       enable+start the generic agent-runner-implementation.timer, so at no
       point are both timers simultaneously enabled. Fails closed (making no
       change) if either the disable or the enable step fails.
@@ -43,7 +43,7 @@ enables, starts, disables or stops any unit.
   --rollback-to-modelspend-only
       The inverse migration: atomically disable
       agent-runner-implementation.timer and re-enable+start
-      modelspend-claude-runner.timer. Requires the legacy unit files to
+      agent-runner-modelspend.timer. Requires the legacy unit files to
       still be present (this script never removes them).
 
   --dry-run
@@ -113,7 +113,7 @@ UNIT_TARGET="$HOME/.config/systemd/user"
 ENV_DIR="$HOME/.config/agent-runner"
 ENV_FILE="$ENV_DIR/implementation-recurrence.env"
 GENERIC_TIMER="agent-runner-implementation.timer"
-LEGACY_TIMER="modelspend-claude-runner.timer"
+LEGACY_TIMER="agent-runner-modelspend.timer"
 
 install_unit_files() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
