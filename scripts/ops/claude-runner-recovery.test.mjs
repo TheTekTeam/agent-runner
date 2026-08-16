@@ -73,6 +73,55 @@ test('#204: attention event and dedupe key retain the exact canonical no-change 
   assert.equal(event.dedupeKey, attentionDedupeKey({ repository: 'o/r', issueNumber: 204, attemptId: 'a', reason: 'implementation-no-repository-change' }));
 });
 
+test('#206: normalizeTerminalOutcome preserves budget-limit-exhausted instead of collapsing it to unknown_failure', () => {
+  assert.equal(normalizeTerminalOutcome('budget-limit-exhausted'), 'budget_limit_exhausted');
+  assert.notEqual(normalizeTerminalOutcome('budget-limit-exhausted'), 'unknown_failure');
+  assert.notEqual(normalizeTerminalOutcome('budget-limit-exhausted'), normalizeTerminalOutcome('quota-paused'));
+  assert.notEqual(normalizeTerminalOutcome('budget-limit-exhausted'), normalizeTerminalOutcome('provider-execution-limit'));
+  assert.notEqual(normalizeTerminalOutcome('budget-limit-exhausted'), normalizeTerminalOutcome('rate-limited'));
+});
+
+test('#206: error_max_budget_usd child classification survives scheduler terminal-outcome normalization', () => {
+  const childPayload = { logPath: 'x.json', executionNoop: false, failureReason: 'budget-limit-exhausted' };
+  const childCheck = evaluateChildRunResult({ execute: true, exitCode: 1, childPayload });
+  assert.equal(childCheck.failed, true);
+  assert.equal(childCheck.reason, 'budget-limit-exhausted');
+  const outcome = deriveTerminalOutcome({ effectiveExitCode: 1, childPayload, childReason: childCheck.reason });
+  assert.equal(outcome, 'budget_limit_exhausted');
+  assert.notEqual(outcome, 'unknown_failure');
+});
+
+test('#206: decideRecovery forbids automatic retry for budget_limit_exhausted even with proven ownership and headroom, and requires explicit manager decision without evidence', () => {
+  const decision = decideRecovery({
+    outcome: 'budget-limit-exhausted',
+    evidence: { ...exclusive, ...headroom, checkpointAvailable: true, sessionAvailable: true, profileCompatible: true, implementationEvidenceValid: false },
+  });
+  assert.equal(decision.eligible, false);
+  assert.equal(decision.action, 'attention_required');
+  assert.equal(decision.status, 'forbidden');
+  assert.equal(decision.reason, 'budget_limit_exhausted');
+  assert.match(decision.nextAction, /explicit manager decision/i);
+  assert.doesNotMatch(decision.nextAction, /salvage/i);
+});
+
+test('#206: decideRecovery classifies a budget-exhausted attempt with valid committed implementation evidence as salvage-required, not fresh-retry-required', () => {
+  const decision = decideRecovery({
+    outcome: 'budget-limit-exhausted',
+    evidence: { ...exclusive, ...headroom, implementationEvidenceValid: true },
+  });
+  assert.equal(decision.eligible, false);
+  assert.notEqual(decision.action, 'fresh_retry');
+  assert.equal(decision.action, 'attention_required');
+  assert.equal(decision.status, 'forbidden');
+  assert.match(decision.nextAction, /salvage/i);
+});
+
+test('#206: attention event and dedupe key retain the exact canonical budget-exhaustion reason', () => {
+  const event = buildAttentionEvent({ repository: 'o/r', project: 'p', issueNumber: 206, reason: 'budget-limit-exhausted', attemptId: 'a', agent: 'claude' });
+  assert.equal(event.reason, 'budget_limit_exhausted');
+  assert.equal(event.dedupeKey, attentionDedupeKey({ repository: 'o/r', issueNumber: 206, attemptId: 'a', reason: 'budget-limit-exhausted' }));
+});
+
 test('normalizes legacy max-turn outcome and refuses resume without checkpoint', () => {
   assert.equal(normalizeTerminalOutcome('provider-execution-limit'), 'provider_execution_limit');
   assert.equal(decideRecovery({ outcome: 'provider-execution-limit', evidence: exclusive }).eligible, false);

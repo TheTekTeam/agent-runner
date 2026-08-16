@@ -39,6 +39,20 @@ export const WORKSPACE_OWNERSHIP_OUTCOMES = Object.freeze([
  */
 export const IMPLEMENTATION_NO_REPOSITORY_CHANGE = 'implementation_no_repository_change';
 
+/**
+ * A per-attempt configured spend cap was reached mid-run (#206). The Claude
+ * child adapter already classifies the CLI's own `error_max_budget_usd`
+ * result envelope subtype as the structured reason `budget-limit-exhausted`;
+ * before this outcome existed, `normalizeTerminalOutcome()` below had no
+ * canonical member or legacy mapping for it, so it collapsed into
+ * `unknown_failure` — the same information-loss pattern
+ * `IMPLEMENTATION_NO_REPOSITORY_CHANGE` above already fixed for a different
+ * cause. This is deliberately distinct from `quota_paused`: a per-attempt
+ * budget cap and an account/session quota are different controls, and this
+ * outcome must never be aliased to the other.
+ */
+export const BUDGET_LIMIT_EXHAUSTED = 'budget_limit_exhausted';
+
 export const TERMINAL_OUTCOMES = Object.freeze([
   'completed', 'plan_only_awaiting_approval', 'provider_execution_limit', 'quota_paused',
   'rate_limited', 'transient_provider_or_network_failure', 'validation_failed',
@@ -46,6 +60,7 @@ export const TERMINAL_OUTCOMES = Object.freeze([
   'unknown_failure', 'orphaned_active_claim',
   ...WORKSPACE_OWNERSHIP_OUTCOMES,
   IMPLEMENTATION_NO_REPOSITORY_CHANGE,
+  BUDGET_LIMIT_EXHAUSTED,
 ]);
 
 /**
@@ -136,6 +151,7 @@ const LEGACY_REASONS = Object.freeze({
   'process-crash-or-signal': 'process_crash_or_signal',
   'checkpoint-incompatible': 'checkpoint_incompatible',
   'unknown-failure': 'unknown_failure',
+  'budget-limit-exhausted': BUDGET_LIMIT_EXHAUSTED,
 });
 
 export function normalizeTerminalOutcome(reason) {
@@ -218,6 +234,19 @@ export function decideRecovery(input, policyOverrides = {}) {
   // decision on scope or approach, not a mechanical retry.
   if (reason === IMPLEMENTATION_NO_REPOSITORY_CHANGE) {
     return forbidden(reason, 'The model session completed successfully but made no repository change. Review the run log and issue scope, then provide an explicit manager decision before any further dispatch; do not automatically resume or retry.');
+  }
+  // A per-attempt configured budget cap is never automatic-retry eligible
+  // (#206): budget exhaustion alone never authorises raising the budget,
+  // switching billing route, using a paid fallback, or launching another
+  // provider/model attempt. When the preserved worktree already has valid
+  // committed implementation evidence, the correct disposition is
+  // deterministic salvage/publication review of that evidence, not a blind
+  // fresh retry; when no valid checkpoint exists, an explicit manager
+  // decision is required before any fresh authority.
+  if (reason === BUDGET_LIMIT_EXHAUSTED) {
+    return forbidden(reason, evidence.implementationEvidenceValid === true
+      ? 'Per-attempt budget was exhausted, but valid committed implementation evidence is preserved. Review it for deterministic salvage/publication rather than a fresh retry; do not raise the budget, switch billing route, or launch another provider/model attempt.'
+      : 'Per-attempt budget was exhausted and no valid committed implementation evidence is preserved. Provide an explicit manager decision before any fresh dispatch; do not automatically raise the budget, switch billing route, or launch another provider/model attempt.');
   }
   if (!ownershipProven(evidence)) return forbidden(reason, 'Resolve ambiguous process, claim, or lease ownership before recovery.');
   if (reason === 'rate_limited') return retry(reason, 'fresh_retry', attempts, policy.rateLimitAttemptCap, nowMs, policy, 'Retry after bounded provider backoff and a fresh quota preflight.');
