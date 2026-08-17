@@ -199,7 +199,7 @@ export function evaluateCandidateMachineProfileAdmission({
       scope: 'machine_profile',
       reason: 'candidate-machine-profile-cost-denied',
       violations: costAdmission.violations,
-      safeNextAction: 'Adjust the manager-preflight profile/model/effort/max_budget_usd to satisfy this machine\'s cost policy, or obtain an explicit machine-local opt-in for Opus/xhigh. This runner will not raise the machine cost ceiling automatically.',
+      safeNextAction: 'A changed manager intent/profile/budget requires a fresh superseding immutable manager-preflight authority; the existing packet must not be edited. Where permitted, use a separately authorised machine-local policy change for Opus/xhigh. This runner will not raise the machine cost ceiling automatically.',
       profile,
       costAdmission,
     };
