@@ -2,6 +2,7 @@
 
 import { spawnSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -203,6 +204,9 @@ function defaultWriteEvidence(record, { env = process.env, now = () => new Date(
   const stamp = now().replace(/[:.]/g, '-');
   const path = resolve(evidenceDir, `activation-${stamp}-${pid}.json`);
   writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+  // `mode` applies on creation; chmod also repairs a pre-existing bounded record
+  // before returning so the evidence contract is positively mode-0600.
+  chmodSync(path, 0o600);
   return path;
 }
 
