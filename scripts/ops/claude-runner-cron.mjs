@@ -72,7 +72,7 @@ import {
 import { inspectWorkspaceOwnership } from './agent-runner-workspace-ownership.mjs';
 import { withWorkspaceIdentitySupport } from './agent-runner-workspace-identity-store.mjs';
 import { withRecoveryIdentityGuard } from './agent-runner-recovery-identity-guard.mjs';
-import { EXECUTION_PHASE_IMPLEMENTATION, inferProfile, isSupportedModelId, managerBudgetOverride, parseKeyValueBlock, resolveImplementationDispatchIdentity, resolveProfile } from './claude-runner.mjs';
+import { EXECUTION_PHASE_IMPLEMENTATION, findPrFollowUpCandidates, inferProfile, isSupportedModelId, managerBudgetOverride, parseKeyValueBlock, resolveImplementationDispatchIdentity, resolveProfile } from './claude-runner.mjs';
 import { anyProfileQuotaAdmissible, evaluateProfileQuotaAdmission, quotaAdmissionEvidenceFromPreflight } from './claude-runner-quota.mjs';
 import {
   decorateIssueWithMetadata,
@@ -383,6 +383,63 @@ export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeS
   // Never set for a recovery re-invocation or a non-implementation dispatch.
   if (model) out.push('--model', String(model));
   return out;
+}
+
+export function prFollowUpArgs(prNumber, args) {
+  const out = [CLAUDE_RUNNER_ENTRYPOINT];
+  if (args.configPath) out.push('--config', args.configPath);
+  out.push('--pr', String(prNumber), '--output-dir', args.outputDir);
+  if (args.execute) out.push('--execute');
+  return out;
+}
+
+// Pure selection over already-fetched #188 follow-up candidates (#236): a
+// selected issue with zero linked-PR candidates preserves ordinary issue
+// dispatch unchanged; exactly one candidate selects pr-followup dispatch on
+// that PR; more than one candidate is genuinely ambiguous follow-up
+// authority and fails closed (no dispatch at all, not even ordinary issue
+// work), matching the issue's required "fail closed on ambiguity" contract.
+export function selectPrFollowUpDispatch({ candidates } = {}) {
+  if (!Array.isArray(candidates)) return { mode: 'unavailable', reason: 'thread-state-unavailable' };
+  if (candidates.length === 0) return { mode: 'issue', reason: null };
+  if (candidates.length > 1) {
+    return { mode: 'ambiguous', reason: 'multiple-linked-prs-with-unresolved-followup', candidates };
+  }
+  return { mode: 'pr-followup', reason: candidates[0].unresolved.reasons.join(','), candidate: candidates[0] };
+}
+
+// Fetches #236 pr-followup candidates for the selected issue and resolves
+// the dispatch decision. Reuses the accepted #188 detector
+// (`findPrFollowUpCandidates`) rather than duplicating GraphQL/review
+// fetching. Fails closed (mode 'unavailable') on any fetch error so an
+// ambiguous/unreadable review-thread state never falls through to an
+// ordinary issue launch by accident.
+//
+// A cheap `gh pr list` pass (via the same injectable `ghRunner` every other
+// cron helper already uses) runs first: when the selected issue has no
+// linked open PR at all, ordinary issue dispatch is preserved without ever
+// reaching the review-thread/GraphQL fetch, exactly matching "no linked PR"
+// semantics and avoiding a redundant network round trip on the overwhelming
+// majority of scheduler passes.
+export async function resolvePrFollowUpDispatch({
+  repo, issueNumber, token, ghRunner = gh, listPullRequests = listOpenPullRequests, fetchCandidates = findPrFollowUpCandidates,
+}) {
+  let openPrs;
+  try {
+    openPrs = listPullRequests(repo, ghRunner);
+  } catch (error) {
+    return { mode: 'unavailable', reason: 'linked-pr-list-fetch-failed', error: String(error?.message || error) };
+  }
+  const linked = findLinkedOpenPullRequests({ issueNumber, pullRequests: openPrs });
+  if (linked.length === 0) return { mode: 'issue', reason: null };
+
+  let candidates;
+  try {
+    candidates = await fetchCandidates({ repo, issue: issueNumber, token });
+  } catch (error) {
+    return { mode: 'unavailable', reason: 'thread-state-fetch-failed', error: String(error?.message || error) };
+  }
+  return selectPrFollowUpDispatch({ candidates });
 }
 
 export function quotaPreflightArgs(args) {
@@ -3363,6 +3420,108 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       })) return emitSystemicStatePause(args, state, 'dry-run-result-persistence', { now, logger: dependencies.logger }).exitCode;
       console.log(JSON.stringify({ ...payload, logPath }, null, 2));
       return 0;
+    }
+
+    // #236: before any fresh recovery attempt, manager-packet claim/status
+    // mutation, new implementation workspace, or ordinary `--issue` child
+    // launch, check whether the selected issue's existing open PR(s) have
+    // genuine unresolved #188 review follow-up. That takes precedence over
+    // starting a fresh issue attempt for the same issue/project this
+    // recurrence -- it dispatches `--pr <n>` on the already-authorised
+    // branch instead. A recovery continuation (`recoveryClaim` truthy)
+    // already owns an active attempt/branch and is not re-selected here.
+    if (!recoveryClaim) {
+      const prFollowUpDispatch = await resolvePrFollowUpDispatch({
+        repo: args.repo,
+        issueNumber: selected.issue.number,
+        token: authEnv.GITHUB_TOKEN || authEnv.GH_TOKEN,
+        ghRunner,
+      });
+      if (prFollowUpDispatch.mode === 'unavailable' || prFollowUpDispatch.mode === 'ambiguous') {
+        // Fail closed: never fall through to an ordinary issue launch when
+        // follow-up authority is unavailable or ambiguous (#236 required
+        // fixture: thread-fetch-unavailable / two-ambiguous-linked-PRs).
+        const finishedAt = now();
+        const payload = {
+          ...plan,
+          dispatchMode: 'pr-followup-fail-closed',
+          failClosedReason: prFollowUpDispatch.reason,
+          claim: null,
+          childLaunched: false,
+          startedAt: schedulerStartedAt,
+          finishedAt,
+          exitCode: 1,
+        };
+        const logPath = writeLog(args.outputDir, payload);
+        if (!state.record('recordRunResult', {
+          repo: args.repo, issueNumber: selected.issue.number, mode: 'pr-followup-fail-closed', exitCode: 1, logPath, payload, startedAt: schedulerStartedAt, finishedAt,
+        })) return emitSystemicStatePause(args, state, 'pr-followup-fail-closed-result', { now, logger: dependencies.logger }).exitCode;
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return 1;
+      }
+      if (prFollowUpDispatch.mode === 'pr-followup') {
+        const prNumber = prFollowUpDispatch.candidate.pr.number;
+        const preRunHeadSha = prFollowUpDispatch.candidate.pr.headSha || null;
+        const prFollowUpStartedAt = now();
+        const prNodeArgs = prFollowUpArgs(prNumber, args);
+        if (!state.ensureWritable('pre-pr-followup-child-launch-write-probe')) {
+          return emitSystemicStatePause(args, state, 'pre-pr-followup-child-launch', { now, logger: dependencies.logger }).exitCode;
+        }
+        const runChild = dependencies.runChild || runChildWithWatchdog;
+        const result = await runChild({
+          command: process.execPath,
+          commandArgs: prNodeArgs,
+          options: { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, env: authEnv },
+          state,
+          args,
+          attemptId: null,
+          ghRunner,
+          spawnRunner: dependencies.spawnRunner || spawn,
+          processProbe: dependencies.processProbe || probeProcessIdentity,
+          progressProbe: dependencies.progressProbe || probeProcessProgress,
+          now,
+          watchdogIntervalMs: dependencies.watchdogIntervalMs || args.watchdogIntervalMs,
+          stalledPassLimit: dependencies.stalledPassLimit || args.stalledPassLimit,
+        });
+        const finishedAt = now();
+        const childPayload = parseChildRunnerOutput(result.stdout);
+        let postRunHeadSha = null;
+        try {
+          const refreshed = await resolvePrFollowUpDispatch({
+            repo: args.repo, issueNumber: selected.issue.number, token: authEnv.GITHUB_TOKEN || authEnv.GH_TOKEN, ghRunner,
+          });
+          postRunHeadSha = refreshed.candidate?.pr?.headSha ?? refreshed.mode ?? null;
+        } catch { postRunHeadSha = null; }
+        const payload = {
+          ...plan,
+          dispatchMode: 'pr-followup',
+          repo: args.repo,
+          issueNumber: selected.issue.number,
+          pr: prNumber,
+          prHeadBranch: prFollowUpDispatch.candidate.pr.headRefName || null,
+          preRunHeadSha,
+          postRunHeadSha,
+          headChanged: Boolean(preRunHeadSha && postRunHeadSha && preRunHeadSha !== postRunHeadSha),
+          unresolvedFollowUpReasons: prFollowUpDispatch.candidate.unresolved.reasons,
+          claim: null,
+          childLaunched: true,
+          runnerArgs: redactExecutableArgs(prNodeArgs),
+          childExitCode: result.status,
+          childSignal: result.signal,
+          childPayload,
+          startedAt: prFollowUpStartedAt,
+          finishedAt,
+          exitCode: result.status === null ? 1 : result.status,
+        };
+        const logPath = writeLog(args.outputDir, payload);
+        if (!state.record('recordRunResult', {
+          repo: args.repo, issueNumber: selected.issue.number, mode: 'pr-followup', exitCode: payload.exitCode, logPath, payload, startedAt: prFollowUpStartedAt, finishedAt,
+        })) return emitSystemicStatePause(args, state, 'pr-followup-result-persistence', { now, logger: dependencies.logger }).exitCode;
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return payload.exitCode;
+      }
+      // mode === 'issue': no linked-PR follow-up applies; preserve current
+      // ordinary issue execution exactly, unchanged below.
     }
 
     const startedAt = now();

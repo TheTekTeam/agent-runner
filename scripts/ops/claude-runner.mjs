@@ -1076,25 +1076,41 @@ async function fetchPullRequestReviewContext({ repo, pr, token }) {
 }
 
 /**
+ * Find every open PR plausibly linked to `issue` that has genuine unresolved
+ * review follow-up under the #188 detector. Used by both the direct
+ * `--issue` blocking check and the scheduler's pr-followup dispatch
+ * selection (#236), which additionally needs to detect *ambiguity* (more
+ * than one candidate) rather than just the first match.
+ */
+export async function findPrFollowUpCandidates({ repo, issue, token }) {
+  const openPrs = await fetchOpenPullRequests({ repo, token });
+  const candidates = findLinkedOpenPullRequests({
+    issueNumber: issue,
+    pullRequests: openPrs.map((pr) => ({
+      number: pr.number, title: pr.title, body: pr.body, headRefName: pr.head?.ref, url: pr.html_url,
+      headSha: pr.head?.sha || null, headRepoFullName: pr.head?.repo?.full_name || null, isDraft: Boolean(pr.draft),
+    })),
+  });
+
+  const matches = [];
+  for (const candidate of candidates) {
+    const { reviews, comments, reviewThreads } = await fetchPullRequestReviewContext({ repo, pr: candidate.number, token });
+    const unresolved = detectUnresolvedReviewFollowUp({ reviews, reviewThreads, comments });
+    if (unresolved.hasUnresolvedFollowUp) {
+      matches.push({ pr: candidate, unresolved });
+    }
+  }
+  return matches;
+}
+
+/**
  * Check whether an open PR plausibly linked to `issue` has unresolved review
  * follow-up. Returns null when no linked PR is blocking, otherwise details
  * for the blocking PR so the caller can refuse to start new issue work.
  */
 export async function findBlockingPrFollowUp({ repo, issue, token }) {
-  const openPrs = await fetchOpenPullRequests({ repo, token });
-  const candidates = findLinkedOpenPullRequests({
-    issueNumber: issue,
-    pullRequests: openPrs.map((pr) => ({ number: pr.number, title: pr.title, body: pr.body, headRefName: pr.head?.ref, url: pr.html_url })),
-  });
-
-  for (const candidate of candidates) {
-    const { reviews, comments, reviewThreads } = await fetchPullRequestReviewContext({ repo, pr: candidate.number, token });
-    const unresolved = detectUnresolvedReviewFollowUp({ reviews, reviewThreads, comments });
-    if (unresolved.hasUnresolvedFollowUp) {
-      return { pr: candidate, unresolved };
-    }
-  }
-  return null;
+  const matches = await findPrFollowUpCandidates({ repo, issue, token });
+  return matches.length > 0 ? matches[0] : null;
 }
 
 function writeRunLog({ outputDir, label, issueNumber, payload }) {
