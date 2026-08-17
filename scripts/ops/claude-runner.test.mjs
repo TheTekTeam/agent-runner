@@ -26,6 +26,7 @@ import {
   inferProfile,
   implementationProcessCwd,
   latestManagerPreflightComment,
+  managerBudgetOverride,
   nativeClaudeWorktreeName,
   parseArgs,
   parseClaudeResultEnvelope,
@@ -36,6 +37,7 @@ import {
   publishImplementationDraft,
   readQuotaPauseState,
   removedClaudeProviderAuthKeys,
+  resolveImplementationDispatchIdentity,
   resolveProfile,
   runOrPlanClaude,
   runPrFollowUp,
@@ -410,6 +412,163 @@ test('Opus/xhigh can only be admitted with explicit machine opt-ins and raised c
     },
   );
   assert.equal(result.allowed, true);
+});
+
+test('managerBudgetOverride normalizes an absent, valid or invalid canonical manager budget', () => {
+  assert.equal(managerBudgetOverride({ present: false, valid: false, value: null, raw: null }), undefined);
+  assert.equal(managerBudgetOverride({ present: true, valid: true, value: 2, raw: '2.00' }), 2);
+  // An invalid budget keeps its raw text for diagnosis, but only behind a
+  // non-numeric prefix: evaluateClaudeCostAdmission() reads the override with
+  // Number.parseFloat(), which would otherwise recover `2` from `2.00"` and
+  // admit a packet #221's quote-safe normalizer already rejected.
+  assert.equal(
+    managerBudgetOverride({ present: true, valid: false, value: null, raw: 'not-a-number' }),
+    'invalid-manager-max-budget-usd:not-a-number',
+  );
+  assert.equal(
+    managerBudgetOverride({ present: true, valid: false, value: null, raw: '2.00"' }),
+    'invalid-manager-max-budget-usd:2.00"',
+  );
+  // Empty explicit raw text must not collapse to a falsy override --
+  // resolveProfile()'s own `||` default fallback would silently substitute
+  // the profile default instead of failing closed downstream.
+  assert.equal(
+    managerBudgetOverride({ present: true, valid: false, value: null, raw: '' }),
+    'invalid-manager-max-budget-usd',
+  );
+  // Every invalid shape must parse back to NaN, never to a number a cost
+  // ceiling comparison could admit.
+  for (const raw of ['2.00"', "2.00'", '"2.00', '0', '-1.00', '']) {
+    const override = managerBudgetOverride({ present: true, valid: false, value: null, raw });
+    assert.ok(Number.isNaN(Number.parseFloat(override)), `expected NaN parse for raw "${raw}"`);
+  }
+});
+
+// #223 field evidence: #208's `.5` attempt persisted `profile.maxBudgetUsd`
+// `"\"4.00\""` and `costAdmission.requested.maxBudgetUsd` `null` because the
+// child-dispatch derivation fed the generic-parser (quote-preserving) value
+// straight into `resolveProfile()`. These fixtures reproduce that exact
+// packet shape through `resolveImplementationDispatchIdentity()`.
+const DISPATCH_FP = `sha256:${'b'.repeat(64)}`;
+const DISPATCH_BASE_COMMIT = 'a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e';
+
+function dispatchPreflight({ maxBudgetUsdLine = 'max_budget_usd: 2.00' } = {}) {
+  return {
+    id: 5310303832,
+    databaseId: 5310303832,
+    user: { login: 'gpcola' },
+    body: `<!-- agent-runner:manager-preflight -->
+
+\`\`\`yaml
+schema_version: agent-runner-manager-preflight/v1
+revision: AR223-DISPATCH-TEST-2026-08-17.1
+fingerprint: ${DISPATCH_FP}
+producer_type: normal_chatgpt_manager_session
+approved_agent: claude-code-cli
+execution_phase: implementation
+approved_repository_scope:
+  - TheTekTeam/agent-runner
+approved_branch: claude/manager-execution-handoff-223-v1
+base_commit: ${DISPATCH_BASE_COMMIT}
+profile: complex
+model: sonnet
+effort: medium
+${maxBudgetUsdLine}
+scope:
+  - bounded scope
+required_validation:
+  - node --test focused
+stop_conditions:
+  - stop on scope expansion
+\`\`\`
+`,
+  };
+}
+
+function dispatchEnv() {
+  return {
+    CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true',
+    CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola',
+  };
+}
+
+function dispatchIssue() {
+  return { number: 223, title: 'RUNNER.MANAGER.EXECUTION.HANDOFF.1', labels: [] };
+}
+
+function dispatchConfig() {
+  return { githubRepo: 'TheTekTeam/agent-runner', localRepoPath: '/workspace/agent-runner' };
+}
+
+// Both production callers pass `argsRepo: args.repo`, and per #180 `parseArgs`
+// defaults `repo` to the configured repository identity. Omitting it here would
+// fail `resolveRepositoryContext()` on `issueRepository` long before the #223
+// budget derivation under test is ever reached.
+function dispatchIdentityFor(maxBudgetUsdLine) {
+  return resolveImplementationDispatchIdentity({
+    issue: dispatchIssue(),
+    currentPreflight: dispatchPreflight({ maxBudgetUsdLine }),
+    config: dispatchConfig(),
+    env: dispatchEnv(),
+    argsRepo: dispatchConfig().githubRepo,
+  });
+}
+
+test('a quoted manager budget equal to the machine cap normalizes identically to unquoted or single-quoted', () => {
+  const variants = ['max_budget_usd: 2.00', 'max_budget_usd: "2.00"', "max_budget_usd: '2.00'"];
+  const budgets = variants.map((maxBudgetUsdLine) => {
+    const dispatchIdentity = dispatchIdentityFor(maxBudgetUsdLine);
+    assert.equal(dispatchIdentity.ok, true, dispatchIdentity.failureReason || '');
+    assert.equal(dispatchIdentity.managerExecutionMeta.profile, 'complex');
+    assert.equal(dispatchIdentity.managerExecutionMeta.model, 'sonnet');
+    assert.equal(dispatchIdentity.managerExecutionMeta.effort, 'medium');
+    const profile = resolveProfile(dispatchIdentity.profileName, {
+      model: dispatchIdentity.managerExecutionMeta.model,
+      effort: dispatchIdentity.managerExecutionMeta.effort,
+      maxBudgetUsd: managerBudgetOverride(dispatchIdentity.managerExecutionMeta.maxBudgetUsd),
+    });
+    const costAdmission = evaluateClaudeCostAdmission(profile, { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' });
+    assert.equal(costAdmission.allowed, true);
+    return costAdmission.requested.maxBudgetUsd;
+  });
+  assert.deepEqual(budgets, [2, 2, 2]);
+});
+
+test('leading-only/trailing-only quoted manager budgets fail closed before provider launch', () => {
+  const malformedLines = [
+    'max_budget_usd: "2.00',
+    'max_budget_usd: 2.00"',
+    "max_budget_usd: '2.00",
+    "max_budget_usd: 2.00'",
+    'max_budget_usd: ""',
+    'max_budget_usd: not-a-number',
+    'max_budget_usd: 0',
+    'max_budget_usd: -1.00',
+  ];
+  for (const maxBudgetUsdLine of malformedLines) {
+    const dispatchIdentity = dispatchIdentityFor(maxBudgetUsdLine);
+    assert.equal(dispatchIdentity.ok, true, dispatchIdentity.failureReason || '');
+    const profile = resolveProfile(dispatchIdentity.profileName, {
+      model: dispatchIdentity.managerExecutionMeta.model,
+      effort: dispatchIdentity.managerExecutionMeta.effort,
+      maxBudgetUsd: managerBudgetOverride(dispatchIdentity.managerExecutionMeta.maxBudgetUsd),
+    });
+    const costAdmission = evaluateClaudeCostAdmission(profile, { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' });
+    assert.equal(costAdmission.allowed, false, `expected fail-closed for "${maxBudgetUsdLine}"`);
+    assert.ok(costAdmission.violations.includes('budget-cap-exceeds-machine-policy'));
+  }
+});
+
+test('an absent manager budget still follows the existing profile-default semantics', () => {
+  const dispatchIdentity = dispatchIdentityFor('');
+  assert.equal(dispatchIdentity.ok, true, dispatchIdentity.failureReason || '');
+  assert.equal(dispatchIdentity.managerExecutionMeta.maxBudgetUsd.present, false);
+  const profile = resolveProfile(dispatchIdentity.profileName, {
+    model: dispatchIdentity.managerExecutionMeta.model,
+    effort: dispatchIdentity.managerExecutionMeta.effort,
+    maxBudgetUsd: managerBudgetOverride(dispatchIdentity.managerExecutionMeta.maxBudgetUsd),
+  });
+  assert.equal(profile.maxBudgetUsd, resolveProfile(dispatchIdentity.profileName).maxBudgetUsd);
 });
 
 test('Claude process env strips provider auth by default without mutating input', () => {
