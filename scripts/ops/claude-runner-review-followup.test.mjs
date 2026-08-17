@@ -48,27 +48,29 @@ test('returns no follow-up when there is nothing unresolved', () => {
   assert.deepEqual(result.reasons, []);
 });
 
-test('linkedIssueNumberFromPr extracts the latest closes/fixes reference', () => {
+test('linkedIssueNumberFromPr extracts the latest accepted linkage reference', () => {
   assert.equal(linkedIssueNumberFromPr({ body: 'Fixes #123' }), 123);
   assert.equal(linkedIssueNumberFromPr({ body: 'Closes #10\n\nAlso resolves #20' }), 20);
+  assert.equal(linkedIssueNumberFromPr({ body: 'Implements #629 from an allowlisted manager preflight.' }), 629);
   assert.equal(linkedIssueNumberFromPr({ body: 'No linkage here' }), null);
 });
 
 test('linkedIssueNumbersFromPr exposes the distinct linked issue set without changing latest-wins compatibility', () => {
-  const input = { title: 'Fixes #10', body: 'Closes #10\nAlso resolves #20\nFixes #20' };
+  const input = { title: 'Fixes #10', body: 'Closes #10\nAlso resolves #20\nImplements #20' };
   assert.deepEqual(linkedIssueNumbersFromPr(input), [10, 20]);
   assert.equal(linkedIssueNumberFromPr(input), 20);
   assert.deepEqual(linkedIssueNumbersFromPr({ body: 'No linkage here' }), []);
 });
 
-test('findLinkedOpenPullRequests matches by close/fix keyword or branch suffix', () => {
+test('findLinkedOpenPullRequests matches by accepted linkage keyword or branch suffix', () => {
   const prs = [
     { number: 1, title: 'unrelated', body: 'no link', headRefName: 'feature/other' },
     { number: 2, title: 'fix', body: 'Fixes #629', headRefName: 'claude/something-629' },
     { number: 3, title: 'fix', body: 'no keyword', headRefName: 'claude/ops-claude-runner-dell-queue-629' },
+    { number: 4, title: 'runner publication', body: 'Implements #629 from an allowlisted manager preflight.', headRefName: 'claude/something-629-v4' },
   ];
   const linked = findLinkedOpenPullRequests({ issueNumber: 629, pullRequests: prs });
-  assert.deepEqual(linked.map((pr) => pr.number).sort(), [2, 3]);
+  assert.deepEqual(linked.map((pr) => pr.number).sort(), [2, 3, 4]);
 });
 
 test('buildReviewFollowUpPrompt includes branch, PR, linked issue, and stay-on-branch instructions', () => {
