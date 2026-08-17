@@ -62,8 +62,11 @@ export function resolvePrContinuationBinding({
   ) {
     return fail('pr-continuation-binding-dependency-missing');
   }
-  if (pullRequest.state && pullRequest.state !== 'open') {
+  if (pullRequest.state !== 'open') {
     return fail('pr-continuation-pr-not-open');
+  }
+  if (!Number.isInteger(pullRequest.number) || pullRequest.number <= 0) {
+    return fail('pr-continuation-pr-number-invalid');
   }
 
   const linkedIssueNumbers = linkedIssueNumbersFromPr({
@@ -187,7 +190,7 @@ export function resolvePrContinuationBinding({
     allowed: true,
     failureReason: null,
     issueNumber: linkedIssueNumber,
-    prNumber: Number.isInteger(pullRequest.number) ? pullRequest.number : null,
+    prNumber: pullRequest.number,
     repository: authorisedRepository,
     branch: authorisedBranch,
     preRunHeadSha: head.sha,
