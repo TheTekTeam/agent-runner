@@ -40,6 +40,9 @@ const REVISION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,160}$/;
 const FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const FULL_SHA_PATTERN = /^[a-f0-9]{40}$/;
 const REASON_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/ -]{2,160}$/;
+const REFUSAL_REASON_PATTERN = /^[a-z0-9][a-z0-9-]{1,95}$/;
+const AUTHORITY_KEY_PATTERN = /^source-activation:[A-Za-z0-9][A-Za-z0-9._:/-]{2,160}:sha256:[a-f0-9]{64}$/;
+const MAX_AUTHORITY_BODY_BYTES = 32 * 1024;
 const REQUIRED_AUTHORITY_FIELDS = Object.freeze([
   'schema_version',
   'revision',
@@ -119,7 +122,7 @@ function parseStrictYamlScalars(block) {
       return { ok: false, reason: 'source-activation-authority-field-duplicate', values };
     }
     const value = String(rawValue || '').trim().replace(/^["']|["']$/g, '');
-    if (!value || /[\r\n]/.test(value)) {
+    if (!value || value.length > 256 || /[\r\n]/.test(value)) {
       return { ok: false, reason: 'source-activation-authority-value-invalid', values };
     }
     values[key] = value;
@@ -154,6 +157,19 @@ function commentAuthor(comment) {
   return String(comment?.user?.login || comment?.author?.login || '').trim().toLowerCase();
 }
 
+function invalidAuthorityResult(reason, comment, body, values = undefined, errors = undefined) {
+  return {
+    valid: false,
+    canonical: true,
+    reason,
+    ...(errors ? { errors } : {}),
+    ...(values ? { values } : {}),
+    comment,
+    commentId: commentId(comment),
+    bodyDigest: packetBodyDigest(body),
+  };
+}
+
 export function parseSourceActivationAuthority(commentOrBody) {
   const comment = typeof commentOrBody === 'string' ? { body: commentOrBody } : (commentOrBody || {});
   const body = String(comment.body || '');
@@ -161,28 +177,25 @@ export function parseSourceActivationAuthority(commentOrBody) {
   if (markers === 0) {
     return { valid: false, canonical: false, reason: 'source-activation-authority-required', comment };
   }
+  if (body.length > MAX_AUTHORITY_BODY_BYTES) {
+    return invalidAuthorityResult('source-activation-authority-body-too-large', comment, body);
+  }
   if (markers !== 1) {
-    return { valid: false, canonical: true, reason: 'source-activation-authority-marker-ambiguous', comment };
+    return invalidAuthorityResult('source-activation-authority-marker-ambiguous', comment, body);
   }
   const blocks = yamlBlocks(body);
   if (blocks.length !== 1) {
-    return { valid: false, canonical: true, reason: 'source-activation-authority-yaml-ambiguous', comment };
+    return invalidAuthorityResult('source-activation-authority-yaml-ambiguous', comment, body);
   }
   const parsed = parseStrictYamlScalars(blocks[0]);
   if (!parsed.ok) {
-    return { valid: false, canonical: true, reason: parsed.reason, comment };
+    return invalidAuthorityResult(parsed.reason, comment, body, parsed.values);
   }
   const values = parsed.values;
   const keys = Object.keys(values).sort();
   const expectedKeys = [...REQUIRED_AUTHORITY_FIELDS].sort();
   if (JSON.stringify(keys) !== JSON.stringify(expectedKeys)) {
-    return {
-      valid: false,
-      canonical: true,
-      reason: 'source-activation-authority-fields-invalid',
-      comment,
-      values,
-    };
+    return invalidAuthorityResult('source-activation-authority-fields-invalid', comment, body, values);
   }
 
   const fingerprint = String(values.fingerprint || '').toLowerCase();
@@ -202,16 +215,7 @@ export function parseSourceActivationAuthority(commentOrBody) {
   if (typeof commentOrBody !== 'string' && !id) errors.push('comment_id');
 
   if (errors.length > 0) {
-    return {
-      valid: false,
-      canonical: true,
-      reason: 'source-activation-authority-invalid',
-      errors,
-      comment,
-      values,
-      commentId: id,
-      bodyDigest: packetBodyDigest(body),
-    };
+    return invalidAuthorityResult('source-activation-authority-invalid', comment, body, values, errors);
   }
 
   return Object.freeze({
@@ -321,14 +325,35 @@ export function normalizeSourceActivationState(value) {
   if (!['pending', 'applied', 'refused'].includes(value.status)) {
     authorityError('source-activation-state-invalid', 'Source-activation state status is invalid.');
   }
-  if (!/^sha256:[a-f0-9]{64}$/.test(String(value.bodyDigest || ''))) {
+  if (!FINGERPRINT_PATTERN.test(String(value.bodyDigest || ''))) {
     authorityError('source-activation-state-invalid', 'Source-activation state body digest is invalid.');
+  }
+  if (value.revision !== null && value.revision !== undefined && !REVISION_PATTERN.test(String(value.revision))) {
+    authorityError('source-activation-state-invalid', 'Source-activation state revision is invalid.');
+  }
+  if (value.fingerprint !== null && value.fingerprint !== undefined && !FINGERPRINT_PATTERN.test(String(value.fingerprint))) {
+    authorityError('source-activation-state-invalid', 'Source-activation state fingerprint is invalid.');
+  }
+  if (value.authorityKey !== null && value.authorityKey !== undefined && !AUTHORITY_KEY_PATTERN.test(String(value.authorityKey))) {
+    authorityError('source-activation-state-invalid', 'Source-activation state authority key is invalid.');
   }
   if (value.targetCommit !== null && value.targetCommit !== undefined && !FULL_SHA_PATTERN.test(String(value.targetCommit))) {
     authorityError('source-activation-state-invalid', 'Source-activation state target is invalid.');
   }
   if (value.finalHead !== null && value.finalHead !== undefined && !FULL_SHA_PATTERN.test(String(value.finalHead))) {
     authorityError('source-activation-state-invalid', 'Source-activation state final head is invalid.');
+  }
+  if (value.refusalReason !== null && value.refusalReason !== undefined && !REFUSAL_REASON_PATTERN.test(String(value.refusalReason))) {
+    authorityError('source-activation-state-invalid', 'Source-activation state refusal reason is invalid.');
+  }
+  if (value.appliedAt !== null && value.appliedAt !== undefined && !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(String(value.appliedAt))) {
+    authorityError('source-activation-state-invalid', 'Source-activation state applied timestamp is invalid.');
+  }
+  if (value.status === 'applied' && (!value.authorityKey || !value.targetCommit || !value.finalHead || !value.appliedAt)) {
+    authorityError('source-activation-state-invalid', 'Applied source-activation state is incomplete.');
+  }
+  if (value.status === 'pending' && (!value.authorityKey || !value.targetCommit)) {
+    authorityError('source-activation-state-invalid', 'Pending source-activation state is incomplete.');
   }
   return Object.freeze({
     schemaVersion: value.schemaVersion,
@@ -382,7 +407,7 @@ export function writeSourceActivationState(
     chmod(temp, 0o600);
     rename(temp, path);
     chmod(path, 0o600);
-  } catch (error) {
+  } catch {
     try { remove(temp, { force: true }); } catch { /* preserve write error */ }
     authorityError('source-activation-state-write-failed', 'Source-activation state could not be persisted.');
   }
@@ -402,16 +427,31 @@ function defaultReadHead({ cwd = REPOSITORY_ROOT } = {}) {
   return head;
 }
 
+function boundedMalformedRevision(parsed) {
+  const candidate = String(parsed.values?.revision || '');
+  return REVISION_PATTERN.test(candidate) ? candidate : null;
+}
+
+function boundedMalformedFingerprint(parsed) {
+  const candidate = String(parsed.values?.fingerprint || '').toLowerCase();
+  return FINGERPRINT_PATTERN.test(candidate) ? candidate : null;
+}
+
+function boundedMalformedTarget(parsed) {
+  const candidate = String(parsed.values?.target_commit || '').toLowerCase();
+  return FULL_SHA_PATTERN.test(candidate) ? candidate : null;
+}
+
 function stateFromAuthority({ issueNumber, parsed, status, refusalReason = null, appliedAt = null, finalHead = null }) {
   return {
     schemaVersion: SOURCE_ACTIVATION_STATE_SCHEMA_VERSION,
     sourceIssueNumber: issueNumber,
     sourceCommentId: parsed.commentId,
     authorityKey: parsed.valid ? parsed.authorityKey : null,
-    revision: parsed.valid ? parsed.revision : (parsed.values?.revision || null),
-    fingerprint: parsed.valid ? parsed.fingerprint : (parsed.values?.fingerprint?.toLowerCase?.() || null),
+    revision: parsed.valid ? parsed.revision : boundedMalformedRevision(parsed),
+    fingerprint: parsed.valid ? parsed.fingerprint : boundedMalformedFingerprint(parsed),
     bodyDigest: parsed.bodyDigest || packetBodyDigest(String(parsed.comment?.body || '')),
-    targetCommit: parsed.valid ? parsed.targetCommit : (FULL_SHA_PATTERN.test(String(parsed.values?.target_commit || '').toLowerCase()) ? String(parsed.values.target_commit).toLowerCase() : null),
+    targetCommit: parsed.valid ? parsed.targetCommit : boundedMalformedTarget(parsed),
     status,
     refusalReason,
     appliedAt,
@@ -420,10 +460,11 @@ function stateFromAuthority({ issueNumber, parsed, status, refusalReason = null,
 }
 
 function sourceMarkerComments(comments) {
-  return comments
-    .filter((comment) => String(comment?.body || '').includes(SOURCE_ACTIVATION_AUTHORITY_MARKER))
-    .filter((comment) => commentId(comment))
-    .sort((a, b) => commentId(a) - commentId(b));
+  const marked = comments.filter((comment) => String(comment?.body || '').includes(SOURCE_ACTIVATION_AUTHORITY_MARKER));
+  if (marked.some((comment) => !commentId(comment))) {
+    authorityError('source-activation-comment-identity-invalid', 'A source-activation authority comment lacks a stable REST comment identity.');
+  }
+  return marked.sort((a, b) => commentId(a) - commentId(b));
 }
 
 function halt(reason, extra = {}) {
@@ -490,7 +531,12 @@ export async function evaluateSourceActivationAuthority({
     if (state?.status === 'refused') {
       return halt(state.refusalReason || 'source-activation-authority-refused', { sourceCommentId: state.sourceCommentId });
     }
-    return { action: 'continue', reason: state?.status === 'applied' ? 'source-activation-authority-already-applied' : 'source-activation-authority-none' };
+    return {
+      action: 'continue',
+      reason: state?.status === 'applied'
+        ? 'source-activation-authority-already-applied'
+        : 'source-activation-authority-none',
+    };
   }
   if (eligible.length !== 1) {
     return halt('source-activation-authority-ambiguous');
@@ -564,7 +610,9 @@ export async function evaluateSourceActivationAuthority({
   writeState(applied);
   return {
     action: 'reexec',
-    reason: activation.result === 'already-active' ? 'source-activation-authority-applied-already-active' : 'source-activation-authority-applied',
+    reason: activation.result === 'already-active'
+      ? 'source-activation-authority-applied-already-active'
+      : 'source-activation-authority-applied',
     sourceCommentId: parsed.commentId,
     targetCommit: parsed.targetCommit,
   };
