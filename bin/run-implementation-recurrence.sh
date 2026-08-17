@@ -82,7 +82,7 @@ export PATH="/usr/local/bin:/opt/homebrew/bin:/opt/cpanel/ea-nodejs22/bin:$HOME/
 # candidate. Disabled is the default and performs no controller/GitHub lookup.
 source_activation_enabled() {
   case "${AGENT_RUNNER_SOURCE_ACTIVATION_ENABLED:-false}" in
-    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]|[Oo][Nn]) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -132,6 +132,15 @@ if source_activation_enabled; then
       ;;
   esac
 fi
+
+# Source-activation configuration is machine control-plane authority only. Once
+# its outer-boundary decision is complete, do not inherit it into candidate
+# selection, project wrappers or implementation workers. A later timer tick
+# reloads the machine policy afresh from runner.env.
+unset AGENT_RUNNER_SOURCE_ACTIVATION_ENABLED
+unset AGENT_RUNNER_SOURCE_ACTIVATION_CONTROL_ISSUE
+unset AGENT_RUNNER_SOURCE_ACTIVATION_STATE
+unset AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH
 
 [ -n "${AGENT_RUNNER_PROJECT_REGISTRY:-}" ] || {
   echo "[agent-runner] ERROR: AGENT_RUNNER_PROJECT_REGISTRY is not configured" >&2
