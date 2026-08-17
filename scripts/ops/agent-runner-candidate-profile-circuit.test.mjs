@@ -13,15 +13,26 @@ import {
   candidateProfileCircuitPausePayload,
 } from './agent-runner-candidate-profile-circuit.mjs';
 
+const FP_B = `sha256:${'b'.repeat(64)}`;
+const FP_D = `sha256:${'d'.repeat(64)}`;
+
+function authority({
+  revision = 'AR235-2026-08-17.1',
+  fingerprint = FP_B,
+  packetDigest = `sha256:${'c'.repeat(64)}`,
+} = {}) {
+  return {
+    authorityKey: `manager-preflight:${revision}:${fingerprint}`,
+    revision,
+    fingerprint,
+    packetDigest,
+  };
+}
+
 function fixture(overrides = {}) {
   return {
-    machineConfigurationFingerprint: 'sha256:' + 'a'.repeat(64),
-    managerAuthority: {
-      authorityKey: 'AR235:test',
-      revision: 'AR235-2026-08-17.1',
-      fingerprint: 'sha256:' + 'b'.repeat(64),
-      packetDigest: 'sha256:' + 'c'.repeat(64),
-    },
+    machineConfigurationFingerprint: `sha256:${'a'.repeat(64)}`,
+    managerAuthority: authority(),
     profile: {
       profile: 'narrow',
       model: 'sonnet',
@@ -102,12 +113,11 @@ test('relevant machine cost policy and manager authority changes alter candidate
     costAdmission: { policy: { maxBudgetUsd: 2, opusAllowed: false, highEffortAllowed: true } },
   }));
   const authorityChanged = candidateEffectiveCostFingerprint(fixture({
-    managerAuthority: {
-      authorityKey: 'AR235:test:2',
+    managerAuthority: authority({
       revision: 'AR235-2026-08-17.2',
-      fingerprint: 'sha256:' + 'd'.repeat(64),
-      packetDigest: 'sha256:' + 'e'.repeat(64),
-    },
+      fingerprint: FP_D,
+      packetDigest: `sha256:${'e'.repeat(64)}`,
+    }),
   }));
   assert.notEqual(baseline, capChanged);
   assert.notEqual(baseline, opusChanged);
@@ -115,9 +125,42 @@ test('relevant machine cost policy and manager authority changes alter candidate
   assert.notEqual(baseline, authorityChanged);
 });
 
-test('fingerprint material is positive-allowlisted and excludes raw packet, credentials, env, paths and tool arrays', () => {
-  const material = candidateEffectiveCostFingerprintMaterial({
+test('fingerprint material fails closed when required authority/profile/machine-policy inputs are incomplete or inconsistent', () => {
+  assert.throws(
+    () => candidateEffectiveCostFingerprint({ ...fixture(), machineConfigurationFingerprint: null }),
+    /machineConfigurationFingerprint/,
+  );
+  assert.throws(
+    () => candidateEffectiveCostFingerprint({ ...fixture(), managerAuthority: { ...authority(), packetDigest: null } }),
+    /packetDigest/,
+  );
+  assert.throws(
+    () => candidateEffectiveCostFingerprint({ ...fixture(), managerAuthority: { ...authority(), authorityKey: 'wrong' } }),
+    /authorityKey does not match/,
+  );
+  assert.throws(
+    () => candidateEffectiveCostFingerprint({ ...fixture(), profile: { ...fixture().profile, model: null } }),
+    /profile.model/,
+  );
+  assert.throws(
+    () => candidateEffectiveCostFingerprint({ ...fixture(), profile: { ...fixture().profile, maxBudgetUsd: null }, managerMaxBudgetUsd: null }),
+    /budget identity/,
+  );
+  assert.throws(
+    () => candidateEffectiveCostFingerprint({ ...fixture(), costAdmission: { policy: { maxBudgetUsd: null, opusAllowed: false, highEffortAllowed: false } } }),
+    /maxBudgetUsd/,
+  );
+  assert.throws(
+    () => candidateEffectiveCostFingerprint({ ...fixture(), costAdmission: { policy: { maxBudgetUsd: 2, opusAllowed: 'false', highEffortAllowed: false } } }),
+    /opusAllowed/,
+  );
+});
+
+test('fingerprint material is positive-allowlisted and irrelevant/raw fields do not alter identity', () => {
+  const baseline = candidateEffectiveCostFingerprint(fixture());
+  const enriched = {
     ...fixture(),
+    policyRevision: 'caller-controlled-revision-must-be-ignored',
     managerAuthority: {
       ...fixture().managerAuthority,
       body: 'TOP SECRET PACKET BODY',
@@ -136,11 +179,13 @@ test('fingerprint material is positive-allowlisted and excludes raw packet, cred
       env: { SECRET: 'value' },
     },
     arbitraryEnv: { TOKEN: 'secret' },
-  });
+  };
+  const material = candidateEffectiveCostFingerprintMaterial(enriched);
   const serialized = JSON.stringify(material);
-  for (const forbidden of ['TOP SECRET', 'secret-token', 'private comment', 'Bash(*)', '/home/gp/private', 'secret prompt', 'secret provider output', 'SECRET', 'TOKEN']) {
+  for (const forbidden of ['TOP SECRET', 'secret-token', 'private comment', 'Bash(*)', '/home/gp/private', 'secret prompt', 'secret provider output', 'SECRET', 'TOKEN', 'caller-controlled-revision']) {
     assert.equal(serialized.includes(forbidden), false, forbidden);
   }
+  assert.equal(candidateEffectiveCostFingerprint(enriched), baseline);
   assert.deepEqual(Object.keys(material).sort(), [
     'machineConfigurationFingerprint',
     'machineCostPolicy',
@@ -188,12 +233,11 @@ test('one candidate refusal trips immediately and identical refusal is blocked a
 test('fresh candidate-effective configuration is stale-not-blocked and replaces old current incident only when recorded', () => withCandidateBreaker((breaker) => {
   const firstFingerprint = candidateEffectiveCostFingerprint(fixture());
   const nextFingerprint = candidateEffectiveCostFingerprint(fixture({
-    managerAuthority: {
-      authorityKey: 'AR235:test:2',
+    managerAuthority: authority({
       revision: 'AR235-2026-08-17.2',
-      fingerprint: 'sha256:' + 'd'.repeat(64),
-      packetDigest: 'sha256:' + 'e'.repeat(64),
-    },
+      fingerprint: FP_D,
+      packetDigest: `sha256:${'e'.repeat(64)}`,
+    }),
     managerMaxBudgetUsd: { present: true, valid: true, value: 1, raw: '1.00' },
     profile: { profile: 'narrow', model: 'sonnet', effort: 'low', maxBudgetUsd: 1 },
   }));
