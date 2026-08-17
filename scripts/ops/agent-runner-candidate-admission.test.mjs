@@ -116,7 +116,6 @@ test('preflight revision change fails closed', () => {
 });
 
 
-
 test('packet text edits without a new revision fail revalidation', () => {
   const initial = candidateSnapshot(selection({ packetNote: 'Original bounded scope.' }));
   const current = candidateSnapshot(selection({ packetNote: 'Expanded scope with the same revision.' }));
@@ -184,7 +183,9 @@ test('genuine over-cap manager budget fails closed with machine_profile scope', 
   assert.equal(decision.scope, 'machine_profile');
   assert.equal(decision.reason, 'candidate-machine-profile-cost-denied');
   assert.ok(decision.violations.includes('budget-cap-exceeds-machine-policy'));
-  assert.ok(decision.safeNextAction);
+  assert.match(decision.safeNextAction, /fresh superseding immutable manager-preflight authority/);
+  assert.match(decision.safeNextAction, /existing packet must not be edited/);
+  assert.match(decision.safeNextAction, /separately authorised machine-local policy change/);
 });
 
 for (const malformed of ['max_budget_usd: "2.00\'', 'max_budget_usd: ""', 'max_budget_usd: not-a-number', 'max_budget_usd: 0', 'max_budget_usd: -1.00']) {
