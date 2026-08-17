@@ -6,7 +6,12 @@
 // has unresolved manager/reviewer feedback and, if so, builds a follow-up
 // Claude prompt scoped to that feedback.
 
-const LINKED_ISSUE_PATTERN = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*#(\d+)/gi;
+// Include "implements" because publishImplementationDraft() uses exactly
+// `Implements #N ...` for runner-created draft PRs. Without this, a valid
+// runner PR whose approved branch does not end in the issue number can become
+// unlinkable to direct PR continuation even though the runner itself created
+// the linkage text.
+const LINKED_ISSUE_PATTERN = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|implement(?:s|ed|ing)?)\s*:?\s*#(\d+)/gi;
 
 function latestReviewStatePerAuthor(reviews = []) {
   const latestByAuthor = new Map();
@@ -66,20 +71,38 @@ export function detectUnresolvedReviewFollowUp({ reviews = [], reviewThreads = [
   };
 }
 
-export function linkedIssueNumberFromPr({ body = '', title = '' } = {}) {
+/**
+ * Return every distinct issue number explicitly linked through the accepted
+ * close/fix/resolve keywords or the runner's own deterministic `Implements`
+ * publication wording, preserving appearance order. Direct PR continuation
+ * admission needs the full set so more than one linked issue can fail closed
+ * instead of silently inheriting linkedIssueNumberFromPr()'s historical
+ * "latest wins" reporting behavior.
+ */
+export function linkedIssueNumbersFromPr({ body = '', title = '' } = {}) {
   const combined = `${title}\n${body}`;
+  const numbers = [];
+  const seen = new Set();
   let match;
-  let latest = null;
   LINKED_ISSUE_PATTERN.lastIndex = 0;
   while ((match = LINKED_ISSUE_PATTERN.exec(combined)) !== null) {
-    latest = Number.parseInt(match[1], 10);
+    const issueNumber = Number.parseInt(match[1], 10);
+    if (Number.isInteger(issueNumber) && issueNumber > 0 && !seen.has(issueNumber)) {
+      seen.add(issueNumber);
+      numbers.push(issueNumber);
+    }
   }
-  return latest;
+  return numbers;
+}
+
+export function linkedIssueNumberFromPr(input = {}) {
+  const numbers = linkedIssueNumbersFromPr(input);
+  return numbers.length > 0 ? numbers[numbers.length - 1] : null;
 }
 
 /**
  * Find open PRs plausibly linked to an issue, from an already-fetched list of
- * open PRs. Matching is intentionally conservative (explicit close/fix
+ * open PRs. Matching is intentionally conservative (explicit linkage
  * keyword, or a branch name ending in the issue number) to avoid pulling in
  * unrelated PRs.
  */
