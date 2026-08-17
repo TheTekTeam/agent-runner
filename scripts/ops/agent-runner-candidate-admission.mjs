@@ -4,13 +4,22 @@ import { pathToFileURL } from 'node:url';
 
 import { normalizeImplementationApprovers } from './agent-runner-admission.mjs';
 import { resolveAgentForLabels } from './agent-runner-agents.mjs';
-import { parseManagerPreflightPacket } from './agent-runner-manager-authority.mjs';
+import {
+  parseManagerPreflightPacket,
+  resolveManagerPreflightExecutionMetadata,
+} from './agent-runner-manager-authority.mjs';
 import { executionLabelAuthority } from './agent-runner-label-authority.mjs';
 import {
   commentRevision,
   normalizeCommentIdentity,
   sameCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
+import {
+  evaluateClaudeCostAdmission,
+  inferProfile,
+  managerBudgetOverride,
+  resolveProfile,
+} from './claude-runner.mjs';
 
 export const CANDIDATE_PAUSED_EXIT_CODE = 3;
 export const NEW_CLAIM_AUTHORIZATION_MODE = 'preflight-direct';
@@ -153,6 +162,55 @@ export function evaluateCandidateAdmission({ initial, current, approvers = [] } 
     return { allowed: false, reason: 'candidate-preflight-author-not-approved' };
   }
   return { allowed: true, reason: 'candidate-admitted' };
+}
+
+/**
+ * Issue #226: pure candidate machine/profile cost decision. Reuses
+ * `resolveManagerPreflightExecutionMetadata()` for quote-safe profile/model/
+ * effort/max_budget_usd scalars and the canonical `resolveProfile()`/
+ * `evaluateClaudeCostAdmission()` semantics claude-runner.mjs already uses
+ * for a real attempt -- no second cost policy. Performs no GitHub, attempt,
+ * workspace or provider mutation; it only inspects the immutable manager
+ * preflight and issue already supplied by the caller.
+ */
+export function evaluateCandidateMachineProfileAdmission({
+  issue = {},
+  preflight = null,
+  argsProfile,
+  argsModel,
+  argsEffort,
+  argsMaxBudgetUsd,
+  env = process.env,
+} = {}) {
+  const managerExecutionMeta = resolveManagerPreflightExecutionMetadata(preflight);
+  const profileName = inferProfile({
+    explicitProfile: argsProfile || managerExecutionMeta.profile,
+    issue,
+  });
+  const profile = resolveProfile(profileName, {
+    model: argsModel || managerExecutionMeta.model,
+    effort: argsEffort || managerExecutionMeta.effort,
+    maxBudgetUsd: argsMaxBudgetUsd || managerBudgetOverride(managerExecutionMeta.maxBudgetUsd),
+  }, env);
+  const costAdmission = evaluateClaudeCostAdmission(profile, env);
+  if (!costAdmission.allowed) {
+    return {
+      allowed: false,
+      scope: 'machine_profile',
+      reason: 'candidate-machine-profile-cost-denied',
+      violations: costAdmission.violations,
+      safeNextAction: 'A changed manager intent/profile/budget requires a fresh superseding immutable manager-preflight authority; the existing packet must not be edited. Where permitted, use a separately authorised machine-local policy change for Opus/xhigh. This runner will not raise the machine cost ceiling automatically.',
+      profile,
+      costAdmission,
+    };
+  }
+  return {
+    allowed: true,
+    scope: 'machine_profile',
+    reason: 'candidate-machine-profile-admitted',
+    profile,
+    costAdmission,
+  };
 }
 
 export function candidatePausePayload(admission, snapshot) {
