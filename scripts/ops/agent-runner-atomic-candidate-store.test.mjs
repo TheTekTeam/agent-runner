@@ -236,6 +236,42 @@ test('candidate pause is audited without opening systemic health', () => {
   assert.equal(raw.calls.some(([kind]) => kind === 'health'), false);
 });
 
+test('candidate-specific machine_profile cost refusal detected during atomic revalidation refuses attempt persistence with the exact typed scope', () => {
+  const raw = fakeStore();
+  const pauseState = { result: null };
+  const fingerprint = `sha256:${'f'.repeat(64)}`;
+  const store = createAtomicAdmissionStore(raw, {
+    pauseState,
+    revalidate: ({ expected }) => ({
+      admission: {
+        allowed: false,
+        scope: 'machine_profile',
+        reason: 'candidate-machine-profile-cost-denied',
+        violations: ['budget-cap-exceeds-machine-policy'],
+        safeNextAction: 'A changed manager intent/profile/budget requires a fresh superseding immutable manager-preflight authority.',
+        effectiveFingerprint: fingerprint,
+        occurrenceCount: 1,
+      },
+      initial: expected,
+      current: snapshotFromSelectionRecord(selectionRecord),
+    }),
+  });
+  store.recordIssueSelection(selectionRecord);
+  assert.throws(() => store.recordRecoveryAttempt(initialAttempt), CandidateAdmissionPausedError);
+  assert.equal(raw.calls.filter(([kind]) => kind === 'attempt').length, 0, 'a candidate-specific cost refusal must write no attempt row');
+  assert.equal(pauseState.result.admission.scope, 'machine_profile');
+
+  store.recordQueueEvent({ eventType: 'systemic-pause', reason: 'runner_state_unavailable', payload: {} });
+  const queue = raw.calls.find(([kind]) => kind === 'queue')?.[1];
+  assert.equal(queue.eventType, 'candidate-admission-paused');
+  assert.equal(queue.payload.failureScope, 'machine_profile');
+  assert.equal(queue.payload.candidateEffectiveFingerprint, fingerprint);
+  assert.equal(queue.payload.attemptCreated, false);
+  assert.equal(queue.payload.childLaunched, false);
+  assert.equal(queue.payload.issueMutation, false);
+  assert.equal(raw.calls.some(([kind]) => kind === 'health'), false, 'a candidate-specific refusal must not open a systemic health condition');
+});
+
 test('standalone atomic scheduler adapter wraps the immutable imported scheduler', () => {
   const source = readFileSync(new URL('./agent-runner-atomic-cron.mjs', import.meta.url), 'utf8');
   assert.match(source, /createAtomicAdmissionStore/);

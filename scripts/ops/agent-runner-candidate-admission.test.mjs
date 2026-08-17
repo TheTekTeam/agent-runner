@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -6,6 +9,7 @@ import {
   candidatePausePayload,
   candidateSnapshot,
   evaluateCandidateAdmission,
+  evaluateCandidateCostAdmission,
   evaluateCandidateMachineProfileAdmission,
 } from './agent-runner-candidate-admission.mjs';
 
@@ -251,4 +255,102 @@ test('admitCurrentCandidate revalidates with two independent selections', async 
   assert.equal(calls, 2);
   assert.equal(result.admission.allowed, false);
   assert.equal(result.admission.reason, 'candidate-preflight-revision-changed');
+});
+
+function tmpCircuitDbPath() {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-runner-candidate-admission-circuit-'));
+  return join(dir, 'circuit.sqlite');
+}
+
+function selectionWithBudget({ maxBudgetLine = 'max_budget_usd: "2.50"', model = 'sonnet', effort = 'low', preflightId = 300 } = {}) {
+  const preflight = {
+    id: preflightId,
+    databaseId: preflightId,
+    createdAt: '2026-08-17T20:00:00Z',
+    body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: AR-${preflightId}\nfingerprint: sha256:${String(preflightId).padStart(64, '0')}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nprofile: narrow\nmodel: ${model}\neffort: ${effort}\n${maxBudgetLine}\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\``,
+    user: { login: 'gpcola' },
+  };
+  return {
+    issue: { number: 9, labels: ['status:ready', 'agent:claude'], statusLabel: 'status:ready', agentLabel: 'agent:claude' },
+    selection: { mode: 'preflight-direct', command: null, preflight },
+    command: null,
+    currentPreflight: preflight,
+  };
+}
+
+test('historical #205 shape: a synthetic over-cap manager budget refuses with machine_profile scope before any attempt/claim/child side effect', async () => {
+  const dbPath = tmpCircuitDbPath();
+  const values = [selectionWithBudget(), selectionWithBudget()];
+  let calls = 0;
+  const result = await admitCurrentCandidate({
+    env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
+    select: async () => values[calls++],
+  });
+  assert.equal(result.admission.allowed, false);
+  assert.equal(result.admission.scope, 'machine_profile');
+  assert.equal(result.admission.reason, 'candidate-machine-profile-cost-denied');
+  assert.ok(result.admission.violations.includes('budget-cap-exceeds-machine-policy'));
+  assert.match(result.admission.effectiveFingerprint, /^sha256:[0-9a-f]{64}$/);
+  assert.equal(result.admission.occurrenceCount, 1);
+
+  const payload = candidatePausePayload(result.admission, result.current);
+  assert.equal(payload.failureScope, 'machine_profile');
+  assert.equal(payload.attemptCreated, false);
+  assert.equal(payload.childLaunched, false);
+  assert.equal(payload.issueMutation, false);
+  assert.equal(payload.systemdOutcome, 'handled');
+});
+
+test('same candidate profile at or below the machine cap continues past the cost gate unchanged', async () => {
+  const dbPath = tmpCircuitDbPath();
+  const values = [selectionWithBudget({ preflightId: 310, maxBudgetLine: 'max_budget_usd: "1.00"' }), selectionWithBudget({ preflightId: 310, maxBudgetLine: 'max_budget_usd: "1.00"' })];
+  let calls = 0;
+  const result = await admitCurrentCandidate({
+    env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
+    select: async () => values[calls++],
+  });
+  assert.equal(result.admission.allowed, true);
+  assert.equal(result.admission.reason, 'candidate-admitted');
+});
+
+test('a repeated identical candidate-effective refusal stays deduped as one bounded circuit incident, and a fresh compliant manager authority is not blocked by the stale entry', async () => {
+  const dbPath = tmpCircuitDbPath();
+  const overCap = [selectionWithBudget({ preflightId: 320 }), selectionWithBudget({ preflightId: 320 })];
+  let calls = 0;
+  const first = await admitCurrentCandidate({
+    env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
+    select: async () => overCap[calls++],
+  });
+  assert.equal(first.admission.scope, 'machine_profile');
+  assert.equal(first.admission.occurrenceCount, 1);
+
+  calls = 0;
+  const second = await admitCurrentCandidate({
+    env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
+    select: async () => overCap[calls++],
+  });
+  assert.equal(second.admission.effectiveFingerprint, first.admission.effectiveFingerprint);
+  assert.equal(second.admission.occurrenceCount, 2, 'the same fingerprint/reason must dedupe into one incrementing incident');
+
+  const compliant = [
+    selectionWithBudget({ preflightId: 321, maxBudgetLine: 'max_budget_usd: "1.00"' }),
+    selectionWithBudget({ preflightId: 321, maxBudgetLine: 'max_budget_usd: "1.00"' }),
+  ];
+  calls = 0;
+  const third = await admitCurrentCandidate({
+    env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
+    select: async () => compliant[calls++],
+  });
+  assert.equal(third.admission.allowed, true, 'a fresh superseding authority with a compliant budget must not be blocked by a stale candidate circuit entry');
+});
+
+test('evaluateCandidateCostAdmission passes through machine-admitted candidates without touching the circuit', () => {
+  const dbPath = tmpCircuitDbPath();
+  const result = evaluateCandidateCostAdmission({
+    issue: { number: 5, title: 'narrow test issue', labels: [] },
+    preflight: { body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: AR-330\nfingerprint: sha256:${'0'.repeat(64)}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nprofile: narrow\nmodel: sonnet\neffort: low\nmax_budget_usd: "1.00"\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`` },
+    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
+  });
+  assert.equal(result.allowed, true);
+  assert.equal(result.decision.scope, 'machine_profile');
 });
