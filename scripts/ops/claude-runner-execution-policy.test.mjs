@@ -160,24 +160,30 @@ test('implementation tool policy is explicit, branch-scoped, and never enables b
   assert.equal(JSON.parse(policy.settings).permissions.disableBypassPermissionsMode, 'disable');
 });
 
-test('installed CLI capability check requires every implementation safety flag and dontAsk', () => {
-  const help = '--permission-mode <mode> dontAsk --allowedTools <tools> --disallowedTools <tools> --tools <tools> --worktree <name> --output-format <format> --setting-sources <sources>';
+test('installed CLI capability check requires every implementation safety flag, cache-stability flag, and dontAsk', () => {
+  const help = '--permission-mode <mode> dontAsk --allowedTools <tools> --disallowedTools <tools> --tools <tools> --worktree <name> --output-format <format> --setting-sources <sources> --exclude-dynamic-system-prompt-sections';
   assert.deepEqual(inspectClaudeCliHelp(help, { exitCode: 0 }), { compatible: true, missing: [], helpExitCode: 0 });
   const missing = inspectClaudeCliHelp('--permission-mode plan', { exitCode: 0 });
   assert.equal(missing.compatible, false);
   assert.ok(missing.missing.includes('worktree'));
+  assert.ok(missing.missing.includes('excludeDynamicSystemPromptSections'));
   assert.ok(missing.missing.includes('permissionMode:dontAsk'));
 });
 
-test('implementation admission uses a minimum Claude CLI version because --help is not exhaustive', () => {
+test('implementation admission version positively covers the cache-stability flag', () => {
   assert.deepEqual(inspectClaudeCliVersion('2.1.208 (Claude Code)', { exitCode: 0 }), {
     compatible: true,
     installedVersion: '2.1.208',
     minimumVersion: '2.1.208',
+    dynamicSystemPromptExclusionSupported: true,
     versionExitCode: 0,
     failureReason: null,
   });
-  assert.equal(inspectClaudeCliVersion('2.1.207', { exitCode: 0 }).failureReason, 'claude-version-too-old');
+  const olderImplementation = inspectClaudeCliVersion('2.1.207', { exitCode: 0 });
+  assert.equal(olderImplementation.failureReason, 'claude-version-too-old');
+  assert.equal(olderImplementation.dynamicSystemPromptExclusionSupported, true);
+  const beforeCacheFlag = inspectClaudeCliVersion('2.1.97', { exitCode: 0 });
+  assert.equal(beforeCacheFlag.dynamicSystemPromptExclusionSupported, false);
   assert.equal(inspectClaudeCliVersion('not installed', { exitCode: 1 }).failureReason, 'claude-version-unavailable');
 });
 
