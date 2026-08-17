@@ -28,7 +28,10 @@ import {
   buildAgentCommandArgs,
   resolveAgentById,
 } from './agent-runner-agents.mjs';
-import { resolveCurrentManagerAuthority } from './agent-runner-manager-authority.mjs';
+import {
+  resolveCurrentManagerAuthority,
+  resolveManagerPreflightExecutionMetadata,
+} from './agent-runner-manager-authority.mjs';
 import { resolveDispatchAuthority } from './agent-runner-dispatch-authority.mjs';
 import {
   CLAUDE_COMMAND_HEADINGS,
@@ -359,6 +362,35 @@ export function inferProfile({ explicitProfile, commandText = '', issue = {} } =
   return 'narrow';
 }
 
+/**
+ * Issue #223: turns the canonical #221 `resolveManagerPreflightExecutionMetadata()`
+ * budget shape into the single override value `resolveProfile()`/
+ * `evaluateClaudeCostAdmission()` consume. An absent manager budget yields
+ * `undefined` so the profile default still applies. A present-but-invalid
+ * manager budget (malformed/empty/nonnumeric/zero/negative, or a one-sided/
+ * mismatched quote) must never resolve to a falsy override -- that would let
+ * `resolveProfile()`'s own `||` default fallback silently substitute the
+ * profile default instead of failing closed in `evaluateClaudeCostAdmission()`.
+ *
+ * An invalid budget must also never be forwarded as its own raw text.
+ * `evaluateClaudeCostAdmission()` reads the override with
+ * `Number.parseFloat()`, which stops at the first invalid character rather
+ * than rejecting the string: a trailing-quote packet like `2.00"` would
+ * parse back to `2` and be admitted, re-opening exactly the quote-safety
+ * hole #221's normalizer closed. The raw text is therefore preserved only
+ * behind a non-numeric prefix, so the value stays diagnosable in the run log
+ * while always parsing to `NaN`. Cost admission is evaluated before any
+ * provider process is launched, so this sentinel never reaches the CLI.
+ */
+export const INVALID_MANAGER_MAX_BUDGET_USD = 'invalid-manager-max-budget-usd';
+
+export function managerBudgetOverride(maxBudgetUsd) {
+  if (!maxBudgetUsd?.present) return undefined;
+  if (maxBudgetUsd.valid) return maxBudgetUsd.value;
+  const raw = String(maxBudgetUsd.raw ?? '');
+  return raw ? `${INVALID_MANAGER_MAX_BUDGET_USD}:${raw}` : INVALID_MANAGER_MAX_BUDGET_USD;
+}
+
 export function resolveProfile(profileName, overrides = {}, env = process.env) {
   const base = DEFAULT_PROFILES[profileName];
   if (!base) throw new Error(`Unknown profile: ${profileName}`);
@@ -457,7 +489,13 @@ export function resolveImplementationDispatchIdentity({
   const preflight = currentPreflight;
   const selectionMode = 'preflight-direct';
   const referenceText = preflight.body;
+  // Legacy generic-parser metadata: kept only for `resolveDispatchAuthority()`'s
+  // repository/branch conflict detection and `evaluateExecutionAuthorization()`'s
+  // `execution_phase`/`permission_mode` checks below, neither of which #221's
+  // canonical resolver covers. Profile/model/effort/max-budget must come from
+  // the canonical resolver (#223) instead of this free-form parser.
   const executionMeta = parseKeyValueBlock(currentPreflight.body || '');
+  const managerExecutionMeta = resolveManagerPreflightExecutionMetadata(currentPreflight);
 
   // Repository and branch authority (#56) are resolved and verified before
   // anything else in this function -- profile inference, execution
@@ -487,7 +525,7 @@ export function resolveImplementationDispatchIdentity({
   }
 
   const profileName = inferProfile({
-    explicitProfile: argsProfile || executionMeta.profile,
+    explicitProfile: argsProfile || managerExecutionMeta.profile,
     commandText: referenceText,
     issue,
   });
@@ -509,6 +547,7 @@ export function resolveImplementationDispatchIdentity({
     preflight,
     selectionMode,
     executionMeta,
+    managerExecutionMeta,
     dispatchAuthority,
     repositoryContext: repositoryContextResult.context,
     profileName,
@@ -1817,16 +1856,16 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     return EXECUTION_POLICY_EXIT_CODE;
   }
   const {
-    preflight, selectionMode, executionMeta, dispatchAuthority, repositoryContext, profileName,
+    preflight, selectionMode, managerExecutionMeta, dispatchAuthority, repositoryContext, profileName,
     executionAuthorization, sourceCommentIdentity, sourcePreflightCommentIdentity, worktreeIdentity,
   } = dispatchIdentity;
   const implementationToolPolicy = worktreeIdentity
     ? buildImplementationToolPolicy({ expectedBranch: worktreeIdentity.expectedBranch, approvedBranch: dispatchAuthority?.branch })
     : null;
   const profile = resolveProfile(profileName, {
-    model: args.model || executionMeta.model,
-    effort: args.effort || executionMeta.effort,
-    maxBudgetUsd: args.maxBudgetUsd || executionMeta.max_budget_usd,
+    model: args.model || managerExecutionMeta.model,
+    effort: args.effort || managerExecutionMeta.effort,
+    maxBudgetUsd: args.maxBudgetUsd || managerBudgetOverride(managerExecutionMeta.maxBudgetUsd),
     permissionMode: executionAuthorization.permissionMode,
     tools: implementationToolPolicy?.tools,
     allowedTools: implementationToolPolicy?.allowedTools,
