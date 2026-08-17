@@ -14,7 +14,31 @@ function runWrapper({ enabled, controllerMode }) {
   const temp = mkdtempSync(join(tmpdir(), 'ar234-hook-'));
   const log = join(temp, 'calls.log');
   const fakeNode = join(temp, 'node');
-  writeFileSync(fakeNode, `#!/usr/bin/env bash\nset -euo pipefail\nscript="${1:-}"\ndepth="${AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH:-0}"\ncase "$script" in\n  *agent-runner-source-activation-authority.mjs)\n    echo "controller:$depth" >> "${LOG_FILE}"\n    case "${CONTROLLER_MODE}" in\n      reexec-once) if [ "$depth" = "0" ]; then exit 10; else exit 0; fi ;;\n      always-reexec) exit 10 ;;\n      handled) exit 3 ;;\n      systemic) exit 1 ;;\n      *) exit 0 ;;\n    esac\n    ;;\n  *agent-runner-implementation-recurrence.mjs)\n    echo "recurrence:$depth" >> "${LOG_FILE}"\n    exit 0\n    ;;\n  *) echo "unexpected:$script" >> "${LOG_FILE}"; exit 99 ;;\nesac\n`);
+  const fakeNodeSource = [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    'script="${1:-}"',
+    'depth="${AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH:-0}"',
+    'case "$script" in',
+    '  *agent-runner-source-activation-authority.mjs)',
+    '    echo "controller:$depth" >> "$LOG_FILE"',
+    '    case "$CONTROLLER_MODE" in',
+    '      reexec-once) if [ "$depth" = "0" ]; then exit 10; else exit 0; fi ;;',
+    '      always-reexec) exit 10 ;;',
+    '      handled) exit 3 ;;',
+    '      systemic) exit 1 ;;',
+    '      *) exit 0 ;;',
+    '    esac',
+    '    ;;',
+    '  *agent-runner-implementation-recurrence.mjs)',
+    '    echo "recurrence:$depth" >> "$LOG_FILE"',
+    '    exit 0',
+    '    ;;',
+    '  *) echo "unexpected:$script" >> "$LOG_FILE"; exit 99 ;;',
+    'esac',
+    '',
+  ].join('\n');
+  writeFileSync(fakeNode, fakeNodeSource);
   chmodSync(fakeNode, 0o755);
   const env = {
     ...process.env,
