@@ -1,3 +1,5 @@
+import { assertClaudePromptCacheEnabled } from './claude-runner-cache-policy.mjs';
+
 export const SHARED_CODEX_CLAUDE_LABEL = 'agent:codex-claude';
 
 export const AGENT_ASSIGNMENT_DISPLAY_NAMES = Object.freeze({
@@ -19,6 +21,7 @@ const FUTURE_CONTROLS = {
   disableSlashCommands: { supported: false },
   settings: { supported: false },
   settingSources: { supported: false },
+  excludeDynamicSystemPromptSections: { supported: false },
 };
 
 export const AGENT_ADAPTERS = Object.freeze({
@@ -45,6 +48,7 @@ export const AGENT_ADAPTERS = Object.freeze({
       disableSlashCommands: Object.freeze({ supported: true, flag: '--disable-slash-commands' }),
       settings: Object.freeze({ supported: true, flag: '--settings' }),
       settingSources: Object.freeze({ supported: true, flag: '--setting-sources' }),
+      excludeDynamicSystemPromptSections: Object.freeze({ supported: true, flag: '--exclude-dynamic-system-prompt-sections' }),
       outputFormat: Object.freeze({ supported: true, flag: '--output-format', default: 'json' }),
     }),
   }),
@@ -128,8 +132,26 @@ export function agentRunMetadata(agent, profile = {}) {
   };
 }
 
-export function buildAgentCommandArgs({ agent = resolveAgentById(), prompt, profile = {}, resumeSession, outputFormat } = {}) {
+export function buildAgentCommandArgs({
+  agent = resolveAgentById(),
+  prompt,
+  profile = {},
+  resumeSession,
+  outputFormat,
+  env = process.env,
+  allowDisabledPromptCaching = false,
+} = {}) {
   if (!agent?.implemented) throw new Error(`Agent '${agent?.agentId || 'unknown'}' is not implemented`);
+
+  const cacheStableImplementation = agent.type === 'claude' && profile.permissionMode === 'dontAsk';
+  if (agent.type === 'claude') {
+    assertClaudePromptCacheEnabled({
+      model: profile.model,
+      env,
+      allowDisabled: allowDisabledPromptCaching,
+    });
+  }
+
   validateAgentControls(agent, {
     model: profile.model,
     effort: profile.effort,
@@ -145,11 +167,13 @@ export function buildAgentCommandArgs({ agent = resolveAgentById(), prompt, prof
     disableSlashCommands: profile.disableSlashCommands,
     settings: profile.settings,
     settingSources: profile.settingSources,
+    excludeDynamicSystemPromptSections: cacheStableImplementation,
   });
   const args = [];
   if (resumeSession) args.push(agent.controls.resumeSession.flag, resumeSession);
   if (profile.worktreeName) args.push(agent.controls.worktree.flag, profile.worktreeName);
   args.push('-p');
+  if (cacheStableImplementation) args.push(agent.controls.excludeDynamicSystemPromptSections.flag);
   args.push(agent.controls.model.flag, profile.model);
   args.push(agent.controls.effort.flag, profile.effort);
   // Implementation runs must be able to continue through discovery, edits,
