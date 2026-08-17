@@ -179,23 +179,38 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
 
   # Re-read the selected candidate twice and require stable issue, status,
   # agent, dispatch mode, command revision, manager-preflight revision and an
-  # approved manager author. A handled refusal occurs before the canonical
-  # scheduler can create an attempt row or mutate GitHub.
+  # approved manager author; also apply the accepted #226 candidate machine/
+  # profile cost evaluator and record/dedupe any refusal through the accepted
+  # #235 candidate-effective circuit. A handled refusal occurs before the
+  # canonical scheduler can create an attempt row or mutate GitHub.
   set +e
-  "$NODE_BIN" "$ROOT/scripts/ops/agent-runner-candidate-admission.mjs" "${ARGS[@]}"
+  CANDIDATE_OUTPUT="$("$NODE_BIN" "$ROOT/scripts/ops/agent-runner-candidate-admission.mjs" "${ARGS[@]}")"
   CANDIDATE_STATUS=$?
   set -e
   case "$CANDIDATE_STATUS" in
     0)
+      printf '%s\n' "$CANDIDATE_OUTPUT"
       write_run_result canonical_runner_invoked canonical-runner-executed 0
       exec "$NODE_BIN" "$PINNED_CRON" "${ARGS[@]}"
       ;;
     3)
-      write_run_result handled_noop candidate-authority-refused 0
-      echo "[agent-runner] candidate authority changed or is not approved; no attempt created or issue mutated"
+      printf '%s\n' "$CANDIDATE_OUTPUT"
+      CANDIDATE_FAILURE_SCOPE="$("$NODE_BIN" -e '
+        let parsed = null;
+        try { parsed = JSON.parse(process.argv[1]); } catch { parsed = null; }
+        process.stdout.write(String(parsed?.admission?.scope || "issue_not_runnable"));
+      ' "$CANDIDATE_OUTPUT")"
+      if [ "$CANDIDATE_FAILURE_SCOPE" = "machine_profile" ]; then
+        write_run_result handled_noop candidate-machine-profile-refused 0
+        echo "[agent-runner] candidate-specific cost/profile policy refused and circuit recorded; no attempt created or issue mutated"
+      else
+        write_run_result handled_noop candidate-authority-refused 0
+        echo "[agent-runner] candidate authority changed or is not approved; no attempt created or issue mutated"
+      fi
       exit 0
       ;;
     *)
+      printf '%s\n' "$CANDIDATE_OUTPUT" >&2
       write_run_result wrapper_failure candidate-admission-failed "$CANDIDATE_STATUS"
       echo "[agent-runner] ERROR: candidate admission failed with exit $CANDIDATE_STATUS" >&2
       exit "$CANDIDATE_STATUS"
