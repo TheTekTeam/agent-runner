@@ -6,6 +6,7 @@ import {
   detectUnresolvedReviewFollowUp,
   findLinkedOpenPullRequests,
   linkedIssueNumberFromPr,
+  linkedIssueNumbersFromPr,
 } from './claude-runner-review-followup.mjs';
 
 test('detects unresolved follow-up when the latest review per author requested changes', () => {
@@ -51,6 +52,13 @@ test('linkedIssueNumberFromPr extracts the latest closes/fixes reference', () =>
   assert.equal(linkedIssueNumberFromPr({ body: 'Fixes #123' }), 123);
   assert.equal(linkedIssueNumberFromPr({ body: 'Closes #10\n\nAlso resolves #20' }), 20);
   assert.equal(linkedIssueNumberFromPr({ body: 'No linkage here' }), null);
+});
+
+test('linkedIssueNumbersFromPr exposes the distinct linked issue set without changing latest-wins compatibility', () => {
+  const input = { title: 'Fixes #10', body: 'Closes #10\nAlso resolves #20\nFixes #20' };
+  assert.deepEqual(linkedIssueNumbersFromPr(input), [10, 20]);
+  assert.equal(linkedIssueNumberFromPr(input), 20);
+  assert.deepEqual(linkedIssueNumbersFromPr({ body: 'No linkage here' }), []);
 });
 
 test('findLinkedOpenPullRequests matches by close/fix keyword or branch suffix', () => {
