@@ -2,8 +2,14 @@
 
 import { pathToFileURL } from 'node:url';
 
-import { normalizeImplementationApprovers } from './agent-runner-admission.mjs';
+import { configurationFingerprint, normalizeImplementationApprovers } from './agent-runner-admission.mjs';
 import { resolveAgentForLabels } from './agent-runner-agents.mjs';
+import { defaultCircuitDbPath } from './agent-runner-circuit-breaker.mjs';
+import {
+  CandidateProfileCircuitBreaker,
+  candidateEffectiveCostFingerprint,
+  candidateProfileCircuitPausePayload,
+} from './agent-runner-candidate-profile-circuit.mjs';
 import {
   parseManagerPreflightPacket,
   resolveManagerPreflightExecutionMetadata,
@@ -213,7 +219,55 @@ export function evaluateCandidateMachineProfileAdmission({
   };
 }
 
+/**
+ * Issue #227: production placement of the accepted #226 evaluator and the
+ * accepted #235 candidate-effective circuit against the freshly re-read
+ * candidate. Only reached once `evaluateCandidateAdmission()` already
+ * admitted the candidate on identity/authority grounds -- this never
+ * substitutes for, or relaxes, that issue-level check. Every refusal here is
+ * recorded/deduped through the accepted #235 breaker so a repeated identical
+ * refusal stays a single bounded/deduped circuit incident rather than an
+ * unbounded history.
+ */
+export function evaluateCandidateCostAdmission({
+  issue = {},
+  preflight = null,
+  env = process.env,
+  circuitDbPath = defaultCircuitDbPath(env),
+} = {}) {
+  const decision = evaluateCandidateMachineProfileAdmission({ issue, preflight, env });
+  if (decision.allowed) return { allowed: true, decision };
+
+  const managerAuthority = parseManagerPreflightPacket(preflight);
+  const { approvers } = normalizeImplementationApprovers(env.CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS);
+  const effectiveFingerprint = candidateEffectiveCostFingerprint({
+    machineConfigurationFingerprint: configurationFingerprint({ env, approvers }),
+    managerAuthority,
+    profile: decision.profile,
+    costAdmission: decision.costAdmission,
+    managerMaxBudgetUsd: resolveManagerPreflightExecutionMetadata(preflight).maxBudgetUsd,
+  });
+
+  const breaker = new CandidateProfileCircuitBreaker(circuitDbPath);
+  let circuitResult;
+  try {
+    circuitResult = breaker.record({ effectiveFingerprint, reason: decision.reason });
+  } finally {
+    breaker.close();
+  }
+
+  return { allowed: false, decision, effectiveFingerprint, circuitResult };
+}
+
 export function candidatePausePayload(admission, snapshot) {
+  if (admission.scope === 'machine_profile') {
+    return candidateProfileCircuitPausePayload({
+      reason: admission.reason,
+      safeNextAction: admission.safeNextAction,
+      effectiveFingerprint: admission.effectiveFingerprint,
+      occurrenceCount: admission.occurrenceCount,
+    });
+  }
   return {
     candidatePaused: true,
     failureScope: 'issue_not_runnable',
@@ -245,13 +299,40 @@ function approverPolicy(env) {
   return { approvers, admission: null };
 }
 
+// Issue #227: once identity/authority admits the freshly re-read candidate,
+// apply the accepted #226 evaluator and #235 circuit against that exact
+// candidate before returning `allowed: true`. A `machine_profile` refusal
+// here carries its own bounded scope/reason/fingerprint rather than being
+// folded into the issue-level `issue_not_runnable` shape.
+function admitCandidateCost({ identityAdmission, currentSelected, env }) {
+  if (identityAdmission.allowed !== true) return identityAdmission;
+  const cost = evaluateCandidateCostAdmission({
+    issue: currentSelected?.issue || {},
+    preflight: currentSelected?.currentPreflight || null,
+    env,
+  });
+  if (cost.allowed) return identityAdmission;
+  return {
+    allowed: false,
+    scope: 'machine_profile',
+    reason: cost.decision.reason,
+    violations: cost.decision.violations,
+    safeNextAction: cost.decision.safeNextAction,
+    effectiveFingerprint: cost.effectiveFingerprint,
+    occurrenceCount: cost.circuitResult.occurrenceCount,
+  };
+}
+
 export async function admitExpectedCandidate({ expected, argv = [], env = process.env, select } = {}) {
   const policy = approverPolicy(env);
   if (policy.admission) return { admission: policy.admission, initial: normalizeCandidateSnapshot(expected), current: {} };
   const selector = await selectorFor({ argv, env, select });
   const initial = normalizeCandidateSnapshot(expected);
-  const current = candidateSnapshot(await selector());
-  return { admission: evaluateCandidateAdmission({ initial, current, approvers: policy.approvers }), initial, current };
+  const currentSelected = await selector();
+  const current = candidateSnapshot(currentSelected);
+  const identityAdmission = evaluateCandidateAdmission({ initial, current, approvers: policy.approvers });
+  const admission = admitCandidateCost({ identityAdmission, currentSelected, env });
+  return { admission, initial, current };
 }
 
 export async function admitCurrentCandidate({ argv = [], env = process.env, select } = {}) {
@@ -262,8 +343,11 @@ export async function admitCurrentCandidate({ argv = [], env = process.env, sele
   }
   const selector = await selectorFor({ argv, env, select });
   const initial = candidateSnapshot(await selector());
-  const current = candidateSnapshot(await selector());
-  return { admission: evaluateCandidateAdmission({ initial, current, approvers: policy.approvers }), initial, current };
+  const currentSelected = await selector();
+  const current = candidateSnapshot(currentSelected);
+  const identityAdmission = evaluateCandidateAdmission({ initial, current, approvers: policy.approvers });
+  const admission = admitCandidateCost({ identityAdmission, currentSelected, env });
+  return { admission, initial, current };
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env, logger = console) {
