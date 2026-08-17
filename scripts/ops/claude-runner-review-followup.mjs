@@ -66,15 +66,32 @@ export function detectUnresolvedReviewFollowUp({ reviews = [], reviewThreads = [
   };
 }
 
-export function linkedIssueNumberFromPr({ body = '', title = '' } = {}) {
+/**
+ * Return every distinct issue number explicitly linked through GitHub's
+ * close/fix/resolve keywords, preserving appearance order. Direct PR
+ * continuation admission needs the full set so more than one linked issue
+ * can fail closed instead of silently inheriting linkedIssueNumberFromPr()'s
+ * historical "latest wins" reporting behavior.
+ */
+export function linkedIssueNumbersFromPr({ body = '', title = '' } = {}) {
   const combined = `${title}\n${body}`;
+  const numbers = [];
+  const seen = new Set();
   let match;
-  let latest = null;
   LINKED_ISSUE_PATTERN.lastIndex = 0;
   while ((match = LINKED_ISSUE_PATTERN.exec(combined)) !== null) {
-    latest = Number.parseInt(match[1], 10);
+    const issueNumber = Number.parseInt(match[1], 10);
+    if (Number.isInteger(issueNumber) && issueNumber > 0 && !seen.has(issueNumber)) {
+      seen.add(issueNumber);
+      numbers.push(issueNumber);
+    }
   }
-  return latest;
+  return numbers;
+}
+
+export function linkedIssueNumberFromPr(input = {}) {
+  const numbers = linkedIssueNumbersFromPr(input);
+  return numbers.length > 0 ? numbers[numbers.length - 1] : null;
 }
 
 /**
