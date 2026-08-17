@@ -13,13 +13,14 @@ import {
   agentRunMetadata,
 } from './agent-runner-agents.mjs';
 
-test('Claude implementation adapter builds an uncapped CLI invocation', () => {
+test('Claude implementation adapter builds a cache-stable uncapped CLI invocation', () => {
   const args = buildAgentCommandArgs({
     agent: resolveAgentById('claude-code-cli'),
     prompt: 'hello',
     profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50', permissionMode: 'dontAsk' },
+    env: {},
   });
-  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.50', '--permission-mode', 'dontAsk', '--output-format', 'json']);
+  assert.deepEqual(args.slice(0, -1), ['-p', '--exclude-dynamic-system-prompt-sections', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.50', '--permission-mode', 'dontAsk', '--output-format', 'json']);
   assert.equal(args.includes(['--max', 'turns'].join('-')), false);
   assert.equal(args.at(-1), 'hello');
 });
@@ -27,14 +28,18 @@ test('Claude implementation adapter builds an uncapped CLI invocation', () => {
 test('agent command construction uses only supported execution controls', () => {
   const agent = resolveAgentById('claude-code-cli');
   assert.equal(Object.keys(agent.controls).includes(['max', 'Turns'].join('')), false);
+  assert.equal(agent.controls.excludeDynamicSystemPromptSections.supported, true);
+  assert.equal(agent.controls.excludeDynamicSystemPromptSections.flag, '--exclude-dynamic-system-prompt-sections');
 
   const args = buildAgentCommandArgs({
     agent,
     prompt: 'complete the issue',
     profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00', permissionMode: 'dontAsk' },
+    env: {},
   });
   assert.equal(args.includes(['--max', 'turns'].join('-')), false);
   assert.equal(args.includes('1'), false);
+  assert.equal(args.includes('--exclude-dynamic-system-prompt-sections'), true);
 });
 
 test('Claude adapter builds a constrained native-worktree implementation invocation without a turn cap', () => {
@@ -55,10 +60,12 @@ test('Claude adapter builds a constrained native-worktree implementation invocat
       settings: '{"permissions":{"disableBypassPermissionsMode":"disable"}}',
       settingSources: '',
     },
+    env: {},
   });
   assert.deepEqual(args.slice(0, -1), [
     '--worktree', 'agent-runner-658-123',
     '-p',
+    '--exclude-dynamic-system-prompt-sections',
     '--model', 'sonnet',
     '--effort', 'medium',
     '--max-budget-usd', '1.00',
@@ -76,13 +83,27 @@ test('Claude adapter builds a constrained native-worktree implementation invocat
   assert.equal(args.at(-1), 'implement the approved preflight');
 });
 
-test('read-only plan mode uses the same resource controls', () => {
+test('read-only plan mode keeps current syntax and does not force dynamic-system-prompt exclusion', () => {
   const args = buildAgentCommandArgs({
     agent: resolveAgentById('claude-code-cli'),
     prompt: 'plan only',
     profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00', permissionMode: 'plan' },
+    env: {},
   });
   assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.00', '--permission-mode', 'plan', '--output-format', 'json']);
+});
+
+test('Claude command construction refuses cache-disabled execution before provider launch', () => {
+  const agent = resolveAgentById('claude-code-cli');
+  const profile = { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00', permissionMode: 'dontAsk' };
+  assert.throws(
+    () => buildAgentCommandArgs({ agent, prompt: 'blocked', profile, env: { DISABLE_PROMPT_CACHING: 'true' } }),
+    (error) => error?.code === 'claude-prompt-cache-disabled' && error?.cachePolicy?.disableVariable === 'DISABLE_PROMPT_CACHING',
+  );
+  assert.throws(
+    () => buildAgentCommandArgs({ agent, prompt: 'blocked', profile, env: { DISABLE_PROMPT_CACHING_SONNET: '1' } }),
+    (error) => error?.code === 'claude-prompt-cache-disabled' && error?.cachePolicy?.reason === 'model-disable',
+  );
 });
 
 test('future agent labels resolve to unsupported skip diagnostics', () => {
