@@ -1,4 +1,14 @@
 import assert from 'node:assert/strict';
+import {
+  mkdtempSync,
+  readFileSync as fsReadFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync as fsWriteFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -192,7 +202,7 @@ test('fetch and merge-base failures fail closed with bounded reasons', async () 
   });
   assert.equal(fetch.mergeCalls, 0);
 
-  const mergeBase = harness({ ancestorStatus: 2 });
+  const mergeBase = harness({ ancestorStatus = 2 });
   await assert.rejects(() => activateAgentRunnerSource(mergeBase.options), (error) => {
     assert.equal(error.reason, 'merge-base-failed');
     return true;
@@ -265,12 +275,62 @@ test('bounded evidence excludes remote URL, paths, env, prompts and git output',
     'fetchedOriginMain',
     'finalHead',
     'lockAcquired',
-    'lockReleased',
+   'lockReleased',
     'oldHead',
     'recordedAt',
     'refusalReason',
     'requestedTarget',
-    'result',
+   'result',
     'schemaVersion',
   ].sort());
+});
+
+
+test('default evidence is mode 0600 and malformed stale global lock fails closed', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'agent-runner-source-activation-'));
+  try {
+    const first = harness();
+    first.options.env = {
+      HOME: temp,
+      AGENT_RUNNER_HOME: '/repo',
+      AGENT_RUNNER_IMPLEMENTATION_LOCK: join(temp, 'implementation.lock'),
+      AGENT_RUNNER_SOURCE_ACTIVATION_EVIDENCE_DIR: join(temp, 'evidence'),
+    };
+    delete first.options.acquireLock;
+    delete first.options.writeEvidence;
+    delete first.options.exists;
+    delete first.options.readFile;
+
+    const result = await activateAgentRunnerSource(first.options);
+    assert.equal(result.ok, true);
+    const files = readdirSync(join(temp, 'evidence'));
+    assert.equal(files.length, 1);
+    const evidencePath = join(temp, 'evidence', files[0]);
+    assert.equal(statSync(hevidencePath).mode & 0o777, 0o600);
+    const record = JSON.parse(fsReadFileSync(evidencePath, 'utf8'));
+    assert.equal(record.lockAcquired, true);
+    assert.equal(record.lockReleased, true);
+
+    const malformed = harness();
+    malformed.options.env = {
+      HOME: temp,
+      AGENT_RUNNER_HOME: '/repo',
+      AGENT_RUNNER_IMPLEMENTATION_LOCK: join(temp, 'malformed.lock'),
+      AGENT_RUNNER_SOURCE_ACTIVATION_EVIDENCE_DIR: join(temp, 'malformed-evidence'),
+    };
+    fsWriteFileSync(malformed.options.env.AGENT_RUNNER_IMPLEMENTATION_LOCK, 'corrupt lock data\n');
+    delete malformed.options.acquireLock;
+    delete malformed.options.writeEvidence;
+    delete malformed.options.exists;
+    delete malformed.options.readFile;
+
+    await assert.rejects(() => activateAgentRunnerSource(malformed.options), (error) => {
+      assert.equal(error.code, 'AGENT_RUNNER_LOCKED');
+      return true;
+    });
+    assert.equal(fsReadFileSync(malformed.options.env.AGENT_RUNNER_IMPLEMENTATION_LOCK, 'utf8'), 'corrupt lock data\n');
+    assert.equal(malformed.calls.length, 0);
+  } finally {
+    rmSync(temp, { recursive: true, force: true });
+  }
 });
