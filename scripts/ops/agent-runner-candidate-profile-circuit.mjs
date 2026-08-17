@@ -26,6 +26,20 @@ function canonicalNumber(value) {
   return parsed == null ? null : String(parsed);
 }
 
+function requireText(value, field) {
+  const normalized = text(value);
+  if (!normalized) throw new Error(`${field} is required for candidate cost fingerprinting`);
+  return normalized;
+}
+
+function requireSha256(value, field) {
+  const normalized = requireText(value, field);
+  if (!/^sha256:[0-9a-f]{64}$/.test(normalized)) {
+    throw new Error(`${field} must be sha256:<64 lowercase hex>`);
+  }
+  return normalized;
+}
+
 export function candidateBudgetIdentity({ managerMaxBudgetUsd = null, profileMaxBudgetUsd = null } = {}) {
   if (managerMaxBudgetUsd?.present === true) {
     const validValue = managerMaxBudgetUsd.valid === true
@@ -49,30 +63,58 @@ export function candidateEffectiveCostFingerprintMaterial({
   profile = {},
   costAdmission = {},
   managerMaxBudgetUsd = null,
-  policyRevision = CANDIDATE_PROFILE_CIRCUIT_POLICY_REVISION,
 } = {}) {
+  const machineFingerprint = requireSha256(machineConfigurationFingerprint, 'machineConfigurationFingerprint');
+  const revision = requireText(managerAuthority.revision, 'managerAuthority.revision');
+  const authorityFingerprint = requireSha256(managerAuthority.fingerprint, 'managerAuthority.fingerprint');
+  const packetDigest = requireSha256(managerAuthority.packetDigest, 'managerAuthority.packetDigest');
+  const authorityKey = requireText(managerAuthority.authorityKey, 'managerAuthority.authorityKey');
+  const expectedAuthorityKey = `manager-preflight:${revision}:${authorityFingerprint}`;
+  if (authorityKey !== expectedAuthorityKey) {
+    throw new Error('managerAuthority.authorityKey does not match revision/fingerprint');
+  }
+
+  const resolvedProfile = requireText(profile.profile, 'profile.profile');
+  const resolvedModel = requireText(profile.model, 'profile.model');
+  const resolvedEffort = requireText(profile.effort, 'profile.effort');
+  const budgetIdentity = candidateBudgetIdentity({
+    managerMaxBudgetUsd,
+    profileMaxBudgetUsd: profile.maxBudgetUsd,
+  });
+  if (budgetIdentity === 'absent') {
+    throw new Error('resolved candidate budget identity is required');
+  }
+
+  const machineMaxBudgetUsd = canonicalNumber(costAdmission?.policy?.maxBudgetUsd);
+  if (machineMaxBudgetUsd == null) {
+    throw new Error('costAdmission.policy.maxBudgetUsd must be a positive finite number');
+  }
+  if (typeof costAdmission?.policy?.opusAllowed !== 'boolean') {
+    throw new Error('costAdmission.policy.opusAllowed must be boolean');
+  }
+  if (typeof costAdmission?.policy?.highEffortAllowed !== 'boolean') {
+    throw new Error('costAdmission.policy.highEffortAllowed must be boolean');
+  }
+
   return {
-    schemaVersion: policyRevision,
-    machineConfigurationFingerprint: text(machineConfigurationFingerprint),
+    schemaVersion: CANDIDATE_PROFILE_CIRCUIT_POLICY_REVISION,
+    machineConfigurationFingerprint: machineFingerprint,
     managerAuthority: {
-      authorityKey: text(managerAuthority.authorityKey),
-      revision: text(managerAuthority.revision),
-      fingerprint: text(managerAuthority.fingerprint),
-      packetDigest: text(managerAuthority.packetDigest),
+      authorityKey,
+      revision,
+      fingerprint: authorityFingerprint,
+      packetDigest,
     },
     resolvedProfile: {
-      profile: text(profile.profile),
-      model: text(profile.model),
-      effort: text(profile.effort),
-      budgetIdentity: candidateBudgetIdentity({
-        managerMaxBudgetUsd,
-        profileMaxBudgetUsd: profile.maxBudgetUsd,
-      }),
+      profile: resolvedProfile,
+      model: resolvedModel,
+      effort: resolvedEffort,
+      budgetIdentity,
     },
     machineCostPolicy: {
-      maxBudgetUsd: canonicalNumber(costAdmission?.policy?.maxBudgetUsd),
-      opusAllowed: costAdmission?.policy?.opusAllowed === true,
-      highEffortAllowed: costAdmission?.policy?.highEffortAllowed === true,
+      maxBudgetUsd: machineMaxBudgetUsd,
+      opusAllowed: costAdmission.policy.opusAllowed,
+      highEffortAllowed: costAdmission.policy.highEffortAllowed,
     },
   };
 }
