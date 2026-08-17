@@ -9,6 +9,7 @@ export const EXECUTION_PHASE_PLAN = 'plan';
 export const EXECUTION_PHASE_IMPLEMENTATION = 'implementation';
 export const IMPLEMENTATION_PERMISSION_MODE = 'dontAsk';
 export const MINIMUM_IMPLEMENTATION_CLAUDE_VERSION = '2.1.208';
+export const MINIMUM_DYNAMIC_SYSTEM_PROMPT_EXCLUSION_VERSION = '2.1.98';
 
 const GENERATED_PREFLIGHT_MARKERS = [
   '_Generated locally by the Dell runner',
@@ -24,6 +25,7 @@ const REQUIRED_IMPLEMENTATION_FLAGS = Object.freeze([
   ['worktree', /--worktree\b|(?:^|\s)-w(?:\s|,)/m],
   ['outputFormat', /--output-format\b/],
   ['settingSources', /--setting-sources\b/],
+  ['excludeDynamicSystemPromptSections', /--exclude-dynamic-system-prompt-sections\b/],
 ]);
 
 function truthy(value) {
@@ -281,23 +283,31 @@ function compareSemanticVersions(left, right) {
 }
 
 /**
- * `claude --help` is intentionally not exhaustive, so admission is based on
- * a known-safe minimum CLI version. Unknown flags still make Claude exit at
- * argument parsing before a model request; the help inspection remains an
- * operator diagnostic rather than a false-negative execution gate.
+ * `claude --help` is intentionally not exhaustive, so implementation
+ * admission is based on a known-safe minimum CLI version. The cache-stability
+ * flag was introduced in 2.1.98; the implementation minimum (2.1.208) is
+ * newer, so every version admitted for implementation supports that syntax.
+ * The help inspection remains a second positive diagnostic when the current
+ * CLI lists the flag explicitly.
  */
 export function inspectClaudeCliVersion(versionText = '', { exitCode = 0, minimumVersion = MINIMUM_IMPLEMENTATION_CLAUDE_VERSION } = {}) {
   const installedParts = parseSemanticVersion(versionText);
   const minimumParts = parseSemanticVersion(minimumVersion);
+  const dynamicExclusionMinimumParts = parseSemanticVersion(MINIMUM_DYNAMIC_SYSTEM_PROMPT_EXCLUSION_VERSION);
   const installedVersion = installedParts ? installedParts.join('.') : null;
   const compatible = exitCode === 0
     && Boolean(installedParts)
     && Boolean(minimumParts)
     && compareSemanticVersions(installedParts, minimumParts) >= 0;
+  const dynamicSystemPromptExclusionSupported = exitCode === 0
+    && Boolean(installedParts)
+    && Boolean(dynamicExclusionMinimumParts)
+    && compareSemanticVersions(installedParts, dynamicExclusionMinimumParts) >= 0;
   return {
     compatible,
     installedVersion,
     minimumVersion,
+    dynamicSystemPromptExclusionSupported,
     versionExitCode: exitCode,
     failureReason: compatible
       ? null
