@@ -6,7 +6,12 @@
 // has unresolved manager/reviewer feedback and, if so, builds a follow-up
 // Claude prompt scoped to that feedback.
 
-const LINKED_ISSUE_PATTERN = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*#(\d+)/gi;
+// Include "implements" because publishImplementationDraft() uses exactly
+// `Implements #N ...` for runner-created draft PRs. Without this, a valid
+// runner PR whose approved branch does not end in the issue number can become
+// unlinkable to direct PR continuation even though the runner itself created
+// the linkage text.
+const LINKED_ISSUE_PATTERN = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|implement(?:s|ed|ing)?)\s*:?\s*#(\d+)/gi;
 
 function latestReviewStatePerAuthor(reviews = []) {
   const latestByAuthor = new Map();
@@ -67,11 +72,12 @@ export function detectUnresolvedReviewFollowUp({ reviews = [], reviewThreads = [
 }
 
 /**
- * Return every distinct issue number explicitly linked through GitHub's
- * close/fix/resolve keywords, preserving appearance order. Direct PR
- * continuation admission needs the full set so more than one linked issue
- * can fail closed instead of silently inheriting linkedIssueNumberFromPr()'s
- * historical "latest wins" reporting behavior.
+ * Return every distinct issue number explicitly linked through the accepted
+ * close/fix/resolve keywords or the runner's own deterministic `Implements`
+ * publication wording, preserving appearance order. Direct PR continuation
+ * admission needs the full set so more than one linked issue can fail closed
+ * instead of silently inheriting linkedIssueNumberFromPr()'s historical
+ * "latest wins" reporting behavior.
  */
 export function linkedIssueNumbersFromPr({ body = '', title = '' } = {}) {
   const combined = `${title}\n${body}`;
@@ -96,7 +102,7 @@ export function linkedIssueNumberFromPr(input = {}) {
 
 /**
  * Find open PRs plausibly linked to an issue, from an already-fetched list of
- * open PRs. Matching is intentionally conservative (explicit close/fix
+ * open PRs. Matching is intentionally conservative (explicit linkage
  * keyword, or a branch name ending in the issue number) to avoid pulling in
  * unrelated PRs.
  */
