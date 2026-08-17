@@ -6,6 +6,7 @@ import {
   candidatePausePayload,
   candidateSnapshot,
   evaluateCandidateAdmission,
+  evaluateCandidateMachineProfileAdmission,
 } from './agent-runner-candidate-admission.mjs';
 
 function selection({
@@ -144,6 +145,99 @@ test('candidate disappearance creates a handled non-mutating pause', () => {
   assert.equal(payload.childLaunched, false);
   assert.equal(payload.issueMutation, false);
   assert.equal(payload.systemdOutcome, 'handled');
+});
+
+function preflightWithBudget(maxBudgetLine) {
+  return {
+    body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: AR-226\nfingerprint: sha256:${'0'.repeat(64)}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nprofile: narrow\nmodel: sonnet\neffort: low\n${maxBudgetLine}\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\``,
+  };
+}
+
+test('quoted manager max_budget_usd normalizes and passes the machine cost gate', () => {
+  const decision = evaluateCandidateMachineProfileAdmission({
+    issue: { number: 5, title: 'narrow test issue', labels: [] },
+    preflight: preflightWithBudget('max_budget_usd: "1.00"'),
+    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
+  });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.scope, 'machine_profile');
+  assert.equal(decision.costAdmission.requested.maxBudgetUsd, 1.0);
+});
+
+test('unquoted manager max_budget_usd is equivalent to the quoted form', () => {
+  const decision = evaluateCandidateMachineProfileAdmission({
+    issue: { number: 5, title: 'narrow test issue', labels: [] },
+    preflight: preflightWithBudget('max_budget_usd: 1.00'),
+    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
+  });
+  assert.equal(decision.allowed, true);
+  assert.equal(decision.costAdmission.requested.maxBudgetUsd, 1.0);
+});
+
+test('genuine over-cap manager budget fails closed with machine_profile scope', () => {
+  const decision = evaluateCandidateMachineProfileAdmission({
+    issue: { number: 5, title: 'narrow test issue', labels: [] },
+    preflight: preflightWithBudget('max_budget_usd: "2.50"'),
+    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.scope, 'machine_profile');
+  assert.equal(decision.reason, 'candidate-machine-profile-cost-denied');
+  assert.ok(decision.violations.includes('budget-cap-exceeds-machine-policy'));
+  assert.ok(decision.safeNextAction);
+});
+
+for (const malformed of ['max_budget_usd: "2.00\'', 'max_budget_usd: ""', 'max_budget_usd: not-a-number', 'max_budget_usd: 0', 'max_budget_usd: -1.00']) {
+  test(`malformed/zero/negative manager budget (${malformed}) fails closed without profile-default fallback`, () => {
+    const decision = evaluateCandidateMachineProfileAdmission({
+      issue: { number: 5, title: 'narrow test issue', labels: [] },
+      preflight: preflightWithBudget(malformed),
+      env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
+    });
+    assert.equal(decision.allowed, false);
+    assert.equal(decision.scope, 'machine_profile');
+    assert.ok(decision.violations.includes('budget-cap-exceeds-machine-policy'));
+    assert.notEqual(decision.costAdmission.requested.maxBudgetUsd, 0.5);
+  });
+}
+
+test('opus model requires explicit machine-local opt-in through the same cost gate', () => {
+  const decision = evaluateCandidateMachineProfileAdmission({
+    issue: { number: 5, title: 'narrow test issue', labels: [] },
+    preflight: preflightWithBudget('max_budget_usd: "1.00"'),
+    argsModel: 'opus',
+    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
+  });
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.violations.includes('opus-requires-explicit-machine-opt-in'));
+
+  const allowed = evaluateCandidateMachineProfileAdmission({
+    issue: { number: 5, title: 'narrow test issue', labels: [] },
+    preflight: preflightWithBudget('max_budget_usd: "1.00"'),
+    argsModel: 'opus',
+    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', CLAUDE_RUNNER_ALLOW_OPUS: 'true' },
+  });
+  assert.equal(allowed.allowed, true);
+});
+
+test('xhigh effort requires explicit machine-local opt-in through the same cost gate', () => {
+  const decision = evaluateCandidateMachineProfileAdmission({
+    issue: { number: 5, title: 'narrow test issue', labels: [] },
+    preflight: preflightWithBudget('max_budget_usd: "1.00"'),
+    argsEffort: 'xhigh',
+    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
+  });
+  assert.equal(decision.allowed, false);
+  assert.ok(decision.violations.includes('high-effort-requires-explicit-machine-opt-in'));
+});
+
+test('manager authority/agent/status/comment identity drift keeps its existing issue_not_runnable reason', () => {
+  const initial = candidateSnapshot(selection({ approvedAgent: 'codex-cli' }));
+  const current = candidateSnapshot(selection({ approvedAgent: 'codex-cli' }));
+  const admission = evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] });
+  assert.equal(admission.reason, 'candidate-preflight-agent-not-approved');
+  const payload = candidatePausePayload(admission, current);
+  assert.equal(payload.failureScope, 'issue_not_runnable');
 });
 
 test('admitCurrentCandidate revalidates with two independent selections', async () => {
