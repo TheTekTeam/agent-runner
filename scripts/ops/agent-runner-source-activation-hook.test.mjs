@@ -31,7 +31,7 @@ function runWrapper({ enabled, controllerMode }) {
     '    esac',
     '    ;;',
     '  *agent-runner-implementation-recurrence.mjs)',
-    '    echo "recurrence:$depth" >> "$LOG_FILE"',
+    '    echo "recurrence:${AGENT_RUNNER_SOURCE_ACTIVATION_ENABLED:-unset}:${AGENT_RUNNER_SOURCE_ACTIVATION_CONTROL_ISSUE:-unset}:${AGENT_RUNNER_SOURCE_ACTIVATION_STATE:-unset}:${AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH:-unset}" >> "$LOG_FILE"',
     '    exit 0',
     '    ;;',
     '  *) echo "unexpected:$script" >> "$LOG_FILE"; exit 99 ;;',
@@ -49,6 +49,8 @@ function runWrapper({ enabled, controllerMode }) {
     AGENT_RUNNER_ENV_FILE: join(temp, 'missing.env'),
     AGENT_RUNNER_PROJECT_REGISTRY: join(temp, 'projects.json'),
     AGENT_RUNNER_SOURCE_ACTIVATION_ENABLED: enabled ? 'true' : 'false',
+    AGENT_RUNNER_SOURCE_ACTIVATION_CONTROL_ISSUE: '225',
+    AGENT_RUNNER_SOURCE_ACTIVATION_STATE: join(temp, 'source-state.json'),
     AGENT_RUNNER_EXECUTE: 'false',
   };
   delete env.AGENT_RUNNER_ARGS;
@@ -62,16 +64,18 @@ function runWrapper({ enabled, controllerMode }) {
   return { ...result, calls };
 }
 
-test('disabled source activation preserves current recurrence path and never invokes controller', () => {
+const CLEAN_RECURRENCE = 'recurrence:unset:unset:unset:unset';
+
+test('disabled source activation preserves current recurrence path, performs no controller call and strips control env', () => {
   const result = runWrapper({ enabled: false, controllerMode: 'systemic' });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(result.calls, ['recurrence:0']);
+  assert.deepEqual(result.calls, [CLEAN_RECURRENCE]);
 });
 
-test('valid activation result re-execs wrapper exactly once then continues recurrence from re-exec depth one', () => {
+test('valid activation result re-execs wrapper exactly once then starts recurrence without source-control env', () => {
   const result = runWrapper({ enabled: true, controllerMode: 'reexec-once' });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(result.calls, ['controller:0', 'controller:1', 'recurrence:1']);
+  assert.deepEqual(result.calls, ['controller:0', 'controller:1', CLEAN_RECURRENCE]);
 });
 
 test('re-exec depth guard prevents recursion even if controller erroneously requests activation twice', () => {
