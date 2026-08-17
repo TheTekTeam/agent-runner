@@ -32,6 +32,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${AGENT_RUNNER_ENV_FILE:-$HOME/.config/agent-runner/runner.env}"
 NODE_BIN="${AGENT_RUNNER_NODE_BIN:-node}"
 RECURRENCE_SCRIPT="$ROOT/scripts/ops/agent-runner-implementation-recurrence.mjs"
+SOURCE_ACTIVATION_CONTROLLER="$ROOT/scripts/ops/agent-runner-source-activation-authority.mjs"
 
 [ -f "$RECURRENCE_SCRIPT" ] || {
   echo "[agent-runner] ERROR: generic implementation recurrence entrypoint is missing" >&2
@@ -75,6 +76,62 @@ unset CLAUDE_RUNNER_CRON_LOCK
 export AGENT_RUNNER_ENV_FILE=/dev/null
 
 export PATH="/usr/local/bin:/opt/homebrew/bin:/opt/cpanel/ea-nodejs22/bin:$HOME/.local/bin:$HOME/bin:$PATH"
+
+# #234 accepted-source authority runs only at this outer boundary, before the
+# Node recurrence acquires the machine-global implementation lock or inspects a
+# candidate. Disabled is the default and performs no controller/GitHub lookup.
+source_activation_enabled() {
+  case "${AGENT_RUNNER_SOURCE_ACTIVATION_ENABLED:-false}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+if source_activation_enabled; then
+  [ -f "$SOURCE_ACTIVATION_CONTROLLER" ] || {
+    echo "[agent-runner] ERROR: source-activation authority controller is missing" >&2
+    exit 1
+  }
+
+  SOURCE_ACTIVATION_REEXEC_DEPTH="${AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH:-0}"
+  case "$SOURCE_ACTIVATION_REEXEC_DEPTH" in
+    0|1) ;;
+    *)
+      echo "[agent-runner] ERROR: invalid source-activation re-exec depth guard" >&2
+      exit 1
+      ;;
+  esac
+
+  set +e
+  SOURCE_ACTIVATION_OUTPUT="$($NODE_BIN "$SOURCE_ACTIVATION_CONTROLLER" 2>&1)"
+  SOURCE_ACTIVATION_STATUS=$?
+  set -e
+  [ -z "$SOURCE_ACTIVATION_OUTPUT" ] || printf '%s\n' "$SOURCE_ACTIVATION_OUTPUT"
+
+  case "$SOURCE_ACTIVATION_STATUS" in
+    0)
+      # Disabled/no-new/already-applied authority: continue current recurrence.
+      ;;
+    10)
+      if [ "$SOURCE_ACTIVATION_REEXEC_DEPTH" -ne 0 ]; then
+        echo "[agent-runner] ERROR: source-activation re-exec depth guard prevented recursion" >&2
+        exit 1
+      fi
+      export AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH=1
+      exec "$ROOT/bin/run-implementation-recurrence.sh" "$@"
+      ;;
+    3)
+      # Handled authority/activation refusal: intentionally do not inspect,
+      # claim or launch an implementation candidate in this recurrence.
+      echo "[agent-runner] source activation requires manager attention; implementation recurrence skipped"
+      exit 0
+      ;;
+    *)
+      echo "[agent-runner] ERROR: source-activation authority evaluation failed" >&2
+      exit "$SOURCE_ACTIVATION_STATUS"
+      ;;
+  esac
+fi
 
 [ -n "${AGENT_RUNNER_PROJECT_REGISTRY:-}" ] || {
   echo "[agent-runner] ERROR: AGENT_RUNNER_PROJECT_REGISTRY is not configured" >&2
