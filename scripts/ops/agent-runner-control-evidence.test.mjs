@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  CONTROL_EVIDENCE_DEFAULT_ISSUE,
   CONTROL_EVIDENCE_MARKER,
   CONTROL_EVIDENCE_SCHEMA_VERSION,
   ControlEvidenceError,
@@ -19,6 +20,7 @@ const HEAD = 'a'.repeat(40);
 function gitResponses(overrides = {}) {
   const defaults = {
     'rev-parse --show-toplevel': { status: 0, stdout: '/canonical/agent-runner\n' },
+    'remote get-url origin': { status: 0, stdout: 'https://github.com/TheTekTeam/agent-runner.git\n' },
     'symbolic-ref --quiet --short HEAD': { status: 0, stdout: 'main\n' },
     'rev-parse --verify HEAD^{commit}': { status: 0, stdout: `${HEAD}\n` },
     'status --porcelain=v1 --untracked-files=all': { status: 0, stdout: '' },
@@ -69,11 +71,12 @@ function baseCollectOptions(overrides = {}) {
   };
 }
 
-test('clean main + idle lock + correct timer topology projects ready', () => {
+test('clean main + idle lock + canonical origin + correct timer topology projects ready', () => {
   const facts = collectControlEvidenceFacts(baseCollectOptions());
   const evidence = buildControlEvidence(facts);
   assert.equal(evidence.readinessCode, 'ready');
   assert.equal(evidence.ready, true);
+  assert.equal(evidence.repositoryVerified, true);
   assert.equal(evidence.branch, 'main');
   assert.equal(evidence.headSha, HEAD);
   assert.equal(evidence.clean, true);
@@ -81,6 +84,17 @@ test('clean main + idle lock + correct timer topology projects ready', () => {
   assert.equal(evidence.genericTimerState, 'enabled-active');
   assert.equal(evidence.legacyTimerDisabled, true);
   assert.equal(evidence.sourceActivationControlIssue, 41);
+});
+
+test('supported canonical SSH origin is accepted without publishing raw origin text', () => {
+  const facts = collectControlEvidenceFacts(baseCollectOptions({
+    runGit: fakeRunGit(gitResponses({
+      'remote get-url origin': { status: 0, stdout: 'git@github.com:TheTekTeam/agent-runner.git\n' },
+    })),
+  }));
+  const evidence = buildControlEvidence(facts);
+  assert.equal(evidence.repositoryVerified, true);
+  assert.equal(buildControlEvidenceCommentBody(evidence).includes('git@github.com'), false);
 });
 
 test('dirty checkout projects not-ready and is never mistaken for ready', () => {
@@ -105,7 +119,7 @@ test('wrong branch projects not-ready-branch-mismatch', () => {
   assert.equal(buildControlEvidence(facts).branch, null);
 });
 
-test('wrong repository identity projects not-ready-repository-mismatch', () => {
+test('wrong checkout path projects not-ready-repository-mismatch', () => {
   const facts = collectControlEvidenceFacts(baseCollectOptions({
     realpath: fakeRealpath({ '/canonical/agent-runner': '/canonical/agent-runner', '/somewhere/else': '/somewhere/else' }),
     runGit: fakeRunGit(gitResponses({
@@ -113,6 +127,29 @@ test('wrong repository identity projects not-ready-repository-mismatch', () => {
     })),
   }));
   assert.equal(evaluateControlEvidenceReadiness(facts), 'not-ready-repository-mismatch');
+});
+
+test('wrong repository origin at the canonical path projects not-ready-repository-mismatch', () => {
+  const facts = collectControlEvidenceFacts(baseCollectOptions({
+    runGit: fakeRunGit(gitResponses({
+      'remote get-url origin': { status: 0, stdout: 'https://github.com/TheTekTeam/modelspend.git\n' },
+    })),
+  }));
+  const evidence = buildControlEvidence(facts);
+  assert.equal(evidence.repositoryVerified, false);
+  assert.equal(evidence.readinessCode, 'not-ready-repository-mismatch');
+  assert.equal(buildControlEvidenceCommentBody(evidence).includes('modelspend.git'), false);
+});
+
+test('missing or ambiguous origin fails closed as repository mismatch', () => {
+  const facts = collectControlEvidenceFacts(baseCollectOptions({
+    runGit: fakeRunGit(gitResponses({
+      'remote get-url origin': { status: 2, stdout: 'token-bearing diagnostic must not leak\n' },
+    })),
+  }));
+  const body = buildControlEvidenceCommentBody(buildControlEvidence(facts));
+  assert.equal(evaluateControlEvidenceReadiness(facts), 'not-ready-repository-mismatch');
+  assert.equal(body.includes('token-bearing'), false);
 });
 
 test('active implementation lock projects not-ready-lock-active', () => {
@@ -201,6 +238,10 @@ test('adversarial env/config/systemd/git strings never enter the published comme
         status: 0,
         stdout: 'main; rm -rf / #<script>alert(1)</script> $(cat /etc/shadow)\n',
       },
+      'remote get-url origin': {
+        status: 0,
+        stdout: 'https://user:secret@github.com/TheTekTeam/agent-runner.git\n',
+      },
     })),
   }));
   const evidence = buildControlEvidence(facts);
@@ -210,7 +251,9 @@ test('adversarial env/config/systemd/git strings never enter the published comme
   assert.equal(body.includes('adversarial-secret-path'), false);
   assert.equal(body.includes('rm -rf'), false);
   assert.equal(body.includes('<script>'), false);
+  assert.equal(body.includes('user:secret'), false);
   assert.equal(evidence.branch, null); // rejected by the branch allowlist pattern, never passed through
+  assert.equal(evidence.repositoryVerified, false); // credential-bearing origin is not canonical
   assert.equal(body.startsWith(CONTROL_EVIDENCE_MARKER), true);
 });
 
@@ -300,33 +343,35 @@ test('publisher failure never mutates local facts or evidence -- only the attemp
   assert.equal(evidence.ready, true);
 });
 
-test('resolveControlEvidenceIssue accepts only one positive integer', () => {
-  assert.equal(resolveControlEvidenceIssue({ AGENT_RUNNER_CONTROL_EVIDENCE_ISSUE: '252' }), 252);
-  assert.equal(resolveControlEvidenceIssue({ AGENT_RUNNER_CONTROL_EVIDENCE_ISSUE: '0' }), null);
-  assert.equal(resolveControlEvidenceIssue({ AGENT_RUNNER_CONTROL_EVIDENCE_ISSUE: 'not-a-number' }), null);
-  assert.equal(resolveControlEvidenceIssue({}), null);
+test('resolveControlEvidenceIssue prefers explicit issue, then source-activation issue, then dedicated default', () => {
+  assert.equal(resolveControlEvidenceIssue({ AGENT_RUNNER_CONTROL_EVIDENCE_ISSUE: '99', AGENT_RUNNER_SOURCE_ACTIVATION_CONTROL_ISSUE: '41' }), 99);
+  assert.equal(resolveControlEvidenceIssue({ AGENT_RUNNER_SOURCE_ACTIVATION_CONTROL_ISSUE: '41' }), 41);
+  assert.equal(resolveControlEvidenceIssue({ AGENT_RUNNER_CONTROL_EVIDENCE_ISSUE: '0' }), CONTROL_EVIDENCE_DEFAULT_ISSUE);
+  assert.equal(resolveControlEvidenceIssue({ AGENT_RUNNER_CONTROL_EVIDENCE_ISSUE: 'not-a-number' }), CONTROL_EVIDENCE_DEFAULT_ISSUE);
+  assert.equal(resolveControlEvidenceIssue({}), CONTROL_EVIDENCE_DEFAULT_ISSUE);
 });
 
-test('runControlEvidence without a configured issue collects evidence but publishes nothing', async () => {
+test('runControlEvidence without a separate evidence destination publishes to dedicated default issue', async () => {
+  let publishedWith = null;
   const result = await runControlEvidence({
     env: {},
     collectFacts: () => collectControlEvidenceFacts(baseCollectOptions({ env: {} })),
-    publish: () => { throw new Error('must not be called'); },
+    publish: (args) => { publishedWith = args; return { action: 'created', commentId: 8 }; },
   });
-  assert.equal(result.published, false);
-  assert.equal(result.publishAction, 'not-configured');
-  assert.equal(result.evidence.ready, true);
+  assert.equal(result.published, true);
+  assert.equal(result.publishAction, 'created');
+  assert.equal(publishedWith.issueNumber, CONTROL_EVIDENCE_DEFAULT_ISSUE);
 });
 
-test('runControlEvidence with a configured issue publishes the collected evidence', async () => {
+test('runControlEvidence reuses configured source-activation control issue when present', async () => {
   let publishedWith = null;
   const result = await runControlEvidence({
-    env: { AGENT_RUNNER_CONTROL_EVIDENCE_ISSUE: '252' },
+    env: { AGENT_RUNNER_SOURCE_ACTIVATION_CONTROL_ISSUE: '41' },
     collectFacts: () => collectControlEvidenceFacts(baseCollectOptions()),
     publish: (args) => { publishedWith = args; return { action: 'created', commentId: 9 }; },
   });
   assert.equal(result.published, true);
   assert.equal(result.publishAction, 'created');
   assert.equal(result.publishedCommentId, 9);
-  assert.equal(publishedWith.issueNumber, 252);
+  assert.equal(publishedWith.issueNumber, 41);
 });
