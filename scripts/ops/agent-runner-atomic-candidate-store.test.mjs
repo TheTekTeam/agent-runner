@@ -51,6 +51,11 @@ const selectionRecord = {
     sourcePreflightBodyDigest: managerBodyDigest,
     sourcePreflightAuthorityKey: managerAuthorityKey,
     sourcePreflightAuthor: 'gpcola',
+    // Issue #189: a combined/alias execution label (the outer scheduler
+    // selection resolved this deterministically to `claude-code-cli`) --
+    // the literal label and the resolved adapter id must both survive the
+    // round-trip through `snapshotFromSelectionRecord()` distinctly.
+    selectedAgentLabel: 'agent:codex-claude',
     agent: { agentId: 'claude-code-cli' },
   },
 };
@@ -76,7 +81,8 @@ test('selection record becomes the expected scheduler authority snapshot', () =>
   assert.deepEqual(snapshotFromSelectionRecord(selectionRecord), {
     issueNumber: 5,
     statusLabel: 'status:ready',
-    agentLabel: 'agent:claude-code-cli',
+    agentLabel: 'agent:codex-claude',
+    resolvedAgentId: 'claude-code-cli',
     selectionMode: 'preflight-direct',
     commandKind: null,
     commandIdentity: null,
