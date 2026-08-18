@@ -2,7 +2,6 @@ import { constants as fsConstants, accessSync } from 'node:fs';
 import { delimiter, join } from 'node:path';
 
 import { probeOutcome } from './agent-runner-adapter-contract.mjs';
-import { getAgentSettings, normalizeAgentPaidUsePolicy } from './agent-runner-agent-settings.mjs';
 import { loadAgentRunnerConfig } from './agent-runner-config.mjs';
 import { buildRunnerDashboard } from './claude-runner-dashboard-api.mjs';
 import { defaultRunnerStateDbPath } from './claude-runner-state.mjs';
@@ -81,39 +80,34 @@ export function computeInstanceLoad({ agentId, env = process.env, dbPath, histor
 }
 
 /**
- * Cost-class/budget-cap/quota-resource read (issue #47 required view:
- * "cost class, budget/cap and quota/resource state"; issue #184: canonical
- * cost/admission posture semantics). This adds no new sink: for
- * `claude-code-cli` it reuses the exact same read-only
- * `buildRunnerDashboard()` summary `computeInstanceLoad()` already reads —
- * the same bounded, already-safe `quota` block the static dashboard has
- * displayed since before this issue (`blockedCount`,
- * `latestSessionUsagePercent`, `latestWeeklyUsagePercent` — no raw
- * prompts, tokens, or provider payload). Every other adapter is either a
- * zero-spend local runtime or not yet implemented, so its cost class is a
- * static, honest label; there is no live billing or provider call in this
- * function for any adapter.
+ * Cost-class/quota-resource read (issue #47 required view; #184 owner
+ * decision 2026-08-18).
  *
- * `claude-code-cli` has no entry in `agent-runner-routing.mjs`'s
- * `PAID_AGENT_IDS`, so it is never automatically routed onto a paid path;
- * its current-path posture is `included-subscription` (`paid: false`)
- * only when the machine-local paid-use policy is positively readable.
- * A missing/unreadable/malformed settings document is not equivalent to a
- * known disabled paid path: it projects bounded `unknown` posture and
- * never exposes the underlying parse/read error. When policy is known, the
- * same paid-use seam already used by routing (`paidUseApproved`,
- * `automaticRoutingApproved`, a positive cost/token cap — see
- * `normalizeAgentPaidUsePolicy()`) determines whether paid fallback is
- * explicitly authorised. Reading this settings file never writes to it, so
- * this remains a pure, read-only projection.
+ * Admission availability is quota-only. This projection never reads an
+ * account balance, flexible-credit state, billing settings, paid-use
+ * approval, auto-top-up state, or provider billing metadata. For the
+ * accepted Claude subscription path it reuses the existing bounded,
+ * read-only dashboard quota summary and reports the execution source as
+ * `included-subscription` with the compatibility `paid` flag false.
+ *
+ * Actual scheduler admission remains governed by the canonical quota
+ * preflight/profile thresholds. Missing or exhausted quota must fail closed
+ * there; the presence or absence of credits is deliberately irrelevant.
+ * Per-attempt budget/token ceilings remain separate execution safety limits
+ * and are not evidence of account credits.
+ *
+ * Every other adapter is either a zero-spend local runtime or not yet
+ * qualified here. No provider call, billing lookup or settings mutation is
+ * performed for any adapter.
  */
-export function computeInstanceQuota({ agentId, env = process.env, dbPath, buildDashboard = buildRunnerDashboard, settingsPath, getSettings = getAgentSettings } = {}) {
+export function computeInstanceQuota({ agentId, env = process.env, dbPath, buildDashboard = buildRunnerDashboard } = {}) {
   if (agentId === 'ollama-agent') {
-    return { costClass: 'free-local-zero-spend', paid: false, paidFallback: 'disabled', quota: null };
+    return { costClass: 'free-local-zero-spend', paid: false, quota: null };
   }
   if (agentId !== 'claude-code-cli') {
-    return { costClass: 'not-yet-qualified', paid: false, paidFallback: 'disabled', quota: null };
+    return { costClass: 'not-yet-qualified', paid: false, quota: null };
   }
+
   const resolvedDbPath = resolveDbPath({ env, dbPath });
   const dashboard = buildDashboard(resolvedDbPath, { historyLimit: 1, strict: false });
   const rawQuota = dashboard?.quota || null;
@@ -125,22 +119,9 @@ export function computeInstanceQuota({ agentId, env = process.env, dbPath, build
       }
     : null;
 
-  const settings = getSettings({ env, agentId, ...(settingsPath ? { settingsPath } : {}) });
-  if (!settings || settings.fileFound === false || settings.parseError) {
-    return {
-      costClass: 'unknown',
-      paid: false,
-      paidFallback: 'unknown',
-      quota,
-    };
-  }
-
-  const paidUse = normalizeAgentPaidUsePolicy(settings.entry);
-  const paidFallbackAuthorised = paidUse.paidUseApproved === true && paidUse.automaticRoutingApproved === true && paidUse.hasPositiveCap === true;
   return {
-    costClass: paidFallbackAuthorised ? 'paid-metered' : 'included-subscription',
-    paid: paidFallbackAuthorised,
-    paidFallback: paidFallbackAuthorised ? 'explicitly-authorised' : 'disabled',
+    costClass: 'included-subscription',
+    paid: false,
     quota,
   };
 }
