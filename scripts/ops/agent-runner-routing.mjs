@@ -22,11 +22,14 @@ import { assessQualification } from './agent-runner-qualification.mjs';
 
 export const GLOBAL_EXECUTION_SLOT_CAPACITY = 1;
 
-// A future implemented paid adapter (Codex CLI, Grok CLI today) is never an
-// automatic fallback merely because it is installed, enabled, or qualified.
-// This local list, not a field on the shared frozen catalogue, is the only
-// place "paid" is asserted -- it does not mutate agent-runner-agents.mjs.
-export const PAID_AGENT_IDS = Object.freeze(['codex-cli', 'grok-cli']);
+// Only adapters whose normal execution route is separately metered belong in
+// this explicit paid-routing list. Owner decision 2026-08-18: Codex CLI is
+// quota-admitted and must not be excluded or reclassified based on flexible
+// credit/account-balance state. If/when Codex is qualified, its current
+// quota/resource signal is authoritative for availability. Grok remains an
+// explicitly metered adapter and therefore retains the positive paid-use
+// approval/cap gate below.
+export const PAID_AGENT_IDS = Object.freeze(['grok-cli']);
 
 function isPaidAgent(agentId) {
   return PAID_AGENT_IDS.includes(agentId);
@@ -59,6 +62,10 @@ function paidRoutingReasons({ agentId, adapter, paidUse }) {
  * secrets. `readiness`/`resourceState` are optional caller-supplied signals
  * (health/ready probes, an agent-local quota/resource block) -- omitted,
  * they simply do not exclude the candidate.
+ *
+ * For quota-backed adapters, including a future qualified Codex CLI, quota
+ * availability belongs in `resourceState`; account credit balances are not
+ * a selector input and are intentionally ignored.
  */
 export function evaluateAgentEligibility({
   agentId,
