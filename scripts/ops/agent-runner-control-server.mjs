@@ -179,7 +179,7 @@ function decorateInstance(instance, ctx) {
   return {
     ...instance,
     load: computeInstanceLoad({ agentId: instance.agentId, env: ctx.env, dbPath: ctx.dbPath }),
-    quota: computeInstanceQuota({ agentId: instance.agentId, env: ctx.env, dbPath: ctx.dbPath, settingsPath: ctx.settingsPath }),
+    quota: computeInstanceQuota({ agentId: instance.agentId, env: ctx.env, dbPath: ctx.dbPath }),
   };
 }
 
