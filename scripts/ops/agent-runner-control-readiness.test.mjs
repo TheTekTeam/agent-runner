@@ -70,26 +70,26 @@ test('computeInstanceLoad reports idle when no active claim is evidenced', () =>
   assert.equal(load.active, 0);
 });
 
-// -- computeInstanceQuota (issue #47 required view: cost class / budget-cap / quota-resource state) --
+// -- computeInstanceQuota (issue #47 required view; #184 quota-only policy) --
 
 test('computeInstanceQuota reports a static, honest zero-spend cost class for the local Ollama adapter, no dashboard read', () => {
   let called = false;
   const quota = computeInstanceQuota({ agentId: 'ollama-agent', buildDashboard: () => { called = true; return {}; } });
-  assert.deepEqual(quota, { costClass: 'free-local-zero-spend', paid: false, paidFallback: 'disabled', quota: null });
+  assert.deepEqual(quota, { costClass: 'free-local-zero-spend', paid: false, quota: null });
   assert.equal(called, false);
 });
 
 test('computeInstanceQuota reports not-yet-qualified for a foundation-only, non-local adapter, no dashboard read', () => {
   let called = false;
   const quota = computeInstanceQuota({ agentId: 'codex-cli', buildDashboard: () => { called = true; return {}; } });
-  assert.deepEqual(quota, { costClass: 'not-yet-qualified', paid: false, paidFallback: 'disabled', quota: null });
+  assert.deepEqual(quota, { costClass: 'not-yet-qualified', paid: false, quota: null });
   assert.equal(called, false);
 });
 
 test('computeInstanceQuota reports not-yet-qualified for the foundation-only grok-cli adapter, no dashboard read', () => {
   let called = false;
   const quota = computeInstanceQuota({ agentId: 'grok-cli', buildDashboard: () => { called = true; return {}; } });
-  assert.deepEqual(quota, { costClass: 'not-yet-qualified', paid: false, paidFallback: 'disabled', quota: null });
+  assert.deepEqual(quota, { costClass: 'not-yet-qualified', paid: false, quota: null });
   assert.equal(called, false);
 });
 
@@ -101,9 +101,7 @@ test('computeInstanceReadiness never probes the foundation-only grok-cli adapter
   assert.equal(probed, false);
 });
 
-// -- issue #184: claude-code-cli included-use-only posture by default, no settings entry --
-
-test('computeInstanceQuota for claude-code-cli reuses the existing read-only dashboard quota summary, never mutates it, and reports included-subscription with no settings entry', () => {
+test('computeInstanceQuota for claude-code-cli reuses only the bounded dashboard quota summary and reports included-subscription', () => {
   let calledWith = null;
   const buildDashboard = (dbPath, options) => {
     calledWith = { dbPath, options };
@@ -113,12 +111,10 @@ test('computeInstanceQuota for claude-code-cli reuses the existing read-only das
     agentId: 'claude-code-cli',
     dbPath: '/tmp/does-not-matter.sqlite',
     buildDashboard,
-    getSettings: () => ({ entry: null }),
   });
   assert.deepEqual(quota, {
     costClass: 'included-subscription',
     paid: false,
-    paidFallback: 'disabled',
     quota: { blockedCount: 2, latestSessionUsagePercent: 41.5, latestWeeklyUsagePercent: 12.25 },
   });
   assert.equal(calledWith.dbPath, '/tmp/does-not-matter.sqlite');
@@ -130,50 +126,38 @@ test('computeInstanceQuota for claude-code-cli degrades to a null quota block wh
     agentId: 'claude-code-cli',
     dbPath: '/tmp/does-not-matter.sqlite',
     buildDashboard: () => ({}),
-    getSettings: () => ({ entry: null }),
   });
-  assert.deepEqual(quota, { costClass: 'included-subscription', paid: false, paidFallback: 'disabled', quota: null });
+  assert.deepEqual(quota, { costClass: 'included-subscription', paid: false, quota: null });
 });
 
-test('computeInstanceQuota never returns a raw prompt, token count, or provider payload — only the three bounded numeric fields', () => {
+test('computeInstanceQuota never returns raw prompt/provider data or account-credit state', () => {
   const buildDashboard = () => ({
-    quota: { blockedCount: 1, latestSessionUsagePercent: 5, latestWeeklyUsagePercent: 5, rawProviderResponse: 'must-not-leak', prompt: 'must-not-leak' },
+    quota: {
+      blockedCount: 1,
+      latestSessionUsagePercent: 5,
+      latestWeeklyUsagePercent: 5,
+      rawProviderResponse: 'must-not-leak',
+      prompt: 'must-not-leak',
+      creditBalance: 123,
+      flexibleCreditsAvailable: true,
+      autoTopUp: true,
+    },
   });
-  const quota = computeInstanceQuota({ agentId: 'claude-code-cli', dbPath: '/tmp/x.sqlite', buildDashboard, getSettings: () => ({ entry: null }) });
+  const quota = computeInstanceQuota({ agentId: 'claude-code-cli', dbPath: '/tmp/x.sqlite', buildDashboard });
   assert.deepEqual(Object.keys(quota.quota).sort(), ['blockedCount', 'latestSessionUsagePercent', 'latestWeeklyUsagePercent']);
   assert.ok(!JSON.stringify(quota).includes('must-not-leak'));
+  assert.ok(!JSON.stringify(quota).includes('creditBalance'));
+  assert.ok(!JSON.stringify(quota).includes('flexibleCreditsAvailable'));
+  assert.ok(!JSON.stringify(quota).includes('autoTopUp'));
 });
 
-// -- issue #184: claude-code-cli paid/credit fallback posture is read from the same machine-local paid-use policy seam as codex-cli/grok-cli --
-
-test('computeInstanceQuota for claude-code-cli stays included-subscription when the paid-use policy is only partially set', () => {
-  const buildDashboard = () => ({ quota: {} });
-  const partiallyApproved = { entry: { paidUseApproved: true, automaticRoutingApproved: false, maxCostUsdPerRun: 5 } };
-  const quota = computeInstanceQuota({ agentId: 'claude-code-cli', dbPath: '/tmp/x.sqlite', buildDashboard, getSettings: () => partiallyApproved });
-  assert.equal(quota.costClass, 'included-subscription');
-  assert.equal(quota.paid, false);
-  assert.equal(quota.paidFallback, 'disabled');
-});
-
-test('computeInstanceQuota for claude-code-cli reports paid-metered only once paid use, automatic routing, and a positive cap are all explicitly authorised', () => {
-  const buildDashboard = () => ({ quota: {} });
-  const fullyApproved = { entry: { paidUseApproved: true, automaticRoutingApproved: true, maxCostUsdPerRun: 5, maxTokensPerRun: 0 } };
-  const quota = computeInstanceQuota({ agentId: 'claude-code-cli', dbPath: '/tmp/x.sqlite', buildDashboard, getSettings: () => fullyApproved });
-  assert.equal(quota.costClass, 'paid-metered');
-  assert.equal(quota.paid, true);
-  assert.equal(quota.paidFallback, 'explicitly-authorised');
-});
-
-test('computeInstanceQuota passes settingsPath and agentId through to getSettings unchanged', () => {
-  let calledWith = null;
+test('computeInstanceQuota has no agent-settings or billing-policy dependency', () => {
   const quota = computeInstanceQuota({
     agentId: 'claude-code-cli',
     dbPath: '/tmp/x.sqlite',
-    buildDashboard: () => ({ quota: {} }),
-    settingsPath: '/tmp/agent-settings.json',
-    getSettings: (args) => { calledWith = args; return { entry: null }; },
+    buildDashboard: () => ({ quota: { latestSessionUsagePercent: 25, latestWeeklyUsagePercent: 10 } }),
   });
-  assert.equal(calledWith.agentId, 'claude-code-cli');
-  assert.equal(calledWith.settingsPath, '/tmp/agent-settings.json');
   assert.equal(quota.costClass, 'included-subscription');
+  assert.equal(quota.paid, false);
+  assert.equal('paidFallback' in quota, false);
 });
