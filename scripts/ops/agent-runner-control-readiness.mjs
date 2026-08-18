@@ -97,12 +97,15 @@ export function computeInstanceLoad({ agentId, env = process.env, dbPath, histor
  * `claude-code-cli` has no entry in `agent-runner-routing.mjs`'s
  * `PAID_AGENT_IDS`, so it is never automatically routed onto a paid path;
  * its current-path posture is `included-subscription` (`paid: false`)
- * unless the same machine-local paid-use policy `agent-runner-routing.mjs`
- * already gates `codex-cli`/`grok-cli` on (`paidUseApproved`,
+ * only when the machine-local paid-use policy is positively readable.
+ * A missing/unreadable/malformed settings document is not equivalent to a
+ * known disabled paid path: it projects bounded `unknown` posture and
+ * never exposes the underlying parse/read error. When policy is known, the
+ * same paid-use seam already used by routing (`paidUseApproved`,
  * `automaticRoutingApproved`, a positive cost/token cap — see
- * `normalizeAgentPaidUsePolicy()`) is explicitly and fully set for this
- * agent too. Reading this settings file never writes to it, so this
- * remains a pure, read-only projection.
+ * `normalizeAgentPaidUsePolicy()`) determines whether paid fallback is
+ * explicitly authorised. Reading this settings file never writes to it, so
+ * this remains a pure, read-only projection.
  */
 export function computeInstanceQuota({ agentId, env = process.env, dbPath, buildDashboard = buildRunnerDashboard, settingsPath, getSettings = getAgentSettings } = {}) {
   if (agentId === 'ollama-agent') {
@@ -114,19 +117,30 @@ export function computeInstanceQuota({ agentId, env = process.env, dbPath, build
   const resolvedDbPath = resolveDbPath({ env, dbPath });
   const dashboard = buildDashboard(resolvedDbPath, { historyLimit: 1, strict: false });
   const rawQuota = dashboard?.quota || null;
+  const quota = rawQuota
+    ? {
+        blockedCount: typeof rawQuota.blockedCount === 'number' ? rawQuota.blockedCount : null,
+        latestSessionUsagePercent: typeof rawQuota.latestSessionUsagePercent === 'number' ? rawQuota.latestSessionUsagePercent : null,
+        latestWeeklyUsagePercent: typeof rawQuota.latestWeeklyUsagePercent === 'number' ? rawQuota.latestWeeklyUsagePercent : null,
+      }
+    : null;
+
   const settings = getSettings({ env, agentId, ...(settingsPath ? { settingsPath } : {}) });
-  const paidUse = normalizeAgentPaidUsePolicy(settings?.entry);
+  if (!settings || settings.fileFound === false || settings.parseError) {
+    return {
+      costClass: 'unknown',
+      paid: false,
+      paidFallback: 'unknown',
+      quota,
+    };
+  }
+
+  const paidUse = normalizeAgentPaidUsePolicy(settings.entry);
   const paidFallbackAuthorised = paidUse.paidUseApproved === true && paidUse.automaticRoutingApproved === true && paidUse.hasPositiveCap === true;
   return {
     costClass: paidFallbackAuthorised ? 'paid-metered' : 'included-subscription',
     paid: paidFallbackAuthorised,
     paidFallback: paidFallbackAuthorised ? 'explicitly-authorised' : 'disabled',
-    quota: rawQuota
-      ? {
-          blockedCount: typeof rawQuota.blockedCount === 'number' ? rawQuota.blockedCount : null,
-          latestSessionUsagePercent: typeof rawQuota.latestSessionUsagePercent === 'number' ? rawQuota.latestSessionUsagePercent : null,
-          latestWeeklyUsagePercent: typeof rawQuota.latestWeeklyUsagePercent === 'number' ? rawQuota.latestWeeklyUsagePercent : null,
-        }
-      : null,
+    quota,
   };
 }
