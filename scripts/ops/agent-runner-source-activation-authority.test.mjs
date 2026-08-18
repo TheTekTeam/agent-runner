@@ -103,6 +103,9 @@ test('source authority is strict, fingerprint-bound and a separate authority dom
   assert.equal(parsed.authorityKey.startsWith('source-activation:'), true);
   assert.equal(parseManagerPreflightPacket(comment).valid, false, 'source authority must never be manager-preflight authority');
 
+  // This only needs to be recognizable as manager-preflight-domain input. The
+  // source parser must ignore it regardless of whether the manager parser later
+  // rejects the deliberately minimal fixture on its own schema requirements.
   const managerPacket = `${'<!-- agent-runner:manager-preflight -->'}\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: SAME-REVISION\nfingerprint: ${parsed.fingerprint}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nscope:\n  - bounded\nrequired_validation:\n  - test\nstop_conditions:\n  - stop\n\`\`\``;
   assert.equal(parseSourceActivationAuthority(managerPacket).valid, false, 'manager preflight must never be source authority');
   assert.notEqual(
