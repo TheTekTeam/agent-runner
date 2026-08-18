@@ -1,10 +1,13 @@
 import { spawnSync } from 'node:child_process';
+import { join } from 'node:path';
 
 import { loadAgentRunnerConfig, projectIdentity } from './agent-runner-config.mjs';
 import { readOnlyRunnerStateSnapshot, unitState } from './agent-runner-operator-doctor.mjs';
 import { readCircuitState } from './agent-runner-operator-status.mjs';
 import { buildRunnerActivity, buildRunnerMetrics, buildRunnerOperatorStatus } from './claude-runner-dashboard-api.mjs';
 import { defaultRunnerStateDbPath } from './claude-runner-state.mjs';
+import { attentionReconciliationLookup, effectiveAttentionReconciliationStatus } from './agent-runner-attention-reconciliation.mjs';
+import { readAttentionReconciliationsForRepository } from './agent-runner-attention-reconciliation-store.mjs';
 
 /**
  * The smallest authenticated read-only operational projection needed to
@@ -354,8 +357,15 @@ export function projectHealth(currentHealthConditions = []) {
  * is deliberately never forwarded — it is the one attention column that can
  * carry a path/URL.
  */
-export function projectAttention(attentionEvents = []) {
-  const rows = (Array.isArray(attentionEvents) ? attentionEvents : []).filter((row) => !row?.resolved_at);
+export function projectAttention(attentionEvents = [], attentionReconciliations = null) {
+  // #183 -- an unresolved row whose GitHub identity has been durably
+  // reconciled as `historical` (issue/PR closed, no bounded rule proving
+  // post-closure action remains required) is not "requires operator action";
+  // a row with no reconciliation decision yet, or only an `unknown` one, is
+  // never dropped here (fails closed).
+  const rows = (Array.isArray(attentionEvents) ? attentionEvents : [])
+    .filter((row) => !row?.resolved_at)
+    .filter((row) => effectiveAttentionReconciliationStatus(row, attentionReconciliations) !== 'historical');
   return {
     unresolvedCount: rows.length,
     events: rows.slice(0, MAX_LIST).map((row) => ({
@@ -481,6 +491,7 @@ export function buildOverviewProjection({
   links = { grafanaRunnerUrl: null, grafanaOperationsUrl: null, legacyDashboardUrl: null },
   generatedAt,
   nowMs = Date.parse(generatedAt),
+  attentionReconciliations = null,
 }) {
   const base = {
     ok: true,
@@ -512,7 +523,7 @@ export function buildOverviewProjection({
   const latest = snapshot.latest || {};
   const activity = buildRunnerActivity(latest);
   const metrics = buildRunnerMetrics({ latest });
-  const operatorStatus = buildRunnerOperatorStatus(latest, activity, snapshot.currentHealthConditions || []);
+  const operatorStatus = buildRunnerOperatorStatus(latest, activity, snapshot.currentHealthConditions || [], attentionReconciliations);
 
   return {
     ...base,
@@ -525,7 +536,7 @@ export function buildOverviewProjection({
     runs: projectRuns(metrics),
     quota: projectQuota(metrics),
     health: projectHealth(snapshot.currentHealthConditions),
-    attention: projectAttention(latest.attentionEvents),
+    attention: projectAttention(latest.attentionEvents, attentionReconciliations),
     notifications: projectNotifications(latest.notifications),
     activity: projectActivity(latest),
   };
@@ -592,6 +603,12 @@ export function readControlOverview({
     }
   };
 
+  const reconciliationDbPath = env.CLAUDE_RUNNER_ATTENTION_RECONCILIATION_DB
+    || join(config.outputDir || '.var/claude-runner', 'attention-reconciliation.sqlite');
+  const attentionReconciliations = config.githubRepo
+    ? attentionReconciliationLookup(readAttentionReconciliationsForRepository(reconciliationDbPath, config.githubRepo), config.githubRepo)
+    : null;
+
   return buildOverviewProjection({
     snapshot,
     circuit,
@@ -600,6 +617,7 @@ export function readControlOverview({
     identity: projectIdentity(config),
     links: projectLinks(env),
     generatedAt,
+    attentionReconciliations,
   });
 }
 
