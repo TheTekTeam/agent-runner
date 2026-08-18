@@ -7,9 +7,38 @@ import {
   MANAGER_PROFILE_SHADOW_SCHEMA_VERSION,
 } from './agent-runner-manager-profile-shadow.mjs';
 import { loadManagerProfileRegistry } from './agent-runner-manager-profile-registry.mjs';
+import { MANAGER_PROFILE_SCHEMA_VERSION, validateManagerProfile } from './agent-runner-manager-profile-schema.mjs';
 
 function agentRunnerConfig(overrides = {}) {
   return { projectId: 'agent-runner', githubRepo: 'TheTekTeam/agent-runner', ...overrides };
+}
+
+function customProfile(overrides = {}) {
+  return validateManagerProfile({
+    schemaVersion: MANAGER_PROFILE_SCHEMA_VERSION,
+    projectId: 'agent-runner',
+    enabled: true,
+    repository: { owner: 'TheTekTeam', name: 'agent-runner' },
+    branches: { allowed: ['main'], default: 'main' },
+    objective: 'Sample objective.',
+    nonGoals: ['No autonomous merge'],
+    instructionPaths: ['CLAUDE.md'],
+    controlIssue: { mode: 'fixedIssue', issueNumber: 258 },
+    labels: { ready: 'status:ready', done: 'status:done' },
+    capabilities: { allowlist: ['claude-code-cli'] },
+    validation: { profile: 'complex', requiredChecks: ['npm test'] },
+    quotaPolicyRef: 'scripts/ops/agent-runner-routing.mjs#quota-only-admission',
+    mutationBounds: { maxIssueMutationsPerRecurrence: 1, maxCommentsPerRecurrence: 1 },
+    escalation: { rules: ['Stop on ambiguous evidence'] },
+    mutationAuthority: {
+      issueMutation: true, authorityIssuance: true, merge: false, close: false, deploy: false, sourceActivation: false,
+    },
+    ...overrides,
+  });
+}
+
+function registryOf(projectId, profile) {
+  return { projectsById: { [projectId]: profile } };
 }
 
 test('a project whose registered profile matches the canonical registry reports available and matching', () => {
@@ -79,9 +108,89 @@ test('shadow computation is deterministic and idempotent across repeated calls',
 });
 
 test('the shadow result is frozen at every level relevant to mutation safety', () => {
-  const ok = computeManagerProfileShadow([{ config: agentRunnerConfig() }]);
+  const ok = computeManagerProfileShadow([
+    { config: agentRunnerConfig() },
+    { config: { projectId: 'modelspend', githubRepo: 'TheTekTeam/modelspend' } },
+  ]);
   assert.ok(Object.isFrozen(ok));
   assert.ok(Object.isFrozen(ok.projects));
   assert.ok(Object.isFrozen(ok.projects[0]));
   assert.ok(Object.isFrozen(ok.projects[0].mismatches));
+  assert.ok(Object.isFrozen(ok.projects[0].nonComparable));
+});
+
+test('branches and instructionPaths are recorded as non-comparable evidence when the canonical config does not carry them', () => {
+  const profileRegistry = loadManagerProfileRegistry();
+  const result = computeManagerProfileShadowForProject({ config: agentRunnerConfig(), profileRegistry });
+  assert.deepEqual(result.nonComparable, ['branches', 'instructionPaths']);
+  assert.equal(result.matches, true);
+});
+
+test('an injected projectId mismatch between a profile and the canonical config it is bound under is recorded, not thrown', () => {
+  const profileRegistry = registryOf('agent-runner', customProfile({ projectId: 'a-different-project' }));
+  const result = computeManagerProfileShadowForProject({ config: agentRunnerConfig(), profileRegistry });
+  assert.equal(result.available, true);
+  assert.equal(result.matches, false);
+  assert.ok(result.mismatches.includes('projectId'));
+});
+
+test('an injected enabled mismatch (disabled profile bound to an admitted canonical project) is recorded, not thrown', () => {
+  const profileRegistry = registryOf('agent-runner', customProfile({ enabled: false }));
+  const result = computeManagerProfileShadowForProject({ config: agentRunnerConfig(), profileRegistry });
+  assert.equal(result.available, true);
+  assert.equal(result.matches, false);
+  assert.ok(result.mismatches.includes('enabled'));
+});
+
+test('an injected branches mismatch is recorded once the canonical config actually carries branch data', () => {
+  const profileRegistry = registryOf('agent-runner', customProfile());
+  const config = agentRunnerConfig({ branches: { allowed: ['develop'], default: 'develop' } });
+  const result = computeManagerProfileShadowForProject({ config, profileRegistry });
+  assert.equal(result.matches, false);
+  assert.ok(result.mismatches.includes('branches'));
+  assert.ok(!result.nonComparable.includes('branches'));
+});
+
+test('a matching branches field is recorded as a match once the canonical config carries branch data', () => {
+  const profileRegistry = registryOf('agent-runner', customProfile());
+  const config = agentRunnerConfig({ branches: { allowed: ['main'], default: 'main' } });
+  const result = computeManagerProfileShadowForProject({ config, profileRegistry });
+  assert.ok(!result.mismatches.includes('branches'));
+  assert.ok(!result.nonComparable.includes('branches'));
+});
+
+test('an injected instructionPaths mismatch is recorded once the canonical config actually carries instruction paths', () => {
+  const profileRegistry = registryOf('agent-runner', customProfile());
+  const config = agentRunnerConfig({ instructionPaths: ['OTHER.md'] });
+  const result = computeManagerProfileShadowForProject({ config, profileRegistry });
+  assert.equal(result.matches, false);
+  assert.ok(result.mismatches.includes('instructionPaths'));
+  assert.ok(!result.nonComparable.includes('instructionPaths'));
+});
+
+test('a matching instructionPaths field is recorded as a match once the canonical config carries instruction paths', () => {
+  const profileRegistry = registryOf('agent-runner', customProfile());
+  const config = agentRunnerConfig({ instructionPaths: ['CLAUDE.md'] });
+  const result = computeManagerProfileShadowForProject({ config, profileRegistry });
+  assert.ok(!result.mismatches.includes('instructionPaths'));
+  assert.ok(!result.nonComparable.includes('instructionPaths'));
+});
+
+test('computeManagerProfileShadow binds the manager-profile registry against the whole set of canonical projects passed to it', () => {
+  const result = computeManagerProfileShadow([
+    { config: agentRunnerConfig() },
+    { config: { projectId: 'modelspend', githubRepo: 'TheTekTeam/modelspend' } },
+  ]);
+  assert.equal(result.available, true);
+  assert.deepEqual(result.projects.map((entry) => entry.projectId).sort(), ['agent-runner', 'modelspend']);
+});
+
+test('computeManagerProfileShadow fails closed (as an unavailable top-level result) when an enabled profile is unregistered against the bound canonical set', () => {
+  // agent-runner is enabled in MANAGER_PROFILE_REGISTRY but omitted here, so
+  // the whole-registry bind cannot find it against the canonical set passed in.
+  const result = computeManagerProfileShadow([
+    { config: { projectId: 'modelspend', githubRepo: 'TheTekTeam/modelspend' } },
+  ]);
+  assert.equal(result.available, false);
+  assert.match(result.reason, /manager-profile-registry-error:.*Unregistered agent runner manager project: 'agent-runner'/);
 });

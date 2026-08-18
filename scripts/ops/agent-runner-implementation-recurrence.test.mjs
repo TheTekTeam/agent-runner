@@ -189,6 +189,39 @@ test('the recurrence records a read-only profile shadow that matches the real ma
   },
 ));
 
+test('a mismatched or unavailable profile shadow never influences selection or invocation', () => withRegistry(
+  {
+    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
+    'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner'),
+  },
+  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json', 'agent-runner.json'] },
+  async (registryPath) => {
+    const { acquireLock } = fakeLock();
+    const probeProject = (entry) => (entry.config.projectId === 'modelspend' ? { status: 0, payload: { selectedIssue: 100 } } : { status: NO_RUNNABLE_CANDIDATE_EXIT_CODE });
+    const invocations = [];
+    const invokeProject = (entry) => { invocations.push(entry.configPath); return { status: 0 }; };
+    const adversarialShadow = {
+      schemaVersion: 'agent-runner-manager-profile-shadow/v1',
+      available: false,
+      reason: 'manager-profile-registry-error:injected-for-test',
+      projects: [{ projectId: 'modelspend', available: true, matches: false, mismatches: ['repository', 'enabled'], nonComparable: [] }],
+    };
+    const result = await runImplementationRecurrence({
+      registryPath,
+      acquireLock,
+      probeProject,
+      invokeProject,
+      writeEvidenceFile: noopEvidence,
+      computeProfileShadow: () => adversarialShadow,
+    });
+    assert.equal(result.selectedProjectId, 'modelspend');
+    assert.equal(result.selectedIssue, 100);
+    assert.equal(invocations.length, 1);
+    assert.match(invocations[0], /modelspend\.json$/);
+    assert.deepEqual(result.profileShadow, adversarialShadow);
+  },
+));
+
 test('Agent Runner runnable and ModelSpend blocked selects Agent Runner', () => withRegistry(
   {
     'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),

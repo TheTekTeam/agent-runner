@@ -171,3 +171,72 @@ test('assertNormalizedManagerProfileShape refuses an object that merely carries 
 test('assertNormalizedManagerProfileShape accepts real validateManagerProfile output', () => {
   assert.doesNotThrow(() => assertNormalizedManagerProfileShape(validateManagerProfile(baseProfile())));
 });
+
+test('assertNormalizedManagerProfileShape refuses a deeply frozen adversarial fake that replicates the real shape exactly', () => {
+  const real = validateManagerProfile(baseProfile());
+  // Rebuild every nested value from scratch (never touching `real`'s own
+  // object identity) and freeze it exactly the way validateManagerProfile
+  // does, so the only difference from a genuine output is provenance.
+  const fake = Object.freeze({
+    schemaVersion: real.schemaVersion,
+    projectId: real.projectId,
+    enabled: real.enabled,
+    repository: Object.freeze({ ...real.repository }),
+    branches: Object.freeze({ allowed: Object.freeze([...real.branches.allowed]), default: real.branches.default }),
+    objective: real.objective,
+    nonGoals: Object.freeze([...real.nonGoals]),
+    instructionPaths: Object.freeze([...real.instructionPaths]),
+    controlIssue: Object.freeze({ ...real.controlIssue }),
+    labels: Object.freeze({ ...real.labels }),
+    capabilities: Object.freeze({ allowlist: Object.freeze([...real.capabilities.allowlist]) }),
+    validation: Object.freeze({ profile: real.validation.profile, requiredChecks: Object.freeze([...real.validation.requiredChecks]) }),
+    quotaPolicyRef: real.quotaPolicyRef,
+    mutationBounds: Object.freeze({ ...real.mutationBounds }),
+    escalation: Object.freeze({ rules: Object.freeze([...real.escalation.rules]) }),
+    mutationAuthority: Object.freeze({ ...real.mutationAuthority }),
+  });
+  assert.notEqual(fake, real);
+  assert.throws(() => assertNormalizedManagerProfileShape(fake), /already-validated manager profile/);
+});
+
+test('rejects an unrecognised label-state key', () => {
+  assert.throws(
+    () => validateManagerProfile(baseProfile({ labels: { ready: 'status:ready', mystery: 'status:mystery' } })),
+    /labels\.mystery is not a recognised label-state key/,
+  );
+});
+
+test('rejects a label value with unsafe syntax', () => {
+  assert.throws(
+    () => validateManagerProfile(baseProfile({ labels: { ready: 'status ready!' } })),
+    /labels\.ready must be a safe label string/,
+  );
+});
+
+test('rejects two label states that duplicate the same label value', () => {
+  assert.throws(
+    () => validateManagerProfile(baseProfile({ labels: { ready: 'status:ready', done: 'status:ready' } })),
+    /labels\.done duplicates label/,
+  );
+});
+
+test('rejects an unsafe capability identifier', () => {
+  assert.throws(
+    () => validateManagerProfile(baseProfile({ capabilities: { allowlist: ['claude code cli'] } })),
+    /not a safe capability identifier/,
+  );
+});
+
+test('rejects a duplicate capability in the allowlist', () => {
+  assert.throws(
+    () => validateManagerProfile(baseProfile({ capabilities: { allowlist: ['claude-code-cli', 'claude-code-cli'] } })),
+    /duplicate capability/,
+  );
+});
+
+test('recursively refuses an account-credit/balance field nested inside labels', () => {
+  assert.throws(
+    () => validateManagerProfile(baseProfile({ labels: { ready: 'status:ready', balance: 'status:balance' } })),
+    /account-credit or balance/,
+  );
+});

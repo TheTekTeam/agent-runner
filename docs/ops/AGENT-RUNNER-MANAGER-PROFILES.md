@@ -1,6 +1,6 @@
 # Agent Runner management profiles
 
-Issue: `TheTekTeam/agent-runner#259` (`BUILD.MANAGER.PROFILES.1`/`.2`, parent `#258`).
+Issue: `TheTekTeam/agent-runner#259` (`BUILD.MANAGER.PROFILES.1`/`.2`/`.3`, parent `#258`).
 
 This is the compatibility-first foundation slice: it defines one versioned,
 provider-neutral, schema-validated per-project management profile and a
@@ -31,6 +31,17 @@ claim or dispatch; that cutover happens in a later, separately accepted step
   `validateManagerProfile()` fails closed on unknown fields, missing
   required fields, malformed repository/branch/control-issue shapes and
   unsafe mutation-capability combinations (e.g. `deploy` without `merge`).
+  It also fails closed on any `labels` key outside a fixed, exact set of
+  supported label-state names, any label/capability value that does not
+  match a safe lowercase syntactic pattern, duplicate label values or
+  duplicate capabilities, and recursively refuses an account-credit or
+  balance style field name anywhere in the profile, at any nesting depth
+  (not merely at the top level). Every object it returns is registered in
+  an internal `WeakSet`, so `assertNormalizedManagerProfileShape()` (used by
+  `resolveManagerContext()`) can refuse an adversarial object that merely
+  *replicates* a validated profile's exact frozen shape and values but was
+  never actually produced by `validateManagerProfile()` -- profile
+  provenance is unforgeable, not just shape-checked.
 - `scripts/ops/agent-runner-manager-profile-registry.mjs` — the explicit
   `MANAGER_PROFILE_REGISTRY` list and `resolveRegisteredManagerProfile()`,
   which fails closed for an unregistered `projectId` or a repository that
@@ -77,9 +88,9 @@ mode), `labels`, `capabilities.allowlist`, `validation`
 
 `scripts/ops/agent-runner-manager-profile-shadow.mjs` compares each enabled
 canonical registry project's profile-resolved manager context against its
-real registry identity, and `agent-runner-implementation-recurrence.mjs`
-records the result on every tick as a `profileShadow` evidence field. This
-is diagnostic only:
+real registry identity **field by field**, and
+`agent-runner-implementation-recurrence.mjs` records the result on every
+tick as a `profileShadow` evidence field. This is diagnostic only:
 
 - It runs after `selectRunnableProject()` has already chosen (or not
   chosen) a project, so it can never influence selection, probing or
@@ -87,12 +98,22 @@ is diagnostic only:
 - Any failure inside it (missing profile, registry load error, mismatch) is
   captured as a bounded result and never thrown, so it can never block or
   alter the real recurrence.
-- `agent-runner-manager-profile-registry.mjs#loadManagerProfileRegistry`
-  binds every *enabled* profile to the canonical managed project registry
-  (`agent-runner-project-registry.mjs`) when one is supplied, failing closed
-  on an unregistered project or repository mismatch — this is the same
-  canonical registry the real recurrence already loads, not a second,
-  unrelated source of project identity.
+- `computeManagerProfileShadow()` binds `loadManagerProfileRegistry()`
+  against the *whole* canonical managed-project set it was given (every
+  enabled project the real recurrence just probed), not a second,
+  independently reloaded copy of the registry. It fails the shadow
+  computation closed (a bounded `available: false` evidence result, never
+  thrown) if an enabled manager profile cannot be matched against that
+  exact canonical set — see
+  `agent-runner-manager-profile-registry.mjs#assertManagerProfileRegisteredInProjectRegistry`.
+- For each project, every behaviour-affecting field expressible by both the
+  canonical project config and the normalized profile is compared
+  independently: `projectId`, `repository`, `enabled`/admitted state,
+  `branches` (allowed/default) and `instructionPaths`. A field the
+  canonical config does not currently carry (the config schema has no
+  per-project `branches`/`instructionPaths` field yet) is recorded in a
+  `nonComparable` evidence list rather than silently treated as a match, so
+  the gap itself is visible evidence.
 
 ## Publication and cutover
 

@@ -47,6 +47,30 @@ test('refuses an adversarial object that merely carries a correct schemaVersion 
   assert.throws(() => resolveManagerContext(fake), /already-validated manager profile/);
 });
 
+test('refuses a deeply frozen adversarial fake that replicates a real validated profile\'s exact shape and values', () => {
+  const real = enabledProfile();
+  const fake = Object.freeze({
+    schemaVersion: real.schemaVersion,
+    projectId: real.projectId,
+    enabled: real.enabled,
+    repository: Object.freeze({ ...real.repository }),
+    branches: Object.freeze({ allowed: Object.freeze([...real.branches.allowed]), default: real.branches.default }),
+    objective: real.objective,
+    nonGoals: Object.freeze([...real.nonGoals]),
+    instructionPaths: Object.freeze([...real.instructionPaths]),
+    controlIssue: Object.freeze({ ...real.controlIssue }),
+    labels: Object.freeze({ ...real.labels }),
+    capabilities: Object.freeze({ allowlist: Object.freeze([...real.capabilities.allowlist]) }),
+    validation: Object.freeze({ profile: real.validation.profile, requiredChecks: Object.freeze([...real.validation.requiredChecks]) }),
+    quotaPolicyRef: real.quotaPolicyRef,
+    mutationBounds: Object.freeze({ ...real.mutationBounds }),
+    escalation: Object.freeze({ rules: Object.freeze([...real.escalation.rules]) }),
+    mutationAuthority: Object.freeze({ ...real.mutationAuthority }),
+  });
+  assert.doesNotThrow(() => resolveManagerContext(real));
+  assert.throws(() => resolveManagerContext(fake), /already-validated manager profile/);
+});
+
 test('an enabled profile preserves its declared mutation authority and bounds', () => {
   const context = resolveManagerContext(enabledProfile());
   assert.equal(context.schemaVersion, MANAGER_CONTEXT_SCHEMA_VERSION);

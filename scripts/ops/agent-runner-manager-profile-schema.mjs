@@ -18,6 +18,36 @@ const MUTATION_AUTHORITY_FIELDS = Object.freeze([
   'sourceActivation',
 ]);
 
+// Every label-state semantic name any registered profile is allowed to use.
+// Anything outside this exact set fails closed rather than being silently
+// accepted as an ad hoc state -- including any attempt to smuggle an
+// account-credit/balance-style key in through the one nested object whose
+// keys are otherwise caller-controlled data rather than a fixed field list.
+const SUPPORTED_LABEL_STATES = Object.freeze(['ready', 'inProgress', 'blocked', 'done', 'needsReview']);
+
+// GitHub label strings and capability/adapter identifiers must be plain,
+// lowercase, machine-safe tokens: no whitespace, control characters or
+// unbounded content that could later be interpreted as something other than
+// an exact label/capability string.
+const LABEL_VALUE_PATTERN = /^[a-z0-9]+(?:[-_:][a-z0-9]+)*$/i;
+const CAPABILITY_VALUE_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+// Refused at any nesting depth, not merely at the top level: no field
+// anywhere in a manager profile may be named after an account-credit or
+// balance concept, since #256/#259 both require quota-only, credit-free
+// admission.
+const FORBIDDEN_FIELD_NAME_PATTERN = /^(account[-_]?credit|balance|account[-_]?balance|credit[-_]?balance)$/i;
+
+/**
+ * Every actual profile object returned by `validateManagerProfile()` is
+ * recorded here. This makes profile provenance unforgeable inside the
+ * process: `assertNormalizedManagerProfileShape()` refuses any object that
+ * merely *looks* like a validated profile (right shape, right values, even
+ * deeply frozen) but was never actually produced by this validator -- a
+ * `WeakSet` cannot be forged or replayed by constructing a look-alike object.
+ */
+const VALIDATED_PROFILES = new WeakSet();
+
 const REQUIRED_TOP_LEVEL_FIELDS = Object.freeze([
   'schemaVersion',
   'projectId',
@@ -70,6 +100,27 @@ function assertNoUnknownFields(object, allowed, label, errors) {
   if (!isPlainObject(object)) return;
   for (const key of Object.keys(object)) {
     if (!allowed.has(key)) errors.push(`${label}.${key} is not a recognised field`);
+  }
+}
+
+/**
+ * Refuse an account-credit or balance style field name anywhere in the raw
+ * profile object, not merely at the top level. This runs before every other
+ * check so a forbidden field cannot hide inside a part of the schema (such
+ * as `labels`, whose keys are otherwise caller-controlled state names) that
+ * would not already reject it as an unrecognised field.
+ */
+function assertNoForbiddenFieldNamesRecursive(value, path, errors) {
+  if (Array.isArray(value)) {
+    value.forEach((item, index) => assertNoForbiddenFieldNamesRecursive(item, `${path}[${index}]`, errors));
+    return;
+  }
+  if (!isPlainObject(value)) return;
+  for (const [key, nested] of Object.entries(value)) {
+    if (FORBIDDEN_FIELD_NAME_PATTERN.test(key)) {
+      errors.push(`${path}.${key} must not carry an account-credit or balance field`);
+    }
+    assertNoForbiddenFieldNamesRecursive(nested, `${path}.${key}`, errors);
   }
 }
 
@@ -137,11 +188,22 @@ function validateLabels(labels, errors) {
   const entries = Object.entries(labels);
   if (entries.length === 0) errors.push('labels must contain at least one state/label mapping');
   const normalized = {};
+  const stateByLabelValue = new Map();
   for (const [state, label] of entries) {
-    if (!nonEmptyString(label)) {
-      errors.push(`labels.${state} must be a non-empty label string`);
+    if (!SUPPORTED_LABEL_STATES.includes(state)) {
+      errors.push(`labels.${state} is not a recognised label-state key (supported: ${SUPPORTED_LABEL_STATES.join(', ')})`);
       continue;
     }
+    if (!nonEmptyString(label) || !LABEL_VALUE_PATTERN.test(label)) {
+      errors.push(`labels.${state} must be a safe label string (lowercase letters/digits with -, _ or : separators)`);
+      continue;
+    }
+    const existingState = stateByLabelValue.get(label);
+    if (existingState) {
+      errors.push(`labels.${state} duplicates label "${label}" already assigned to state "${existingState}"`);
+      continue;
+    }
+    stateByLabelValue.set(label, state);
     normalized[state] = label;
   }
   if (errors.length) return null;
@@ -159,7 +221,22 @@ function validateCapabilities(capabilities, errors) {
     errors.push('capabilities.allowlist must be an array of strings');
     return null;
   }
-  return Object.freeze({ allowlist: freezeArray([...new Set(allowlist)]) });
+  const seen = new Set();
+  const normalized = [];
+  for (const capability of allowlist) {
+    if (!CAPABILITY_VALUE_PATTERN.test(capability)) {
+      errors.push(`capabilities.allowlist entry "${capability}" is not a safe capability identifier (lowercase letters/digits with - separators)`);
+      continue;
+    }
+    if (seen.has(capability)) {
+      errors.push(`capabilities.allowlist contains a duplicate capability "${capability}"`);
+      continue;
+    }
+    seen.add(capability);
+    normalized.push(capability);
+  }
+  if (errors.length) return null;
+  return Object.freeze({ allowlist: freezeArray(normalized) });
 }
 
 function validateValidation(validation, errors) {
@@ -250,6 +327,7 @@ export function validateManagerProfile(input) {
   if (!isPlainObject(input)) {
     throw new Error('Invalid agent runner manager profile: profile must be a JSON object');
   }
+  assertNoForbiddenFieldNamesRecursive(input, 'profile', errors);
   assertNoUnknownFields(input, ALLOWED_TOP_LEVEL_FIELDS, 'profile', errors);
   for (const field of REQUIRED_TOP_LEVEL_FIELDS) {
     if (!(field in input)) errors.push(`profile.${field} is required`);
@@ -263,9 +341,6 @@ export function validateManagerProfile(input) {
   if (!stringArray(input.nonGoals)) errors.push('nonGoals must be an array of strings');
   if (!stringArray(input.instructionPaths) || input.instructionPaths.length === 0) errors.push('instructionPaths must be a non-empty array of strings');
   if (!nonEmptyString(input.quotaPolicyRef)) errors.push('quotaPolicyRef is required');
-  if ('accountCredit' in input || 'balance' in input || 'accountBalance' in input) {
-    errors.push('profile must not carry an account-credit or balance field');
-  }
 
   const repository = validateRepository(input.repository, errors);
   const branches = validateBranches(input.branches, errors);
@@ -279,7 +354,7 @@ export function validateManagerProfile(input) {
 
   if (errors.length) throw new Error(`Invalid agent runner manager profile: ${errors.join('; ')}`);
 
-  return Object.freeze({
+  const normalized = Object.freeze({
     schemaVersion: input.schemaVersion,
     projectId: input.projectId,
     enabled: input.enabled,
@@ -297,6 +372,8 @@ export function validateManagerProfile(input) {
     escalation,
     mutationAuthority,
   });
+  VALIDATED_PROFILES.add(normalized);
+  return normalized;
 }
 
 export function managerProfileRepositoryFull(profile) {
@@ -312,18 +389,21 @@ function isFrozenStringArray(value) {
 }
 
 /**
- * A profile carrying the right `schemaVersion` is not proof it passed
- * `validateManagerProfile()` -- an adversarial or hand-built object could
- * set that one field and nothing else correctly. `resolveManagerContext`
- * must refuse to trust anything that merely *looks* validated; this checks
- * the exact frozen, normalized shape `validateManagerProfile()` produces
- * (including that every nested array/object survived deep-freezing) before
- * any context is derived from it.
+ * A profile carrying the right `schemaVersion` -- even one that is deeply
+ * frozen and otherwise shaped exactly like a real validated profile -- is
+ * not proof it passed `validateManagerProfile()`: an adversarial or
+ * hand-built object could replicate every field and freeze it identically.
+ * `resolveManagerContext` must refuse to trust anything that merely *looks*
+ * validated, so provenance is checked against `VALIDATED_PROFILES`, a
+ * `WeakSet` populated only by `validateManagerProfile()` itself and
+ * therefore unforgeable by constructing a look-alike object. The exact
+ * frozen, normalized shape `validateManagerProfile()` produces is still
+ * checked afterwards as defense in depth.
  */
 export function assertNormalizedManagerProfileShape(profile) {
   const errors = [];
-  if (!isFrozenPlainObject(profile)) {
-    throw new Error('resolveManagerContext requires an already-validated manager profile: profile must be a frozen, validated manager profile object');
+  if (!isFrozenPlainObject(profile) || !VALIDATED_PROFILES.has(profile)) {
+    throw new Error('resolveManagerContext requires an already-validated manager profile: object was not produced by validateManagerProfile');
   }
   if (profile.schemaVersion !== MANAGER_PROFILE_SCHEMA_VERSION) errors.push('schemaVersion');
   if (!nonEmptyString(profile.projectId)) errors.push('projectId');
