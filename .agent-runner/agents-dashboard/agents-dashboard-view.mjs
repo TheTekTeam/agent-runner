@@ -45,10 +45,18 @@ export function classifyExecutionSurface(adapterType) {
   return EXECUTION_SURFACE_BY_TYPE[adapterType] || 'External / manual';
 }
 
-/** Issue #47 required view: "cost class ... state" — paired with the server-computed `quota.costClass`. */
+/**
+ * Issue #47 required view: "cost class ... state" — paired with the
+ * server-computed `quota.costClass`. Issue #184: `included-subscription`
+ * covers included provider/session allowance with paid/credit fallback not
+ * currently authorised for the admitted path — it must never be described
+ * as "paid" merely because the provider can support paid execution in some
+ * other configuration.
+ */
 export function describeCostClass(costClass) {
   switch (costClass) {
     case 'paid-metered': return 'Paid (metered)';
+    case 'included-subscription': return 'Included (subscription)';
     case 'free-local-zero-spend': return 'Free (local, zero-spend)';
     case 'not-yet-qualified': return 'Not yet qualified';
     default: return 'Unknown';
@@ -138,7 +146,13 @@ export function findLastStateChange(auditEntries, agentId) {
   return match ? match.at : null;
 }
 
-/** Issue #47 required view #17: paid-agent enablement needs explicit confirmation. Only claude-code-cli is both paid and implemented today. */
+/**
+ * Issue #47 required view #17: paid-agent enablement needs explicit
+ * confirmation. Issue #184: `quota.paid` is only ever true for a currently
+ * *admitted* separately-authorised paid/credit path, never merely because a
+ * provider can support paid execution — so an included-use-only
+ * `claude-code-cli` never triggers this confirmation.
+ */
 export function requiresPaidEnableConfirmation(instance) {
   return Boolean(instance?.implemented) && instance?.quota?.paid === true;
 }

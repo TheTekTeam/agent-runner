@@ -560,8 +560,8 @@ test('full dashboard-shaped flow: create, configure, enable (pre-claim eligible)
   // The new required-view fields are present and honest — no fabricated version, no leaked path.
   assert.equal(claude.command, 'claude');
   assert.ok(claude.capabilities && claude.capabilities.model.supported === true);
-  assert.equal(claude.quota.paid, true);
-  assert.equal(claude.quota.costClass, 'paid-metered');
+  assert.equal(claude.quota.paid, false);
+  assert.equal(claude.quota.costClass, 'included-subscription');
   assert.ok(!('probes' in (claude.readiness || {})));
 
   const created = await apiRequest(baseUrl, '/api/instances', { method: 'POST', cookie, csrfToken, body: { agentId: 'claude-code-cli' } });
