@@ -80,17 +80,25 @@ export function computeInstanceLoad({ agentId, env = process.env, dbPath, histor
 }
 
 /**
- * Cost-class/budget-cap/quota-resource read (issue #47 required view:
- * "cost class, budget/cap and quota/resource state"). This adds no new
- * sink: for `claude-code-cli` it reuses the exact same read-only
- * `buildRunnerDashboard()` summary `computeInstanceLoad()` already reads —
- * the same bounded, already-safe `quota` block the static dashboard has
- * displayed since before this issue (`blockedCount`,
- * `latestSessionUsagePercent`, `latestWeeklyUsagePercent` — no raw
- * prompts, tokens, or provider payload). Every other adapter is either a
- * zero-spend local runtime or not yet implemented, so its cost class is a
- * static, honest label; there is no live billing or provider call in this
- * function for any adapter.
+ * Cost-class/quota-resource read (issue #47 required view; #184 owner
+ * decision 2026-08-18).
+ *
+ * Admission availability is quota-only. This projection never reads an
+ * account balance, flexible-credit state, billing settings, paid-use
+ * approval, auto-top-up state, or provider billing metadata. For the
+ * accepted Claude subscription path it reuses the existing bounded,
+ * read-only dashboard quota summary and reports the execution source as
+ * `included-subscription` with the compatibility `paid` flag false.
+ *
+ * Actual scheduler admission remains governed by the canonical quota
+ * preflight/profile thresholds. Missing or exhausted quota must fail closed
+ * there; the presence or absence of credits is deliberately irrelevant.
+ * Per-attempt budget/token ceilings remain separate execution safety limits
+ * and are not evidence of account credits.
+ *
+ * Every other adapter is either a zero-spend local runtime or not yet
+ * qualified here. No provider call, billing lookup or settings mutation is
+ * performed for any adapter.
  */
 export function computeInstanceQuota({ agentId, env = process.env, dbPath, buildDashboard = buildRunnerDashboard } = {}) {
   if (agentId === 'ollama-agent') {
@@ -99,18 +107,21 @@ export function computeInstanceQuota({ agentId, env = process.env, dbPath, build
   if (agentId !== 'claude-code-cli') {
     return { costClass: 'not-yet-qualified', paid: false, quota: null };
   }
+
   const resolvedDbPath = resolveDbPath({ env, dbPath });
   const dashboard = buildDashboard(resolvedDbPath, { historyLimit: 1, strict: false });
   const rawQuota = dashboard?.quota || null;
+  const quota = rawQuota
+    ? {
+        blockedCount: typeof rawQuota.blockedCount === 'number' ? rawQuota.blockedCount : null,
+        latestSessionUsagePercent: typeof rawQuota.latestSessionUsagePercent === 'number' ? rawQuota.latestSessionUsagePercent : null,
+        latestWeeklyUsagePercent: typeof rawQuota.latestWeeklyUsagePercent === 'number' ? rawQuota.latestWeeklyUsagePercent : null,
+      }
+    : null;
+
   return {
-    costClass: 'paid-metered',
-    paid: true,
-    quota: rawQuota
-      ? {
-          blockedCount: typeof rawQuota.blockedCount === 'number' ? rawQuota.blockedCount : null,
-          latestSessionUsagePercent: typeof rawQuota.latestSessionUsagePercent === 'number' ? rawQuota.latestSessionUsagePercent : null,
-          latestWeeklyUsagePercent: typeof rawQuota.latestWeeklyUsagePercent === 'number' ? rawQuota.latestWeeklyUsagePercent : null,
-        }
-      : null,
+    costClass: 'included-subscription',
+    paid: false,
+    quota,
   };
 }

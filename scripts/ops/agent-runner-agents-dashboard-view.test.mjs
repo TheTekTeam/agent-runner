@@ -33,8 +33,9 @@ test('classifyExecutionSurface matches the documented three-way split', () => {
   assert.equal(classifyExecutionSurface('made-up-type'), 'External / manual');
 });
 
-test('describeCostClass renders the three server-computed cost classes honestly', () => {
+test('describeCostClass renders the server-computed cost classes honestly', () => {
   assert.equal(describeCostClass('paid-metered'), 'Paid (metered)');
+  assert.equal(describeCostClass('included-subscription'), 'Included (subscription)');
   assert.equal(describeCostClass('free-local-zero-spend'), 'Free (local, zero-spend)');
   assert.equal(describeCostClass('not-yet-qualified'), 'Not yet qualified');
   assert.equal(describeCostClass(undefined), 'Unknown');

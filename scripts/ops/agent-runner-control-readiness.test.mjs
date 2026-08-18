@@ -70,7 +70,7 @@ test('computeInstanceLoad reports idle when no active claim is evidenced', () =>
   assert.equal(load.active, 0);
 });
 
-// -- computeInstanceQuota (issue #47 required view: cost class / budget-cap / quota-resource state) --
+// -- computeInstanceQuota (issue #47 required view; #184 quota-only policy) --
 
 test('computeInstanceQuota reports a static, honest zero-spend cost class for the local Ollama adapter, no dashboard read', () => {
   let called = false;
@@ -101,16 +101,20 @@ test('computeInstanceReadiness never probes the foundation-only grok-cli adapter
   assert.equal(probed, false);
 });
 
-test('computeInstanceQuota for claude-code-cli reuses the existing read-only dashboard quota summary, never mutates it', () => {
+test('computeInstanceQuota for claude-code-cli reuses only the bounded dashboard quota summary and reports included-subscription', () => {
   let calledWith = null;
   const buildDashboard = (dbPath, options) => {
     calledWith = { dbPath, options };
     return { quota: { blockedCount: 2, latestSessionUsagePercent: 41.5, latestWeeklyUsagePercent: 12.25 } };
   };
-  const quota = computeInstanceQuota({ agentId: 'claude-code-cli', dbPath: '/tmp/does-not-matter.sqlite', buildDashboard });
+  const quota = computeInstanceQuota({
+    agentId: 'claude-code-cli',
+    dbPath: '/tmp/does-not-matter.sqlite',
+    buildDashboard,
+  });
   assert.deepEqual(quota, {
-    costClass: 'paid-metered',
-    paid: true,
+    costClass: 'included-subscription',
+    paid: false,
     quota: { blockedCount: 2, latestSessionUsagePercent: 41.5, latestWeeklyUsagePercent: 12.25 },
   });
   assert.equal(calledWith.dbPath, '/tmp/does-not-matter.sqlite');
@@ -118,15 +122,42 @@ test('computeInstanceQuota for claude-code-cli reuses the existing read-only das
 });
 
 test('computeInstanceQuota for claude-code-cli degrades to a null quota block when the dashboard has no quota summary yet', () => {
-  const quota = computeInstanceQuota({ agentId: 'claude-code-cli', dbPath: '/tmp/does-not-matter.sqlite', buildDashboard: () => ({}) });
-  assert.deepEqual(quota, { costClass: 'paid-metered', paid: true, quota: null });
+  const quota = computeInstanceQuota({
+    agentId: 'claude-code-cli',
+    dbPath: '/tmp/does-not-matter.sqlite',
+    buildDashboard: () => ({}),
+  });
+  assert.deepEqual(quota, { costClass: 'included-subscription', paid: false, quota: null });
 });
 
-test('computeInstanceQuota never returns a raw prompt, token count, or provider payload — only the three bounded numeric fields', () => {
+test('computeInstanceQuota never returns raw prompt/provider data or account-credit state', () => {
   const buildDashboard = () => ({
-    quota: { blockedCount: 1, latestSessionUsagePercent: 5, latestWeeklyUsagePercent: 5, rawProviderResponse: 'must-not-leak', prompt: 'must-not-leak' },
+    quota: {
+      blockedCount: 1,
+      latestSessionUsagePercent: 5,
+      latestWeeklyUsagePercent: 5,
+      rawProviderResponse: 'must-not-leak',
+      prompt: 'must-not-leak',
+      creditBalance: 123,
+      flexibleCreditsAvailable: true,
+      autoTopUp: true,
+    },
   });
   const quota = computeInstanceQuota({ agentId: 'claude-code-cli', dbPath: '/tmp/x.sqlite', buildDashboard });
   assert.deepEqual(Object.keys(quota.quota).sort(), ['blockedCount', 'latestSessionUsagePercent', 'latestWeeklyUsagePercent']);
   assert.ok(!JSON.stringify(quota).includes('must-not-leak'));
+  assert.ok(!JSON.stringify(quota).includes('creditBalance'));
+  assert.ok(!JSON.stringify(quota).includes('flexibleCreditsAvailable'));
+  assert.ok(!JSON.stringify(quota).includes('autoTopUp'));
+});
+
+test('computeInstanceQuota has no agent-settings or billing-policy dependency', () => {
+  const quota = computeInstanceQuota({
+    agentId: 'claude-code-cli',
+    dbPath: '/tmp/x.sqlite',
+    buildDashboard: () => ({ quota: { latestSessionUsagePercent: 25, latestWeeklyUsagePercent: 10 } }),
+  });
+  assert.equal(quota.costClass, 'included-subscription');
+  assert.equal(quota.paid, false);
+  assert.equal('paidFallback' in quota, false);
 });
