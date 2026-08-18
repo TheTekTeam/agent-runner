@@ -46,6 +46,41 @@ export const DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG = Object.freeze({
 
 const CONFIG_ENV = 'AGENT_RUNNER_CONFIG';
 
+function truthy(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function requestedExecuteMode(argv = [], env = process.env) {
+  let execute = truthy(env?.CLAUDE_RUNNER_CRON_EXECUTE);
+  for (const arg of Array.isArray(argv) ? argv : []) {
+    if (arg === '--execute') execute = true;
+    else if (arg === '--dry-run') execute = false;
+  }
+  return execute;
+}
+
+/**
+ * #256: current quota evidence is mandatory for every executing scheduled run.
+ * The historical skip controls may remain parseable for mutation-free dry-run
+ * diagnostics, but they must fail closed before config loading, candidate
+ * discovery, claim mutation, workspace creation, or provider launch whenever
+ * the scheduler resolves to execute mode. Account-credit state is deliberately
+ * not consulted.
+ */
+export function assertMandatoryQuotaPreflight({ argv = [], env = process.env } = {}) {
+  const args = Array.isArray(argv) ? argv : [];
+  if (!requestedExecuteMode(args, env)) return;
+
+  const skipFlagRequested = args.includes('--skip-quota-preflight');
+  const skipEnvRequested = truthy(env?.CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT);
+  if (!skipFlagRequested && !skipEnvRequested) return;
+
+  const sources = [];
+  if (skipFlagRequested) sources.push('--skip-quota-preflight');
+  if (skipEnvRequested) sources.push('CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT');
+  throw new Error(`Quota preflight is mandatory in execute mode; refusing legacy quota-preflight bypass (${sources.join(', ')})`);
+}
+
 function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -63,6 +98,7 @@ function cleanPathForError(path) {
 }
 
 export function resolveConfigPath(argv = [], env = process.env) {
+  assertMandatoryQuotaPreflight({ argv, env });
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--config') {
@@ -175,6 +211,7 @@ export function validateAgentRunnerConfig(input) {
 }
 
 export function loadAgentRunnerConfig({ argv = [], env = process.env, configPath = resolveConfigPath(argv, env) } = {}) {
+  assertMandatoryQuotaPreflight({ argv, env });
   if (!configPath) return validateAgentRunnerConfig(DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG);
   return validateAgentRunnerConfig(readConfigFile(configPath));
 }

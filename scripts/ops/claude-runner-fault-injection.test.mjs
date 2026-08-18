@@ -8,7 +8,7 @@ import test from 'node:test';
 import {
   classifyAttemptLivenessState,
   createStateRecorder,
-  main,
+  main as schedulerMain,
   reconcilePendingRecoveryTransitions,
   reconcileSchedulerAttempts,
   activeRunBlockForIssue,
@@ -32,6 +32,51 @@ import {
 // need revalidation to legitimately pass must supply this full, fully-true
 // evidence object (mirrors SAFE_RECOVERY_REVALIDATION_EVIDENCE in
 // claude-runner-cron.test.mjs).
+
+const AVAILABLE_QUOTA_RUNNER = () => ({
+  status: 0,
+  signal: null,
+  stdout: JSON.stringify({
+    status: 'available',
+    state: {
+      quotaUsage: {
+        session: { usedPercent: 0, resetAt: null, resetText: null },
+        weekly: { usedPercent: 0, resetAt: null, resetText: null },
+      },
+    },
+  }),
+  stderr: '',
+});
+
+// Historical execute-path fixtures used --skip-quota-preflight only to avoid
+// launching a real quota probe. #256 makes that production bypass invalid.
+// Adapt those fixtures to execute with positive bounded synthetic quota
+// evidence instead: the legacy option is removed before production parsing,
+// and the normal quota preflight/admission path still runs through an injected
+// process result. Tests that exercise the legacy flag itself call parseArgs or
+// assertMandatoryQuotaPreflight directly and therefore remain unadapted.
+function main(argv = [], env = {}, dependencies = {}) {
+  let execute = ['1', 'true', 'yes', 'on'].includes(
+    String(env?.CLAUDE_RUNNER_CRON_EXECUTE || '').trim().toLowerCase(),
+  );
+  for (const arg of argv) {
+    if (arg === '--execute') execute = true;
+    else if (arg === '--dry-run') execute = false;
+  }
+  const legacySkipRequested = argv.includes('--skip-quota-preflight')
+    || ['1', 'true', 'yes', 'on'].includes(
+      String(env?.CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT || '').trim().toLowerCase(),
+    );
+  if (!execute || !legacySkipRequested) return schedulerMain(argv, env, dependencies);
+
+  const effectiveArgv = argv.filter((arg) => arg !== '--skip-quota-preflight');
+  const effectiveEnv = { ...env, CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT: 'false' };
+  return schedulerMain(effectiveArgv, effectiveEnv, {
+    ...dependencies,
+    quotaRunner: dependencies.quotaRunner || AVAILABLE_QUOTA_RUNNER,
+  });
+}
+
 const FULL_PASSING_EVIDENCE = Object.freeze({
   issueOpen: true, expectedStatusCurrent: true, agentOwnershipCurrent: true,
   claimRevisionCurrent: true, preflightRevisionCurrent: true,
