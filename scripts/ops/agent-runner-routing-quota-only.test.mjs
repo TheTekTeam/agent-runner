@@ -10,17 +10,15 @@ const READY = { healthy: true, ready: true };
 const SETTINGS = {
   lifecycle: { enabled: true, paused: false, draining: false, disabled: false },
   qualification: { taskClasses: ['*'], riskClasses: ['*'], models: ['*'], harness: '*' },
-  // Deliberately false: Codex eligibility must not depend on paid/credit
-  // approval or any inferred account balance. Quota belongs in resourceState.
+  // Deliberately false: once current quota/resource evidence exists, Codex
+  // eligibility must not depend on paid/credit approval or account balance.
   paidUse: { paidUseApproved: false, automaticRoutingApproved: false, hasPositiveCap: false },
 };
 
-test('Codex CLI is not intrinsically classified as a paid adapter', () => {
-  assert.equal(PAID_AGENT_IDS.includes('codex-cli'), false);
+test('legacy paid-adapter compatibility does not override positively resolved Codex quota state', () => {
+  assert.equal(PAID_AGENT_IDS.includes('codex-cli'), true);
   assert.equal(PAID_AGENT_IDS.includes('grok-cli'), true);
-});
 
-test('a future qualified Codex CLI candidate is eligible when quota/resource state is available even with no credit approval', () => {
   const decision = evaluateAgentEligibility({
     agentId: 'codex-cli',
     adapter: CODEX_IMPLEMENTED,
@@ -34,7 +32,7 @@ test('a future qualified Codex CLI candidate is eligible when quota/resource sta
   assert.deepEqual(decision.reasons, []);
 });
 
-test('Codex CLI is excluded when its quota/resource state is blocked', () => {
+test('Codex CLI is excluded when its quota/resource state is blocked, without adding credit-policy reasons', () => {
   const decision = evaluateAgentEligibility({
     agentId: 'codex-cli',
     adapter: CODEX_IMPLEMENTED,
