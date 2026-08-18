@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 
+import { resolveAgentForLabels } from './agent-runner-agents.mjs';
 import { candidatePausePayload } from './agent-runner-candidate-admission.mjs';
 
 export class CandidateAdmissionPausedError extends Error {
@@ -34,10 +35,21 @@ export function snapshotFromSelectionRecord(record = {}) {
     ?? null;
   const explicitPacketValid = record.sourcePreflightPacketValid
     ?? plan.sourcePreflightPacketValid;
+  // Literal authoritative GitHub execution label, kept distinct from the
+  // resolved concrete adapter id below. Rewriting this to `agent:<agentId>`
+  // (the resolved adapter) collapsed both identity domains into one string
+  // and made an unchanged combined/alias label (e.g. `agent:codex-claude`)
+  // compare unequal to itself against the freshly re-read candidate
+  // snapshot, which always preserves the literal label (issue #189).
+  const agentLabel = record.agentLabel ?? plan.selectedAgentLabel ?? null;
+  const resolvedAgentId = plan.agent?.agentId
+    ?? resolveAgentForLabels([agentLabel])?.agentId
+    ?? null;
   return {
     issueNumber: record.issueNumber ?? plan.selectedIssue ?? null,
     statusLabel: record.statusLabel ?? plan.selectedStatusLabel ?? null,
-    agentLabel: plan.agent?.agentId ? `agent:${plan.agent.agentId}` : plan.selectedAgentLabel ?? null,
+    agentLabel,
+    resolvedAgentId,
     selectionMode: record.selectionMode ?? plan.selectionMode ?? null,
     commandKind: record.commandKind ?? plan.selectedCommandKind ?? null,
     commandIdentity: record.sourceCommentIdentity ?? plan.sourceCommentIdentity ?? null,
