@@ -8,7 +8,7 @@ import {
 } from './agent-runner-config.mjs';
 import { parseArgs as parseCronArgs } from './claude-runner-cron.mjs';
 
-test('mandatory quota guard rejects execute with the legacy CLI bypass before config resolution', () => {
+test('mandatory quota guard rejects CLI execute with the legacy CLI bypass before config resolution', () => {
   assert.throws(
     () => assertMandatoryQuotaPreflight({ argv: ['--execute', '--skip-quota-preflight'], env: {} }),
     /Quota preflight is mandatory in execute mode.*--skip-quota-preflight/,
@@ -19,10 +19,13 @@ test('mandatory quota guard rejects execute with the legacy CLI bypass before co
   );
 });
 
-test('mandatory quota guard rejects execute with the legacy environment bypass without exposing its value', () => {
-  const env = { CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT: 'true' };
+test('mandatory quota guard rejects service execute mode with the legacy environment bypass without exposing its value', () => {
+  const env = {
+    CLAUDE_RUNNER_CRON_EXECUTE: 'true',
+    CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT: 'true',
+  };
   assert.throws(
-    () => loadAgentRunnerConfig({ argv: ['--execute'], env }),
+    () => loadAgentRunnerConfig({ argv: [], env }),
     (error) => {
       assert.match(error.message, /Quota preflight is mandatory in execute mode/);
       assert.match(error.message, /CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT/);
@@ -38,25 +41,39 @@ test('cron parseArgs cannot construct an executing scheduler pass with either le
     /Quota preflight is mandatory in execute mode/,
   );
   assert.throws(
-    () => parseCronArgs(['--execute'], { CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT: '1' }),
+    () => parseCronArgs([], {
+      CLAUDE_RUNNER_CRON_EXECUTE: '1',
+      CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT: '1',
+    }),
+    /Quota preflight is mandatory in execute mode/,
+  );
+  assert.throws(
+    () => parseCronArgs(['--skip-quota-preflight'], { CLAUDE_RUNNER_CRON_EXECUTE: 'yes' }),
     /Quota preflight is mandatory in execute mode/,
   );
 });
 
-test('ordinary execute keeps quota preflight enabled and false-like legacy env values cannot disable it', () => {
-  const ordinary = parseCronArgs(['--execute'], {});
-  assert.equal(ordinary.execute, true);
-  assert.equal(ordinary.quotaPreflight, true);
+test('ordinary CLI and service execute modes keep quota preflight enabled', () => {
+  const cliExecute = parseCronArgs(['--execute'], {});
+  assert.equal(cliExecute.execute, true);
+  assert.equal(cliExecute.quotaPreflight, true);
+
+  const serviceExecute = parseCronArgs([], { CLAUDE_RUNNER_CRON_EXECUTE: 'true' });
+  assert.equal(serviceExecute.execute, true);
+  assert.equal(serviceExecute.quotaPreflight, true);
 
   for (const value of ['', '0', 'false', 'no', 'off']) {
-    const parsed = parseCronArgs(['--execute'], { CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT: value });
+    const parsed = parseCronArgs([], {
+      CLAUDE_RUNNER_CRON_EXECUTE: 'true',
+      CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT: value,
+    });
     assert.equal(parsed.execute, true);
     assert.equal(parsed.quotaPreflight, true);
   }
 });
 
-test('dry-run compatibility may retain the legacy skip controls because it cannot launch a provider or mutate a claim', () => {
-  const cliDryRun = parseCronArgs(['--dry-run', '--skip-quota-preflight'], {});
+test('explicit dry-run overrides service execute env and may retain legacy skip controls as mutation-free diagnostics', () => {
+  const cliDryRun = parseCronArgs(['--dry-run', '--skip-quota-preflight'], { CLAUDE_RUNNER_CRON_EXECUTE: 'true' });
   assert.equal(cliDryRun.execute, false);
   assert.equal(cliDryRun.quotaPreflight, false);
 
