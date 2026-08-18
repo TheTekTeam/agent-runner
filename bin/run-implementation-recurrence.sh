@@ -118,7 +118,10 @@ if source_activation_enabled; then
         exit 1
       fi
       export AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH=1
-      exec "$ROOT/bin/run-implementation-recurrence.sh" "$@"
+      # Re-enter the canonical Bash wrapper through Bash rather than relying on
+      # the repository file's execute bit. GitHub/checkouts may preserve this
+      # entrypoint as mode 0644 even though the service invokes it via Bash.
+      exec bash "$ROOT/bin/run-implementation-recurrence.sh" "$@"
       ;;
     3)
       # Handled authority/activation refusal: intentionally do not inspect,
