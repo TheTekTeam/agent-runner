@@ -1,0 +1,60 @@
+{
+  "schemaVersion": "agent-runner-manager-profile/v1",
+  "projectId": "agent-runner",
+  "enabled": true,
+  "repository": {
+    "owner": "TheTekTeam",
+    "name": "agent-runner"
+  },
+  "branches": {
+    "allowed": ["main"],
+    "default": "main"
+  },
+  "objective": "Keep the Agent Runner harness itself (dispatch authority, quota admission, scheduler, adapters, docs) moving through the manager-authored preflight -> implementation -> draft-PR -> supervised-merge recurrence.",
+  "nonGoals": [
+    "Autonomous merge, deploy, issue close or source activation without a separately accepted contract",
+    "A second manager recurrence, scheduler authority or shell surface"
+  ],
+  "instructionPaths": [
+    "CLAUDE.md",
+    "AGENTS.md",
+    "docs/ops/AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md",
+    "docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-CODE-MAP.md"
+  ],
+  "controlIssue": {
+    "mode": "labelSelector",
+    "labelSelector": "status:ready"
+  },
+  "labels": {
+    "ready": "status:ready",
+    "inProgress": "status:in-progress",
+    "blocked": "status:blocked",
+    "done": "status:done"
+  },
+  "capabilities": {
+    "allowlist": ["claude-code-cli"]
+  },
+  "validation": {
+    "profile": "complex",
+    "requiredChecks": ["npm test", "npm run validate", "git diff --check", "github-actions:exact-head"]
+  },
+  "quotaPolicyRef": "scripts/ops/agent-runner-routing.mjs#quota-only-admission",
+  "mutationBounds": {
+    "maxIssueMutationsPerRecurrence": 1,
+    "maxCommentsPerRecurrence": 1
+  },
+  "escalation": {
+    "rules": [
+      "Stop and report if required validation fails or evidence is ambiguous",
+      "Stop before merge, close, deploy or source activation; those remain separate accepted contracts"
+    ]
+  },
+  "mutationAuthority": {
+    "issueMutation": true,
+    "authorityIssuance": true,
+    "merge": false,
+    "close": false,
+    "deploy": false,
+    "sourceActivation": false
+  }
+}

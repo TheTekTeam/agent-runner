@@ -1,0 +1,58 @@
+{
+  "schemaVersion": "agent-runner-manager-profile/v1",
+  "projectId": "modelspend",
+  "enabled": true,
+  "repository": {
+    "owner": "TheTekTeam",
+    "name": "modelspend"
+  },
+  "branches": {
+    "allowed": ["main"],
+    "default": "main"
+  },
+  "objective": "Move ModelSpend backlog issues through the manager-authored preflight -> implementation -> draft-PR -> supervised-merge recurrence using the same bounded authority as Agent Runner.",
+  "nonGoals": [
+    "Autonomous merge, deploy, issue close or source activation without a separately accepted contract",
+    "A second manager recurrence, scheduler authority or shell surface"
+  ],
+  "instructionPaths": [
+    "CLAUDE.md",
+    "AGENTS.md"
+  ],
+  "controlIssue": {
+    "mode": "labelSelector",
+    "labelSelector": "status:ready"
+  },
+  "labels": {
+    "ready": "status:ready",
+    "inProgress": "status:in-progress",
+    "blocked": "status:blocked",
+    "done": "status:done"
+  },
+  "capabilities": {
+    "allowlist": ["claude-code-cli"]
+  },
+  "validation": {
+    "profile": "complex",
+    "requiredChecks": ["npm run validate:quick:plan -- --files <changed-files>", "npm run validate:thorough", "github-actions:exact-head"]
+  },
+  "quotaPolicyRef": "scripts/ops/agent-runner-routing.mjs#quota-only-admission",
+  "mutationBounds": {
+    "maxIssueMutationsPerRecurrence": 1,
+    "maxCommentsPerRecurrence": 1
+  },
+  "escalation": {
+    "rules": [
+      "Stop and report if required validation fails or evidence is ambiguous",
+      "Stop before merge, close, deploy or source activation; those remain separate accepted contracts"
+    ]
+  },
+  "mutationAuthority": {
+    "issueMutation": true,
+    "authorityIssuance": true,
+    "merge": false,
+    "close": false,
+    "deploy": false,
+    "sourceActivation": false
+  }
+}
