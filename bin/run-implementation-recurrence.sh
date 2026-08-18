@@ -33,6 +33,7 @@ ENV_FILE="${AGENT_RUNNER_ENV_FILE:-$HOME/.config/agent-runner/runner.env}"
 NODE_BIN="${AGENT_RUNNER_NODE_BIN:-node}"
 RECURRENCE_SCRIPT="$ROOT/scripts/ops/agent-runner-implementation-recurrence.mjs"
 SOURCE_ACTIVATION_CONTROLLER="$ROOT/scripts/ops/agent-runner-source-activation-authority.mjs"
+CONTROL_EVIDENCE_PUBLISHER="$ROOT/scripts/ops/agent-runner-control-evidence.mjs"
 
 [ -f "$RECURRENCE_SCRIPT" ] || {
   echo "[agent-runner] ERROR: generic implementation recurrence entrypoint is missing" >&2
@@ -69,6 +70,27 @@ load_env_file() {
 # them after agent-runner-implementation-recurrence.mjs has rebound the exact
 # project config. Global policy/provider/quota values remain inherited.
 load_env_file "$ENV_FILE"
+
+# #252 bounded control-plane evidence is emitted from this outer deterministic
+# Dell controller path before source activation and before the Node recurrence
+# can acquire the machine-global implementation lock. This is read-only with
+# respect to checkout/timers/claims. If evidence cannot be collected/published,
+# fail closed by skipping all source activation and implementation work for this
+# recurrence rather than creating a claim that the manager cannot safely see.
+[ -f "$CONTROL_EVIDENCE_PUBLISHER" ] || {
+  echo "[agent-runner] ERROR: control-evidence publisher is missing; implementation recurrence skipped" >&2
+  exit 0
+}
+set +e
+CONTROL_EVIDENCE_OUTPUT="$($NODE_BIN "$CONTROL_EVIDENCE_PUBLISHER" 2>&1)"
+CONTROL_EVIDENCE_STATUS=$?
+set -e
+if [ "$CONTROL_EVIDENCE_STATUS" -ne 0 ]; then
+  [ -z "$CONTROL_EVIDENCE_OUTPUT" ] || printf '%s\n' "$CONTROL_EVIDENCE_OUTPUT" >&2
+  echo "[agent-runner] control-evidence publication failed; implementation recurrence skipped" >&2
+  exit 0
+fi
+
 unset GITHUB_REPOSITORY
 unset CLAUDE_RUNNER_OUTPUT_DIR
 unset CLAUDE_RUNNER_STATE_DB
