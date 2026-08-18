@@ -22,14 +22,14 @@ import { assessQualification } from './agent-runner-qualification.mjs';
 
 export const GLOBAL_EXECUTION_SLOT_CAPACITY = 1;
 
-// Only adapters whose normal execution route is separately metered belong in
-// this explicit paid-routing list. Owner decision 2026-08-18: Codex CLI is
-// quota-admitted and must not be excluded or reclassified based on flexible
-// credit/account-balance state. If/when Codex is qualified, its current
-// quota/resource signal is authoritative for availability. Grok remains an
-// explicitly metered adapter and therefore retains the positive paid-use
-// approval/cap gate below.
-export const PAID_AGENT_IDS = Object.freeze(['grok-cli']);
+// Legacy issue-#50 compatibility list for adapters whose early foundation
+// treated them as separately paid. Owner decision 2026-08-18 changes Codex
+// runtime admission: once a caller supplies a positively resolved Codex
+// quota/resource state, that quota state is authoritative and the paid-use
+// settings below are not consulted. Grok remains explicitly metered.
+// #186 owns final Codex qualification/integration and can retire the legacy
+// list membership once all callers provide the quota contract.
+export const PAID_AGENT_IDS = Object.freeze(['codex-cli', 'grok-cli']);
 
 function isPaidAgent(agentId) {
   return PAID_AGENT_IDS.includes(agentId);
@@ -45,7 +45,13 @@ export function hasGlobalSlotAvailable(activeCount = 0) {
   return activeCount < GLOBAL_EXECUTION_SLOT_CAPACITY;
 }
 
-function paidRoutingReasons({ agentId, adapter, paidUse }) {
+function paidRoutingReasons({ agentId, adapter, paidUse, resourceState }) {
+  // Quota-only Codex policy (#184 owner decision): a resolved quota/resource
+  // state is the admission authority. Never require paid/credit approval or
+  // infer an account balance once quota evidence exists. `blocked:true` is
+  // handled by the common resource-state gate below.
+  if (agentId === 'codex-cli' && resourceState && typeof resourceState.blocked === 'boolean') return [];
+
   if (!isPaidAgent(agentId)) return [];
   const reasons = [];
   if (!adapter?.implemented) return reasons; // already excluded by the implemented check; avoid a redundant reason
@@ -102,7 +108,7 @@ export function evaluateAgentEligibility({
 
   if (resourceState?.blocked) reasons.push(resourceState.reason || 'agent-resource-blocked');
 
-  if (settingsEntry) reasons.push(...paidRoutingReasons({ agentId, adapter, paidUse: settingsEntry.paidUse }));
+  if (settingsEntry) reasons.push(...paidRoutingReasons({ agentId, adapter, paidUse: settingsEntry.paidUse, resourceState }));
 
   return { agentId, status: reasons.length === 0 ? 'eligible' : 'excluded', reasons };
 }
