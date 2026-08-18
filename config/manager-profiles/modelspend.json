@@ -20,8 +20,8 @@
     "AGENTS.md"
   ],
   "controlIssue": {
-    "mode": "labelSelector",
-    "labelSelector": "status:ready"
+    "mode": "fixedIssue",
+    "issueNumber": 686
   },
   "labels": {
     "ready": "status:ready",

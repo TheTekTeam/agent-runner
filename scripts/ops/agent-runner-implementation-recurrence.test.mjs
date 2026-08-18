@@ -167,6 +167,28 @@ test('ModelSpend runnable and Agent Runner idle selects ModelSpend and invokes i
   },
 ));
 
+test('the recurrence records a read-only profile shadow that matches the real manager profiles without altering selection or invocation', () => withRegistry(
+  {
+    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
+    'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner'),
+  },
+  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json', 'agent-runner.json'] },
+  async (registryPath) => {
+    const { acquireLock } = fakeLock();
+    const probeProject = (entry) => (entry.config.projectId === 'modelspend' ? { status: 0, payload: { selectedIssue: 100 } } : { status: NO_RUNNABLE_CANDIDATE_EXIT_CODE });
+    const invocations = [];
+    const invokeProject = (entry) => { invocations.push(entry.configPath); return { status: 0 }; };
+    const result = await runImplementationRecurrence({
+      registryPath, acquireLock, probeProject, invokeProject, writeEvidenceFile: noopEvidence,
+    });
+    assert.equal(result.selectedProjectId, 'modelspend');
+    assert.equal(invocations.length, 1);
+    assert.equal(result.profileShadow.available, true);
+    assert.equal(result.profileShadow.projects.length, 2);
+    assert.ok(result.profileShadow.projects.every((entry) => entry.available === true && entry.matches === true));
+  },
+));
+
 test('Agent Runner runnable and ModelSpend blocked selects Agent Runner', () => withRegistry(
   {
     'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),

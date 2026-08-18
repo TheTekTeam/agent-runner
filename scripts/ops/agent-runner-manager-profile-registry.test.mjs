@@ -2,11 +2,22 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  assertManagerProfileRegisteredInProjectRegistry,
   loadManagerProfileRegistry,
   MANAGER_PROFILE_REGISTRY,
   resolveRegisteredManagerProfile,
 } from './agent-runner-manager-profile-registry.mjs';
 import { resolveManagerContext } from './agent-runner-manager-context.mjs';
+
+function canonicalProjectRegistry(overrides = {}) {
+  return {
+    projectsById: {
+      'agent-runner': { projectId: 'agent-runner', githubRepo: 'TheTekTeam/agent-runner' },
+      modelspend: { projectId: 'modelspend', githubRepo: 'TheTekTeam/modelspend' },
+      ...overrides,
+    },
+  };
+}
 
 test('the registry lists exactly the explicitly approved fixture projects', () => {
   assert.deepEqual(
@@ -123,4 +134,57 @@ test('a registry entry whose file declares a different projectId is rejected', (
     }),
     /does not match profile\.projectId/,
   );
+});
+
+test('agent-runner and modelspend use a real fixed control issue, not the status:ready candidate queue label', () => {
+  const registry = loadManagerProfileRegistry();
+  assert.deepEqual(registry.projectsById['agent-runner'].controlIssue, { mode: 'fixedIssue', issueNumber: 258 });
+  assert.deepEqual(registry.projectsById.modelspend.controlIssue, { mode: 'fixedIssue', issueNumber: 686 });
+});
+
+test('enabled profiles bind to and match the canonical managed project registry', () => {
+  const registry = loadManagerProfileRegistry({ projectRegistry: canonicalProjectRegistry() });
+  assert.equal(registry.projectsById['agent-runner'].projectId, 'agent-runner');
+  assert.equal(registry.projectsById.modelspend.projectId, 'modelspend');
+});
+
+test('fails closed when an enabled profile is not present in the canonical managed project registry', () => {
+  const projectRegistry = canonicalProjectRegistry();
+  delete projectRegistry.projectsById['agent-runner'];
+  assert.throws(
+    () => loadManagerProfileRegistry({ projectRegistry }),
+    /Unregistered agent runner manager project: 'agent-runner'/,
+  );
+});
+
+test('fails closed when an enabled profile repository does not match the canonical managed project registry', () => {
+  const projectRegistry = canonicalProjectRegistry({
+    'agent-runner': { projectId: 'agent-runner', githubRepo: 'SomeoneElse/agent-runner' },
+  });
+  assert.throws(
+    () => loadManagerProfileRegistry({ projectRegistry }),
+    /Repository mismatch for project 'agent-runner'/,
+  );
+});
+
+test('a disabled fixture profile is never bound to the canonical managed project registry', () => {
+  const projectRegistry = canonicalProjectRegistry();
+  assert.doesNotThrow(() => loadManagerProfileRegistry({ projectRegistry }));
+  assert.ok(!projectRegistry.projectsById['fixture-third-project']);
+});
+
+test('assertManagerProfileRegisteredInProjectRegistry fails closed for an unregistered project and a repository mismatch', () => {
+  const registry = loadManagerProfileRegistry();
+  const profile = registry.projectsById['agent-runner'];
+  assert.throws(
+    () => assertManagerProfileRegisteredInProjectRegistry(profile, { projectsById: {} }),
+    /Unregistered agent runner manager project/,
+  );
+  assert.throws(
+    () => assertManagerProfileRegisteredInProjectRegistry(profile, canonicalProjectRegistry({
+      'agent-runner': { projectId: 'agent-runner', githubRepo: 'SomeoneElse/agent-runner' },
+    })),
+    /Repository mismatch/,
+  );
+  assert.doesNotThrow(() => assertManagerProfileRegisteredInProjectRegistry(profile, canonicalProjectRegistry()));
 });

@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { MANAGER_PROFILE_SCHEMA_VERSION, validateManagerProfile } from './agent-runner-manager-profile-schema.mjs';
+import {
+  assertNormalizedManagerProfileShape,
+  MANAGER_PROFILE_SCHEMA_VERSION,
+  validateManagerProfile,
+} from './agent-runner-manager-profile-schema.mjs';
 
 function baseProfile(overrides = {}) {
   return {
@@ -139,4 +143,31 @@ test('is deterministic and idempotent for repeated validation of the same input'
   const first = validateManagerProfile(JSON.parse(JSON.stringify(raw)));
   const second = validateManagerProfile(JSON.parse(JSON.stringify(raw)));
   assert.deepEqual(first, second);
+});
+
+test('every normalized array is itself frozen, not merely its containing object', () => {
+  const profile = validateManagerProfile(baseProfile());
+  assert.ok(Object.isFrozen(profile.nonGoals));
+  assert.ok(Object.isFrozen(profile.instructionPaths));
+  assert.ok(Object.isFrozen(profile.branches.allowed));
+  assert.ok(Object.isFrozen(profile.capabilities.allowlist));
+  assert.ok(Object.isFrozen(profile.validation.requiredChecks));
+  assert.ok(Object.isFrozen(profile.escalation.rules));
+  assert.throws(() => profile.capabilities.allowlist.push('rogue-agent'), TypeError);
+  assert.throws(() => profile.escalation.rules.push('rogue rule'), TypeError);
+});
+
+test('assertNormalizedManagerProfileShape refuses an object that merely carries the right schemaVersion', () => {
+  assert.throws(
+    () => assertNormalizedManagerProfileShape({ schemaVersion: MANAGER_PROFILE_SCHEMA_VERSION, projectId: 'sample' }),
+    /already-validated manager profile/,
+  );
+  assert.throws(
+    () => assertNormalizedManagerProfileShape(validateManagerProfile(baseProfile()).mutationAuthority),
+    /already-validated manager profile/,
+  );
+});
+
+test('assertNormalizedManagerProfileShape accepts real validateManagerProfile output', () => {
+  assert.doesNotThrow(() => assertNormalizedManagerProfileShape(validateManagerProfile(baseProfile())));
 });

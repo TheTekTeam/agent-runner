@@ -8,6 +8,8 @@
  * (see agent-runner-manager-profile-schema.mjs).
  */
 
+import { assertNormalizedManagerProfileShape } from './agent-runner-manager-profile-schema.mjs';
+
 export const MANAGER_CONTEXT_SCHEMA_VERSION = 'agent-runner-manager-context/v1';
 
 /**
@@ -36,9 +38,7 @@ function effectiveMutationAuthority(profile) {
  * profile always yields a deep-equal, independently frozen result.
  */
 export function resolveManagerContext(profile) {
-  if (!profile || profile.schemaVersion == null) {
-    throw new Error('resolveManagerContext requires an already-validated manager profile');
-  }
+  assertNormalizedManagerProfileShape(profile);
   const mutationAuthority = effectiveMutationAuthority(profile);
   const mutationBounds = profile.enabled
     ? profile.mutationBounds

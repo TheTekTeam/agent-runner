@@ -31,10 +31,37 @@ function readProfileFile(absolutePath) {
 }
 
 /**
- * Load and validate every explicitly registered profile. Pure/read-only:
- * no GitHub call, no clone, no mutation.
+ * A manager profile fixture is only meaningful if it describes a project
+ * the *canonical* managed project registry (`agent-runner-project-registry.mjs`
+ * / #100 / #177) actually knows about -- this manager-profile registry is
+ * never itself an independent source of project identity. Only *enabled*
+ * profiles are bound: the disabled third-project fixture (#259 requirement
+ * 10) intentionally describes a project that is never registered, cloned or
+ * contacted, so it is exempt by construction.
  */
-export function loadManagerProfileRegistry({ entries = MANAGER_PROFILE_REGISTRY, baseDir = __dirname } = {}) {
+export function assertManagerProfileRegisteredInProjectRegistry(profile, projectRegistry) {
+  const canonicalProject = projectRegistry?.projectsById?.[profile.projectId];
+  if (!canonicalProject) {
+    throw new Error(
+      `Unregistered agent runner manager project: '${profile.projectId}' is not present in the canonical managed project registry`,
+    );
+  }
+  if (String(canonicalProject.githubRepo).toLowerCase() !== profile.repository.full.toLowerCase()) {
+    throw new Error(
+      `Repository mismatch for project '${profile.projectId}': canonical managed project registry declares '${canonicalProject.githubRepo}', manager profile declares '${profile.repository.full}'`,
+    );
+  }
+}
+
+/**
+ * Load and validate every explicitly registered profile. Pure/read-only:
+ * no GitHub call, no clone, no mutation. When `projectRegistry` is supplied
+ * (the already-loaded canonical managed project registry, see
+ * `agent-runner-project-registry.mjs`), every *enabled* profile must also
+ * bind to a registered project with an exactly matching repository, failing
+ * closed otherwise.
+ */
+export function loadManagerProfileRegistry({ entries = MANAGER_PROFILE_REGISTRY, baseDir = __dirname, projectRegistry = null } = {}) {
   const projectsById = {};
   const projectsByRepository = {};
   for (const entry of entries) {
@@ -51,6 +78,9 @@ export function loadManagerProfileRegistry({ entries = MANAGER_PROFILE_REGISTRY,
     const repositoryKey = profile.repository.full.toLowerCase();
     if (projectsByRepository[repositoryKey]) {
       throw new Error(`Invalid agent runner manager profile registry: duplicate repository '${profile.repository.full}'`);
+    }
+    if (projectRegistry && profile.enabled) {
+      assertManagerProfileRegisteredInProjectRegistry(profile, projectRegistry);
     }
     projectsById[entry.projectId] = profile;
     projectsByRepository[repositoryKey] = profile;

@@ -55,6 +55,17 @@ function isBoolean(value) {
   return typeof value === 'boolean';
 }
 
+/**
+ * Every array embedded in a normalized profile must itself be frozen, not
+ * merely the object that holds it -- otherwise `Object.freeze(parent)`
+ * leaves the array reference mutable and a caller could push into it after
+ * validation. Values here are always already-checked string/number
+ * primitives, so a shallow array freeze is sufficient.
+ */
+function freezeArray(array) {
+  return Object.freeze([...array]);
+}
+
 function assertNoUnknownFields(object, allowed, label, errors) {
   if (!isPlainObject(object)) return;
   for (const key of Object.keys(object)) {
@@ -92,7 +103,7 @@ function validateBranches(branches, errors) {
     errors.push('branches.default must be a member of branches.allowed');
   }
   if (errors.length) return null;
-  return Object.freeze({ allowed: [...allowed], default: defaultBranch });
+  return Object.freeze({ allowed: freezeArray(allowed), default: defaultBranch });
 }
 
 function validateControlIssue(controlIssue, errors) {
@@ -148,7 +159,7 @@ function validateCapabilities(capabilities, errors) {
     errors.push('capabilities.allowlist must be an array of strings');
     return null;
   }
-  return Object.freeze({ allowlist: [...new Set(allowlist)] });
+  return Object.freeze({ allowlist: freezeArray([...new Set(allowlist)]) });
 }
 
 function validateValidation(validation, errors) {
@@ -161,7 +172,7 @@ function validateValidation(validation, errors) {
   if (!nonEmptyString(profile)) errors.push('validation.profile is required');
   if (!stringArray(requiredChecks) || requiredChecks.length === 0) errors.push('validation.requiredChecks must be a non-empty array of strings');
   if (errors.length) return null;
-  return Object.freeze({ profile, requiredChecks: [...requiredChecks] });
+  return Object.freeze({ profile, requiredChecks: freezeArray(requiredChecks) });
 }
 
 function validateMutationBounds(mutationBounds, errors) {
@@ -193,7 +204,7 @@ function validateEscalation(escalation, errors) {
   const { rules } = escalation;
   if (!stringArray(rules) || rules.length === 0) errors.push('escalation.rules must be a non-empty array of strings');
   if (errors.length) return null;
-  return Object.freeze({ rules: [...rules] });
+  return Object.freeze({ rules: freezeArray(rules) });
 }
 
 function validateMutationAuthority(mutationAuthority, errors) {
@@ -275,8 +286,8 @@ export function validateManagerProfile(input) {
     repository,
     branches,
     objective: input.objective,
-    nonGoals: Object.freeze([...input.nonGoals]),
-    instructionPaths: Object.freeze([...input.instructionPaths]),
+    nonGoals: freezeArray(input.nonGoals),
+    instructionPaths: freezeArray(input.instructionPaths),
     controlIssue,
     labels,
     capabilities,
@@ -290,4 +301,50 @@ export function validateManagerProfile(input) {
 
 export function managerProfileRepositoryFull(profile) {
   return profile?.repository?.full ?? null;
+}
+
+function isFrozenPlainObject(value) {
+  return isPlainObject(value) && Object.isFrozen(value);
+}
+
+function isFrozenStringArray(value) {
+  return Array.isArray(value) && Object.isFrozen(value) && value.every((item) => typeof item === 'string');
+}
+
+/**
+ * A profile carrying the right `schemaVersion` is not proof it passed
+ * `validateManagerProfile()` -- an adversarial or hand-built object could
+ * set that one field and nothing else correctly. `resolveManagerContext`
+ * must refuse to trust anything that merely *looks* validated; this checks
+ * the exact frozen, normalized shape `validateManagerProfile()` produces
+ * (including that every nested array/object survived deep-freezing) before
+ * any context is derived from it.
+ */
+export function assertNormalizedManagerProfileShape(profile) {
+  const errors = [];
+  if (!isFrozenPlainObject(profile)) {
+    throw new Error('resolveManagerContext requires an already-validated manager profile: profile must be a frozen, validated manager profile object');
+  }
+  if (profile.schemaVersion !== MANAGER_PROFILE_SCHEMA_VERSION) errors.push('schemaVersion');
+  if (!nonEmptyString(profile.projectId)) errors.push('projectId');
+  if (!isBoolean(profile.enabled)) errors.push('enabled');
+  if (!nonEmptyString(profile.objective)) errors.push('objective');
+  if (!isFrozenStringArray(profile.nonGoals)) errors.push('nonGoals');
+  if (!isFrozenStringArray(profile.instructionPaths) || profile.instructionPaths.length === 0) errors.push('instructionPaths');
+  if (!nonEmptyString(profile.quotaPolicyRef)) errors.push('quotaPolicyRef');
+  if (!isFrozenPlainObject(profile.repository) || !nonEmptyString(profile.repository.full)) errors.push('repository');
+  if (!isFrozenPlainObject(profile.branches) || !isFrozenStringArray(profile.branches.allowed)) errors.push('branches');
+  if (!isFrozenPlainObject(profile.controlIssue) || !['fixedIssue', 'labelSelector'].includes(profile.controlIssue.mode)) errors.push('controlIssue');
+  if (!isFrozenPlainObject(profile.labels)) errors.push('labels');
+  if (!isFrozenPlainObject(profile.capabilities) || !isFrozenStringArray(profile.capabilities.allowlist)) errors.push('capabilities');
+  if (!isFrozenPlainObject(profile.validation) || !isFrozenStringArray(profile.validation.requiredChecks)) errors.push('validation');
+  if (!isFrozenPlainObject(profile.mutationBounds)) errors.push('mutationBounds');
+  if (!isFrozenPlainObject(profile.escalation) || !isFrozenStringArray(profile.escalation.rules)) errors.push('escalation');
+  if (!isFrozenPlainObject(profile.mutationAuthority)
+    || !MUTATION_AUTHORITY_FIELDS.every((field) => isBoolean(profile.mutationAuthority[field]))) {
+    errors.push('mutationAuthority');
+  }
+  if (errors.length) {
+    throw new Error(`resolveManagerContext requires an already-validated manager profile: invalid or unfrozen fields: ${errors.join(', ')}`);
+  }
 }

@@ -1,13 +1,16 @@
 # Agent Runner management profiles
 
-Issue: `TheTekTeam/agent-runner#259` (`BUILD.MANAGER.PROFILES.1`, parent `#258`).
+Issue: `TheTekTeam/agent-runner#259` (`BUILD.MANAGER.PROFILES.1`/`.2`, parent `#258`).
 
 This is the compatibility-first foundation slice: it defines one versioned,
 provider-neutral, schema-validated per-project management profile and a
 pure resolver that turns a validated profile into the single bounded
-normalized manager context. It does **not** wire profile resolution into
-the live management recurrence — that happens in a later, separately
-accepted cutover step (see "Publication and cutover" below).
+normalized manager context. Profile resolution is wired into the one
+existing implementation recurrence (`agent-runner-implementation-recurrence.mjs`)
+as a **read-only shadow** only — see "Read-only shadow wiring" below. It does
+**not** yet make the profile-resolved context authoritative over selection,
+claim or dispatch; that cutover happens in a later, separately accepted step
+(see "Publication and cutover" below).
 
 ## What this is not
 
@@ -70,10 +73,32 @@ mode), `labels`, `capabilities.allowlist`, `validation`
 (`issueMutation`, `authorityIssuance`, `merge`, `close`, `deploy`,
 `sourceActivation`).
 
+## Read-only shadow wiring
+
+`scripts/ops/agent-runner-manager-profile-shadow.mjs` compares each enabled
+canonical registry project's profile-resolved manager context against its
+real registry identity, and `agent-runner-implementation-recurrence.mjs`
+records the result on every tick as a `profileShadow` evidence field. This
+is diagnostic only:
+
+- It runs after `selectRunnableProject()` has already chosen (or not
+  chosen) a project, so it can never influence selection, probing or
+  invocation.
+- Any failure inside it (missing profile, registry load error, mismatch) is
+  captured as a bounded result and never thrown, so it can never block or
+  alter the real recurrence.
+- `agent-runner-manager-profile-registry.mjs#loadManagerProfileRegistry`
+  binds every *enabled* profile to the canonical managed project registry
+  (`agent-runner-project-registry.mjs`) when one is supplied, failing closed
+  on an unregistered project or repository mismatch — this is the same
+  canonical registry the real recurrence already loads, not a second,
+  unrelated source of project identity.
+
 ## Publication and cutover
 
-This branch only adds the schema, registry, resolver, fixtures and tests.
-Enabling profile resolution inside the existing manager recurrence, and
-any rollback to the previous manager configuration, are separate
-programme actions performed after merge and independent source
-activation, per the #259 issue's "Publication and cutover" section.
+This branch adds the schema, registry, resolver, fixtures, read-only shadow
+wiring and tests. Making profile resolution authoritative over selection,
+claim or dispatch inside the existing manager recurrence, and any rollback
+to the previous manager configuration, are separate programme actions
+performed after merge and independent source activation, per the #259
+issue's "Publication and cutover" section.

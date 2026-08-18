@@ -22,8 +22,8 @@
     "docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-CODE-MAP.md"
   ],
   "controlIssue": {
-    "mode": "labelSelector",
-    "labelSelector": "status:ready"
+    "mode": "fixedIssue",
+    "issueNumber": 258
   },
   "labels": {
     "ready": "status:ready",

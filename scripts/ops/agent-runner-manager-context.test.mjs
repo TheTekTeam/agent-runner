@@ -37,6 +37,16 @@ test('refuses to resolve an unvalidated input', () => {
   assert.throws(() => resolveManagerContext({ projectId: 'sample' }), /already-validated manager profile/);
 });
 
+test('refuses an adversarial object that merely carries a correct schemaVersion but is not frozen or structurally validated', () => {
+  const fake = {
+    schemaVersion: MANAGER_PROFILE_SCHEMA_VERSION,
+    projectId: 'sample',
+    enabled: true,
+    mutationAuthority: { issueMutation: true, authorityIssuance: true, merge: true, close: true, deploy: true, sourceActivation: true },
+  };
+  assert.throws(() => resolveManagerContext(fake), /already-validated manager profile/);
+});
+
 test('an enabled profile preserves its declared mutation authority and bounds', () => {
   const context = resolveManagerContext(enabledProfile());
   assert.equal(context.schemaVersion, MANAGER_CONTEXT_SCHEMA_VERSION);
