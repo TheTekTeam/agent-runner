@@ -50,16 +50,26 @@ function truthy(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
 }
 
+function requestedExecuteMode(argv = [], env = process.env) {
+  let execute = truthy(env?.CLAUDE_RUNNER_CRON_EXECUTE);
+  for (const arg of Array.isArray(argv) ? argv : []) {
+    if (arg === '--execute') execute = true;
+    else if (arg === '--dry-run') execute = false;
+  }
+  return execute;
+}
+
 /**
  * #256: current quota evidence is mandatory for every executing scheduled run.
  * The historical skip controls may remain parseable for mutation-free dry-run
  * diagnostics, but they must fail closed before config loading, candidate
  * discovery, claim mutation, workspace creation, or provider launch whenever
- * `--execute` is present. Account-credit state is deliberately not consulted.
+ * the scheduler resolves to execute mode. Account-credit state is deliberately
+ * not consulted.
  */
 export function assertMandatoryQuotaPreflight({ argv = [], env = process.env } = {}) {
   const args = Array.isArray(argv) ? argv : [];
-  if (!args.includes('--execute')) return;
+  if (!requestedExecuteMode(args, env)) return;
 
   const skipFlagRequested = args.includes('--skip-quota-preflight');
   const skipEnvRequested = truthy(env?.CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT);
