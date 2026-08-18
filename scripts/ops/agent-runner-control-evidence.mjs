@@ -24,12 +24,21 @@ import {
 export const CONTROL_EVIDENCE_MARKER = '<!-- agent-runner:control-evidence:v1 -->';
 export const CONTROL_EVIDENCE_SCHEMA_VERSION = 'agent-runner-control-evidence/v1';
 export const CONTROL_EVIDENCE_ISSUE_ENV = 'AGENT_RUNNER_CONTROL_EVIDENCE_ISSUE';
+export const CONTROL_EVIDENCE_DEFAULT_ISSUE = 252;
 export const CONTROL_EVIDENCE_GENERIC_TIMER_UNIT = 'agent-runner-implementation.timer';
 export const CONTROL_EVIDENCE_LEGACY_TIMER_UNIT = 'agent-runner-modelspend.timer';
 
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 const BRANCH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/;
 const CONTROL_ISSUE_PATTERN = /^[1-9][0-9]{0,9}$/;
+const CANONICAL_ORIGIN_URLS = new Set([
+  `https://github.com/${SOURCE_ACTIVATION_REPOSITORY}`,
+  `https://github.com/${SOURCE_ACTIVATION_REPOSITORY}.git`,
+  `git@github.com:${SOURCE_ACTIVATION_REPOSITORY}`,
+  `git@github.com:${SOURCE_ACTIVATION_REPOSITORY}.git`,
+  `ssh://git@github.com/${SOURCE_ACTIVATION_REPOSITORY}`,
+  `ssh://git@github.com/${SOURCE_ACTIVATION_REPOSITORY}.git`,
+]);
 
 export const CONTROL_EVIDENCE_TIMER_STATES = Object.freeze([
   'enabled-active',
@@ -79,6 +88,10 @@ function gitText(runGit, args, { cwd }) {
   return text || null;
 }
 
+function canonicalOriginMatches(origin) {
+  return typeof origin === 'string' && CANONICAL_ORIGIN_URLS.has(origin.trim());
+}
+
 function verifyRepositoryIdentity({ repositoryRoot, runGit, realpath }) {
   let canonicalRoot;
   try {
@@ -89,10 +102,17 @@ function verifyRepositoryIdentity({ repositoryRoot, runGit, realpath }) {
   const topLevel = gitText(runGit, ['rev-parse', '--show-toplevel'], { cwd: repositoryRoot });
   if (!topLevel) return false;
   try {
-    return realpath(topLevel) === canonicalRoot;
+    if (realpath(topLevel) !== canonicalRoot) return false;
   } catch {
     return false;
   }
+
+  // Path identity alone is insufficient: a different repository could occupy
+  // the canonical checkout path. Positively allowlist only supported canonical
+  // GitHub origin forms and retain only the boolean result; raw remote text is
+  // never included in the evidence object or GitHub comment.
+  const origin = gitText(runGit, ['remote', 'get-url', 'origin'], { cwd: repositoryRoot });
+  return canonicalOriginMatches(origin);
 }
 
 function readBranch({ repositoryRoot, runGit }) {
@@ -280,8 +300,10 @@ export function buildControlEvidenceCommentBody(evidence) {
 }
 
 export function resolveControlEvidenceIssue(env = process.env) {
-  const raw = String(env[CONTROL_EVIDENCE_ISSUE_ENV] || '').trim();
-  return CONTROL_ISSUE_PATTERN.test(raw) ? Number(raw) : null;
+  const explicitRaw = String(env[CONTROL_EVIDENCE_ISSUE_ENV] || '').trim();
+  if (CONTROL_ISSUE_PATTERN.test(explicitRaw)) return Number(explicitRaw);
+  const sourceActivationIssue = boundedControlIssue(env);
+  return sourceActivationIssue ?? CONTROL_EVIDENCE_DEFAULT_ISSUE;
 }
 
 function controlEvidenceMarkedComments(comments) {
@@ -360,12 +382,11 @@ export function publishControlEvidence({
 }
 
 /**
- * Collects facts and, only when a control-evidence issue is configured,
- * publishes/dedupes the projection. Publisher failure never mutates
- * anything: `collectControlEvidenceFacts()` / `buildControlEvidence()` have
- * already completed by the time any GitHub write is attempted, and a write
- * failure surfaces as a thrown `ControlEvidenceError` with no local or
- * remote side effect beyond the attempted (and rejected) comment write.
+ * Collects facts and publishes/dedupes the projection onto an explicitly
+ * configured evidence issue, the existing source-activation control issue,
+ * or the dedicated #252 control-evidence issue as the deterministic fallback.
+ * This removes any need for a separate machine-local evidence destination
+ * merely to obtain routine manager-visible state.
  */
 export async function runControlEvidence({
   env = process.env,
@@ -375,9 +396,6 @@ export async function runControlEvidence({
   const facts = collectFacts({ env });
   const evidence = buildControlEvidence(facts);
   const issueNumber = resolveControlEvidenceIssue(env);
-  if (!issueNumber) {
-    return { evidence, published: false, publishAction: 'not-configured', publishedCommentId: null };
-  }
   const result = publish({ issueNumber, evidence, env });
   return { evidence, published: true, publishAction: result.action, publishedCommentId: result.commentId };
 }
