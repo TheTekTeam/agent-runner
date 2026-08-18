@@ -1,0 +1,57 @@
+{
+  "schemaVersion": "agent-runner-manager-profile/v1",
+  "projectId": "fixture-third-project",
+  "enabled": false,
+  "repository": {
+    "owner": "TheTekTeam",
+    "name": "example-docs-site"
+  },
+  "branches": {
+    "allowed": ["main", "release"],
+    "default": "release"
+  },
+  "objective": "Read-only fixture proving a materially different project shape (fixed control issue, release-branch default, docs-only capability allowlist) resolves through the same profile schema without any Agent Runner source special-casing.",
+  "nonGoals": [
+    "Enabling or contacting the fixture repository",
+    "Any manager mutation while this fixture remains disabled"
+  ],
+  "instructionPaths": [
+    "docs/CONTRIBUTING.md"
+  ],
+  "controlIssue": {
+    "mode": "fixedIssue",
+    "issueNumber": 1
+  },
+  "labels": {
+    "ready": "queue:ready",
+    "inProgress": "queue:working",
+    "blocked": "queue:blocked",
+    "done": "queue:shipped",
+    "needsReview": "queue:review"
+  },
+  "capabilities": {
+    "allowlist": ["docs-only-agent"]
+  },
+  "validation": {
+    "profile": "docs-only",
+    "requiredChecks": ["npm run lint:docs"]
+  },
+  "quotaPolicyRef": "scripts/ops/agent-runner-routing.mjs#quota-only-admission",
+  "mutationBounds": {
+    "maxIssueMutationsPerRecurrence": 0,
+    "maxCommentsPerRecurrence": 0
+  },
+  "escalation": {
+    "rules": [
+      "This fixture must remain disabled; escalate any request to enable it to a human maintainer"
+    ]
+  },
+  "mutationAuthority": {
+    "issueMutation": false,
+    "authorityIssuance": false,
+    "merge": false,
+    "close": false,
+    "deploy": false,
+    "sourceActivation": false
+  }
+}
