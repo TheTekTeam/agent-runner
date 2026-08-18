@@ -36,7 +36,7 @@ import {
   parseAgentLabels,
   parseArgs,
   parseChildRunnerOutput,
-  main,
+  main as schedulerMain,
   MAX_TRANSITION_MUTATION_ATTEMPTS,
   probeProcessIdentity,
   preflightAlreadyClaimed,
@@ -67,6 +67,51 @@ import { RUNNER_STATE_TABLES, openRunnerStateStore } from './claude-runner-state
 import { createSyntheticNotificationTransport, reconcileNotifications } from './agent-runner-notifications.mjs';
 import { readRestrictedRecoveryHandle, restrictedHandleBindingDigest, restrictedRecoveryDir, writeRestrictedRecoveryHandle } from './claude-runner-recovery-adapter.mjs';
 import { withRecoveryIdentityGuard } from './agent-runner-recovery-identity-guard.mjs';
+
+
+const AVAILABLE_QUOTA_RUNNER = () => ({
+  status: 0,
+  signal: null,
+  stdout: JSON.stringify({
+    status: 'available',
+    state: {
+      quotaUsage: {
+        session: { usedPercent: 0, resetAt: null, resetText: null },
+        weekly: { usedPercent: 0, resetAt: null, resetText: null },
+      },
+    },
+  }),
+  stderr: '',
+});
+
+// Historical execute-path fixtures used --skip-quota-preflight only to avoid
+// launching a real quota probe. #256 makes that production bypass invalid.
+// Adapt those fixtures to execute with positive bounded synthetic quota
+// evidence instead: the legacy option is removed before production parsing,
+// and the normal quota preflight/admission path still runs through an injected
+// process result. Tests that exercise the legacy flag itself call parseArgs or
+// assertMandatoryQuotaPreflight directly and therefore remain unadapted.
+function main(argv = [], env = {}, dependencies = {}) {
+  let execute = ['1', 'true', 'yes', 'on'].includes(
+    String(env?.CLAUDE_RUNNER_CRON_EXECUTE || '').trim().toLowerCase(),
+  );
+  for (const arg of argv) {
+    if (arg === '--execute') execute = true;
+    else if (arg === '--dry-run') execute = false;
+  }
+  const legacySkipRequested = argv.includes('--skip-quota-preflight')
+    || ['1', 'true', 'yes', 'on'].includes(
+      String(env?.CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT || '').trim().toLowerCase(),
+    );
+  if (!execute || !legacySkipRequested) return schedulerMain(argv, env, dependencies);
+
+  const effectiveArgv = argv.filter((arg) => arg !== '--skip-quota-preflight');
+  const effectiveEnv = { ...env, CLAUDE_RUNNER_CRON_SKIP_QUOTA_PREFLIGHT: 'false' };
+  return schedulerMain(effectiveArgv, effectiveEnv, {
+    ...dependencies,
+    quotaRunner: dependencies.quotaRunner || AVAILABLE_QUOTA_RUNNER,
+  });
+}
 
 const TEST_MANAGER_FINGERPRINT = `sha256:${'a'.repeat(64)}`;
 const TEST_BASE_COMMIT = '0'.repeat(40);
