@@ -19,6 +19,7 @@ import {
   settingsRevisionUnchanged,
   snapshotAgentSettings,
 } from './agent-runner-agent-settings.mjs';
+import { executionLabelAuthority } from './agent-runner-label-authority.mjs';
 import { classifyIssueTaskRisk } from './agent-runner-qualification.mjs';
 import { selectAgentForIssue } from './agent-runner-routing.mjs';
 import { computeInstanceReadiness } from './agent-runner-control-readiness.mjs';
@@ -3283,6 +3284,12 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       requireManagerPreflight: args.requireManagerPreflight,
       selectedIssue: selected.issue?.number || null,
       selectedStatusLabel: selected.issue?.statusLabel || null,
+      // Literal authoritative GitHub execution label (e.g. the raw
+      // `agent:codex-claude` alias), distinct from `agent.agentId` below,
+      // which is the resolved concrete adapter. Atomic revalidation needs
+      // both to compare like-for-like across the selection-time snapshot
+      // and the freshly re-read candidate (issue #189).
+      selectedAgentLabel: recoveryClaim ? null : executionLabelAuthority(selected.issue || {}).agentLabel,
       selectedMetadataConflicts: selected.metadataConflicts || issueMetadataConflicts(selected.issue),
       agent: recoveryClaim
         ? { agentId: recoveryClaim.agent, agentType: recoveryClaim.harness, implemented: true, model: recoveryClaim.model, effort: null }

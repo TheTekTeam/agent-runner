@@ -11,7 +11,9 @@ import {
   evaluateCandidateAdmission,
   evaluateCandidateCostAdmission,
   evaluateCandidateMachineProfileAdmission,
+  normalizeCandidateSnapshot,
 } from './agent-runner-candidate-admission.mjs';
+import { snapshotFromSelectionRecord } from './agent-runner-atomic-candidate-store.mjs';
 
 function selection({
   issue = 5,
@@ -130,6 +132,92 @@ test('manager packet approved agent must match the selected adapter', () => {
   const initial = candidateSnapshot(selection({ approvedAgent: 'codex-cli' }));
   const current = candidateSnapshot(selection({ approvedAgent: 'codex-cli' }));
   assert.equal(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }).reason, 'candidate-preflight-agent-not-approved');
+});
+
+test('multiple execution agent labels fail closed before attempt creation', () => {
+  const current = candidateSnapshot(selection({ labels: ['status:ready', 'agent:claude', 'agent:codex-cli'] }));
+  assert.equal(current.labelAuthorityAllowed, false);
+  assert.equal(evaluateCandidateAdmission({ initial: current, current, approvers: ['gpcola'] }).reason, 'candidate-agent-label-ambiguous');
+});
+
+// Issue #189: unchanged combined/alias identity must survive atomic
+// revalidation regardless of which literal label the GitHub issue carries,
+// as long as it resolves to the same manager-approved concrete adapter.
+test('unchanged concrete agent:claude-code-cli survives atomic revalidation', () => {
+  const initial = candidateSnapshot(selection({ agent: 'agent:claude-code-cli', selectedAgent: 'agent:claude-code-cli' }));
+  const current = candidateSnapshot(selection({ agent: 'agent:claude-code-cli', selectedAgent: 'agent:claude-code-cli' }));
+  assert.equal(initial.resolvedAgentId, 'claude-code-cli');
+  assert.deepEqual(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }), {
+    allowed: true,
+    reason: 'candidate-admitted',
+  });
+});
+
+test('unchanged agent:codex-claude resolving to claude-code-cli survives atomic revalidation', () => {
+  const initial = candidateSnapshot(selection({ agent: 'agent:codex-claude', selectedAgent: 'agent:codex-claude' }));
+  const current = candidateSnapshot(selection({ agent: 'agent:codex-claude', selectedAgent: 'agent:codex-claude' }));
+  assert.equal(initial.agentLabel, 'agent:codex-claude');
+  assert.equal(initial.resolvedAgentId, 'claude-code-cli');
+  assert.deepEqual(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }), {
+    allowed: true,
+    reason: 'candidate-admitted',
+  });
+});
+
+test('a scheduler-selection-record snapshot round-trips the same alias identity as a freshly re-read candidate', () => {
+  const initial = normalizeCandidateSnapshot(snapshotFromSelectionRecord({
+    issueNumber: 5,
+    statusLabel: 'status:ready',
+    selectionMode: 'preflight-direct',
+    commandKind: null,
+    sourceCommentIdentity: null,
+    sourcePreflightCommentIdentity: { databaseId: 100 },
+    sourcePreflightCommentId: 'github-comment:database-id:100',
+    payload: {
+      selectedIssue: 5,
+      selectedStatusLabel: 'status:ready',
+      selectionMode: 'preflight-direct',
+      selectedCommandKind: null,
+      sourceCommentIdentity: null,
+      sourcePreflightCommentIdentity: { databaseId: 100 },
+      sourcePreflightCommentId: 'github-comment:database-id:100',
+      sourcePreflightRevision: 'AR-100',
+      sourcePreflightFingerprint: `sha256:${'0'.repeat(64)}`,
+      sourcePreflightBodyDigest: `sha256:${'1'.repeat(64)}`,
+      sourcePreflightAuthorityKey: `manager-preflight:AR-100:sha256:${'0'.repeat(64)}`,
+      sourcePreflightAuthor: 'gpcola',
+      selectedAgentLabel: 'agent:codex-claude',
+      agent: { agentId: 'claude-code-cli' },
+    },
+  }));
+  const current = candidateSnapshot(selection({
+    agent: 'agent:codex-claude',
+    selectedAgent: 'agent:codex-claude',
+    preflightId: 100,
+  }));
+  current.preflightAuthorityKey = initial.preflightAuthorityKey;
+  current.preflightFingerprint = initial.preflightFingerprint;
+  current.preflightBodyDigest = initial.preflightBodyDigest;
+  current.preflightRevision = initial.preflightRevision;
+  assert.equal(initial.agentLabel, current.agentLabel);
+  assert.equal(initial.resolvedAgentId, current.resolvedAgentId);
+  assert.deepEqual(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }), {
+    allowed: true,
+    reason: 'candidate-admitted',
+  });
+});
+
+test('alias label changed between snapshots fails closed', () => {
+  const initial = candidateSnapshot(selection({ agent: 'agent:codex-claude', selectedAgent: 'agent:codex-claude' }));
+  const current = candidateSnapshot(selection({ agent: 'agent:claude', selectedAgent: 'agent:claude' }));
+  assert.equal(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }).reason, 'candidate-agent-changed');
+});
+
+test('alias resolving to a different concrete adapter fails closed even with an unchanged literal label', () => {
+  const initial = candidateSnapshot(selection({ agent: 'agent:codex-claude', selectedAgent: 'agent:codex-claude' }));
+  const current = candidateSnapshot(selection({ agent: 'agent:codex-claude', selectedAgent: 'agent:codex-claude' }));
+  current.resolvedAgentId = 'codex-cli';
+  assert.equal(evaluateCandidateAdmission({ initial, current, approvers: ['gpcola'] }).reason, 'candidate-agent-changed');
 });
 
 test('unapproved manager author fails closed', () => {

@@ -52,10 +52,20 @@ export function candidateSnapshot(selected = {}) {
     agentLabel: null,
     evidence: { statusLabels: [], agentLabels: [] },
   };
+  // `labelAuthority.agentLabel` is the literal authoritative GitHub
+  // execution label (e.g. a combined/alias label like `agent:codex-claude`);
+  // `resolvedAgentId` is the concrete adapter it deterministically resolves
+  // to via the canonical catalogue. Atomic revalidation needs both kept
+  // distinct so an unchanged alias never gets compared against a resolved
+  // identity built from a different representation (issue #189).
+  const resolvedAgentId = labelAuthority.agentLabel
+    ? resolveAgentForLabels([labelAuthority.agentLabel])?.agentId ?? null
+    : null;
   return {
     issueNumber: selected.issue?.number || null,
     statusLabel: labelAuthority.statusLabel,
     agentLabel: labelAuthority.agentLabel,
+    resolvedAgentId,
     labelAuthorityAllowed: labelAuthority.allowed,
     labelAuthorityReason: labelAuthority.reason,
     labelAuthorityEvidence: labelAuthority.evidence,
@@ -85,6 +95,7 @@ export function normalizeCandidateSnapshot(snapshot = {}) {
     issueNumber: snapshot.issueNumber || null,
     statusLabel: snapshot.statusLabel || null,
     agentLabel: snapshot.agentLabel || null,
+    resolvedAgentId: snapshot.resolvedAgentId || null,
     labelAuthorityAllowed: snapshot.labelAuthorityAllowed !== false,
     labelAuthorityReason: snapshot.labelAuthorityReason || null,
     labelAuthorityEvidence: snapshot.labelAuthorityEvidence || null,
@@ -139,6 +150,9 @@ export function evaluateCandidateAdmission({ initial, current, approvers = [] } 
   if (initial.agentLabel !== current.agentLabel) {
     return { allowed: false, reason: 'candidate-agent-changed' };
   }
+  if (initial.resolvedAgentId !== current.resolvedAgentId) {
+    return { allowed: false, reason: 'candidate-agent-changed' };
+  }
   if (initial.selectionMode !== current.selectionMode) {
     return { allowed: false, reason: 'candidate-dispatch-mode-changed' };
   }
@@ -151,8 +165,7 @@ export function evaluateCandidateAdmission({ initial, current, approvers = [] } 
   if (current.preflightPacketValid !== true || !current.preflightAuthorityKey) {
     return { allowed: false, reason: current.preflightPacketReason || 'candidate-manager-preflight-invalid' };
   }
-  const selectedAgent = resolveAgentForLabels([current.agentLabel]);
-  if (!selectedAgent?.agentId || current.preflightApprovedAgent !== selectedAgent.agentId) {
+  if (!current.resolvedAgentId || current.preflightApprovedAgent !== current.resolvedAgentId) {
     return { allowed: false, reason: 'candidate-preflight-agent-not-approved' };
   }
   if (!initial.preflightAuthorityKey || initial.preflightAuthorityKey !== current.preflightAuthorityKey) {
