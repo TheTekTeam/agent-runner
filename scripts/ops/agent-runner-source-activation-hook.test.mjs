@@ -20,6 +20,10 @@ function runWrapper({ enabled, controllerMode }) {
     'script="${1:-}"',
     'depth="${AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH:-0}"',
     'case "$script" in',
+    '  *agent-runner-control-evidence.mjs)',
+    '    echo "evidence:$depth" >> "$LOG_FILE"',
+    '    exit 0',
+    '    ;;',
     '  *agent-runner-source-activation-authority.mjs)',
     '    echo "controller:$depth" >> "$LOG_FILE"',
     '    case "$CONTROLLER_MODE" in',
@@ -66,33 +70,33 @@ function runWrapper({ enabled, controllerMode }) {
 
 const CLEAN_RECURRENCE = 'recurrence:unset:unset:unset:unset';
 
-test('disabled source activation preserves current recurrence path, performs no controller call and strips control env', () => {
+test('disabled source activation preserves current recurrence path, publishes evidence and strips control env', () => {
   const result = runWrapper({ enabled: false, controllerMode: 'systemic' });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(result.calls, [CLEAN_RECURRENCE]);
+  assert.deepEqual(result.calls, ['evidence:0', CLEAN_RECURRENCE]);
 });
 
-test('valid activation result re-execs wrapper exactly once then starts recurrence without source-control env', () => {
+test('valid activation result re-execs wrapper exactly once, publishes evidence on each outer recurrence and starts clean', () => {
   const result = runWrapper({ enabled: true, controllerMode: 'reexec-once' });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(result.calls, ['controller:0', 'controller:1', CLEAN_RECURRENCE]);
+  assert.deepEqual(result.calls, ['evidence:0', 'controller:0', 'evidence:1', 'controller:1', CLEAN_RECURRENCE]);
 });
 
 test('re-exec depth guard prevents recursion even if controller erroneously requests activation twice', () => {
   const result = runWrapper({ enabled: true, controllerMode: 'always-reexec' });
   assert.notEqual(result.status, 0);
-  assert.deepEqual(result.calls, ['controller:0', 'controller:1']);
+  assert.deepEqual(result.calls, ['evidence:0', 'controller:0', 'evidence:1', 'controller:1']);
   assert.match(result.stderr, /re-exec depth guard/i);
 });
 
-test('handled source-authority refusal exits without candidate recurrence', () => {
+test('handled source-authority refusal exits without candidate recurrence after evidence publication', () => {
   const result = runWrapper({ enabled: true, controllerMode: 'handled' });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(result.calls, ['controller:0']);
+  assert.deepEqual(result.calls, ['evidence:0', 'controller:0']);
 });
 
-test('systemic source-authority failure exits nonzero without candidate recurrence', () => {
+test('systemic source-authority failure exits nonzero without candidate recurrence after evidence publication', () => {
   const result = runWrapper({ enabled: true, controllerMode: 'systemic' });
   assert.notEqual(result.status, 0);
-  assert.deepEqual(result.calls, ['controller:0']);
+  assert.deepEqual(result.calls, ['evidence:0', 'controller:0']);
 });
