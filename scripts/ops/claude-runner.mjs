@@ -58,6 +58,25 @@ import {
   commentRevision,
   normalizeCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
+import {
+  buildClaudeAdapterIdentitySection,
+  buildDynamicTaskIdentitySection,
+  buildEvidenceSchemaSection,
+  buildExecutionPhaseInvariantsSection,
+  buildFinalRequestSection,
+  buildPromptCacheMetadata,
+  buildRepositoryInstructionContractSection,
+  buildSafetyAuthorityInvariantsSection,
+  buildWorktreeAssignmentSection,
+  compilePrompt,
+  joinSections,
+  PROMPT_SCHEMA_VERSION,
+} from './claude-runner-prompt-compiler.mjs';
+
+export {
+  buildPromptCacheMetadata,
+  PROMPT_SCHEMA_VERSION,
+};
 
 const DEFAULT_REPO = 'TheTekTeam/modelspend';
 const DEFAULT_OUTPUT_DIR = '.var/claude-runner';
@@ -415,34 +434,74 @@ export function shouldUseClear({ noClear = false, resumeSession } = {}) {
   return !noClear && !resumeSession;
 }
 
-function executionPhasePrompt({ executionPhase, worktreeIdentity } = {}) {
-  if (executionPhase === EXECUTION_PHASE_IMPLEMENTATION) {
-    return `Execution phase: implementation. The manager preflight is the approved plan; do not spend this attempt writing another plan.\nMake the smallest complete repository change and run the mapped validation.\nClaude Code placed this session in isolated worktree \`${worktreeIdentity?.name || 'runner-owned'}\` on branch \`${worktreeIdentity?.expectedBranch || 'runner-owned'}\`. Do not leave, rename, delete, or switch this worktree/branch.\nFinish with a clean commit on that exact branch using \`git commit --no-verify ...\`; validation is explicit and unattended repository hooks must not run. Do not push or call GitHub: after evidence checks, the runner will push this exact branch and create a draft PR deterministically. Never merge, approve, close the issue, force-push, or change other branches.\nIf an operation is outside the runner allowlist, stop and report it; do not look for a bypass.\n`;
-  }
-  return 'Execution phase: plan. Read and reason only; do not edit repository files, create commits, push branches, or claim implementation success.\n';
-}
-
 function repositoryIdentityLine(repositoryContext) {
   const repo = repositoryContext?.implementationRepository;
   return repo ? `You are Claude Code CLI working on ${repo}.` : 'You are Claude Code CLI working on this repository.';
 }
 
-function repositoryInstructionRules(repositoryContext) {
-  const paths = repositoryContext?.implementationInstructionPaths?.length
+function repositoryInstructionPaths(repositoryContext) {
+  return repositoryContext?.implementationInstructionPaths?.length
     ? repositoryContext.implementationInstructionPaths
     : DEFAULT_PROJECT_REPOSITORY_INSTRUCTIONS;
-  return paths.map((path) => `Follow ${path}.`).join('\n- ');
 }
 
-export function buildClaudePrompt({ issue, commandText, currentPreflight = null, profile, clearContext, executionPhase = profile?.permissionMode === 'plan' ? EXECUTION_PHASE_PLAN : EXECUTION_PHASE_IMPLEMENTATION, worktreeIdentity = null, repositoryContext = null }) {
+/**
+ * #193 stable-prefix compiler: builds each of the compiled prompt's logical
+ * sections in the required order (safety/authority invariants; repository
+ * instruction contract; execution-phase invariants; evidence schema;
+ * adapter-specific stable instructions; dynamic task identity/profile; issue
+ * body/manager-packet mutable evidence; final task-specific request) and
+ * returns both the assembled prompt and its stable/dynamic halves so callers
+ * can derive bounded cache metadata without re-parsing the prompt text.
+ */
+function buildClaudePromptSections({
+  issue, commandText, currentPreflight = null, preflight = null, selectionMode = 'compat',
+  profile, clearContext, executionPhase, worktreeIdentity = null, repositoryContext = null,
+}) {
   const clearPrefix = clearContext
     ? 'Start a fresh task context. Do not carry assumptions or files from any previous Claude task.\n\n'
     : '';
-  const preflightText = currentPreflight
-    ? `\n\nCurrent manager preflight packet (source comment ${commentRevision(currentPreflight) || 'unknown'}):\n\n${currentPreflight.body || ''}`
+  const modeLine = selectionMode === 'preflight-direct'
+    ? 'Selection mode: preflight-direct — the current canonical manager packet is the sole new-claim authority. Historical proceed/continue comments are ignored.'
+    : '';
+  const preflightDirectScopeNote = selectionMode === 'preflight-direct'
+    ? 'Use the manager preflight packet as the durable implementation scope. Do not redo broad repo discovery/preflight. Implement only the issue as scoped by its body and the preflight packet.'
     : '';
 
-  return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. Continue until the issue is complete or a genuine blocker is reached; remain within the configured monetary and safety policies.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nLatest Claude command:\n\n${commandText}${preflightText}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
+  const stableSections = [
+    joinSections([buildSafetyAuthorityInvariantsSection(), preflightDirectScopeNote]),
+    buildRepositoryInstructionContractSection(repositoryInstructionPaths(repositoryContext)),
+    buildExecutionPhaseInvariantsSection(executionPhase),
+    buildEvidenceSchemaSection(),
+    buildClaudeAdapterIdentitySection({ repositoryIdentityLine: repositoryIdentityLine(repositoryContext), modeLine }),
+  ];
+
+  const mutableEvidence = selectionMode === 'preflight-direct'
+    ? joinSections([
+      `Issue body:\n\n${issue.body || '(no issue body)'}`,
+      `Latest manager preflight packet (source comment ${commentRevision(preflight) || 'unknown'}):\n\n${preflight.body}`,
+    ])
+    : joinSections([
+      `Latest Claude command:\n\n${commandText}`,
+      currentPreflight
+        ? `Current manager preflight packet (source comment ${commentRevision(currentPreflight) || 'unknown'}):\n\n${currentPreflight.body || ''}`
+        : '',
+    ]);
+
+  const dynamicSections = [
+    buildDynamicTaskIdentitySection({ issue, profile }),
+    buildWorktreeAssignmentSection(executionPhase, worktreeIdentity),
+    mutableEvidence,
+    buildFinalRequestSection(executionPhase),
+  ];
+
+  return compilePrompt({ clearPrefix, stableSections, dynamicSections });
+}
+
+export function buildClaudePrompt({ issue, commandText, currentPreflight = null, profile, clearContext, executionPhase = profile?.permissionMode === 'plan' ? EXECUTION_PHASE_PLAN : EXECUTION_PHASE_IMPLEMENTATION, worktreeIdentity = null, repositoryContext = null }) {
+  return buildClaudePromptSections({
+    issue, commandText, currentPreflight, profile, clearContext, executionPhase, worktreeIdentity, repositoryContext,
+  }).prompt;
 }
 
 /**
@@ -451,11 +510,31 @@ export function buildClaudePrompt({ issue, commandText, currentPreflight = null,
  * proceed/continue comments are not relayed as authority.
  */
 export function buildPreflightDirectPrompt({ issue, preflight, profile, clearContext, executionPhase = profile?.permissionMode === 'plan' ? EXECUTION_PHASE_PLAN : EXECUTION_PHASE_IMPLEMENTATION, worktreeIdentity = null, repositoryContext = null }) {
-  const clearPrefix = clearContext
-    ? 'Start a fresh task context. Do not carry assumptions or files from any previous Claude task.\n\n'
-    : '';
+  return buildClaudePromptSections({
+    issue, preflight, selectionMode: 'preflight-direct', profile, clearContext, executionPhase, worktreeIdentity, repositoryContext,
+  }).prompt;
+}
 
-  return `${clearPrefix}${repositoryIdentityLine(repositoryContext)}\n\nIssue: #${issue.number} — ${issue.title}\n\nSelection mode: preflight-direct — the current canonical manager packet is the sole new-claim authority. Historical proceed/continue comments are ignored.\n\nModel/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max budget usd: ${profile.maxBudgetUsd}\n\nRunner rules:\n- ${repositoryInstructionRules(repositoryContext)}\n- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.\n- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.\n- Keep reads bounded to the issue and supplied preflight. Continue until the issue is complete or a genuine blocker is reached; remain within the configured monetary and safety policies.\n- Use the smallest complete change.\n- Do not hardcode secrets.\n- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.\n- Use the manager preflight packet below as the durable implementation scope. Do not redo broad repo discovery/preflight.\n- Implement only the issue as scoped by its body and the preflight packet.\n- ${executionPhasePrompt({ executionPhase, worktreeIdentity }).trim().replace(/\n/g, '\n- ')}\n\nIssue body:\n\n${issue.body || '(no issue body)'}\n\nLatest manager preflight packet (source comment ${commentRevision(preflight) || 'unknown'}):\n\n${preflight.body}\n\nFinal report must include branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.\n`;
+/**
+ * #193 bounded cache-aware metadata for the exact prompt a run compiled.
+ * Never persists prompt text -- only content-addressed fingerprints and
+ * locally measurable size estimates (see claude-runner-prompt-compiler.mjs).
+ */
+export function claudePromptCacheMetadata({
+  issue, commandText, currentPreflight = null, preflight = null, selectionMode = 'compat',
+  profile, clearContext, executionPhase, worktreeIdentity = null, repositoryContext = null,
+}) {
+  const { stableText, dynamicText } = buildClaudePromptSections({
+    issue, commandText, currentPreflight, preflight, selectionMode, profile, clearContext, executionPhase, worktreeIdentity, repositoryContext,
+  });
+  return buildPromptCacheMetadata({
+    stableText,
+    dynamicText,
+    adapterId: 'claude-code-cli',
+    model: profile?.model,
+    profile: profile?.profile,
+    cacheStrategy: 'provider-managed',
+  });
 }
 
 /**
@@ -1899,6 +1978,27 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       repositoryContext,
     });
   const claudeArgs = buildClaudeArgs({ prompt, profile, resumeSession: args.resumeSession });
+  const promptCacheMetadata = command
+    ? claudePromptCacheMetadata({
+      issue: { number: args.issue, title: issue.title },
+      commandText: command.body,
+      currentPreflight,
+      profile,
+      clearContext,
+      executionPhase: executionAuthorization.phase,
+      worktreeIdentity,
+      repositoryContext,
+    })
+    : claudePromptCacheMetadata({
+      issue: { number: args.issue, title: issue.title, body: issue.body },
+      preflight,
+      selectionMode: 'preflight-direct',
+      profile,
+      clearContext,
+      executionPhase: executionAuthorization.phase,
+      worktreeIdentity,
+      repositoryContext,
+    });
 
   const runPlan = {
     dryRun: !args.execute,
@@ -1907,6 +2007,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     repo: args.repo,
     repositoryContext,
     selectionMode,
+    promptCacheMetadata,
     commandKind: command?.kind || null,
     commandHeading: command?.heading || null,
     sourceCommentId: command?.sourceCommentId || null,
