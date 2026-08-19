@@ -13,7 +13,7 @@ import {
 import { deriveTerminalOutcome, evaluateChildRunResult } from './claude-runner-cron.mjs';
 
 const exclusive = { processOwner: false, conflictingLease: false, ownershipAmbiguous: false };
-const headroom = { sameProfileAvailable: true, quotaHeadroom: true, budgetHeadroom: true, continuationHeadroom: true };
+const headroom = { sameProfileAvailable: true, quotaHeadroom: true, executionPolicyAdmitted: true, continuationHeadroom: true };
 
 test('#686 root cause: normalizeTerminalOutcome preserves the child-reported workspace-conflict reason instead of collapsing it to unknown_failure', () => {
   // This is the literal proven #686 defect: the child's structured

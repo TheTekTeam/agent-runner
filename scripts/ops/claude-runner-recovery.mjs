@@ -40,7 +40,7 @@ export const WORKSPACE_OWNERSHIP_OUTCOMES = Object.freeze([
 export const IMPLEMENTATION_NO_REPOSITORY_CHANGE = 'implementation_no_repository_change';
 
 /**
- * A per-attempt configured spend cap was reached mid-run (#206). The Claude
+ * A legacy per-attempt configured spend cap was reached mid-run (#206). The Claude
  * child adapter already classifies the CLI's own `error_max_budget_usd`
  * result envelope subtype as the structured reason `budget-limit-exhausted`;
  * before this outcome existed, `normalizeTerminalOutcome()` below had no
@@ -190,7 +190,7 @@ function ownershipProven(evidence) {
 }
 
 function headroomProven(evidence) {
-  return evidence.sameProfileAvailable === true && evidence.quotaHeadroom === true && evidence.budgetHeadroom === true;
+  return evidence.sameProfileAvailable === true && evidence.quotaHeadroom === true && evidence.executionPolicyAdmitted === true;
 }
 
 /**
@@ -235,7 +235,7 @@ export function decideRecovery(input, policyOverrides = {}) {
   if (reason === IMPLEMENTATION_NO_REPOSITORY_CHANGE) {
     return forbidden(reason, 'The model session completed successfully but made no repository change. Review the run log and issue scope, then provide an explicit manager decision before any further dispatch; do not automatically resume or retry.');
   }
-  // A per-attempt configured budget cap is never automatic-retry eligible
+  // A legacy per-attempt configured budget-cap outcome is never automatic-retry eligible
   // (#206): budget exhaustion alone never authorises raising the budget,
   // switching billing route, using a paid fallback, or launching another
   // provider/model attempt. When the preserved worktree already has valid
@@ -245,8 +245,8 @@ export function decideRecovery(input, policyOverrides = {}) {
   // decision is required before any fresh authority.
   if (reason === BUDGET_LIMIT_EXHAUSTED) {
     return forbidden(reason, evidence.implementationEvidenceValid === true
-      ? 'Per-attempt budget was exhausted, but valid committed implementation evidence is preserved. Review it for deterministic salvage/publication rather than a fresh retry; do not raise the budget, switch billing route, or launch another provider/model attempt.'
-      : 'Per-attempt budget was exhausted and no valid committed implementation evidence is preserved. Provide an explicit manager decision before any fresh dispatch; do not automatically raise the budget, switch billing route, or launch another provider/model attempt.');
+      ? 'A legacy per-attempt budget was exhausted, but valid committed implementation evidence is preserved. Review it for deterministic salvage/publication rather than a fresh retry; do not raise the budget, switch billing route, or launch another provider/model attempt.'
+      : 'A legacy per-attempt budget was exhausted and no valid committed implementation evidence is preserved. Provide an explicit manager decision before any fresh dispatch; do not automatically raise the budget, switch billing route, or launch another provider/model attempt.');
   }
   if (!ownershipProven(evidence)) return forbidden(reason, 'Resolve ambiguous process, claim, or lease ownership before recovery.');
   if (reason === 'rate_limited') return retry(reason, 'fresh_retry', attempts, policy.rateLimitAttemptCap, nowMs, policy, 'Retry after bounded provider backoff and a fresh quota preflight.');

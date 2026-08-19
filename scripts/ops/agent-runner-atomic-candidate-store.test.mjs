@@ -242,7 +242,7 @@ test('candidate pause is audited without opening systemic health', () => {
   assert.equal(raw.calls.some(([kind]) => kind === 'health'), false);
 });
 
-test('candidate-specific machine_profile cost refusal detected during atomic revalidation refuses attempt persistence with the exact typed scope', () => {
+test('candidate-specific machine_profile model refusal detected during atomic revalidation refuses attempt persistence with the exact typed scope', () => {
   const raw = fakeStore();
   const pauseState = { result: null };
   const fingerprint = `sha256:${'f'.repeat(64)}`;
@@ -253,8 +253,8 @@ test('candidate-specific machine_profile cost refusal detected during atomic rev
         allowed: false,
         scope: 'machine_profile',
         reason: 'candidate-machine-profile-cost-denied',
-        violations: ['budget-cap-exceeds-machine-policy'],
-        safeNextAction: 'A changed manager intent/profile/budget requires a fresh superseding immutable manager-preflight authority.',
+        violations: ['opus-requires-explicit-machine-opt-in'],
+        safeNextAction: 'A changed manager intent/profile requires a fresh superseding immutable manager-preflight authority.',
         effectiveFingerprint: fingerprint,
         occurrenceCount: 1,
       },
@@ -264,7 +264,7 @@ test('candidate-specific machine_profile cost refusal detected during atomic rev
   });
   store.recordIssueSelection(selectionRecord);
   assert.throws(() => store.recordRecoveryAttempt(initialAttempt), CandidateAdmissionPausedError);
-  assert.equal(raw.calls.filter(([kind]) => kind === 'attempt').length, 0, 'a candidate-specific cost refusal must write no attempt row');
+  assert.equal(raw.calls.filter(([kind]) => kind === 'attempt').length, 0, 'a candidate-specific profile refusal must write no attempt row');
   assert.equal(pauseState.result.admission.scope, 'machine_profile');
 
   store.recordQueueEvent({ eventType: 'systemic-pause', reason: 'runner_state_unavailable', payload: {} });
