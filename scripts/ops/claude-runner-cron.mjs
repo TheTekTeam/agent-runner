@@ -73,7 +73,7 @@ import {
 import { inspectWorkspaceOwnership } from './agent-runner-workspace-ownership.mjs';
 import { withWorkspaceIdentitySupport } from './agent-runner-workspace-identity-store.mjs';
 import { withRecoveryIdentityGuard } from './agent-runner-recovery-identity-guard.mjs';
-import { EXECUTION_PHASE_IMPLEMENTATION, inferProfile, isSupportedModelId, managerBudgetOverride, parseKeyValueBlock, resolveImplementationDispatchIdentity, resolveProfile } from './claude-runner.mjs';
+import { EXECUTION_PHASE_IMPLEMENTATION, inferProfile, isSupportedModelId, parseKeyValueBlock, resolveImplementationDispatchIdentity, resolveProfile } from './claude-runner.mjs';
 import { anyProfileQuotaAdmissible, evaluateProfileQuotaAdmission, quotaAdmissionEvidenceFromPreflight } from './claude-runner-quota.mjs';
 import {
   decorateIssueWithMetadata,
@@ -3434,7 +3434,6 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       ? resolveProfile(dispatchIdentity.profileName, {
         model: dispatchIdentity.managerExecutionMeta?.model,
         effort: dispatchIdentity.managerExecutionMeta?.effort,
-        maxBudgetUsd: managerBudgetOverride(dispatchIdentity.managerExecutionMeta?.maxBudgetUsd),
       }, authEnv)
       : null;
     const resolvedModel = freshImplementationDispatch ? (resolvedProfile?.model ?? null) : null;
@@ -3846,7 +3845,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
           && actualModel === (freshImplementationDispatch ? resolvedModel : expectedModel) && actualHarness === plan.agent?.agentType),
         sameProfileAvailable: childPayload?.recoveryEvidence?.sameProfileAvailable === true,
         quotaHeadroom: quotaPreflight.blocked === false && quotaPreflight.skipped === false,
-        budgetHeadroom: childPayload?.costAdmission?.allowed === true,
+        executionPolicyAdmitted: childPayload?.costAdmission?.allowed === true,
         conflictingWorktree: Boolean(childPayload?.worktreeIdentity?.rootPath), conflictingBranch: Boolean(childPayload?.implementationPublication?.branch), conflictingPr: Boolean(childPayload?.implementationPublication?.pullRequest),
         worktreeAvailable: Boolean(childPayload?.worktreeIdentity),
         explicitDeterministicValidationFailure: childPayload?.recoveryEvidence?.deterministicValidationFailure === true,

@@ -15,7 +15,7 @@ function managerPacket({ id = 1, revision = 'AR241.1' } = {}) {
     id,
     createdAt: '2026-08-17T19:00:00Z',
     user: { login: 'gpcola' },
-    body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: ${revision}\nfingerprint: ${FINGERPRINT}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nprofile: complex\nmodel: sonnet\neffort: medium\nmax_budget_usd: "2.00"\napproved_repository_scope:\n  - ${REPO}\napproved_branch: ${BRANCH}\nbase_commit: ${BASE}\nscope:\n  - bounded continuation binding fixture\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\``,
+    body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: ${revision}\nfingerprint: ${FINGERPRINT}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nprofile: complex\nmodel: sonnet\neffort: medium\napproved_repository_scope:\n  - ${REPO}\napproved_branch: ${BRANCH}\nbase_commit: ${BASE}\nscope:\n  - bounded continuation binding fixture\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\``,
   };
 }
 
@@ -47,7 +47,6 @@ function fixture(overrides = {}) {
       profile: 'complex',
       model: 'sonnet',
       effort: 'medium',
-      maxBudgetUsd: { present: true, valid: true, value: 2, raw: '2.00' },
     },
     executionAuthorization: { allowed: true, phase: 'implementation', permissionMode: 'dontAsk' },
     repositoryContext: { implementationRepository: REPO, implementationCheckout: '/repo' },

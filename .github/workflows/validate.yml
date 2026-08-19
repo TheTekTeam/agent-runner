@@ -4,10 +4,13 @@ on:
   pull_request:
     branches:
       - main
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: agent-runner-validation-${{ github.event.pull_request.number || github.ref }}
@@ -15,18 +18,16 @@ concurrency:
 
 jobs:
   validate:
-    name: Apply and validate #264
-    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.head.repo.full_name == github.repository
+    name: Validate Agent Runner
     runs-on:
       - self-hosted
       - dev-cluster-dell
     timeout-minutes: 30
 
     steps:
-      - name: Check out exact PR head
+      - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.ref || github.ref_name }}
           fetch-depth: 0
 
       - name: Set up Node.js
@@ -34,56 +35,5 @@ jobs:
         with:
           node-version: 22.23.0
 
-      - name: Execute bounded #264 repository patch
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          workflow = Path('.github/workflows/tmp-remove-budget-caps-264.yml').read_text()
-          marker = "          python3 - <<'PY'\n"
-          start = workflow.index(marker) + len(marker)
-          end = workflow.index("\n          PY", start)
-          lines = workflow[start:end].splitlines()
-          code = '\n'.join(line[10:] if line.startswith('          ') else line for line in lines)
-          exec(compile(code, '#264-embedded-patch', 'exec'), {'__name__': '__main__'})
-          PY
-
-      - name: Prove active monetary cap surfaces are removed
-        run: |
-          if git grep -nE 'maxBudgetUsd|CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT|--max-budget-usd|budget-cap-exceeds-machine-policy|managerBudgetOverride|candidateBudgetIdentity' -- scripts config; then
-            echo 'ERROR: active dollar-budget enforcement remains under scripts/config' >&2
-            exit 1
-          fi
-          echo 'Legacy packet/result terminology retained only where explicitly compatibility/history scoped:'
-          git grep -nE 'max_budget_usd|budget-limit-exhausted|error_max_budget_usd' -- scripts config || true
-
-      - name: Syntax checks
-        run: |
-          node --check scripts/ops/claude-runner.mjs
-          node --check scripts/ops/agent-runner-agents.mjs
-          node --check scripts/ops/agent-runner-manager-authority.mjs
-          node --check scripts/ops/agent-runner-candidate-admission.mjs
-          node --check scripts/ops/agent-runner-candidate-profile-circuit.mjs
-
-      - name: Focused tests
-        run: |
-          node --test scripts/ops/agent-runner-agents.test.mjs
-          node --test scripts/ops/agent-runner-manager-authority.test.mjs
-          node --test scripts/ops/agent-runner-candidate-profile-circuit.test.mjs
-          node --test scripts/ops/agent-runner-candidate-admission.test.mjs
-          node --test scripts/ops/claude-runner.test.mjs
-
-      - name: Full repository validation
-        run: |
-          npm test
-          npm run validate
-          git diff --check
-
-      - name: Restore canonical workflow, remove patch machinery, commit and push
-        run: |
-          git checkout origin/main -- .github/workflows/validate.yml
-          rm -f .github/workflows/tmp-remove-budget-caps-264.yml .github/workflows/tmp-pr-run-budget-patch-264.yml
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add -A
-          git commit -m 'RUNNER.SUBSCRIPTION.BUDGET.CAP.REMOVAL.1 — remove Claude dollar caps (#264)'
-          git push origin HEAD:${{ github.event.pull_request.head.ref || github.ref_name }}
+      - name: Run canonical repository validation
+        run: npm run validate

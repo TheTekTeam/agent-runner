@@ -128,21 +128,18 @@ export const DEFAULT_PROFILES = {
     modelEnv: 'CLAUDE_RUNNER_MODEL_DOCS',
     defaultModel: 'haiku',
     effort: 'low',
-    maxBudgetUsd: '0.25',
     permissionMode: 'plan',
   },
   narrow: {
     modelEnv: 'CLAUDE_RUNNER_MODEL_NARROW',
     defaultModel: 'sonnet',
     effort: 'low',
-    maxBudgetUsd: '0.50',
     permissionMode: 'plan',
   },
   complex: {
     modelEnv: 'CLAUDE_RUNNER_MODEL_COMPLEX',
     defaultModel: 'sonnet',
     effort: 'medium',
-    maxBudgetUsd: '1.00',
     permissionMode: 'plan',
   },
   critical: {
@@ -151,7 +148,6 @@ export const DEFAULT_PROFILES = {
     // can still approve those controls explicitly through the cost policy.
     defaultModel: 'sonnet',
     effort: 'high',
-    maxBudgetUsd: '1.50',
     permissionMode: 'plan',
   }
 };
@@ -176,21 +172,16 @@ function truthy(value) {
 }
 
 
-function positiveNumber(value, fallback) {
-  const parsed = Number.parseFloat(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
 /**
- * Fail-closed admission for an unattended paid Claude run. Explicit CLI or
- * issue metadata cannot silently raise the machine's spend ceiling.
- * Opus and xhigh/max each require their own machine-local opt-in.
+ * Fail-closed admission for unattended subscription-backed Claude controls.
+ *
+ * Provider availability is governed by the mandatory live quota/headroom
+ * path. This admission gate deliberately contains no dollar-denominated
+ * attempt limit. It only protects model/effort escalation.
  */
 export function evaluateClaudeCostAdmission(profile = {}, env = process.env) {
-  const maxBudgetUsd = positiveNumber(env.CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT, 2);
   const model = String(profile.model || '').trim().toLowerCase();
   const effort = String(profile.effort || '').trim().toLowerCase();
-  const requestedBudgetUsd = Number.parseFloat(profile.maxBudgetUsd);
   const violations = [];
 
   if (model.includes('opus') && !truthy(env.CLAUDE_RUNNER_ALLOW_OPUS)) {
@@ -199,9 +190,6 @@ export function evaluateClaudeCostAdmission(profile = {}, env = process.env) {
   if (['xhigh', 'max'].includes(effort) && !truthy(env.CLAUDE_RUNNER_ALLOW_XHIGH)) {
     violations.push('high-effort-requires-explicit-machine-opt-in');
   }
-  if (!Number.isFinite(requestedBudgetUsd) || requestedBudgetUsd <= 0 || requestedBudgetUsd > maxBudgetUsd) {
-    violations.push('budget-cap-exceeds-machine-policy');
-  }
 
   return {
     allowed: violations.length === 0,
@@ -209,10 +197,8 @@ export function evaluateClaudeCostAdmission(profile = {}, env = process.env) {
     requested: {
       model: profile.model || null,
       effort: profile.effort || null,
-      maxBudgetUsd: Number.isFinite(requestedBudgetUsd) ? requestedBudgetUsd : null,
     },
     policy: {
-      maxBudgetUsd,
       opusAllowed: truthy(env.CLAUDE_RUNNER_ALLOW_OPUS),
       highEffortAllowed: truthy(env.CLAUDE_RUNNER_ALLOW_XHIGH),
     },
@@ -232,7 +218,6 @@ export function parseArgs(argv = process.argv.slice(2), { defaultRepo = process.
     pr: undefined,
     model: undefined,
     effort: undefined,
-    maxBudgetUsd: undefined,
     resumeSession: undefined,
     attemptId: undefined,
     recoveryMode: undefined,
@@ -264,7 +249,6 @@ export function parseArgs(argv = process.argv.slice(2), { defaultRepo = process.
     else if (arg === '--profile') args.profile = next();
     else if (arg === '--model') args.model = next();
     else if (arg === '--effort') args.effort = next();
-    else if (arg === '--max-budget-usd') args.maxBudgetUsd = next();
     else if (arg === '--resume-session') args.resumeSession = next();
     else if (arg === '--attempt-id') args.attemptId = next();
     else if (arg === '--recovery-mode') args.recoveryMode = next();
@@ -316,7 +300,6 @@ Options:
   --profile <name>          docs | narrow | complex | critical
   --model <model>           Override profile model. Prefer env vars for durable config.
   --effort <level>          low | medium | high | xhigh | max
-  --max-budget-usd <value>  Claude print-mode budget cap
   --resume-session <name>   Resume a matching Claude session; skips clear by default
   --no-clear                Skip clear-context instruction for new task. Not recommended.
   --inherit-provider-auth   Pass Anthropic/Bedrock/Vertex provider auth env vars through to Claude. Default is to strip them.
@@ -330,7 +313,7 @@ Exit codes (--execute mode):
   0    Claude produced verified repository-change evidence.
   1    Execution failed, produced no implementation artifact, or returned another plan during implementation.
   ${PLAN_ONLY_EXIT_CODE}    Explicit plan-only run completed; awaiting approval/continuation.
-  ${COST_POLICY_EXIT_CODE}    Machine-local cost policy blocked the run before Claude started.
+  ${COST_POLICY_EXIT_CODE}    Machine-local model/effort policy blocked the run before Claude started.
   ${EXECUTION_POLICY_EXIT_CODE}    Authorization, CLI capability, or isolated-worktree policy blocked the run before Claude started.
 `);
 }
@@ -381,35 +364,6 @@ export function inferProfile({ explicitProfile, commandText = '', issue = {} } =
   return 'narrow';
 }
 
-/**
- * Issue #223: turns the canonical #221 `resolveManagerPreflightExecutionMetadata()`
- * budget shape into the single override value `resolveProfile()`/
- * `evaluateClaudeCostAdmission()` consume. An absent manager budget yields
- * `undefined` so the profile default still applies. A present-but-invalid
- * manager budget (malformed/empty/nonnumeric/zero/negative, or a one-sided/
- * mismatched quote) must never resolve to a falsy override -- that would let
- * `resolveProfile()`'s own `||` default fallback silently substitute the
- * profile default instead of failing closed in `evaluateClaudeCostAdmission()`.
- *
- * An invalid budget must also never be forwarded as its own raw text.
- * `evaluateClaudeCostAdmission()` reads the override with
- * `Number.parseFloat()`, which stops at the first invalid character rather
- * than rejecting the string: a trailing-quote packet like `2.00"` would
- * parse back to `2` and be admitted, re-opening exactly the quote-safety
- * hole #221's normalizer closed. The raw text is therefore preserved only
- * behind a non-numeric prefix, so the value stays diagnosable in the run log
- * while always parsing to `NaN`. Cost admission is evaluated before any
- * provider process is launched, so this sentinel never reaches the CLI.
- */
-export const INVALID_MANAGER_MAX_BUDGET_USD = 'invalid-manager-max-budget-usd';
-
-export function managerBudgetOverride(maxBudgetUsd) {
-  if (!maxBudgetUsd?.present) return undefined;
-  if (maxBudgetUsd.valid) return maxBudgetUsd.value;
-  const raw = String(maxBudgetUsd.raw ?? '');
-  return raw ? `${INVALID_MANAGER_MAX_BUDGET_USD}:${raw}` : INVALID_MANAGER_MAX_BUDGET_USD;
-}
-
 export function resolveProfile(profileName, overrides = {}, env = process.env) {
   const base = DEFAULT_PROFILES[profileName];
   if (!base) throw new Error(`Unknown profile: ${profileName}`);
@@ -417,7 +371,6 @@ export function resolveProfile(profileName, overrides = {}, env = process.env) {
     profile: profileName,
     model: overrides.model || env[base.modelEnv] || base.defaultModel,
     effort: overrides.effort || base.effort,
-    maxBudgetUsd: overrides.maxBudgetUsd || base.maxBudgetUsd,
     permissionMode: overrides.permissionMode || base.permissionMode,
     tools: overrides.tools,
     allowedTools: overrides.allowedTools,
@@ -557,7 +510,6 @@ export function resolveImplementationDispatchIdentity({
   argsProfile,
   argsModel,
   argsEffort,
-  argsMaxBudgetUsd,
 } = {}) {
   if (!currentPreflight) {
     return { ok: false, failureReason: 'manager-preflight-missing', failureScope: 'issue_not_runnable' };
@@ -571,7 +523,7 @@ export function resolveImplementationDispatchIdentity({
   // Legacy generic-parser metadata: kept only for `resolveDispatchAuthority()`'s
   // repository/branch conflict detection and `evaluateExecutionAuthorization()`'s
   // `execution_phase`/`permission_mode` checks below, neither of which #221's
-  // canonical resolver covers. Profile/model/effort/max-budget must come from
+  // canonical resolver covers. Profile/model/effort must come from
   // the canonical resolver (#223) instead of this free-form parser.
   const executionMeta = parseKeyValueBlock(currentPreflight.body || '');
   const managerExecutionMeta = resolveManagerPreflightExecutionMetadata(currentPreflight);
@@ -954,7 +906,7 @@ export function publishImplementationDraft({
   let pullRequest = parsePullRequestList(listed.stdout);
   if (!pullRequest) {
     const title = `${String(issueTitle || `Issue #${issueNumber}`).slice(0, 210)} (#${issueNumber})`;
-    const body = `Implements #${issueNumber} from an allowlisted manager preflight.\n\nCreated as a draft by the ModelSpend agent runner after isolated-worktree, clean-commit, cost and permission-policy checks. Human review, merge and issue closure are required.`;
+    const body = `Implements #${issueNumber} from an allowlisted manager preflight.\n\nCreated as a draft by the ModelSpend agent runner after isolated-worktree, clean-commit, model/effort and permission-policy checks. Human review, merge and issue closure are required.`;
     const created = runner('gh', [
       'pr', 'create',
       '--repo', repo,
@@ -1546,7 +1498,7 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
       blocked: true,
       reason: 'cost-policy-blocked',
       failureReason: 'cost-policy-blocked',
-      message: 'The requested paid-agent controls exceed this machine\'s unattended cost policy. No Claude process was started.',
+      message: 'The requested model/effort controls exceed this machine\'s unattended policy. No Claude process was started.',
     };
     const logPath = writeRunLog({ outputDir: args.outputDir, label, payload });
     console.log(JSON.stringify({ ...payload, logPath }, null, 2));
@@ -1809,7 +1761,7 @@ export async function runPrFollowUp(args, env, token) {
     repo: args.repo,
   });
   const profileName = inferProfile({ explicitProfile: args.profile, issue: { title: pullRequest.title, body: pullRequest.body } });
-  const profile = resolveProfile(profileName, { model: args.model, effort: args.effort, maxBudgetUsd: args.maxBudgetUsd }, env);
+  const profile = resolveProfile(profileName, { model: args.model, effort: args.effort }, env);
   const clearContext = shouldUseClear({ noClear: args.noClear, resumeSession: args.resumeSession });
   const claudeArgs = buildClaudeArgs({ prompt, profile, resumeSession: args.resumeSession });
 
@@ -1922,7 +1874,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const dispatchIdentity = resolveImplementationDispatchIdentity({
     issue, command, currentPreflight, config, env,
     argsRepo: args.repo, argsProfile: args.profile, argsModel: args.model,
-    argsEffort: args.effort, argsMaxBudgetUsd: args.maxBudgetUsd,
+    argsEffort: args.effort,
   });
   if (!dispatchIdentity.ok) {
     const payload = {
@@ -1944,7 +1896,6 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const profile = resolveProfile(profileName, {
     model: args.model || managerExecutionMeta.model,
     effort: args.effort || managerExecutionMeta.effort,
-    maxBudgetUsd: args.maxBudgetUsd || managerBudgetOverride(managerExecutionMeta.maxBudgetUsd),
     permissionMode: executionAuthorization.permissionMode,
     tools: implementationToolPolicy?.tools,
     allowedTools: implementationToolPolicy?.allowedTools,

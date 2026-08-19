@@ -93,8 +93,9 @@ export function computeInstanceLoad({ agentId, env = process.env, dbPath, histor
  * Actual scheduler admission remains governed by the canonical quota
  * preflight/profile thresholds. Missing or exhausted quota must fail closed
  * there; the presence or absence of credits is deliberately irrelevant.
- * Per-attempt budget/token ceilings remain separate execution safety limits
- * and are not evidence of account credits.
+ * Model/effort authorization and provider/token execution limits remain
+ * separate safety controls. No dollar-denominated per-attempt ceiling is
+ * applied to subscription-backed Claude execution.
  *
  * Every other adapter is either a zero-spend local runtime or not yet
  * qualified here. No provider call, billing lookup or settings mutation is

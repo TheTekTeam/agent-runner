@@ -9,7 +9,6 @@ export const AGENT_ASSIGNMENT_DISPLAY_NAMES = Object.freeze({
 const FUTURE_CONTROLS = {
   model: { supported: false },
   effort: { supported: false },
-  maxBudgetUsd: { supported: false },
   permissionMode: { supported: false },
   resumeSession: { supported: false },
   outputFormat: { supported: false },
@@ -37,7 +36,6 @@ export const AGENT_ADAPTERS = Object.freeze({
     controls: Object.freeze({
       model: Object.freeze({ supported: true, flag: '--model' }),
       effort: Object.freeze({ supported: true, flag: '--effort' }),
-      maxBudgetUsd: Object.freeze({ supported: true, flag: '--max-budget-usd' }),
       permissionMode: Object.freeze({ supported: true, flag: '--permission-mode' }),
       resumeSession: Object.freeze({ supported: true, flag: '--resume' }),
       tools: Object.freeze({ supported: true, flag: '--tools' }),
@@ -155,7 +153,6 @@ export function buildAgentCommandArgs({
   validateAgentControls(agent, {
     model: profile.model,
     effort: profile.effort,
-    maxBudgetUsd: profile.maxBudgetUsd,
     permissionMode: profile.permissionMode,
     resumeSession,
     outputFormat: outputFormat || agent.controls.outputFormat?.default,
@@ -176,10 +173,8 @@ export function buildAgentCommandArgs({
   if (cacheStableImplementation) args.push(agent.controls.excludeDynamicSystemPromptSections.flag);
   args.push(agent.controls.model.flag, profile.model);
   args.push(agent.controls.effort.flag, profile.effort);
-  // Implementation runs must be able to continue through discovery, edits,
-  // validation and commit. Retain the legacy cap only for read-only plan mode
-  // until the remaining profile/config cleanup in #27 is completed.
-  args.push(agent.controls.maxBudgetUsd.flag, String(profile.maxBudgetUsd));
+  // Subscription-backed Claude execution has no dollar-denominated attempt
+  // ceiling. Mandatory quota/headroom admission remains the provider gate.
   args.push(agent.controls.permissionMode.flag, profile.permissionMode);
   if (profile.tools) args.push(agent.controls.tools.flag, profile.tools);
   if (profile.allowedTools) {

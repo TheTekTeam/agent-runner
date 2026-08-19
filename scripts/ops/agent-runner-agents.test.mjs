@@ -17,11 +17,12 @@ test('Claude implementation adapter builds a cache-stable uncapped CLI invocatio
   const args = buildAgentCommandArgs({
     agent: resolveAgentById('claude-code-cli'),
     prompt: 'hello',
-    profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50', permissionMode: 'dontAsk' },
+    profile: { model: 'sonnet', effort: 'medium', permissionMode: 'dontAsk' },
     env: {},
   });
-  assert.deepEqual(args.slice(0, -1), ['-p', '--exclude-dynamic-system-prompt-sections', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.50', '--permission-mode', 'dontAsk', '--output-format', 'json']);
+  assert.deepEqual(args.slice(0, -1), ['-p', '--exclude-dynamic-system-prompt-sections', '--model', 'sonnet', '--effort', 'medium', '--permission-mode', 'dontAsk', '--output-format', 'json']);
   assert.equal(args.includes(['--max', 'turns'].join('-')), false);
+  assert.equal(args.includes('--max-budget-usd'), false);
   assert.equal(args.at(-1), 'hello');
 });
 
@@ -34,7 +35,7 @@ test('agent command construction uses only supported execution controls', () => 
   const args = buildAgentCommandArgs({
     agent,
     prompt: 'complete the issue',
-    profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00', permissionMode: 'dontAsk' },
+    profile: { model: 'sonnet', effort: 'medium', permissionMode: 'dontAsk' },
     env: {},
   });
   assert.equal(args.includes(['--max', 'turns'].join('-')), false);
@@ -49,7 +50,6 @@ test('Claude adapter builds a constrained native-worktree implementation invocat
     profile: {
       model: 'sonnet',
       effort: 'medium',
-      maxBudgetUsd: '1.00',
       permissionMode: 'dontAsk',
       worktreeName: 'agent-runner-658-123',
       tools: 'Read,Edit,Bash',
@@ -68,7 +68,6 @@ test('Claude adapter builds a constrained native-worktree implementation invocat
     '--exclude-dynamic-system-prompt-sections',
     '--model', 'sonnet',
     '--effort', 'medium',
-    '--max-budget-usd', '1.00',
     '--permission-mode', 'dontAsk',
     '--tools', 'Read,Edit,Bash',
     '--allowedTools', 'Read', 'Edit', 'Bash(git status *)',
@@ -87,15 +86,15 @@ test('read-only plan mode keeps current syntax and does not force dynamic-system
   const args = buildAgentCommandArgs({
     agent: resolveAgentById('claude-code-cli'),
     prompt: 'plan only',
-    profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00', permissionMode: 'plan' },
+    profile: { model: 'sonnet', effort: 'medium', permissionMode: 'plan' },
     env: {},
   });
-  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.00', '--permission-mode', 'plan', '--output-format', 'json']);
+  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--permission-mode', 'plan', '--output-format', 'json']);
 });
 
 test('Claude command construction refuses cache-disabled execution before provider launch', () => {
   const agent = resolveAgentById('claude-code-cli');
-  const profile = { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00', permissionMode: 'dontAsk' };
+  const profile = { model: 'sonnet', effort: 'medium', permissionMode: 'dontAsk' };
   assert.throws(
     () => buildAgentCommandArgs({ agent, prompt: 'blocked', profile, env: { DISABLE_PROMPT_CACHING: 'true' } }),
     (error) => error?.code === 'claude-prompt-cache-disabled' && error?.cachePolicy?.disableVariable === 'DISABLE_PROMPT_CACHING',

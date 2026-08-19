@@ -49,7 +49,7 @@ test('the safety/authority invariants section never mentions issue-specific or p
 test('the model/effort statement appears exactly once across a compiled preflight-direct prompt (no duplicated boilerplate)', () => {
   const issue = { number: 641, title: 'Agent Runner v2', body: 'Implement preflight-direct dispatch.' };
   const preflight = { id: 12, sourceCommentId: 12, body: '## Manager preflight packet\nFiles checked by ChatGPT.' };
-  const profile = { profile: 'complex', model: 'sonnet', effort: 'high', maxBudgetUsd: '4.00' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'high' };
   const prompt = buildPreflightDirectPrompt({ issue, preflight, profile, clearContext: false });
   const occurrences = prompt.match(/Model\/effort profile selected by runner:/g) || [];
   assert.equal(occurrences.length, 1);
@@ -117,7 +117,7 @@ test('sha256Hex is deterministic and one-way: identical text always yields the i
 // produce the identical stable-prefix fingerprint -- the whole point of a
 // stable prefix is that it does not vary with the dynamic issue identity.
 const BASE_POLICY = {
-  profile: { profile: 'complex', model: 'sonnet', effort: 'medium', maxBudgetUsd: '4.00' },
+  profile: { profile: 'complex', model: 'sonnet', effort: 'medium' },
   executionPhase: EXECUTION_PHASE_IMPLEMENTATION,
   clearContext: true,
   worktreeIdentity: { name: 'agent-runner-1-1', expectedBranch: 'worktree-agent-runner-1-1' },
@@ -180,7 +180,7 @@ test('the stable-prefix fingerprint changes when the applicable repository instr
 test('semantic equivalence: the compiled preflight-direct prompt still carries every required authority invariant', () => {
   const issue = { number: 686, title: 'Standalone runner acceptance', body: 'Acceptance body.' };
   const preflight = { id: 5029607103, sourceCommentId: 5029607103, body: '## Manager preflight packet\nBounded scope.' };
-  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium' };
   const worktreeIdentity = { name: 'agent-runner-686-5029607103', expectedBranch: 'worktree-agent-runner-686-5029607103' };
   const prompt = buildPreflightDirectPrompt({
     issue, preflight, profile, clearContext: true,

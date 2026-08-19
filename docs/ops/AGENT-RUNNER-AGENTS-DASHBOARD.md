@@ -92,7 +92,7 @@ describes.
 | Model/profile, capability classes | `instance.model`/`profile` (unchanged) + `instance.capabilities` (new, static) |
 | Context/output limits | Honestly reported as "not modeled by this adapter's control surface" — this runner has no such field for any adapter; `timeout` (wall-clock, not tokens) is shown alongside it |
 | Authentication status | `GET /api/secrets/:id` status enum only — never a value |
-| Cost class, budget/cap, quota | `computeInstanceQuota()` (new) + `instance.policy.requireHumanApproval` (unchanged) |
+| Cost class, subscription source, quota | `computeInstanceQuota()` (new) + `instance.policy.requireHumanApproval` (unchanged) |
 | Current task/slot | `instance.load` (unchanged #46 field) |
 | Readiness time, settings revision, last state change | Readiness time is stamped client-side at fetch completion; revision comes from `GET /api/settings/revisions`; last state change is derived client-side from `GET /api/audit`'s already value-free `changedFields` |
 | Explanations for unavailable actions | `describeActionAvailability()` in `agents-dashboard-view.mjs` |

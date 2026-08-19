@@ -37,7 +37,7 @@ export function buildSafetyAuthorityInvariantsSection() {
     'Runner safety/authority invariants:',
     '- Use the selected model/effort profile; do not escalate model/effort unless the task is blocked and you record why.',
     '- Work directly in this single session. Do not invoke Agent/Task subagents or delegate discovery in an unattended run.',
-    '- Keep reads bounded to the issue and supplied preflight. Continue until the issue is complete or a genuine blocker is reached; remain within the configured monetary and safety policies.',
+    '- Keep reads bounded to the issue and supplied preflight. Continue until the issue is complete or a genuine blocker is reached; remain within the configured safety and authorization policies.',
     '- Use the smallest complete change.',
     '- Do not hardcode secrets.',
     '- Stop if scope expands, validation becomes unclear, or external credentials/human decisions are needed.',
@@ -83,7 +83,7 @@ export function buildClaudeAdapterIdentitySection({ repositoryIdentityLine, mode
 export function buildDynamicTaskIdentitySection({ issue, profile }) {
   return joinSections([
     `Issue: #${issue.number} — ${issue.title}`,
-    `Model/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}\n- max budget usd: ${profile.maxBudgetUsd}`,
+    `Model/effort profile selected by runner:\n- profile: ${profile.profile}\n- model: ${profile.model}\n- effort: ${profile.effort}`,
   ]);
 }
 

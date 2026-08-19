@@ -128,7 +128,7 @@ A missing DB returns a structured diagnostic instead of crashing, so a fresh che
 
 ## Agent Runner v3.1: agent adapter boundary
 
-`scripts/ops/agent-runner-agents.mjs` defines the small agent/runtime adapter map used by the current ModelSpend runner. Claude Code CLI remains the only implemented runtime. The adapter records the implemented Claude labels (`agent:claude`, `agent:claude-code-cli`), command name, supported controls (`model`, `effort`, `maxTurns`, `maxBudgetUsd`, `permissionMode`, `resumeSession`, and text output format), and command-argument builder used by `scripts/ops/claude-runner.mjs`.
+`scripts/ops/agent-runner-agents.mjs` defines the small agent/runtime adapter map used by the current ModelSpend runner. Claude Code CLI remains the only implemented runtime. The adapter records the implemented Claude labels (`agent:claude`, `agent:claude-code-cli`), command name, supported controls (`model`, `effort`, `permissionMode`, `resumeSession`, and text output format), and command-argument builder used by `scripts/ops/claude-runner.mjs`.
 
 Future labels for Codex, GPT/OpenAI, Gemini, and Ollama are registered only as unsupported placeholders. The cron selector can report `unsupported-agent` when an operator explicitly includes one of those labels, but it does not execute those tools and does not assume their CLI flags. Default cron selection remains Claude-only.
 
