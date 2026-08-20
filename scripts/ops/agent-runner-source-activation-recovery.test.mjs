@@ -100,7 +100,7 @@ function harness({ newer = [], currentHead = CURRENT, activation = null, state =
   };
 }
 
-test('stale applied state reconciles only through one newer approved exact-current-head authority', async () => {
+test('stale applied state reconciles through a newer approved exact-current-head authority', async () => {
   const next = authorityComment({
     id: 101,
     revision: 'AR-SOURCE-ACTIVATE-2026-08-20.6',
@@ -123,6 +123,22 @@ test('stale applied state reconciles only through one newer approved exact-curre
   assert.equal(h.writes[0].finalHead, CURRENT);
 });
 
+test('stale applied state may cross valid historical generations but only the newest may match current HEAD', async () => {
+  const h = harness({
+    newer: [
+      authorityComment({ id: 101, revision: 'AR-SOURCE-ACTIVATE-2026-08-20.6', target: OTHER }),
+      authorityComment({ id: 102, revision: 'AR-SOURCE-ACTIVATE-2026-08-20.7', target: CURRENT }),
+    ],
+  });
+  const result = await recoverAppliedSourceActivationHeadMismatch(h.options);
+  assert.equal(result.action, 'reexec');
+  assert.equal(result.sourceCommentId, 102);
+  assert.equal(result.targetCommit, CURRENT);
+  assert.equal(h.calls.activate, 1);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.writes[0].sourceCommentId, 102);
+});
+
 test('unexplained applied-head drift with no newer authority remains fail closed and immutable', async () => {
   const h = harness();
   const result = await recoverAppliedSourceActivationHeadMismatch(h.options);
@@ -132,13 +148,13 @@ test('unexplained applied-head drift with no newer authority remains fail closed
   assert.equal(h.writes.length, 0);
 });
 
-test('newer authority must target the exact current canonical HEAD', async () => {
-  const next = authorityComment({
-    id: 101,
-    revision: 'AR-SOURCE-ACTIVATE-2026-08-20.6',
-    target: OTHER,
+test('newest authority must target the exact current canonical HEAD', async () => {
+  const h = harness({
+    newer: [
+      authorityComment({ id: 101, revision: 'AR-SOURCE-ACTIVATE-2026-08-20.6', target: CURRENT }),
+      authorityComment({ id: 102, revision: 'AR-SOURCE-ACTIVATE-2026-08-20.7', target: OTHER }),
+    ],
   });
-  const h = harness({ newer: [next] });
   const result = await recoverAppliedSourceActivationHeadMismatch(h.options);
   assert.equal(result.action, 'halt');
   assert.equal(result.reason, 'source-activation-recovery-target-head-mismatch');
@@ -146,46 +162,36 @@ test('newer authority must target the exact current canonical HEAD', async () =>
   assert.equal(h.writes.length, 0);
 });
 
-test('malformed or unapproved newer authority cannot replace the stale applied record', async () => {
+test('malformed or unapproved newer authority anywhere in the chain cannot replace the stale applied record', async () => {
   const malformed = authorityComment({
     id: 101,
     revision: 'AR-SOURCE-ACTIVATE-2026-08-20.6',
-    target: CURRENT,
+    target: OTHER,
     fingerprint: `sha256:${'f'.repeat(64)}`,
   });
-  const invalid = harness({ newer: [malformed] });
+  const invalid = harness({
+    newer: [
+      malformed,
+      authorityComment({ id: 102, revision: 'AR-SOURCE-ACTIVATE-2026-08-20.7', target: CURRENT }),
+    ],
+  });
   const invalidResult = await recoverAppliedSourceActivationHeadMismatch(invalid.options);
   assert.equal(invalidResult.action, 'halt');
   assert.equal(invalidResult.reason, 'source-activation-recovery-authority-invalid');
   assert.equal(invalid.calls.activate, 0);
   assert.equal(invalid.writes.length, 0);
 
-  const unapproved = authorityComment({
-    id: 101,
-    revision: 'AR-SOURCE-ACTIVATE-2026-08-20.6',
-    target: CURRENT,
-    login: 'worker-bot',
+  const denied = harness({
+    newer: [
+      authorityComment({ id: 101, revision: 'AR-SOURCE-ACTIVATE-2026-08-20.6', target: OTHER, login: 'worker-bot' }),
+      authorityComment({ id: 102, revision: 'AR-SOURCE-ACTIVATE-2026-08-20.7', target: CURRENT }),
+    ],
   });
-  const denied = harness({ newer: [unapproved] });
   const deniedResult = await recoverAppliedSourceActivationHeadMismatch(denied.options);
   assert.equal(deniedResult.action, 'halt');
   assert.equal(deniedResult.reason, 'source-activation-recovery-author-unapproved');
   assert.equal(denied.calls.activate, 0);
   assert.equal(denied.writes.length, 0);
-});
-
-test('ambiguous newer source authorities fail closed without activation or durable mutation', async () => {
-  const h = harness({
-    newer: [
-      authorityComment({ id: 101, revision: 'AR-SOURCE-ACTIVATE-2026-08-20.6', target: CURRENT }),
-      authorityComment({ id: 102, revision: 'AR-SOURCE-ACTIVATE-2026-08-20.7', target: CURRENT }),
-    ],
-  });
-  const result = await recoverAppliedSourceActivationHeadMismatch(h.options);
-  assert.equal(result.action, 'halt');
-  assert.equal(result.reason, 'source-activation-recovery-authority-ambiguous');
-  assert.equal(h.calls.activate, 0);
-  assert.equal(h.writes.length, 0);
 });
 
 test('edited previously consumed authority blocks recovery before activation', async () => {
