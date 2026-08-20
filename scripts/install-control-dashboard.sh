@@ -179,7 +179,7 @@ probe_unit_enabled_state() {
         return 1
       fi
       ;;
-    *) printf 'ERROR: could not determine whether %s is enabled (status %s)\n' "$SERVICE_NAME" "$rc" >&2; return 1 ;;
+    *) printf 'ERROR: could not determine whether %s is enabled (status %s, state %q)\n' "$SERVICE_NAME" "$rc" "$output" >&2; return 1 ;;
   esac
 }
 
@@ -189,7 +189,18 @@ probe_unit_active_state() {
   case "$output" in
     active) printf 'active\n' ;;
     inactive|failed) printf 'inactive\n' ;;
-    *) printf 'ERROR: could not determine whether %s is active (status %s)\n' "$SERVICE_NAME" "$rc" >&2; return 1 ;;
+    *) printf 'ERROR: could not determine whether %s is active (status %s, state %q)\n' "$SERVICE_NAME" "$rc" "$output" >&2; return 1 ;;
+  esac
+}
+
+probe_unit_startup_state() {
+  local output rc
+  if output=$(systemctl --user is-active "$SERVICE_NAME" 2>/dev/null); then rc=0; else rc=$?; fi
+  case "$output" in
+    active) printf 'active\n' ;;
+    activating) printf 'activating\n' ;;
+    inactive|failed) printf 'inactive\n' ;;
+    *) printf 'ERROR: could not determine whether %s is starting (status %s, state %q)\n' "$SERVICE_NAME" "$rc" "$output" >&2; return 1 ;;
   esac
 }
 
@@ -249,14 +260,14 @@ verify_shell_health() {
 }
 
 wait_for_runtime_health() {
-  local attempt active_state
+  local attempt startup_state
   for (( attempt=1; attempt<=STARTUP_VERIFY_ATTEMPTS; attempt++ )); do
-    active_state=$(probe_unit_active_state) || return 1
-    if [[ "$active_state" != active ]]; then
-      printf 'ERROR: %s is not active\n' "$SERVICE_NAME" >&2
+    startup_state=$(probe_unit_startup_state) || return 1
+    if [[ "$startup_state" == inactive ]]; then
+      printf 'ERROR: %s became inactive before its listener was healthy\n' "$SERVICE_NAME" >&2
       return 1
     fi
-    if verify_exact_listener >/dev/null 2>&1; then
+    if [[ "$startup_state" == active ]] && verify_exact_listener >/dev/null 2>&1; then
       if ! verify_shell_health; then
         printf 'ERROR: dashboard shell health check failed after listener became ready\n' >&2
         return 1
@@ -267,8 +278,10 @@ wait_for_runtime_health() {
       sleep "$STARTUP_VERIFY_INTERVAL"
     fi
   done
-  printf 'ERROR: %s did not establish %s:%s within the bounded startup window\n' \
+  printf 'ERROR: %s did not become active with %s:%s within the bounded startup window\n' \
     "$SERVICE_NAME" "$FIXED_HOST" "$PORT" >&2
+  startup_state=$(probe_unit_startup_state 2>/dev/null || true)
+  [[ -n "$startup_state" ]] && printf 'ERROR: final startup state: %s\n' "$startup_state" >&2
   verify_exact_listener || true
   return 1
 }

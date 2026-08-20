@@ -71,7 +71,16 @@ case "$cmd" in
     if [[ ! -f "$unit" ]]; then echo not-found; exit 4; fi
     echo disabled; exit 1 ;;
   is-active)
-    if [[ -f "$FAKE_STATE/active" ]]; then echo active; exit 0; fi
+    if [[ -f "$FAKE_STATE/activating-after-stop" ]]; then echo activating; exit 3; fi
+    if [[ -f "$FAKE_STATE/active" ]]; then
+      count=0
+      [[ ! -f "$FAKE_STATE/is-active-count" ]] || count=$(cat "$FAKE_STATE/is-active-count")
+      count=$((count + 1))
+      printf '%s' "$count" >"$FAKE_STATE/is-active-count"
+      activating_count=\${FAKE_STARTUP_ACTIVATING_COUNT:-0}
+      if (( count <= activating_count )); then echo activating; exit 3; fi
+      echo active; exit 0
+    fi
     echo inactive; exit 3 ;;
   enable)
     touch "$FAKE_STATE/enabled"
@@ -79,8 +88,12 @@ case "$cmd" in
     ln -sfn "$unit" "$wants" ;;
   disable)
     rm -f "$FAKE_STATE/enabled" "$wants" ;;
-  start|restart) touch "$FAKE_STATE/active" ;;
-  stop) rm -f "$FAKE_STATE/active" ;;
+  start|restart)
+    rm -f "$FAKE_STATE/activating-after-stop" "$FAKE_STATE/is-active-count"
+    touch "$FAKE_STATE/active" ;;
+  stop)
+    rm -f "$FAKE_STATE/active"
+    if [[ \${FAKE_STOP_STAYS_ACTIVATING:-0} == 1 ]]; then touch "$FAKE_STATE/activating-after-stop"; else rm -f "$FAKE_STATE/activating-after-stop"; fi ;;
   daemon-reload) : ;;
   status) [[ -f "$FAKE_STATE/active" ]] ;;
 esac
@@ -162,6 +175,17 @@ test('fresh install waits through the Type=simple startup window before requirin
   assert.equal(existsSync(fixture.wants), true);
 });
 
+test('fresh install tolerates a bounded activating state before becoming active', (t) => {
+  if (process.platform !== 'linux') return t.skip('systemd installer contract is Linux-only');
+  if (process.getuid?.() === 0) return t.skip('installer correctly refuses root');
+  const fixture = makeFixture(t);
+  const result = fixture.run({ FAKE_STARTUP_ACTIVATING_COUNT: '2' });
+  assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+  assert.match(result.stdout, /INSTALLED: agent-runner-control\.service is enabled and healthy/);
+  assert.equal(existsSync(fixture.unit), true);
+  assert.equal(existsSync(fixture.wants), true);
+});
+
 test('fresh activation failure restores the absent state without a dangling wants link or status-4 rollback error', (t) => {
   if (process.platform !== 'linux') return t.skip('systemd installer contract is Linux-only');
   if (process.getuid?.() === 0) return t.skip('installer correctly refuses root');
@@ -173,6 +197,16 @@ test('fresh activation failure restores the absent state without a dangling want
   assert.doesNotMatch(result.stderr, /could not determine whether agent-runner-control\.service is enabled/);
   assert.equal(existsSync(fixture.unit), false);
   assert.equal(existsSync(fixture.wants), false);
+});
+
+test('rollback remains fail-closed if stop leaves the service in activating state', (t) => {
+  if (process.platform !== 'linux') return t.skip('systemd installer contract is Linux-only');
+  if (process.getuid?.() === 0) return t.skip('installer correctly refuses root');
+  const fixture = makeFixture(t);
+  const result = fixture.run({ FAKE_ALWAYS_NO_LISTENER: '1', FAKE_STOP_STAYS_ACTIVATING: '1' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /rollback could not fully restore previous service state/);
+  assert.equal(existsSync(fixture.unit), true, 'strict rollback must preserve the unit when stop state is transient');
 });
 
 test('fresh preflight collision preserves the absent state without trying to stop a nonexistent unit', (t) => {
