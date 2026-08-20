@@ -7,13 +7,13 @@ import * as ops from './agents-overview-view.mjs';
  * formatting decision lives in the two framework-free, unit-tested view
  * modules imported above.
  *
- * Session handling is unchanged from #47 and deliberately minimal:
  * `sessionState.csrfToken` lives only in this closure (never
- * `localStorage`/`sessionStorage`/a DOM attribute/a cookie JS can read) and
- * is discarded on reload, so a reload always requires a fresh login,
- * matching the server's in-memory session model exactly. The session cookie
- * itself is HttpOnly, so this script never even has the option of touching
- * it. Credential `<input type="password">` values are cleared synchronously,
+ * `localStorage`/`sessionStorage`/a DOM attribute/a cookie JS can read).
+ * A page reload rehydrates that ephemeral value from the authenticated
+ * same-origin `/api/session` context endpoint using the existing HttpOnly
+ * session cookie. Nothing is persisted by this script, while logout, TTL
+ * expiry and a service restart still invalidate the server-side session.
+ * Credential `<input type="password">` values are cleared synchronously,
  * before the request that reads them settles.
  *
  * Nothing on this page is persisted anywhere in the browser — not even the
@@ -913,6 +913,19 @@ async function handleLoginSubmit(event) {
   startRefreshLoop();
 }
 
+async function bootstrapSession() {
+  const result = await apiFetch('/api/session');
+  if (!result.ok || !result.json?.csrfToken || !result.json?.username) {
+    sessionState.csrfToken = null;
+    showLogin();
+    return;
+  }
+  sessionState.csrfToken = result.json.csrfToken;
+  showShell(result.json.username);
+  await refreshAll();
+  if (sessionState.csrfToken) startRefreshLoop();
+}
+
 async function handleLogout() {
   await apiFetch('/api/session/logout', { method: 'POST' });
   sessionState.csrfToken = null;
@@ -1105,7 +1118,7 @@ function init() {
     }
   });
 
-  showLogin();
+  bootstrapSession();
 }
 
 if (document.readyState === 'loading') {
