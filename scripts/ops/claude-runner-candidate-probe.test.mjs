@@ -9,20 +9,32 @@ test('candidate probe reports no candidate for an empty queue', () => {
     selectedIssue: null,
     selectionMode: null,
     skipCount: 0,
+    candidateSnapshot: null,
   });
 });
 
-test('candidate probe recognises an already-runnable selected issue', () => {
-  assert.deepEqual(candidateFromSelection({
-    issue: { number: 711 },
+test('candidate probe recognises an already-runnable selected issue and emits a sanitized handoff snapshot', () => {
+  const result = candidateFromSelection({
+    issue: {
+      number: 711,
+      labels: ['status:ready', 'agent:claude-code-cli'],
+      statusLabel: 'status:ready',
+      agentLabel: 'agent:claude-code-cli',
+    },
     selection: { mode: 'preflight-direct' },
     skipped: [],
-  }), {
-    candidate: true,
-    selectedIssue: 711,
-    selectionMode: 'preflight-direct',
-    skipCount: 0,
   });
+
+  assert.equal(result.candidate, true);
+  assert.equal(result.selectedIssue, 711);
+  assert.equal(result.selectionMode, 'preflight-direct');
+  assert.equal(result.skipCount, 0);
+  assert.equal(result.candidateSnapshot.issueNumber, 711);
+  assert.equal(result.candidateSnapshot.statusLabel, 'status:ready');
+  assert.equal(result.candidateSnapshot.agentLabel, 'agent:claude-code-cli');
+  assert.equal(result.candidateSnapshot.resolvedAgentId, 'claude-code-cli');
+  assert.equal(result.candidateSnapshot.selectionMode, 'preflight-direct');
+  assert.equal(Object.prototype.hasOwnProperty.call(result.candidateSnapshot, 'body'), false);
 });
 
 test('candidate probe does not treat missing manager authority as locally repairable', () => {
@@ -31,6 +43,7 @@ test('candidate probe does not treat missing manager authority as locally repair
     skipped: [{ issue: 711, reason: 'manager-preflight-required' }],
   });
   assert.equal(result.candidate, false);
+  assert.equal(result.candidateSnapshot, null);
 });
 
 test('empty-poll payload records no-selection without pretending a quota sample occurred', () => {
