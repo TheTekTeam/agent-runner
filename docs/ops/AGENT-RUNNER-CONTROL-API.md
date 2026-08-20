@@ -1,297 +1,69 @@
-# Authenticated machine-local control service (issue #46)
+# Authenticated machine-local control service (issues #46, #174, #175)
 
-Status: **foundation only — not wired into any installer, systemd unit,
-timer, or the live scheduler.** This is a manually-launched service for an
-operator on the same machine. See `TheTekTeam/agent-runner#41` for the MVP
-sequencing this slice belongs to, `#5` for the separate reliability/live-
-activation gate, `#40` for the agent-lifecycle settings contract this
-service writes to, and `#45` for the protected secret store it integrates
-with write-only.
+Status: **permanent repository-managed control service, loopback-only and authenticated.** The service is installed as the hardened systemd user unit documented in [`AGENT-RUNNER-CONTROL-SERVICE.md`](AGENT-RUNNER-CONTROL-SERVICE.md) and defaults to `127.0.0.1:8789`. Port `8787` is reserved for event ingress.
 
-## What this adds
+The HTTP security and data-boundary contract from #46 remains unchanged: the service is not a LAN/public listener, never returns secret values, never writes runner execution SQLite, and does not change scheduler, quota, provider, admission, event-transport, exporter/Grafana, or source-activation semantics.
 
-- `scripts/ops/agent-runner-control-settings-store.mjs` — atomic,
-  optimistically-versioned read/write access to the same
-  `agent-settings.json` file `agent-runner-agent-settings.mjs` (#40) already
-  reads. A write here is a normal file write with no cache in front of it,
-  so the very next `getAgentSettings()`/`isAgentRoutable()` call — the
-  pre-claim gate — sees it, with no service restart required.
-- `scripts/ops/agent-runner-control-instances.mjs` — the instance registry:
-  creation gated to the approved `AGENT_ADAPTERS` catalogue
-  (`agent-runner-agents.mjs`), a positive field allowlist for updates
-  (`model`, `profile`, `endpoint`, `timeout`, `maxConcurrency`, `policy`),
-  the four #40 lifecycle transitions (`enabled`/`paused`/`draining`/
-  `disabled`), derived read-only `unsupported`/`unavailable` states, and the
-  `claimEligibility()`/`evaluateClaimEligibility()` pre-claim gate.
-- `scripts/ops/agent-runner-control-readiness.mjs` — deterministic,
-  zero-process-spawn readiness checks (a pure `accessSync` walk of `PATH`)
-  and a read-only "current load" derived from the existing dashboard
-  summary.
-- `scripts/ops/agent-runner-control-auth.mjs` — operator authentication
-  (scrypt-hashed credential verifier, never the plaintext password) and
-  in-memory, expiring, HttpOnly/`SameSite=Strict` sessions.
-- `scripts/ops/agent-runner-control-csrf.mjs` — double-submit CSRF token
-  validation and strict loopback-only Origin/Referer validation.
-- `scripts/ops/agent-runner-control-audit.mjs` — an append-only audit trail
-  that is structurally incapable of carrying a value: its only content
-  parameter is `changedFields: string[]`.
-- `scripts/ops/agent-runner-control-server.mjs` — the `node:http` server
-  wiring all of the above together, with a hard loopback-only bind refusal
-  checked *before* any `listen()` call.
+## Starting and accessing the service
 
-Nothing here modifies `claude-runner-cron.mjs`, `agent-runner-agents.mjs`,
-or any ModelSpend product code. `claimEligibility()`/
-`evaluateClaimEligibility()` prove the disabled/draining-ineligible
-property in isolation (see Validation below); wiring that gate into the
-live scheduler is explicitly out of scope for this issue (see
-`prohibited_work` in the governing manager packet: no automatic routing, no
-live issue execution, no scope expansion into multi-agent routing).
-
-## Running it
-
-There is no installer, systemd unit, or CLI flag that starts this
-automatically. To try it locally:
+Use the lifecycle installer; do not launch a long-lived production instance manually:
 
 ```bash
-node -e "
-import('./scripts/ops/agent-runner-control-auth.mjs').then(({ setOperatorCredential }) => {
-  setOperatorCredential({ username: 'operator', password: 'a-strong-local-password-16+chars' });
-});
-"
-node scripts/ops/agent-runner-control-server.mjs --port 8787
+scripts/install-control-dashboard.sh install
+scripts/install-control-dashboard.sh verify
+scripts/install-control-dashboard.sh status
 ```
 
-The server binds `127.0.0.1` by default. Any other `--host` value throws
-before a socket is ever opened — see "Loopback-only binding" below.
+The browser endpoint is `http://127.0.0.1:8789/` by default. Remote browser access must use an operator-controlled tunnel to that loopback endpoint. There is no supported host override.
 
-## Four sinks, never a fifth
+The installer does not create or rotate the operator credential. Bootstrap it separately with `setOperatorCredential()` as described in `AGENT-RUNNER-CONTROL-SERVICE.md`.
 
-Every request handler in `agent-runner-control-server.mjs` only ever
-touches:
+## CLI and bind contract
 
-1. the control settings document (`agent-settings.json`) — metadata and
-   `secretref:`-shaped strings only, never a secret value;
-2. the #45 protected secret store — values, **write-only**: nothing in this
-   service ever reads a value back out of it;
-3. the control audit log — actor/source/time/revision/changed-field-*names*
-   only;
-4. the operator-credential verifier — a scrypt hash comparison only.
+`scripts/ops/agent-runner-control-server.mjs` has a production CLI default of `127.0.0.1:8789`. Its only runtime option is `--port` with a canonical decimal value from `1` through `65535`; missing, zero, signed, whitespace-padded, suffixed, leading-zero, out-of-range, duplicate, and unknown arguments are rejected. Programmatic tests may still call `listenControlServer(..., { port: 0 })` for an ephemeral socket.
 
-Nothing here opens the runner SQLite state DB for writing. There are two
-SQLite *reads*: `computeInstanceLoad()`'s reuse of the existing,
-already-exported `buildRunnerDashboard()` — the same read-only summary the
-static dashboard already renders — to report whether `claude-code-cli`
-currently has an outstanding claim; and `GET /api/overview`'s
-`readControlOverview()` (issue #175), which goes through the operator CLI's
-`readOnlyRunnerStateSnapshot()` private-snapshot path and therefore cannot
-create, migrate or write the live database — not even a `-wal`/`-shm`
-sidecar. This is the concrete, structural reason a secret value
-can never reach SQLite, dashboard payloads, or a snapshot: there is no code
-path from a secret value to any of those three.
+The underlying `resolveBindHost()` still fails closed before `listen()` for non-loopback hosts. Production CLI/service wiring never supplies a non-loopback host.
 
-No route logs a request body. A validation failure on a bad secret value
-reports a bounded reason code (`secret-value-required`,
-`secret-create-failed`, …), never an echo of what was submitted.
+## Writable sinks and read-only runner state
 
-## `GET /api/overview` — the read-only operational projection (#175)
+Dynamic control handlers retain the established control surfaces: control settings, the protected write-only secret store, the append-only control audit log, and in-memory authentication/session state. The persistent operator credential is read only for verification. Runner execution SQLite remains read-only; `GET /api/overview` uses the established read-only snapshot path.
 
-One authenticated, read-only route backs the operations console's Overview
-and Activity views. It is deliberately the *smallest* positive-allowlist
-read surface that renders those views, and it is canonical by construction
-rather than by imitation: `agent-runner-control-overview.mjs` composes the
-same read path (`readOnlyRunnerStateSnapshot()`) and the same pure
-derivations (`buildRunnerActivity()`, `buildRunnerMetrics()`,
-`buildRunnerOperatorStatus()`) that `agent-runner-operator-status.mjs`
-already composes for the `status` CLI. A test asserts field-for-field
-parity against `buildOperatorStatus()` for the same database, so the
-standalone dashboard and the CLI cannot silently disagree.
+No route logs request bodies. Error responses use bounded reason codes and never echo submitted secret values.
 
-Response shape (fixed allowlist): `ok`, `schemaVersion`, `generatedAt`,
-`project` (`projectId`/`displayName`/`githubRepo` only), `links`,
-`stateAvailable`, `runner`, `operatorStatusCode`, `scheduler`,
-`currentTask`, `queue`, `runs`, `quota`, `health`, `attention`,
-`notifications`, `circuit`, `activity`.
+The user unit reinforces the boundary: only `~/.config/agent-runner`, `~/.local/state/agent-runner/secrets`, and the exact `~/.local/state/agent-runner/control-audit.jsonl` file are writable. The rest of Agent Runner state is read-only.
 
-Never included, at any nesting depth: any filesystem path (including
-`projectIdentity().localRepoPath` and the state `dbPath`), raw `latest.*`
-state rows, `payload_json`, `attention_events.dashboard_reference`,
-prompts, provider output, raw errors, manager packet or comment bodies,
-tokens, credentials or session handles. Every string that does reach the
-wire passes through a `boundedText`/`boundedReason`/`boundedCount`/
-`boundedTimestamp` narrowing, and `boundedReason()` additionally replaces
-anything path-shaped with `[path-redacted]`.
+## Static shell and unauthenticated health
 
-Other properties:
+`GET /` and the fixed repository static assets are intentionally available before dynamic API authentication because a browser must load the login shell before a session exists. They contain no runner/settings/secret/session/audit data and use the existing CSP and `nosniff` protections.
 
-- authenticated, origin/Referer-checked, GET-only — `POST`/`PATCH`/`DELETE`
-  on this path are not routable at all;
-- no mutation caused by a read, proven with before/after durable-state
-  evidence over the whole state directory and the whole control-service
-  directory;
-- a missing or unreadable state database fails closed to
-  `runner.code = "unavailable"` with an explanation and a safe next action
-  — never to `healthy`;
-- bounded payload (activity capped at 40 events, lists at 12, strings at
-  160–200 characters) and short-TTL server-side memoisation so a polling
-  browser tab cannot cause one systemd spawn plus one SQLite snapshot copy
-  per request.
-
-Grafana must **not** consume this route; it continues to use the read-only
-exporter from `#1`. Optional operator-configured companion links are read
-from `AGENT_RUNNER_GRAFANA_RUNNER_URL`,
-`AGENT_RUNNER_GRAFANA_OPERATIONS_URL` and
-`AGENT_RUNNER_LEGACY_DASHBOARD_URL`; each must be an absolute `http(s)` URL
-with no userinfo component or it is dropped. The page renders them as
-anchors and never fetches them, so an unavailable Grafana cannot affect the
-console.
-
-## Loopback-only binding
-
-`resolveBindHost()` checks the requested host against an allowlist of
-exactly `127.0.0.1`, `localhost`, `::1` and throws
-`AGENT_RUNNER_CONTROL_NON_LOOPBACK_BIND_REFUSED` for anything else —
-`0.0.0.0`, a LAN IP, a hostname — **before** `createControlServer()`
-constructs anything that could be passed to `listen()`. There is no flag,
-environment variable, or code path in this foundation that reaches
-`server.listen()` with an unvalidated host. LAN exposure behind an
-authenticated reverse proxy is explicitly out of scope for this
-implementation (see the governing manager packet's `scope`).
+The service installer uses a bounded unauthenticated `GET /` as its post-activation health check. It sends no credentials, cookies, CSRF token, or request body. All dynamic `/api/*` data remains protected by the existing authentication/origin/CSRF contract.
 
 ## Authentication and sessions
 
-`setOperatorCredential()` is a local, machine-local bootstrap/rotation
-function — it is **never** exposed as an HTTP route, since there would be
-no way to authenticate a request to change the credential before one
-exists. It stores `{ algorithm: 'scrypt', salt, hash }` at mode `0600`
-(`~/.local/state/agent-runner/control-operator.json` by default, override
-with `AGENT_RUNNER_CONTROL_OPERATOR_PATH`) — never the plaintext password.
+The operator credential is scrypt-hashed and bootstrapped separately; plaintext is never persisted by the service. Login creates an in-memory session with an HttpOnly `SameSite=Strict` cookie and a CSRF token. Sessions are intentionally memory-only, so a service restart requires login again. This is why an unchanged reinstall is explicitly restart-free.
 
-`POST /api/session/login` verifies with `crypto.timingSafeEqual` and, on
-success, issues an in-memory session: a random 32-byte session id (an
-HttpOnly, `SameSite=Strict` cookie) plus a random 32-byte CSRF token
-(returned in the response **body**, not the cookie — the double-submit
-pattern below depends on this). Sessions are **never persisted to disk**;
-a service restart always requires a fresh login. This is a deliberate
-trade-off: no session token exists anywhere for "restart persistence" to
-even be a question for.
+Every authenticated API read/write is subject to strict loopback Origin/Referer validation. Mutations additionally require the session CSRF token.
 
-## CSRF and origin
+## Existing API contracts
 
-Every mutating route (`POST`/`PATCH`/`DELETE`) requires an `X-CSRF-Token`
-header that matches the session's token via `crypto.timingSafeEqual`. A
-cross-site request can rely on the browser attaching the session cookie
-automatically, but has no way to read the login response body to learn the
-token — that is the double-submit property.
+The #46/#175 contracts remain authoritative: instances are limited to approved adapters; settings writes use positive allowlists and optimistic revisions; lifecycle targets remain bounded; credentials remain write-only; `GET /api/overview` remains a positive-allowlist read-only projection; and readiness does not make paid/live provider calls.
 
-Independently, **every** API request (read or write) is checked against a
-strict `Origin` (falling back to `Referer`) allowlist built from the
-loopback host/port the server actually bound to. A missing header or any
-value outside that allowlist — including a LAN address — is rejected with
-`403`, before authentication is even checked.
+Grafana must not consume the control API. Grafana continues to use the independent read-only exporter.
 
-## Instance registry
+## Service lifecycle and validation
 
-An "instance" is one entry, keyed by agent id, in the control settings
-document's `agents` map (the same map `agent-runner-agent-settings.mjs`
-reads). `POST /api/instances` only accepts an `agentId` present in the
-frozen `AGENT_ADAPTERS` catalogue (`agent-runner-agents.mjs`) — there is no
-path to register an arbitrary/unknown adapter id.
+See `AGENT-RUNNER-CONTROL-SERVICE.md` for install/verify/status/enable/disable/remove, strict port validation, rendered-unit hardening, collision checks, exact listener verification, changed-upgrade rollback, state preservation, and the post-merge Dell acceptance gate.
 
-Updates (`PATCH /api/instances/:id/settings`) go through a **positive**
-field allowlist — `model`, `profile`, `endpoint`, `timeout`,
-`maxConcurrency`, `policy` — and reject the entire update (not partially)
-if any submitted field is outside it. `executablePath` and any future
-adapter-specific field are structurally unreachable through this API.
-`endpoint` accepts only loopback `http(s)` URLs. `maxConcurrency` accepts
-only the literal `1` — there is no writable value that increases
-concurrency. `policy` is a closed two-key object
-(`requireHumanApproval`, `notes`); there is no key anywhere in this API
-that can enable paid fallback or automatic routing.
-
-Lifecycle transitions (`POST /api/instances/:id/lifecycle`) only ever
-accept `enabled`, `paused`, `draining`, `disabled` — the exact #40
-contract. `unsupported` (the adapter is not `implemented`) and
-`unavailable` (a readiness probe failed) are computed at read time in
-`deriveInstanceState()` and are never accepted as a transition target.
-
-## Deterministic readiness, no paid or live provider calls
-
-`probeCommandOnPath()` is a pure, synchronous `PATH` walk
-(`accessSync(candidate, X_OK)` per directory) — it never spawns a process
-and never opens a socket. An unimplemented catalogue adapter is never
-probed at all (its effective state is already forced to `unsupported`).
-"Current load" reuses the existing read-only `buildRunnerDashboard()` to
-report whether `claude-code-cli` has an outstanding claim; every other
-adapter reports a static `capacity: 1, active: 0` (honest, not fabricated —
-this foundation does not yet track their load).
-
-## Optimistic concurrency, atomic replacement, rollback
-
-Every settings write goes through `agent-runner-control-settings-store.mjs`:
-an exclusive per-file lock serializes writers, and an optional
-`expectedRevision` is checked against the on-disk revision *before*
-anything is touched — a stale write is rejected with `409` and the last
-known good revision is untouched. Every successful write is a temp-file +
-`rename(2)` (the same atomic-write pattern `agent-runner-secret-store.mjs`
-uses), and the document it replaces is first snapshotted into a bounded
-history directory. `POST /api/settings/rollback` restores a retained
-revision's content as a **new**, monotonically higher revision — rollback
-never rewinds the revision counter, so no other reader's optimistic-
-concurrency expectations become invalid.
-
-## Write-only secret integration (#45)
-
-`POST /api/secrets/:id`, `POST /api/secrets/:id/rotate`, and
-`DELETE /api/secrets/:id` call `createSecret`/`rotateSecret`/`removeSecret`
-directly from `agent-runner-secret-store.mjs`. The submitted `value` is
-read from the parsed request body and handed straight to that function —
-it is never assigned to a variable that is logged, audited, or included in
-a response. `GET /api/secrets/:id` returns only the safe status enum
-(`configured`/`missing`/`invalid`/`rotation-required`) from
-`getSecretStatus()`.
-
-## Known limitations
-
-- Single-operator authentication only; there is no multi-user or
-  role-based access model in this foundation.
-- Readiness/load reads exist only for the two catalogue entries that need
-  them today (`claude-code-cli`'s PATH presence and dashboard-derived
-  load); other adapters report a static "not yet tracked" load rather than
-  a live probe, since wiring their `implemented: false` catalogue entries
-  to real health checks is future, separately-scoped work.
-- No HTML/browser client ships with this foundation — API/`curl` only —
-  which is also how "no provider token in browser storage" is made moot
-  rather than merely avoided.
-- LAN exposure behind an authenticated reverse proxy, live routing wiring
-  into `claude-runner-cron.mjs`, concurrency beyond 1, and the recurring
-  execution timer all remain explicitly out of scope.
-
-## Validation
+Focused service coverage is in `scripts/ops/agent-runner-control-dashboard-service.test.mjs`; the existing control-server/security tests remain authoritative for HTTP behavior.
 
 ```bash
-node --check scripts/ops/agent-runner-control-settings-store.mjs \
-  scripts/ops/agent-runner-control-instances.mjs \
-  scripts/ops/agent-runner-control-readiness.mjs \
-  scripts/ops/agent-runner-control-auth.mjs \
-  scripts/ops/agent-runner-control-csrf.mjs \
-  scripts/ops/agent-runner-control-audit.mjs \
-  scripts/ops/agent-runner-control-server.mjs
-
-node --test scripts/ops/agent-runner-control-settings-store.test.mjs \
-  scripts/ops/agent-runner-control-instances.test.mjs \
-  scripts/ops/agent-runner-control-readiness.test.mjs \
-  scripts/ops/agent-runner-control-auth.test.mjs \
-  scripts/ops/agent-runner-control-csrf.test.mjs \
-  scripts/ops/agent-runner-control-audit.test.mjs \
-  scripts/ops/agent-runner-control-server.test.mjs
-
-node --test scripts/ops/agent-runner-agent-settings.test.mjs \
-  scripts/ops/agent-runner-agents.test.mjs \
-  scripts/ops/agent-runner-secret-store.test.mjs \
-  scripts/ops/agent-runner-secret-reference.test.mjs \
-  scripts/ops/agent-runner-secret-environment.test.mjs \
-  scripts/ops/agent-runner-ollama-adapter.test.mjs
-
+bash -n scripts/install-control-dashboard.sh
+node --check scripts/ops/agent-runner-control-server.mjs \
+  scripts/ops/agent-runner-control-server-core.mjs \
+  scripts/ops/agent-runner-control-server-cli.mjs
+node --test scripts/ops/agent-runner-control-dashboard-service.test.mjs \
+  scripts/ops/agent-runner-control-server.test.mjs \
+  scripts/ops/agent-runner-control-static.test.mjs
 npm test
 npm run validate
 git diff --check

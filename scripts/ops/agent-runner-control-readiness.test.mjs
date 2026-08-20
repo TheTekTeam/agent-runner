@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { computeInstanceLoad, computeInstanceQuota, computeInstanceReadiness, probeCommandOnPath } from './agent-runner-control-readiness.mjs';
+import {
+  buildReadOnlyControlSummary,
+  computeInstanceLoad,
+  computeInstanceQuota,
+  computeInstanceReadiness,
+  probeCommandOnPath,
+} from './agent-runner-control-readiness.mjs';
 
 test('probeCommandOnPath never spawns a process — pure accessSync walk of PATH', () => {
   const calls = [];
@@ -44,12 +50,43 @@ test('computeInstanceReadiness runs the PATH probe for an implemented adapter', 
   assert.equal(readiness.probes.length, 1);
 });
 
+test('buildReadOnlyControlSummary uses the private snapshot reader and bounded dashboard derivations', () => {
+  let calledWith = null;
+  const summary = buildReadOnlyControlSummary('/tmp/runner.sqlite', {
+    historyLimit: 3,
+    snapshotReader: (dbPath, options) => {
+      calledWith = { dbPath, options };
+      return {
+        ok: true,
+        latest: {
+          claims: [{ id: 1, created_at: '2026-08-20T00:00:00.000Z', repo: 'TheTekTeam/modelspend', issue_number: 174, action: 'claimed', status_label: 'status:in-progress', selection_mode: 'issue-run' }],
+          runResults: [],
+          selections: [],
+          queueEvents: [],
+          quota: [{ id: 1, created_at: '2026-08-20T00:00:00.000Z', blocked: 0, session_usage_percent: 25, weekly_usage_percent: 10 }],
+        },
+      };
+    },
+  });
+  assert.deepEqual(calledWith, { dbPath: '/tmp/runner.sqlite', options: { historyLimit: 3, includeLatest: true } });
+  assert.equal(summary.activity.status, 'active-or-unresolved');
+  assert.deepEqual(summary.quota, { blockedCount: 0, latestSessionUsagePercent: 25, latestWeeklyUsagePercent: 10 });
+});
+
+test('buildReadOnlyControlSummary fails closed without inventing quota when the snapshot is unavailable', () => {
+  const summary = buildReadOnlyControlSummary('/tmp/missing.sqlite', {
+    snapshotReader: () => ({ ok: false, latest: null }),
+  });
+  assert.equal(summary.activity.status, 'empty');
+  assert.equal(summary.quota, null);
+});
+
 test('computeInstanceLoad reports a static, honest capacity of 1 and no active load for a non-claude adapter', () => {
   const load = computeInstanceLoad({ agentId: 'ollama-agent' });
   assert.deepEqual(load, { capacity: 1, active: 0, note: 'load-tracking-not-available-for-this-adapter' });
 });
 
-test('computeInstanceLoad for claude-code-cli reads the existing read-only dashboard summary, never mutates it', () => {
+test('computeInstanceLoad for claude-code-cli reads the existing bounded read-only summary, never mutates it', () => {
   let calledWith = null;
   const buildDashboard = (dbPath, options) => {
     calledWith = { dbPath, options };
@@ -58,7 +95,7 @@ test('computeInstanceLoad for claude-code-cli reads the existing read-only dashb
   const load = computeInstanceLoad({ agentId: 'claude-code-cli', dbPath: '/tmp/does-not-matter.sqlite', buildDashboard });
   assert.deepEqual(load, { capacity: 1, active: 1, note: null });
   assert.equal(calledWith.dbPath, '/tmp/does-not-matter.sqlite');
-  assert.equal(calledWith.options.strict, false);
+  assert.deepEqual(calledWith.options, { historyLimit: 5 });
 });
 
 test('computeInstanceLoad reports idle when no active claim is evidenced', () => {
@@ -101,7 +138,7 @@ test('computeInstanceReadiness never probes the foundation-only grok-cli adapter
   assert.equal(probed, false);
 });
 
-test('computeInstanceQuota for claude-code-cli reuses only the bounded dashboard quota summary and reports included-subscription', () => {
+test('computeInstanceQuota for claude-code-cli reuses only the bounded read-only quota summary and reports included-subscription', () => {
   let calledWith = null;
   const buildDashboard = (dbPath, options) => {
     calledWith = { dbPath, options };
@@ -118,10 +155,10 @@ test('computeInstanceQuota for claude-code-cli reuses only the bounded dashboard
     quota: { blockedCount: 2, latestSessionUsagePercent: 41.5, latestWeeklyUsagePercent: 12.25 },
   });
   assert.equal(calledWith.dbPath, '/tmp/does-not-matter.sqlite');
-  assert.equal(calledWith.options.strict, false);
+  assert.deepEqual(calledWith.options, { historyLimit: 1 });
 });
 
-test('computeInstanceQuota for claude-code-cli degrades to a null quota block when the dashboard has no quota summary yet', () => {
+test('computeInstanceQuota for claude-code-cli degrades to a null quota block when the summary has no quota yet', () => {
   const quota = computeInstanceQuota({
     agentId: 'claude-code-cli',
     dbPath: '/tmp/does-not-matter.sqlite',

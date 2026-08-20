@@ -449,6 +449,24 @@ test('reading the overview never mutates the runner state directory', () => {
   });
 });
 
+test('control-service scheduler overrides select the canonical generic service and timer', () => {
+  const inspected = [];
+  const env = {
+    ...process.env,
+    AGENT_RUNNER_CONTROL_SCHEDULER_SERVICE: 'agent-runner-implementation.service',
+    AGENT_RUNNER_CONTROL_SCHEDULER_TIMER: 'agent-runner-implementation.timer',
+  };
+  readControlOverview({
+    env,
+    dbPath: join(tmpdir(), 'ar174-missing-runner-state.sqlite'),
+    spawn: (_command, args) => {
+      inspected.push(args.find((value) => /\.(?:service|timer)$/.test(value)));
+      return { status: 1, stdout: '', stderr: '' };
+    },
+  });
+  assert.deepEqual(inspected, ['agent-runner-implementation.service', 'agent-runner-implementation.timer']);
+});
+
 /** Durable-state evidence: every file under the state directory, with its size and mtime. */
 function snapshotDirectory(dir) {
   return readdirSync(dir, { withFileTypes: true, recursive: true })

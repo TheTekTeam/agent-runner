@@ -1,0 +1,44 @@
+[Unit]
+Description=Agent Runner authenticated control dashboard
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+WorkingDirectory=@@CHECKOUT@@
+Environment=NODE_OPTIONS=--jitless
+Environment=AGENT_RUNNER_CONFIG=%h/.config/agent-runner/modelspend.json
+Environment=CLAUDE_RUNNER_OUTPUT_DIR=%h/.local/state/agent-runner/modelspend
+Environment=CLAUDE_RUNNER_STATE_DB=%h/.local/state/agent-runner/modelspend/runner-state.sqlite
+Environment=AGENT_RUNNER_AGENT_SETTINGS_PATH=%h/.config/agent-runner/agent-settings.json
+Environment=AGENT_RUNNER_SECRET_STORE_DIR=%h/.local/state/agent-runner/secrets
+Environment=AGENT_RUNNER_CONTROL_OPERATOR_PATH=%h/.local/state/agent-runner/control-operator.json
+Environment=AGENT_RUNNER_CONTROL_AUDIT_PATH=%h/.local/state/agent-runner/control-audit.jsonl
+Environment=AGENT_RUNNER_CONTROL_SCHEDULER_SERVICE=agent-runner-implementation.service
+Environment=AGENT_RUNNER_CONTROL_SCHEDULER_TIMER=agent-runner-implementation.timer
+ExecStart=@@NODE@@ --jitless @@SERVER@@ --port @@PORT@@
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=20s
+TimeoutStopSec=15s
+TasksMax=64
+MemoryMax=384M
+OOMPolicy=stop
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=%h/.local/state/agent-runner
+ReadWritePaths=%h/.config/agent-runner
+ReadWritePaths=%h/.local/state/agent-runner/secrets
+ReadWritePaths=%h/.local/state/agent-runner/control-audit.jsonl
+RestrictAddressFamilies=AF_UNIX AF_INET
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+UMask=0077
+
+[Install]
+WantedBy=default.target
