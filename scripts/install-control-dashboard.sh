@@ -11,6 +11,8 @@ CANONICAL_ORIGIN_HTTPS='https://github.com/TheTekTeam/agent-runner.git'
 MINIMUM_NODE_MAJOR=22
 MINIMUM_NODE_MINOR=23
 NODE_BIN='/usr/bin/node'
+STARTUP_VERIFY_ATTEMPTS=50
+STARTUP_VERIFY_INTERVAL='0.1'
 
 usage() {
   cat <<'USAGE'
@@ -69,6 +71,8 @@ SOURCE_UNIT="$CHECKOUT/systemd/user/agent-runner-control.service.in"
 SERVER="$CHECKOUT/scripts/ops/agent-runner-control-server.mjs"
 TARGET_DIR="$HOME/.config/systemd/user"
 TARGET_UNIT="$TARGET_DIR/$SERVICE_NAME"
+TARGET_WANTS_DIR="$TARGET_DIR/default.target.wants"
+TARGET_WANTS_LINK="$TARGET_WANTS_DIR/$SERVICE_NAME"
 CONTROL_CONFIG_DIR="$HOME/.config/agent-runner"
 CONTROL_STATE_ROOT="$HOME/.local/state/agent-runner"
 CONTROL_SECRET_DIR="$CONTROL_STATE_ROOT/secrets"
@@ -167,6 +171,14 @@ probe_unit_enabled_state() {
   case "$output" in
     enabled|enabled-runtime|linked|linked-runtime|alias) printf 'enabled\n' ;;
     disabled|disabled-runtime|masked|masked-runtime|static|indirect|generated|transient) printf 'disabled\n' ;;
+    not-found)
+      if [[ ! -e "$TARGET_UNIT" && ! -L "$TARGET_UNIT" ]]; then
+        printf 'absent\n'
+      else
+        printf 'ERROR: %s is present on disk but systemd reports not-found (status %s)\n' "$SERVICE_NAME" "$rc" >&2
+        return 1
+      fi
+      ;;
     *) printf 'ERROR: could not determine whether %s is enabled (status %s)\n' "$SERVICE_NAME" "$rc" >&2; return 1 ;;
   esac
 }
@@ -204,7 +216,11 @@ verify_exact_listener() {
     printf 'ERROR: could not inspect the control-service listener\n' >&2
     return 1
   fi
-  mapfile -t locals < <(awk '{print $4}' <<<"$listeners")
+  if [[ -z "$listeners" ]]; then
+    printf 'ERROR: expected exactly one TCP listener on %s, found 0\n' "$PORT" >&2
+    return 1
+  fi
+  mapfile -t locals < <(awk 'NF {print $4}' <<<"$listeners")
   if (( ${#locals[@]} != 1 )); then
     printf 'ERROR: expected exactly one TCP listener on %s, found %s\n' "$PORT" "${#locals[@]}" >&2
     return 1
@@ -232,21 +248,39 @@ verify_shell_health() {
   rm -f -- "$headers" "$body"
 }
 
+wait_for_runtime_health() {
+  local attempt active_state
+  for (( attempt=1; attempt<=STARTUP_VERIFY_ATTEMPTS; attempt++ )); do
+    active_state=$(probe_unit_active_state) || return 1
+    if [[ "$active_state" != active ]]; then
+      printf 'ERROR: %s is not active\n' "$SERVICE_NAME" >&2
+      return 1
+    fi
+    if verify_exact_listener >/dev/null 2>&1; then
+      if ! verify_shell_health; then
+        printf 'ERROR: dashboard shell health check failed after listener became ready\n' >&2
+        return 1
+      fi
+      return 0
+    fi
+    if (( attempt < STARTUP_VERIFY_ATTEMPTS )); then
+      sleep "$STARTUP_VERIFY_INTERVAL"
+    fi
+  done
+  printf 'ERROR: %s did not establish %s:%s within the bounded startup window\n' \
+    "$SERVICE_NAME" "$FIXED_HOST" "$PORT" >&2
+  verify_exact_listener || true
+  return 1
+}
+
 verify_installed_service() {
-  local active_state
   validate_installed_runtime || return 1
   if [[ ! -f "$TARGET_UNIT" ]]; then
     printf 'ERROR: service is not installed: %s\n' "$TARGET_UNIT" >&2
     return 1
   fi
   validate_rendered_unit "$TARGET_UNIT" || return 1
-  active_state=$(probe_unit_active_state) || return 1
-  if [[ "$active_state" != active ]]; then
-    printf 'ERROR: %s is not active\n' "$SERVICE_NAME" >&2
-    return 1
-  fi
-  verify_exact_listener || return 1
-  verify_shell_health || return 1
+  wait_for_runtime_health || return 1
 }
 
 ensure_private_directory() {
@@ -313,38 +347,89 @@ provision_writable_paths() {
   fi
 }
 
+remove_verified_dangling_wants_link() {
+  local link_target
+  [[ -L "$TARGET_WANTS_LINK" ]] || return 0
+  if [[ -L "$TARGET_WANTS_DIR" ]]; then
+    printf 'ERROR: refusing symlinked default.target.wants directory during rollback\n' >&2
+    return 1
+  fi
+  link_target=$(readlink -- "$TARGET_WANTS_LINK") || return 1
+  if [[ "$link_target" != "$TARGET_UNIT" ]]; then
+    printf 'ERROR: refusing unexpected control-service wants-link target during rollback\n' >&2
+    return 1
+  fi
+  rm -f -- "$TARGET_WANTS_LINK"
+}
+
 restore_previous_state() {
   local backup=$1 had_unit=$2 was_enabled=$3 was_active=$4 rc=0 enabled_state active_state
   set +e
-  if ! systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1; then
-    set -e
-    return 1
-  fi
-  active_state=$(probe_unit_active_state) || rc=1
-  if [[ "$active_state" != inactive ]]; then
-    set -e
-    return 1
-  fi
+
   if (( had_unit )); then
+    if ! systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1; then
+      set -e
+      return 1
+    fi
+    active_state=$(probe_unit_active_state) || rc=1
+    if [[ "$active_state" != inactive ]]; then
+      set -e
+      return 1
+    fi
     install -m 0600 "$backup" "$TARGET_UNIT" || rc=1
-  else
-    rm -f -- "$TARGET_UNIT" || rc=1
+    systemctl --user daemon-reload >/dev/null 2>&1 || rc=1
+    if (( was_enabled )); then
+      systemctl --user enable "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
+    else
+      systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
+    fi
+    if (( was_active )); then
+      systemctl --user start "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
+    else
+      systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+    enabled_state=$(probe_unit_enabled_state) || rc=1
+    active_state=$(probe_unit_active_state) || rc=1
+    if (( was_enabled )); then [[ "$enabled_state" == enabled ]] || rc=1; else [[ "$enabled_state" == disabled ]] || rc=1; fi
+    if (( was_active )); then [[ "$active_state" == active ]] || rc=1; else [[ "$active_state" == inactive ]] || rc=1; fi
+    set -e
+    return "$rc"
   fi
+
+  # Fresh-install rollback restores the true prior state: no target unit and
+  # no enablement link. A failure before unit installation must not call
+  # systemctl stop on a nonexistent unit. A failure after activation must
+  # first stop and verify the temporary target, then disable it while its unit
+  # still exists so systemd can remove WantedBy coherently.
+  if [[ -f "$TARGET_UNIT" ]]; then
+    if ! systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1; then
+      set -e
+      return 1
+    fi
+    active_state=$(probe_unit_active_state) || rc=1
+    if [[ "$active_state" != inactive ]]; then
+      set -e
+      return 1
+    fi
+    if ! systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1; then
+      set -e
+      return 1
+    fi
+  else
+    active_state=$(probe_unit_active_state) || rc=1
+    if [[ "$active_state" != inactive ]]; then
+      set -e
+      return 1
+    fi
+    remove_verified_dangling_wants_link || rc=1
+  fi
+
+  rm -f -- "$TARGET_UNIT" || rc=1
   systemctl --user daemon-reload >/dev/null 2>&1 || rc=1
-  if (( was_enabled )); then
-    systemctl --user enable "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
-  else
-    systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1 || true
-  fi
-  if (( was_active )); then
-    systemctl --user start "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
-  else
-    systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || true
-  fi
   enabled_state=$(probe_unit_enabled_state) || rc=1
   active_state=$(probe_unit_active_state) || rc=1
-  if (( was_enabled )); then [[ "$enabled_state" == enabled ]] || rc=1; else [[ "$enabled_state" == disabled ]] || rc=1; fi
-  if (( was_active )); then [[ "$active_state" == active ]] || rc=1; else [[ "$active_state" == inactive ]] || rc=1; fi
+  [[ "$enabled_state" == absent ]] || rc=1
+  [[ "$active_state" == inactive ]] || rc=1
   set -e
   return "$rc"
 }
