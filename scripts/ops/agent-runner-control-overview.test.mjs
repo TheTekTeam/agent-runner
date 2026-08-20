@@ -24,9 +24,11 @@ import {
   readControlOverview,
 } from './agent-runner-control-overview.mjs';
 import { buildOperatorStatus } from './agent-runner-operator-status.mjs';
-import { buildRunnerActivity, buildRunnerMetrics, buildRunnerOperatorStatus } from './claude-runner-dashboard-api.mjs';
+import { buildRunnerActivity, buildRunnerDashboard, buildRunnerMetrics, buildRunnerOperatorStatus } from './claude-runner-dashboard-api.mjs';
 import { loadAgentRunnerConfig } from './agent-runner-config.mjs';
 import { openRunnerStateStore } from './claude-runner-state.mjs';
+import { buildAttentionEvent } from './claude-runner-recovery.mjs';
+import { runAttentionReconciliation } from './agent-runner-attention-reconcile-command.mjs';
 
 const NOW = '2026-08-11T12:00:00.000Z';
 const NOW_MS = Date.parse(NOW);
@@ -123,8 +125,9 @@ test('attention events never forward dashboard_reference, the one column that ca
   const projection = projectAttention([
     { repo: 'TheTekTeam/agent-runner', issue_number: 7, reason: 'stalled', dashboard_reference: '/var/www/runner/index.html', created_at: NOW, resolved_at: null },
   ]);
-  assert.equal(projection.unresolvedCount, 1);
-  assert.equal(projection.events[0].reason, 'stalled');
+  assert.equal(projection.unresolvedCount, 0);
+  assert.equal(projection.unknownCount, 1);
+  assert.equal(projection.uncertainEvents[0].reason, 'stalled');
   assert.ok(!JSON.stringify(projection).includes('/var/www'));
   assert.ok(!JSON.stringify(projection).includes('dashboardReference'));
 });
@@ -137,6 +140,7 @@ test('every status the derivations can produce is inside the shared vocabulary',
     deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'global_systemic_pause' } }),
     deriveRunnerStatus({ snapshot: okSnapshot(), circuit: { blocked: true } }),
     deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'attention_required', count: 2 } }),
+    deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'attention_reconciliation_degraded', unknownCount: 1, staleCount: 0 } }),
     deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'queue_inspection_degraded' } }),
     deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'task_local_quarantines', count: 1 } }),
     deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'queue_moving' }, activity: { activeIssue: { issue_number: 1 } } }),
@@ -399,6 +403,38 @@ test('a real state database produces the same operator status and current task a
     assert.equal(projection.queue.skipEventCount, cliReport.queue.skipEventCount);
     assert.equal(projection.queue.skippedIssueCount, cliReport.queue.skippedIssueCount);
   });
+});
+
+test('real current attention proof produces identical actionable counts across CLI, control and dashboard', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-runner-attention-parity-'));
+  try {
+    const dbPath = join(dir, 'runner-state.sqlite');
+    const reconciliationDbPath = join(dir, 'attention-reconciliation.sqlite');
+    const baseEnv = { ...process.env, HOME: dir, CLAUDE_RUNNER_STATE_DB: dbPath,
+      CLAUDE_RUNNER_ATTENTION_RECONCILIATION_DB: reconciliationDbPath };
+    const baseConfig = loadAgentRunnerConfig({ env: baseEnv });
+    const repo = baseConfig.githubRepo;
+    const store = openRunnerStateStore(dbPath);
+    const event = buildAttentionEvent({ repository: repo, issueNumber: 183, attemptId: 'parity-attempt',
+      reason: 'unknown_failure', recoveryStatus: 'forbidden', nextAction: 'Manager review.' });
+    store.recordRecoveryAttempt({ attemptId: 'parity-attempt', repo, issueNumber: 183, startedAt: NOW,
+      attentionStatus: 'attention_required', attentionDedupeKey: event.dedupeKey,
+      resolutionState: 'operator_attention_required' });
+    store.upsertAttentionEvent(event); store.close();
+    const env = baseEnv;
+    const config = { ...baseConfig, stateDbPath: dbPath, outputDir: dir };
+    runAttentionReconciliation({ env, config, now: () => NOW,
+      client: { getIssue: (_repository, issueNumber) => ({ number: issueNumber, state: 'open', updated_at: NOW }) } });
+    const spawn = () => ({ error: new Error('systemctl unavailable in test'), status: 1, stdout: '' });
+    const cli = buildOperatorStatus(config, env, { now: () => NOW, spawn });
+    const control = readControlOverview({ env, dbPath, now: () => NOW, spawn });
+    const dashboard = buildRunnerDashboard(dbPath, { env, config, now: () => NOW, reconciliationDbPath });
+    assert.equal(cli.operatorStatus.code, 'attention_required');
+    assert.deepEqual(cli.attention.counts, dashboard.attention.counts);
+    assert.equal(control.attention.actionableCount, dashboard.attention.counts.actionable);
+    assert.equal(control.attention.unknownCount, dashboard.attention.counts.unknown);
+    assert.equal(control.operatorStatusCode, dashboard.operatorStatus.code);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('reading the overview never mutates the runner state directory', () => {

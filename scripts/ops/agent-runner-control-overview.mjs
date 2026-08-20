@@ -5,6 +5,9 @@ import { readOnlyRunnerStateSnapshot, unitState } from './agent-runner-operator-
 import { readCircuitState } from './agent-runner-operator-status.mjs';
 import { buildRunnerActivity, buildRunnerMetrics, buildRunnerOperatorStatus } from './claude-runner-dashboard-api.mjs';
 import { defaultRunnerStateDbPath } from './claude-runner-state.mjs';
+import { attentionEventIdentity, buildAttentionReconciliationProjection } from './agent-runner-attention-reconciliation.mjs';
+import { resolveAttentionReconciliationDbPath } from './agent-runner-attention-reconciliation-path.mjs';
+import { readAttentionReconciliationState } from './agent-runner-attention-reconciliation-store.mjs';
 
 /**
  * The smallest authenticated read-only operational projection needed to
@@ -191,6 +194,11 @@ export function deriveRunnerStatus({ snapshot, operatorStatus, activity, circuit
   if (operatorStatus?.code === 'attention_required') {
     return status('attention', 'Attention required', `${operatorStatus.count || 0} unresolved attention event(s) are waiting on a human.`, 'Review the unresolved attention events and resolve or reassign them.');
   }
+  if (operatorStatus?.code === 'attention_reconciliation_degraded') {
+    return status('degraded', 'Attention state uncertain',
+      `${operatorStatus.unknownCount || 0} unknown and ${operatorStatus.staleCount || 0} stale attention event(s) cannot be classified safely.`,
+      'Restore fresh GitHub reconciliation or provide an exact-evidence acknowledgement.');
+  }
   if (operatorStatus?.code === 'queue_inspection_degraded') {
     return status('degraded', 'Queue inspection degraded', operatorStatus.reason || 'GitHub could not be reached to check for eligible work, so "no eligible work" is unproven.', 'Restore GitHub reachability, then re-check queue inspection.');
   }
@@ -354,11 +362,13 @@ export function projectHealth(currentHealthConditions = []) {
  * is deliberately never forwarded — it is the one attention column that can
  * carry a path/URL.
  */
-export function projectAttention(attentionEvents = []) {
+export function projectAttention(attentionEvents = [], attentionProjection = null) {
+  const projection = attentionProjection || buildAttentionReconciliationProjection(attentionEvents, [], null);
+  const byEvent = new Map(projection.items.map((item) => [item.eventKey, item]));
   const rows = (Array.isArray(attentionEvents) ? attentionEvents : []).filter((row) => !row?.resolved_at);
-  return {
-    unresolvedCount: rows.length,
-    events: rows.slice(0, MAX_LIST).map((row) => ({
+  const project = (row) => {
+    const item = byEvent.get(attentionEventIdentity(row));
+    return {
       repo: boundedRepo(row?.repo),
       issueNumber: boundedIssueNumber(row?.issue_number),
       issueUrl: issueUrl(row?.repo, row?.issue_number),
@@ -367,7 +377,19 @@ export function projectAttention(attentionEvents = []) {
       recoveryStatus: boundedText(row?.recovery_status, 48),
       nextAction: boundedReason(row?.next_action),
       createdAt: boundedTimestamp(row?.created_at),
-    })),
+      reconciliationStatus: boundedText(item?.status, 16) || 'unknown',
+      reconciliationReason: boundedText(item?.reasonCode, 64) || 'reconciliation-missing',
+    };
+  };
+  return {
+    posture: projection.posture,
+    unresolvedCount: projection.counts.actionable,
+    actionableCount: projection.counts.actionable,
+    historicalCount: projection.counts.historical,
+    unknownCount: projection.counts.unknown,
+    staleCount: projection.counts.stale,
+    events: rows.filter((row) => byEvent.get(attentionEventIdentity(row))?.status === 'actionable').slice(0, MAX_LIST).map(project),
+    uncertainEvents: rows.filter((row) => ['unknown', 'stale'].includes(byEvent.get(attentionEventIdentity(row))?.status || 'unknown')).slice(0, MAX_LIST).map(project),
   };
 }
 
@@ -481,6 +503,7 @@ export function buildOverviewProjection({
   links = { grafanaRunnerUrl: null, grafanaOperationsUrl: null, legacyDashboardUrl: null },
   generatedAt,
   nowMs = Date.parse(generatedAt),
+  attentionProjection = null,
 }) {
   const base = {
     ok: true,
@@ -512,7 +535,7 @@ export function buildOverviewProjection({
   const latest = snapshot.latest || {};
   const activity = buildRunnerActivity(latest);
   const metrics = buildRunnerMetrics({ latest });
-  const operatorStatus = buildRunnerOperatorStatus(latest, activity, snapshot.currentHealthConditions || []);
+  const operatorStatus = buildRunnerOperatorStatus(latest, activity, snapshot.currentHealthConditions || [], attentionProjection);
 
   return {
     ...base,
@@ -525,7 +548,7 @@ export function buildOverviewProjection({
     runs: projectRuns(metrics),
     quota: projectQuota(metrics),
     health: projectHealth(snapshot.currentHealthConditions),
-    attention: projectAttention(latest.attentionEvents),
+    attention: projectAttention(snapshot.attentionSource?.attentionEvents || latest.attentionEvents || [], attentionProjection),
     notifications: projectNotifications(latest.notifications),
     activity: projectActivity(latest),
   };
@@ -535,7 +558,7 @@ function resolveStateDbPath({ env, config, dbPath }) {
   if (dbPath) return dbPath;
   return env.CLAUDE_RUNNER_STATE_DB
     || config?.stateDbPath
-    || defaultRunnerStateDbPath(config?.outputDir || '.var/claude-runner');
+    || defaultRunnerStateDbPath(env.CLAUDE_RUNNER_OUTPUT_DIR || config?.outputDir || '.var/claude-runner');
 }
 
 /**
@@ -571,7 +594,7 @@ export function readControlOverview({
 
   let snapshot;
   try {
-    snapshot = readOnlyRunnerStateSnapshot(resolveStateDbPath({ env, config, dbPath }), { historyLimit: 20, includeLatest: true });
+    snapshot = readOnlyRunnerStateSnapshot(resolveStateDbPath({ env, config, dbPath }), { historyLimit: 20, includeLatest: true, attentionRepository: config.githubRepo });
   } catch {
     snapshot = { ok: false, reason: 'state-db-unreadable', safeNextAction: 'Repair or restore the runner state database; this read never creates or modifies it.' };
   }
@@ -592,6 +615,13 @@ export function readControlOverview({
     }
   };
 
+  const reconciliationDbPath = resolveAttentionReconciliationDbPath({ env, config });
+  const attentionState = config.githubRepo ? readAttentionReconciliationState(reconciliationDbPath, config.githubRepo) : null;
+  const attentionProjection = buildAttentionReconciliationProjection(
+    snapshot?.attentionSource?.attentionEvents || [], snapshot?.attentionSource?.recoveryAttempts || [], attentionState,
+    { repository: config.githubRepo, now: generatedAt, sourceTotal: snapshot?.attentionSource?.total, sourceOverflow: snapshot?.attentionSource?.overflow },
+  );
+
   return buildOverviewProjection({
     snapshot,
     circuit,
@@ -600,6 +630,7 @@ export function readControlOverview({
     identity: projectIdentity(config),
     links: projectLinks(env),
     generatedAt,
+    attentionProjection,
   });
 }
 

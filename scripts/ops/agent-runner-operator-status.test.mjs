@@ -464,7 +464,7 @@ test('#172: a terminal result for the same issue number under a different repo n
   }
 });
 
-test('#172: task-local unresolved attention with no current claim stays attention_required/idle, not a global stop', () => {
+test('#172/#183: unreconciled task-local attention with no current claim stays degraded/idle, not a global stop', () => {
   const dir = mkdtempSync(join(tmpdir(), 'status-task-local-attention-'));
   try {
     const { config } = writeConfig(dir);
@@ -488,8 +488,8 @@ test('#172: task-local unresolved attention with no current claim stays attentio
       // buildRunnerActivity() deliberately reports `empty` when there has
       // never been any selection/claim/run activity at all. The preserved
       // #757 condition has a terminal run result, so with no current claim
-      // its correct current-task state is `idle` while unresolved task-local
-      // attention remains `attention_required`.
+      // its correct current-task state is `idle` while missing reconciliation
+      // remains explicitly degraded rather than being called operator action.
       store.recordRunResult({
         repo: 'TheTekTeam/modelspend',
         issueNumber: 757,
@@ -506,7 +506,8 @@ test('#172: task-local unresolved attention with no current claim stays attentio
     const report = buildOperatorStatus(config, {}, { spawn: installedSpawn(config) });
     assert.equal(report.ok, true);
     assert.equal(report.currentTask.status, 'idle');
-    assert.equal(report.operatorStatus.code, 'attention_required');
+    assert.equal(report.operatorStatus.code, 'attention_reconciliation_degraded');
+    assert.equal(report.attention.counts.unknown, 1);
     assert.notEqual(report.operatorStatus.code, 'global_systemic_pause');
   } finally {
     rmSync(dir, { recursive: true, force: true });

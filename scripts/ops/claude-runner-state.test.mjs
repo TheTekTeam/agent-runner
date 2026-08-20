@@ -288,6 +288,24 @@ test('recovery counters, deadlines, attention state and dedupe survive reopening
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('attention reconciliation source returns every unresolved event with exact matching attempt proof', () => {
+  withStore((store) => {
+    const repo = 'TheTekTeam/modelspend';
+    const event = buildAttentionEvent({ repository: repo, issueNumber: 183, attemptId: 'attempt-source',
+      reason: 'unknown_failure', recoveryStatus: 'forbidden', nextAction: 'Manager review.' });
+    store.recordRecoveryAttempt({ attemptId: 'attempt-source', repo, issueNumber: 183,
+      startedAt: '2026-08-20T01:00:00.000Z', attentionStatus: 'attention_required',
+      attentionDedupeKey: event.dedupeKey, resolutionState: 'operator_attention_required' });
+    store.upsertAttentionEvent(event);
+    const source = store.attentionReconciliationSource(repo);
+    assert.equal(source.attentionEvents.length, 1);
+    assert.equal(source.attentionEvents[0].dedupe_key, event.dedupeKey);
+    assert.equal(source.recoveryAttempts.length, 1);
+    assert.equal(source.recoveryAttempts[0].attention_dedupe_key, event.dedupeKey);
+    assert.equal(source.recoveryAttempts[0].resolution_state, 'operator_attention_required');
+  });
+});
+
 test('unchanged attention preserves its stable timestamp and performs no material update', () => {
   const dir = mkdtempSync(join(tmpdir(), 'modelspend-runner-attention-stable-'));
   const dbPath = join(dir, 'state.sqlite');

@@ -84,6 +84,75 @@ const AVAILABLE_QUOTA_RUNNER = () => ({
   stderr: '',
 });
 
+test('#183: execute pass invokes attention reconciliation once before quota-blocked return; dry-run invokes none', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-attention-reconcile-seam-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  let calls = 0;
+  const reconcileAttention = ({ config }) => {
+    calls += 1;
+    assert.equal(config.githubRepo, 'TheTekTeam/modelspend');
+    assert.equal(config.stateDbPath, stateDbPath);
+    return { ok: true };
+  };
+  const blockedQuotaRunner = () => ({ status: 1, stdout: '', stderr: 'synthetic quota block' });
+  const noNotifications = async () => ({ discovered: 0 });
+  const ghRunner = (args) => {
+    if (args[0] === 'pr' && args[1] === 'list') return JSON.stringify([]);
+    if (args[0] === 'issue' && args[1] === 'list') return JSON.stringify([]);
+    throw new Error(`unexpected GitHub call: ${args.join(' ')}`);
+  };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    assert.equal(await main([
+      '--execute', '--allow-root', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, {
+      ghRunner: () => { throw new Error('quota-blocked pass must not inspect the queue'); },
+      quotaRunner: blockedQuotaRunner, reconcileNotifications: noNotifications, reconcileAttention,
+    }), 0);
+    assert.equal(calls, 1);
+
+    assert.equal(await main([
+      '--allow-root', '--skip-quota-preflight', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, { ghRunner, reconcileNotifications: noNotifications, reconcileAttention }), 0);
+    assert.equal(calls, 1, 'dry-run does not invoke reconciliation');
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#183: attention reconciliation failure is task-local and does not change scheduler outcome', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-attention-reconcile-task-local-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', join(dir, 'cron.lock'),
+    ], { GH_TOKEN: 'test-token' }, {
+      ghRunner: () => { throw new Error('quota-blocked pass must not inspect the queue'); },
+      quotaRunner: () => ({ status: 1, stdout: '', stderr: 'synthetic quota block' }),
+      reconcileNotifications: async () => ({ discovered: 0 }),
+      reconcileAttention: () => { throw new Error('/home/gp/private ghp_runtime_secret synthetic attention lookup failure'); },
+    });
+    assert.equal(exitCode, 0);
+    const store = openRunnerStateStore(stateDbPath);
+    const result = store.allRows('run_results').find((row) => row.mode === 'quota-blocked');
+    store.close();
+    assert.equal(result.exit_code, 0);
+    const serializedLogs = readdirSync(dir).filter((name) => name.startsWith('cron-'))
+      .map((name) => readFileSync(join(dir, name), 'utf8')).join('\n');
+    assert.equal(serializedLogs.includes('/home/gp/private'), false);
+    assert.equal(serializedLogs.includes('ghp_runtime_secret'), false);
+    assert.equal(serializedLogs.includes('attention-reconciliation-failed'), true);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // Historical execute-path fixtures used --skip-quota-preflight only to avoid
 // launching a real quota probe. #256 makes that production bypass invalid.
 // Adapt those fixtures to execute with positive bounded synthetic quota

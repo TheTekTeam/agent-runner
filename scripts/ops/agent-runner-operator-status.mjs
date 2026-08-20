@@ -40,6 +40,9 @@ import { defaultCircuitDbPath, effectiveConfigurationFingerprint } from './agent
 import { loadAgentRunnerConfig, projectIdentity } from './agent-runner-config.mjs';
 import { defaultRunnerStateDbPath } from './claude-runner-state.mjs';
 import { buildRunnerActivity, buildRunnerMetrics, buildRunnerOperatorStatus } from './claude-runner-dashboard-api.mjs';
+import { buildAttentionReconciliationProjection } from './agent-runner-attention-reconciliation.mjs';
+import { resolveAttentionReconciliationDbPath } from './agent-runner-attention-reconciliation-path.mjs';
+import { readAttentionReconciliationState } from './agent-runner-attention-reconciliation-store.mjs';
 
 export const STATUS_SCHEMA_VERSION = 'agent-runner-operator-status/v1';
 export const USAGE_ERROR_EXIT_CODE = 2;
@@ -94,10 +97,12 @@ export function readCircuitState(env = process.env) {
   }
 }
 
-function boundedAttention(latestAttentionEvents = []) {
+function boundedAttention(projection) {
   return {
-    unresolvedCount: latestAttentionEvents.filter((row) => !row.resolved_at).length,
-    recent: latestAttentionEvents,
+    posture: projection.posture,
+    counts: projection.counts,
+    generation: projection.generation,
+    current: projection.items.filter((item) => item.status !== 'historical').slice(0, 10),
   };
 }
 
@@ -116,13 +121,14 @@ export function requiredUnitsInstalled(service, timer) {
 
 export function buildOperatorStatus(config, env = process.env, { now = isoNow, spawn } = {}) {
   const dbPath = env.CLAUDE_RUNNER_STATE_DB || config.stateDbPath || defaultRunnerStateDbPath(config.outputDir || '.var/claude-runner');
-  const snapshot = readOnlyRunnerStateSnapshot(dbPath, { historyLimit: 10, includeLatest: true });
+  const snapshot = readOnlyRunnerStateSnapshot(dbPath, { historyLimit: 10, includeLatest: true, attentionRepository: config.githubRepo });
   const circuit = readCircuitState(env);
   const service = unitState(config.systemd.serviceName, spawn);
   const timer = unitState(config.systemd.timerName, spawn);
+  const generatedAt = now();
   const base = {
     schemaVersion: STATUS_SCHEMA_VERSION,
-    generatedAt: now(),
+    generatedAt,
     project: projectIdentity(config),
     service,
     timer,
@@ -144,7 +150,15 @@ export function buildOperatorStatus(config, env = process.env, { now = isoNow, s
 
   const activity = buildRunnerActivity(snapshot.latest);
   const metrics = buildRunnerMetrics({ latest: snapshot.latest });
-  const operatorStatus = buildRunnerOperatorStatus(snapshot.latest, activity, snapshot.currentHealthConditions);
+  const reconciliationDbPath = resolveAttentionReconciliationDbPath({ env, config });
+  const attentionState = config.githubRepo
+    ? readAttentionReconciliationState(reconciliationDbPath, config.githubRepo)
+    : null;
+  const attentionProjection = buildAttentionReconciliationProjection(
+    snapshot.attentionSource?.attentionEvents || [], snapshot.attentionSource?.recoveryAttempts || [], attentionState,
+    { repository: config.githubRepo, now: generatedAt, sourceTotal: snapshot.attentionSource?.total, sourceOverflow: snapshot.attentionSource?.overflow },
+  );
+  const operatorStatus = buildRunnerOperatorStatus(snapshot.latest, activity, snapshot.currentHealthConditions, attentionProjection);
 
   return {
     ...base,
@@ -155,7 +169,7 @@ export function buildOperatorStatus(config, env = process.env, { now = isoNow, s
     health: snapshot.currentHealthConditions,
     currentTask: activity,
     queue: metrics.queue,
-    attention: boundedAttention(snapshot.latest.attentionEvents),
+    attention: boundedAttention(attentionProjection),
     notification: boundedNotification(snapshot.latest.notifications),
   };
 }

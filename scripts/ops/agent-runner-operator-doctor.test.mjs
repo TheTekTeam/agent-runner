@@ -11,6 +11,7 @@ import test from 'node:test';
 
 import { redactSensitiveText } from './lib/redact.mjs';
 import { openRunnerStateStore, RUNNER_STATE_TABLES } from './claude-runner-state.mjs';
+import { buildAttentionEvent } from './claude-runner-recovery.mjs';
 import {
   buildDoctorReport,
   exitCodeForDoctorReport,
@@ -494,6 +495,36 @@ test('readOnlyRunnerStateSnapshot projects only bounded assignment evidence out 
     assert.equal(serialized.includes('/home/doctor-user/secret-state-path'), false);
     assert.equal(serialized.includes('not-a-catalogue-label'), false);
     assert.equal(redactSensitiveText(serialized), serialized);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('read-only attention source finds an old unresolved event and exact attempt proof outside the latest history window', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'doctor-attention-source-'));
+  try {
+    const dbPath = join(dir, 'state.sqlite');
+    const repo = 'TheTekTeam/modelspend';
+    const store = openRunnerStateStore(dbPath);
+    const openEvent = buildAttentionEvent({ repository: repo, issueNumber: 183, attemptId: 'old-open',
+      reason: 'unknown_failure', recoveryStatus: 'forbidden', nextAction: 'Manager review.' });
+    store.recordRecoveryAttempt({ attemptId: 'old-open', repo, issueNumber: 183,
+      startedAt: '2026-08-20T00:00:00.000Z', attentionStatus: 'attention_required',
+      attentionDedupeKey: openEvent.dedupeKey, resolutionState: 'operator_attention_required' });
+    store.upsertAttentionEvent(openEvent);
+    for (let issue = 1000; issue < 1060; issue += 1) {
+      const resolved = buildAttentionEvent({ repository: repo, issueNumber: issue, attemptId: `resolved-${issue}`,
+        reason: 'unknown_failure', recoveryStatus: 'forbidden', nextAction: 'Manager review.' });
+      store.upsertAttentionEvent(resolved);
+      store.resolveAttentionForAttempt(`resolved-${issue}`);
+    }
+    store.close();
+    const snapshot = readOnlyRunnerStateSnapshot(dbPath, { includeLatest: true, historyLimit: 50, attentionRepository: repo });
+    assert.equal(snapshot.ok, true);
+    assert.equal(snapshot.latest.attentionEvents.some((row) => row.issue_number === 183), false);
+    assert.equal(snapshot.attentionSource.total, 1);
+    assert.equal(snapshot.attentionSource.attentionEvents[0].dedupe_key, openEvent.dedupeKey);
+    assert.equal(snapshot.attentionSource.recoveryAttempts[0].resolution_state, 'operator_attention_required');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -1187,6 +1187,20 @@ export class RunnerStateStore {
     return this.db.prepare('SELECT * FROM attention_events WHERE repo = ? AND dedupe_key = ?').get(repo, dedupeKey) || null;
   }
 
+  /** Exact bounded unresolved source used by the event-scoped #183 projection. */
+  attentionReconciliationSource(repo, limit = 201) {
+    const boundedLimit = Number.isInteger(limit) && limit > 0 ? Math.min(limit, 201) : 201;
+    const total = this.db.prepare('SELECT COUNT(*) AS total FROM attention_events WHERE repo = ? AND resolved_at IS NULL').get(repo)?.total ?? 0;
+    const attentionEvents = this.db.prepare(`SELECT id,dedupe_key,updated_at,repo,issue_number,attempt_id,reason,
+      recovery_status,next_action,policy_revision,resolved_at,event_json FROM attention_events
+      WHERE repo = ? AND resolved_at IS NULL ORDER BY id ASC LIMIT ?`).all(repo, boundedLimit);
+    const attemptIds = [...new Set(attentionEvents.map((row) => row.attempt_id).filter(Boolean))];
+    const recoveryAttempts = attemptIds.length === 0 ? [] : this.db.prepare(`SELECT attempt_id,repo,outcome,finished_at,
+      attention_status,attention_dedupe_key,resolution_state FROM recovery_attempts
+      WHERE repo = ? AND attempt_id IN (${attemptIds.map(() => '?').join(',')})`).all(repo, ...attemptIds);
+    return { attentionEvents, recoveryAttempts, total, overflow: total > 200 };
+  }
+
   /** A single runner_health_conditions row by its (repo, condition_type) unique key -- a targeted lookup, never a full-table scan (#53 review round 3, item 7). */
   healthConditionForType(repo, conditionType) {
     if (!conditionType) return null;
@@ -1768,7 +1782,7 @@ export function repairFalseDryRunAttention(dbPath, options = {}) {
   }
 }
 
-export function summarizeRunnerState(dbPath, { now = isoNow, historyLimit = 5, requireExisting = false } = {}) {
+export function summarizeRunnerState(dbPath, { now = isoNow, historyLimit = 5, requireExisting = false, attentionRepository = null } = {}) {
   if (!dbPath || typeof dbPath !== 'string') {
     return {
       ok: false,
@@ -1810,6 +1824,7 @@ export function summarizeRunnerState(dbPath, { now = isoNow, historyLimit = 5, r
     // history view; `currentHealthConditions` is the operator-facing truth
     // (unresolved only, resolved conditions excluded regardless of recency).
     const currentHealthConditions = store.currentHealthConditions(null);
+    const attentionSource = attentionRepository ? store.attentionReconciliationSource(attentionRepository) : null;
 
     return {
       ok: true,
@@ -1820,6 +1835,7 @@ export function summarizeRunnerState(dbPath, { now = isoNow, historyLimit = 5, r
       counts,
       latest,
       currentHealthConditions,
+      attentionSource,
     };
   } catch (error) {
     return {

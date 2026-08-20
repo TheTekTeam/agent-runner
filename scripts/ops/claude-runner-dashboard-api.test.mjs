@@ -49,7 +49,9 @@ test('operator summary distinguishes systemic pause, attention, quarantine, movi
   // which could keep showing a cleared condition indefinitely.
   const systemicPause = [{ condition_type: 'systemic_pause', reason: 'runner_state_unavailable' }];
   assert.equal(buildRunnerOperatorStatus({ queueEvents: [] }, {}, systemicPause).code, 'global_systemic_pause');
-  assert.equal(buildRunnerOperatorStatus({ queueEvents: [], attentionEvents: [{ resolved_at: null }] }, {}, []).code, 'attention_required');
+  const actionableAttention = { counts: { actionable: 1, historical: 0, unknown: 0, stale: 0 } };
+  assert.equal(buildRunnerOperatorStatus({ queueEvents: [], attentionEvents: [{ resolved_at: null }] }, {}, [], actionableAttention).code, 'attention_required');
+  assert.equal(buildRunnerOperatorStatus({ queueEvents: [], attentionEvents: [{ resolved_at: null }] }, {}, []).code, 'attention_reconciliation_degraded');
   // A *resolved* attention event must never itself trigger
   // `attention_required` — only the still-unresolved subset does (#698
   // round 4, finding 4's fourth enumerated state: "resolved attention").
@@ -72,7 +74,7 @@ test('operator summary distinguishes systemic pause, attention, quarantine, movi
   // unproven `idle`.
   const both = [{ condition_type: 'systemic_pause' }, { condition_type: 'queue_inspection_degraded' }];
   assert.equal(buildRunnerOperatorStatus({ queueEvents: [], attentionEvents: [] }, {}, both).code, 'global_systemic_pause');
-  assert.equal(buildRunnerOperatorStatus({ queueEvents: [], attentionEvents: [{ resolved_at: null }] }, {}, degradedCondition).code, 'attention_required');
+  assert.equal(buildRunnerOperatorStatus({ queueEvents: [], attentionEvents: [{ resolved_at: null }] }, {}, degradedCondition, actionableAttention).code, 'attention_required');
   assert.equal(buildRunnerOperatorStatus({ queueEvents: [{ event_type: 'quarantine' }], attentionEvents: [] }, {}, degradedCondition).code, 'task_local_quarantines');
   assert.equal(buildRunnerOperatorStatus({ queueEvents: [], attentionEvents: [], runResults: [{ mode: 'issue-run' }] }, {}, degradedCondition).code, 'queue_moving');
 
