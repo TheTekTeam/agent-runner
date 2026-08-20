@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { pathToFileURL } from 'node:url';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { configurationFingerprint, normalizeImplementationApprovers } from './agent-runner-admission.mjs';
 import { resolveAgentForLabels } from './agent-runner-agents.mjs';
@@ -27,7 +28,24 @@ import {
 } from './claude-runner.mjs';
 
 export const CANDIDATE_PAUSED_EXIT_CODE = 3;
+export const CANDIDATE_REVALIDATION_FAILURE_EXIT_CODE = 1;
+export const CANDIDATE_REVALIDATION_FAILURE_SCOPE = 'candidate_revalidation';
+export const DEFAULT_CANDIDATE_SELECTION_TIMEOUT_MS = 30_000;
 export const NEW_CLAIM_AUTHORIZATION_MODE = 'preflight-direct';
+
+const MIN_CANDIDATE_SELECTION_TIMEOUT_MS = 50;
+const MAX_CANDIDATE_SELECTION_TIMEOUT_MS = 60_000;
+
+export function candidateSelectionTimeoutMs(env = process.env) {
+  const raw = String(env.AGENT_RUNNER_CANDIDATE_SELECTION_TIMEOUT_MS ?? '').trim();
+  if (!raw) return DEFAULT_CANDIDATE_SELECTION_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return DEFAULT_CANDIDATE_SELECTION_TIMEOUT_MS;
+  return Math.max(
+    MIN_CANDIDATE_SELECTION_TIMEOUT_MS,
+    Math.min(MAX_CANDIDATE_SELECTION_TIMEOUT_MS, Math.trunc(parsed)),
+  );
+}
 
 function preflightAuthor(preflight) {
   return String(
@@ -281,7 +299,7 @@ export function candidatePausePayload(admission, snapshot) {
     candidatePaused: true,
     failureScope: 'issue_not_runnable',
     reason: admission.reason,
-    safeNextAction: 'Repair execution-critical status/agent labels or provide a current immutable manager preflight from an approved ChatGPT manager identity. Proceed or continue comments cannot authorize a new claim.',
+    safeNextAction: admission.safeNextAction || 'Repair execution-critical status/agent labels or provide a current immutable manager preflight from an approved ChatGPT manager identity. Proceed or continue comments cannot authorize a new claim.',
     selectedIssue: snapshot?.issueNumber || null,
     candidateRevision: snapshot?.preflightRevision || null,
     candidateFingerprint: snapshot?.preflightFingerprint || null,
@@ -308,11 +326,123 @@ function approverPolicy(env) {
   return { approvers, admission: null };
 }
 
+function candidateRevalidationFailure(reason, initial = {}) {
+  return {
+    admission: {
+      allowed: false,
+      scope: CANDIDATE_REVALIDATION_FAILURE_SCOPE,
+      reason,
+      safeNextAction: 'Repair the standalone candidate revalidation path before dispatching or mutating any issue. Candidate authority remains unconsumed.',
+    },
+    initial: normalizeCandidateSnapshot(initial),
+    current: {},
+  };
+}
+
+async function boundedOperation(operation, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(operation),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error('candidate revalidation timed out');
+          error.code = 'CANDIDATE_REVALIDATION_TIMEOUT';
+          reject(error);
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function resolveSelector({ argv, env, select, timeoutMs }) {
+  try {
+    return {
+      ok: true,
+      selector: await boundedOperation(() => selectorFor({ argv, env, select }), timeoutMs),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error?.code === 'CANDIDATE_REVALIDATION_TIMEOUT'
+        ? 'candidate-revalidation-timeout'
+        : 'candidate-revalidation-unavailable',
+    };
+  }
+}
+
+async function selectBounded(selector, timeoutMs) {
+  try {
+    return { ok: true, selected: await boundedOperation(selector, timeoutMs) };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error?.code === 'CANDIDATE_REVALIDATION_TIMEOUT'
+        ? 'candidate-revalidation-timeout'
+        : 'candidate-revalidation-unavailable',
+    };
+  }
+}
+
+export function revalidateCandidateInChild({
+  expected,
+  argv = [],
+  env = process.env,
+  spawn = spawnSync,
+  processTimeoutMs = candidateSelectionTimeoutMs(env) + 5_000,
+} = {}) {
+  const initial = normalizeCandidateSnapshot(expected);
+  let result;
+  try {
+    result = spawn(process.execPath, [fileURLToPath(import.meta.url), ...argv], {
+      encoding: 'utf8',
+      maxBuffer: 2 * 1024 * 1024,
+      timeout: processTimeoutMs,
+      env: {
+        ...env,
+        AGENT_RUNNER_ATOMIC_EXPECTED_JSON: JSON.stringify(initial),
+        AGENT_RUNNER_ATOMIC_ARGV_JSON: JSON.stringify(argv),
+      },
+    });
+  } catch {
+    return candidateRevalidationFailure('candidate-revalidation-unavailable', initial);
+  }
+
+  if (result?.error) {
+    return candidateRevalidationFailure(
+      result.error.code === 'ETIMEDOUT'
+        ? 'candidate-revalidation-timeout'
+        : 'candidate-revalidation-unavailable',
+      initial,
+    );
+  }
+
+  let parsed = null;
+  try {
+    parsed = JSON.parse(String(result?.stdout || '').trim());
+  } catch {
+    parsed = null;
+  }
+
+  if (parsed?.admission && (
+    result?.status === 0
+    || result?.status === CANDIDATE_PAUSED_EXIT_CODE
+    || (result?.status === CANDIDATE_REVALIDATION_FAILURE_EXIT_CODE
+      && parsed.admission.scope === CANDIDATE_REVALIDATION_FAILURE_SCOPE)
+  )) {
+    return parsed;
+  }
+
+  return candidateRevalidationFailure('candidate-revalidation-unavailable', initial);
+}
+
 // Issue #227: once identity/authority admits the freshly re-read candidate,
-// apply the accepted #226 evaluator and #235 circuit against that exact
-// candidate before returning `allowed: true`. A `machine_profile` refusal
-// here carries its own bounded scope/reason/fingerprint rather than being
-// folded into the issue-level `issue_not_runnable` shape.
+// apply the accepted #226 evaluator and #235 circuit against the freshly
+// re-read candidate before returning `allowed: true`. A `machine_profile`
+// refusal here carries its own bounded scope/reason/fingerprint rather than
+// being folded into the issue-level `issue_not_runnable` shape.
 function admitCandidateCost({ identityAdmission, currentSelected, env }) {
   if (identityAdmission.allowed !== true) return identityAdmission;
   const cost = evaluateCandidateCostAdmission({
@@ -332,44 +462,86 @@ function admitCandidateCost({ identityAdmission, currentSelected, env }) {
   };
 }
 
-export async function admitExpectedCandidate({ expected, argv = [], env = process.env, select } = {}) {
+export async function admitExpectedCandidate({
+  expected,
+  argv = [],
+  env = process.env,
+  select,
+  selectorTimeoutMs = candidateSelectionTimeoutMs(env),
+} = {}) {
   const policy = approverPolicy(env);
-  if (policy.admission) return { admission: policy.admission, initial: normalizeCandidateSnapshot(expected), current: {} };
-  const selector = await selectorFor({ argv, env, select });
   const initial = normalizeCandidateSnapshot(expected);
-  const currentSelected = await selector();
+  if (policy.admission) return { admission: policy.admission, initial, current: {} };
+
+  const resolved = await resolveSelector({ argv, env, select, timeoutMs: selectorTimeoutMs });
+  if (!resolved.ok) return candidateRevalidationFailure(resolved.reason, initial);
+
+  const observed = await selectBounded(resolved.selector, selectorTimeoutMs);
+  if (!observed.ok) return candidateRevalidationFailure(observed.reason, initial);
+
+  const currentSelected = observed.selected;
   const current = candidateSnapshot(currentSelected);
   const identityAdmission = evaluateCandidateAdmission({ initial, current, approvers: policy.approvers });
   const admission = admitCandidateCost({ identityAdmission, currentSelected, env });
   return { admission, initial, current };
 }
 
-export async function admitCurrentCandidate({ argv = [], env = process.env, select } = {}) {
+export async function admitCurrentCandidate({
+  argv = [],
+  env = process.env,
+  select,
+  selectorTimeoutMs = candidateSelectionTimeoutMs(env),
+  revalidate = revalidateCandidateInChild,
+} = {}) {
   const policy = approverPolicy(env);
   if (policy.admission) {
     const current = {};
     return { admission: policy.admission, initial: current, current };
   }
-  const selector = await selectorFor({ argv, env, select });
-  const initial = candidateSnapshot(await selector());
-  const currentSelected = await selector();
-  const current = candidateSnapshot(currentSelected);
-  const identityAdmission = evaluateCandidateAdmission({ initial, current, approvers: policy.approvers });
-  const admission = admitCandidateCost({ identityAdmission, currentSelected, env });
-  return { admission, initial, current };
+
+  const resolved = await resolveSelector({ argv, env, select, timeoutMs: selectorTimeoutMs });
+  if (!resolved.ok) return candidateRevalidationFailure(resolved.reason);
+
+  const firstObservation = await selectBounded(resolved.selector, selectorTimeoutMs);
+  if (!firstObservation.ok) return candidateRevalidationFailure(firstObservation.reason);
+
+  const initial = candidateSnapshot(firstObservation.selected);
+
+  // Tests that inject a selector keep the original deterministic two-read
+  // seam. Production uses a fresh child process for the second observation,
+  // matching the already-accepted atomic revalidation architecture and
+  // preventing one selector instance from having to be re-entered.
+  if (select) {
+    const secondObservation = await selectBounded(resolved.selector, selectorTimeoutMs);
+    if (!secondObservation.ok) return candidateRevalidationFailure(secondObservation.reason, initial);
+    const currentSelected = secondObservation.selected;
+    const current = candidateSnapshot(currentSelected);
+    const identityAdmission = evaluateCandidateAdmission({ initial, current, approvers: policy.approvers });
+    const admission = admitCandidateCost({ identityAdmission, currentSelected, env });
+    return { admission, initial, current };
+  }
+
+  return revalidate({ expected: initial, argv, env });
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env, logger = console) {
   let result;
   if (env.AGENT_RUNNER_ATOMIC_EXPECTED_JSON) {
-    const expected = JSON.parse(env.AGENT_RUNNER_ATOMIC_EXPECTED_JSON);
-    const atomicArgv = env.AGENT_RUNNER_ATOMIC_ARGV_JSON ? JSON.parse(env.AGENT_RUNNER_ATOMIC_ARGV_JSON) : argv;
-    result = await admitExpectedCandidate({ expected, argv: atomicArgv, env });
+    try {
+      const expected = JSON.parse(env.AGENT_RUNNER_ATOMIC_EXPECTED_JSON);
+      const atomicArgv = env.AGENT_RUNNER_ATOMIC_ARGV_JSON ? JSON.parse(env.AGENT_RUNNER_ATOMIC_ARGV_JSON) : argv;
+      result = await admitExpectedCandidate({ expected, argv: atomicArgv, env });
+    } catch {
+      result = candidateRevalidationFailure('candidate-revalidation-unavailable');
+    }
   } else {
     result = await admitCurrentCandidate({ argv, env });
   }
   logger.log(JSON.stringify(result));
-  return result.admission.allowed ? 0 : CANDIDATE_PAUSED_EXIT_CODE;
+  if (result.admission.allowed) return 0;
+  return result.admission.scope === CANDIDATE_REVALIDATION_FAILURE_SCOPE
+    ? CANDIDATE_REVALIDATION_FAILURE_EXIT_CODE
+    : CANDIDATE_PAUSED_EXIT_CODE;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
