@@ -118,22 +118,29 @@ export async function recoverAppliedSourceActivationHeadMismatch({
   }
 
   const newer = markerComments.filter((comment) => commentId(comment) > state.sourceCommentId);
-  if (newer.length !== 1) {
-    return halt(
-      newer.length === 0
-        ? 'source-activation-applied-head-mismatch'
-        : 'source-activation-recovery-authority-ambiguous',
-      { sourceCommentId: state.sourceCommentId },
-    );
+  if (newer.length === 0) {
+    return halt('source-activation-applied-head-mismatch', { sourceCommentId: state.sourceCommentId });
   }
 
-  const parsed = parseSourceActivationAuthority(newer[0]);
-  if (!parsed.valid) {
-    return halt('source-activation-recovery-authority-invalid', { sourceCommentId: parsed.commentId || state.sourceCommentId });
+  // Recovery may legitimately span multiple accepted-source generations. Every
+  // intervening marker must still be a valid immutable authority from an
+  // approved manager; only the uniquely newest marker may reconcile the
+  // durable state, and it must target the exact current HEAD. This lets a
+  // stale .5 state recover through historical .6 to a current .7 authority
+  // without reinterpreting or skipping an invalid authority in the chain.
+  const parsedNewer = [];
+  for (const comment of newer) {
+    const parsed = parseSourceActivationAuthority(comment);
+    if (!parsed.valid) {
+      return halt('source-activation-recovery-authority-invalid', { sourceCommentId: parsed.commentId || state.sourceCommentId });
+    }
+    if (!approvers.includes(commentAuthor(comment))) {
+      return halt('source-activation-recovery-author-unapproved', { sourceCommentId: parsed.commentId });
+    }
+    parsedNewer.push(parsed);
   }
-  if (!approvers.includes(commentAuthor(newer[0]))) {
-    return halt('source-activation-recovery-author-unapproved', { sourceCommentId: parsed.commentId });
-  }
+
+  const parsed = parsedNewer.at(-1);
   if (parsed.targetCommit !== currentHead) {
     return halt('source-activation-recovery-target-head-mismatch', { sourceCommentId: parsed.commentId });
   }
