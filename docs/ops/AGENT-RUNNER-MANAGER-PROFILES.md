@@ -123,3 +123,7 @@ claim or dispatch inside the existing manager recurrence, and any rollback
 to the previous manager configuration, are separate programme actions
 performed after merge and independent source activation, per the #259
 issue's "Publication and cutover" section.
+
+`#261` (`BUILD.MANAGER.PLANNER.1`) builds on a validated profile from this
+slice to produce a read-only, versioned evidence snapshot, project brief and
+plan proposal -- see `docs/ops/AGENT-RUNNER-MANAGER-PLANNER.md`.
