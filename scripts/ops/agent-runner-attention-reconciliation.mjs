@@ -1,145 +1,157 @@
-import { GhCliReconciliationClient } from './agent-runner-issue-reconciliation.mjs';
+import { createHash, randomUUID } from 'node:crypto';
 
-export const ATTENTION_RECONCILIATION_SCHEMA_VERSION = 1;
+export const ATTENTION_RECONCILIATION_SCHEMA_VERSION = 2;
+export const ATTENTION_RECONCILIATION_MAX_AGE_MS = 30 * 60 * 1000;
+export const ATTENTION_RECONCILIATION_MAX_EVENTS = 200;
+export const ATTENTION_RECONCILIATION_MAX_ISSUES = 25;
 
-/** Bounded, deterministic vocabulary. `unknown` fails closed and is never treated as resolved/healthy. */
-export const ATTENTION_RECONCILIATION_STATUSES = Object.freeze(['actionable', 'historical', 'unknown']);
+const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const hash = (value) => `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`;
 
-const repoPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+export function attentionEventIdentity(row) {
+  if (!REPOSITORY.test(row?.repo || '') || !Number.isInteger(row?.issue_number) || row.issue_number <= 0) return null;
+  const hasId = Number.isInteger(row.id) && row.id > 0;
+  const hasKeys = typeof row.dedupe_key === 'string' && row.dedupe_key && typeof row.attempt_id === 'string' && row.attempt_id;
+  if (!hasId && !hasKeys) return null;
+  return hash({ repository: row.repo, id: hasId ? row.id : null, dedupeKey: hash(row.dedupe_key || ''), attemptId: hash(row.attempt_id || '') });
+}
 
-/**
- * Pure classification of one already-fetched GitHub issue read against the
- * bounded reconciliation vocabulary. An open issue is `actionable` by
- * default (fail closed: absence of proof it is closed is not proof it is
- * done), and a closed issue is `historical` regardless of its specific
- * close reason, since #183 explicitly requires closed/completed/not-planned/
- * duplicate items to stop inflating the current operator-action count and
- * defines no bounded rule under which a closed issue still requires action.
- */
-export function classifyGithubIssueState(issue) {
-  if (!issue || typeof issue !== 'object' || typeof issue.state !== 'string') {
-    return Object.freeze({ status: 'unknown', reasonCode: 'issue-not-found' });
-  }
+function currentAttemptProof(row, attempts = []) {
+  const attempt = attempts.find((candidate) => candidate?.attempt_id === row?.attempt_id);
+  if (!attempt || attempt.attention_dedupe_key !== row.dedupe_key) return null;
+  const revision = hash({
+    attemptId: hash(attempt.attempt_id), resolutionState: attempt.resolution_state || null,
+    attentionStatus: attempt.attention_status || null, outcome: attempt.outcome || null,
+    finishedAt: attempt.finished_at || null,
+  });
+  const actionable = attempt.attention_status === 'attention_required'
+    && attempt.resolution_state === 'operator_attention_required';
+  return Object.freeze({ actionable, revision });
+}
+
+export function attentionEventRevision(row, attempts = []) {
+  return hash({
+    eventKey: attentionEventIdentity(row), updatedAt: row?.updated_at || null, resolvedAt: row?.resolved_at || null,
+    recoveryStatus: row?.recovery_status || null, policyRevision: row?.policy_revision || null,
+    reasonDigest: hash(row?.reason || ''), nextActionDigest: hash(row?.next_action || ''),
+    eventDigest: hash(row?.event_json || ''), attemptRevision: currentAttemptProof(row, attempts)?.revision || null,
+  });
+}
+
+export function attentionSourceSnapshotDigest(attentionEvents = [], attempts = []) {
+  return hash(attentionEvents.filter((row) => !row?.resolved_at).map((row) => ({
+    eventKey: attentionEventIdentity(row), eventRevision: attentionEventRevision(row, attempts),
+  })).sort((a, b) => String(a.eventKey).localeCompare(String(b.eventKey))));
+}
+
+export function classifyGithubIssueState(issue, { hasCurrentActionProof = false } = {}) {
+  if (!issue || typeof issue !== 'object' || typeof issue.state !== 'string') return Object.freeze({ status: 'unknown', reasonCode: 'issue-not-found' });
   if (issue.state === 'closed') {
     const reason = typeof issue.state_reason === 'string' && issue.state_reason ? issue.state_reason : 'unspecified';
     return Object.freeze({ status: 'historical', reasonCode: `closed-${reason}` });
   }
-  if (issue.state === 'open') {
-    return Object.freeze({ status: 'actionable', reasonCode: 'issue-open' });
-  }
+  if (issue.state === 'open' && hasCurrentActionProof) return Object.freeze({ status: 'actionable', reasonCode: 'current-operator-hold' });
+  if (issue.state === 'open') return Object.freeze({ status: 'unknown', reasonCode: 'open-without-current-action-proof' });
   return Object.freeze({ status: 'unknown', reasonCode: 'issue-state-unrecognized' });
 }
 
-/**
- * Repository-qualified, read-only reconciliation of a single attention
- * record's GitHub identity. Never mutates GitHub. Any lookup failure
- * (network, malformed response, rate limit, ambiguous read) fails closed to
- * `unknown` -- it is never promoted to `historical`.
- */
-export function reconcileAttentionIdentity({ repository, issueNumber, client }) {
-  if (!repoPattern.test(repository || '')) {
-    return Object.freeze({ repository, issueNumber, status: 'unknown', reasonCode: 'invalid-repository', githubState: null, githubStateReason: null });
-  }
-  if (!Number.isInteger(issueNumber) || issueNumber <= 0) {
-    return Object.freeze({ repository, issueNumber, status: 'unknown', reasonCode: 'invalid-issue-number', githubState: null, githubStateReason: null });
-  }
-  let raw;
-  try {
-    raw = client.request('GET', `/repos/${repository}/issues/${issueNumber}`);
-  } catch {
-    return Object.freeze({ repository, issueNumber, status: 'unknown', reasonCode: 'lookup-unavailable', githubState: null, githubStateReason: null });
-  }
-  if (raw && raw.number !== issueNumber) {
-    return Object.freeze({ repository, issueNumber, status: 'unknown', reasonCode: 'lookup-ambiguous', githubState: null, githubStateReason: null });
-  }
-  const { status, reasonCode } = classifyGithubIssueState(raw);
-  return Object.freeze({
-    repository,
-    issueNumber,
-    status,
-    reasonCode,
-    githubState: raw?.state ?? null,
-    githubStateReason: raw?.state_reason ?? null,
+function githubEvidenceRevision(repository, issue, errorCode = null) {
+  return hash(errorCode ? { repository, errorCode } : {
+    repository, number: issue?.number, state: issue?.state, stateReason: issue?.state_reason ?? null,
+    updatedAt: issue?.updated_at ?? null, closedAt: issue?.closed_at ?? null,
+    isPullRequest: Boolean(issue?.is_pull_request),
   });
 }
 
-/**
- * Deduplicates a bounded list of `attention_events` rows down to distinct,
- * repository-qualified (repository, issueNumber) identities -- reconciliation
- * is never performed by issue number alone, and never against an already
- * internally-resolved attention row.
- */
-export function distinctUnresolvedAttentionIdentities(attentionEvents = []) {
-  const seen = new Map();
-  for (const row of attentionEvents) {
-    if (row?.resolved_at) continue;
-    const repository = row?.repo;
-    const issueNumber = row?.issue_number;
-    if (typeof repository !== 'string' || !repository || !Number.isInteger(issueNumber)) continue;
-    seen.set(`${repository} ${issueNumber}`, { repository, issueNumber });
-  }
-  return [...seen.values()];
+export function reconcileAttentionEvent({ row, attempts = [], githubResult, checkedAt }) {
+  const eventKey = attentionEventIdentity(row);
+  const eventRevision = attentionEventRevision(row, attempts);
+  const proof = currentAttemptProof(row, attempts);
+  let issue = githubResult?.issue ?? null;
+  let errorCode = githubResult?.errorCode ?? null;
+  if (!eventKey) errorCode = 'invalid-attention-event-identity';
+  if (!errorCode && (!issue || issue.number !== row.issue_number)) errorCode = 'lookup-ambiguous';
+  const classified = errorCode
+    ? { status: 'unknown', reasonCode: errorCode }
+    : classifyGithubIssueState(issue, { hasCurrentActionProof: proof?.actionable === true });
+  return Object.freeze({
+    repository: row?.repo || null, eventKey, eventRevision,
+    attentionEventId: Number.isInteger(row?.id) ? row.id : null,
+    issueNumber: Number.isInteger(row?.issue_number) ? row.issue_number : null,
+    status: classified.status, reasonCode: classified.reasonCode,
+    githubState: errorCode ? null : issue.state,
+    githubStateReason: errorCode ? null : issue.state_reason ?? null,
+    githubEvidenceRevision: githubEvidenceRevision(row?.repo, issue, errorCode), checkedAt,
+  });
 }
 
-/**
- * Reconciles every distinct unresolved (repository, issueNumber) identity in
- * `attentionEvents` against live GitHub state and durably records each
- * decision in `store` -- idempotent (re-running against unchanged GitHub
- * state re-verifies and re-records the same decision) and never deletes
- * prior evidence in `attentionEvents` itself, which this function never
- * touches.
- */
-export function reconcileAttentionEvents({ attentionEvents = [], store, client = new GhCliReconciliationClient(), now = () => new Date().toISOString() } = {}) {
-  if (!store || typeof store.upsert !== 'function') throw new Error('reconciliation store is required');
-  const identities = distinctUnresolvedAttentionIdentities(attentionEvents);
-  const results = [];
-  for (const identity of identities) {
-    const decision = reconcileAttentionIdentity({ ...identity, client });
-    const recorded = store.upsert({
-      repository: decision.repository,
-      issueNumber: decision.issueNumber,
-      status: decision.status,
-      reasonCode: decision.reasonCode,
-      githubState: decision.githubState,
-      githubStateReason: decision.githubStateReason,
-      evidence: { githubState: decision.githubState, githubStateReason: decision.githubStateReason },
-      now: now(),
+export function reconcileAttentionEvents({ repository, attentionEvents = [], attempts = [], store, client, now = () => new Date().toISOString(), generationId = randomUUID(), maxAgeMs = ATTENTION_RECONCILIATION_MAX_AGE_MS, verifySource = () => true } = {}) {
+  if (!REPOSITORY.test(repository || '')) throw new Error('repository is required');
+  if (!store || typeof store.publishGeneration !== 'function') throw new Error('reconciliation store is required');
+  if (!client || typeof client.getIssue !== 'function') throw new Error('GET-only attention client is required');
+  const unresolved = attentionEvents.filter((row) => !row?.resolved_at && row?.repo === repository);
+  if (unresolved.length > ATTENTION_RECONCILIATION_MAX_EVENTS) throw Object.assign(new Error('attention event bound exceeded'), { code: 'attention-event-bound-exceeded' });
+  const identities = [...new Set(unresolved.map((row) => `${row.repo}#${row.issue_number}`))];
+  if (identities.length > ATTENTION_RECONCILIATION_MAX_ISSUES) throw Object.assign(new Error('attention issue bound exceeded'), { code: 'attention-issue-bound-exceeded' });
+  const startedAt = now();
+  const cache = new Map();
+  for (const row of unresolved) {
+    const key = `${row.repo}#${row.issue_number}`;
+    if (cache.has(key)) continue;
+    try { cache.set(key, { issue: client.getIssue(row.repo, row.issue_number) }); }
+    catch { cache.set(key, { errorCode: 'lookup-unavailable' }); }
+  }
+  const decisions = unresolved.map((row) => reconcileAttentionEvent({
+    row, attempts, githubResult: cache.get(`${row.repo}#${row.issue_number}`), checkedAt: now(),
+  }));
+  if (!verifySource()) throw Object.assign(new Error('attention source changed during reconciliation'), { code: 'attention-source-changed' });
+  const completedAt = now();
+  return store.publishGeneration({
+    generationId, repository, sourceSnapshotDigest: attentionSourceSnapshotDigest(unresolved, attempts),
+    sourceEventCount: unresolved.length, startedAt, completedAt,
+    expiresAt: new Date(Date.parse(completedAt) + maxAgeMs).toISOString(), decisions,
+    checkedIssueCount: identities.length,
+  });
+}
+
+export function buildAttentionReconciliationProjection(attentionEvents = [], attempts = [], state = null, { repository = null, now = new Date().toISOString() } = {}) {
+  const unresolved = attentionEvents.filter((row) => !row?.resolved_at && (!repository || row?.repo === repository));
+  const sourceDigest = attentionSourceSnapshotDigest(unresolved, attempts);
+  const generationFresh = state?.generation?.state === 'completed'
+    && state.generation.sourceSnapshotDigest === sourceDigest
+    && Date.parse(state.generation.expiresAt) > Date.parse(now);
+  const itemsByKey = new Map((state?.items || []).map((item) => [item.eventKey, item]));
+  const revoked = new Set((state?.acknowledgements || []).filter((ack) => ack.action === 'revoke').map((ack) => ack.targetId));
+  const grants = new Map();
+  for (const ack of state?.acknowledgements || []) {
+    if (ack.action !== 'grant' || revoked.has(ack.id) || Date.parse(ack.expiresAt) <= Date.parse(now)) continue;
+    grants.set(`${ack.eventKey}|${ack.eventRevision}|${ack.githubEvidenceRevision}`, ack);
+  }
+  const items = unresolved.map((row) => {
+    const eventKey = attentionEventIdentity(row);
+    const eventRevision = attentionEventRevision(row, attempts);
+    const recorded = generationFresh ? itemsByKey.get(eventKey) : null;
+    let status = generationFresh ? 'unknown' : (state?.generation ? 'stale' : 'unknown');
+    let reasonCode = generationFresh ? 'not-reconciled' : (state?.generation ? 'reconciliation-stale-or-source-changed' : 'reconciliation-missing');
+    let acknowledged = false;
+    if (recorded && recorded.eventRevision === eventRevision) {
+      status = recorded.status; reasonCode = recorded.reasonCode;
+      const ack = grants.get(`${eventKey}|${recorded.eventRevision}|${recorded.githubEvidenceRevision}`);
+      if (ack) { status = ack.status; reasonCode = ack.reasonCode; acknowledged = true; }
+    }
+    return Object.freeze({
+      eventKey, repository: row?.repo || null, issueNumber: row?.issue_number || null,
+      status, reasonCode, checkedAt: recorded?.checkedAt || null, acknowledged,
     });
-    results.push(recorded);
-  }
-  return results;
-}
-
-/**
- * Builds a "repository issueNumber" -> reconciliation row lookup map for the
- * canonical status-projection layer (buildRunnerOperatorStatus()) to
- * consume, shared identically by the standalone dashboard, the CLI and any
- * future read-only exporter. Accepts either a store (with
- * listForRepository()) or an already-fetched array of reconciliation rows.
- */
-export function attentionReconciliationLookup(storeOrRows, repository) {
-  const rows = Array.isArray(storeOrRows)
-    ? storeOrRows
-    : (storeOrRows && typeof storeOrRows.listForRepository === 'function' ? storeOrRows.listForRepository(repository) : []);
-  const map = new Map();
-  for (const row of rows) {
-    map.set(`${row.repository} ${row.issueNumber}`, row);
-  }
-  return map;
-}
-
-/**
- * Effective reconciliation status for one attention_events row, honoring an
- * explicit operator acknowledgement over the automatic decision when
- * present. Returns null (no opinion -- still counted as unresolved by the
- * caller) when no reconciliation has ever been recorded for this identity,
- * so a fresh unresolved attention record is never silently treated as
- * historical before it has actually been reconciled.
- */
-export function effectiveAttentionReconciliationStatus(row, reconciliationsByIdentity) {
-  if (!reconciliationsByIdentity || typeof row?.repo !== 'string' || !Number.isInteger(row?.issue_number)) return null;
-  const record = reconciliationsByIdentity.get(`${row.repo} ${row.issue_number}`);
-  if (!record) return null;
-  if (record.acknowledgedStatus) return record.acknowledgedStatus;
-  return record.status;
+  });
+  const count = (value) => items.filter((item) => item.status === value).length;
+  const actionableCount = count('actionable'); const unknownCount = count('unknown'); const staleCount = count('stale');
+  return Object.freeze({
+    schemaVersion: ATTENTION_RECONCILIATION_SCHEMA_VERSION, repository,
+    generatedAt: now,
+    generation: state?.generation ? Object.freeze({ ...state.generation, freshness: generationFresh ? 'current' : 'stale' }) : Object.freeze({ id: null, freshness: 'missing' }),
+    items: Object.freeze(items),
+    counts: Object.freeze({ actionable: actionableCount, historical: count('historical'), unknown: unknownCount, stale: staleCount, total: items.length }),
+    posture: actionableCount > 0 ? 'attention' : (unknownCount + staleCount > 0 ? 'degraded' : 'clear'),
+  });
 }

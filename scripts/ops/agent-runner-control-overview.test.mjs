@@ -123,8 +123,9 @@ test('attention events never forward dashboard_reference, the one column that ca
   const projection = projectAttention([
     { repo: 'TheTekTeam/agent-runner', issue_number: 7, reason: 'stalled', dashboard_reference: '/var/www/runner/index.html', created_at: NOW, resolved_at: null },
   ]);
-  assert.equal(projection.unresolvedCount, 1);
-  assert.equal(projection.events[0].reason, 'stalled');
+  assert.equal(projection.unresolvedCount, 0);
+  assert.equal(projection.unknownCount, 1);
+  assert.equal(projection.uncertainEvents[0].reason, 'stalled');
   assert.ok(!JSON.stringify(projection).includes('/var/www'));
   assert.ok(!JSON.stringify(projection).includes('dashboardReference'));
 });
@@ -137,6 +138,7 @@ test('every status the derivations can produce is inside the shared vocabulary',
     deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'global_systemic_pause' } }),
     deriveRunnerStatus({ snapshot: okSnapshot(), circuit: { blocked: true } }),
     deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'attention_required', count: 2 } }),
+    deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'attention_reconciliation_degraded', unknownCount: 1, staleCount: 0 } }),
     deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'queue_inspection_degraded' } }),
     deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'task_local_quarantines', count: 1 } }),
     deriveRunnerStatus({ snapshot: okSnapshot(), operatorStatus: { code: 'queue_moving' }, activity: { activeIssue: { issue_number: 1 } } }),

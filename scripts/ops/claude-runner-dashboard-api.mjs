@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 import { agentAssignmentDisplayName, allAgentLabels } from './agent-runner-agents.mjs';
 import { loadAgentRunnerConfig, projectIdentity, stripConfigArgs } from './agent-runner-config.mjs';
 import { defaultRunnerStateDbPath, RUNNER_STATE_SCHEMA_VERSION, summarizeRunnerState } from './claude-runner-state.mjs';
-import { effectiveAttentionReconciliationStatus, attentionReconciliationLookup } from './agent-runner-attention-reconciliation.mjs';
-import { readAttentionReconciliationsForRepository } from './agent-runner-attention-reconciliation-store.mjs';
+import { buildAttentionReconciliationProjection } from './agent-runner-attention-reconciliation.mjs';
+import { resolveAttentionReconciliationDbPath } from './agent-runner-attention-reconciliation-path.mjs';
+import { readAttentionReconciliationState } from './agent-runner-attention-reconciliation-store.mjs';
 
 const TABLE_TO_DASHBOARD_KEY = Object.freeze({
   queue_events: 'queueEvents',
@@ -35,8 +35,7 @@ function defaultDbPathFromEnv(env = process.env, config = loadAgentRunnerConfig(
 }
 
 function defaultReconciliationDbPathFromEnv(env = process.env, config = loadAgentRunnerConfig({ env })) {
-  return env.CLAUDE_RUNNER_ATTENTION_RECONCILIATION_DB
-    || join(env.CLAUDE_RUNNER_OUTPUT_DIR || config.outputDir || '.var/claude-runner', 'attention-reconciliation.sqlite');
+  return resolveAttentionReconciliationDbPath({ env, config });
 }
 
 /**
@@ -46,9 +45,14 @@ function defaultReconciliationDbPathFromEnv(env = process.env, config = loadAgen
  * stays counted exactly as it did before this feature existed -- reading or
  * opening the dashboard never itself resolves anything.
  */
-function loadAttentionReconciliations(reconciliationDbPath, repository) {
-  if (!reconciliationDbPath || !repository) return null;
-  return attentionReconciliationLookup(readAttentionReconciliationsForRepository(reconciliationDbPath, repository), repository);
+function loadAttentionProjection(reconciliationDbPath, repository, latest, generatedAt) {
+  const state = reconciliationDbPath && repository
+    ? readAttentionReconciliationState(reconciliationDbPath, repository)
+    : null;
+  return buildAttentionReconciliationProjection(
+    latest.attentionEvents || [], latest.recoveryAttempts || [], state,
+    { repository, now: generatedAt },
+  );
 }
 
 function parsePositiveInteger(value, fallback) {
@@ -575,22 +579,27 @@ function preflightFingerprints(preflights = []) {
  * the moment the condition clears (see `emitSystemicStatePause()`/
  * `selectIssue()` in claude-runner-cron.mjs).
  */
-export function buildRunnerOperatorStatus(latest, activity, currentHealthConditions = [], attentionReconciliations = null) {
+export function buildRunnerOperatorStatus(latest, activity, currentHealthConditions = [], attentionProjection = null) {
   const systemicPause = currentHealthConditions.find((row) => row.condition_type === 'systemic_pause');
   if (systemicPause) {
     return { code: 'global_systemic_pause', label: 'Globally paused due to a systemic safety fault', reason: systemicPause.reason || null };
   }
-  // #183 -- an internally-unresolved attention row that GitHub reconciliation
-  // has since durably classified as `historical` (the issue/PR closed, with
-  // no bounded rule proving post-closure action is still required) no longer
-  // inflates the current operator-action count. A row with no reconciliation
-  // decision yet, or one reconciliation could only classify `unknown`, is
-  // never treated as resolved -- reconciliation fails closed, never healthy.
-  const unresolved = (latest.attentionEvents || []).filter((row) => {
-    if (row.resolved_at) return false;
-    return effectiveAttentionReconciliationStatus(row, attentionReconciliations) !== 'historical';
-  });
-  if (unresolved.length) return { code: 'attention_required', label: 'Attention required', count: unresolved.length };
+  const attention = attentionProjection || buildAttentionReconciliationProjection(
+    latest.attentionEvents || [], latest.recoveryAttempts || [], null,
+  );
+  if (attention.counts.actionable > 0) {
+    return {
+      code: 'attention_required', label: 'Attention required', count: attention.counts.actionable,
+      unknownCount: attention.counts.unknown, staleCount: attention.counts.stale,
+    };
+  }
+  if (attention.counts.unknown + attention.counts.stale > 0) {
+    return {
+      code: 'attention_reconciliation_degraded',
+      label: 'Attention state uncertain — reconciliation is missing, stale or inconclusive',
+      unknownCount: attention.counts.unknown, staleCount: attention.counts.stale,
+    };
+  }
   const quarantines = (latest.queueEvents || []).filter((row) => row.event_type === 'quarantine');
   if (quarantines.length) return { code: 'task_local_quarantines', label: 'Timer healthy with task-local quarantines', count: quarantines.length };
   if (activity?.activeIssue || (latest.runResults || []).some((row) => row.mode === 'issue-run')) {
@@ -615,7 +624,7 @@ export function buildRunnerOperatorStatus(latest, activity, currentHealthConditi
 
 export function buildRunnerDashboard(dbPath, {
   now = isoNow, historyLimit = 20, strict = false, config = loadAgentRunnerConfig(),
-  reconciliationDbPath = defaultReconciliationDbPathFromEnv(process.env, config),
+  env = process.env, reconciliationDbPath = null,
 } = {}) {
   const summary = summarizeRunnerState(dbPath, {
     now,
@@ -646,7 +655,8 @@ export function buildRunnerDashboard(dbPath, {
   // unresolved-only, independent of `latest.healthConditions`' bounded
   // history window.
   const currentHealthConditions = (summary.currentHealthConditions || []).map(TABLE_SERIALIZERS.runner_health_conditions);
-  const attentionReconciliations = loadAttentionReconciliations(reconciliationDbPath, config?.githubRepo);
+  const resolvedReconciliationDbPath = reconciliationDbPath || defaultReconciliationDbPathFromEnv(env, config);
+  const attentionProjection = loadAttentionProjection(resolvedReconciliationDbPath, config?.githubRepo, latest, summary.generatedAt);
 
   const activity = buildRunnerActivity(latest);
   return {
@@ -662,7 +672,8 @@ export function buildRunnerDashboard(dbPath, {
     aggregates,
     metrics: buildRunnerMetrics({ latest }),
     activity,
-    operatorStatus: buildRunnerOperatorStatus(latest, activity, currentHealthConditions, attentionReconciliations),
+    attention: attentionProjection,
+    operatorStatus: buildRunnerOperatorStatus(latest, activity, currentHealthConditions, attentionProjection),
     diagnostics,
     ...(summary.error ? { error: summary.error } : {}),
   };
@@ -718,6 +729,7 @@ export function run(argv = process.argv.slice(2), env = process.env, io = { stdo
     historyLimit: args.historyLimit,
     strict: args.strict,
     config: args.config,
+    env,
   });
   io.stdout.write(`${JSON.stringify(dashboard, null, 2)}\n`);
   return args.strict && !dashboard.ok ? 1 : 0;

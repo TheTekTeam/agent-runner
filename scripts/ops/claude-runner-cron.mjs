@@ -89,6 +89,7 @@ import {
 } from './claude-runner-recovery-adapter.mjs';
 import { redactExecutableArgs } from './lib/redact.mjs';
 import { reconcileNotifications } from './agent-runner-notifications.mjs';
+import { runAttentionReconciliation } from './agent-runner-attention-reconcile-command.mjs';
 
 const DEFAULT_REPO = 'TheTekTeam/modelspend';
 const DEFAULT_LOCK = '.var/claude-runner/cron.lock';
@@ -3053,6 +3054,32 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       const reconcileNotificationEvents = dependencies.reconcileNotifications || reconcileNotifications;
       await reconcileNotificationEvents({ state, args, transport: dependencies.notificationTransport, now });
       if (!state.healthy) return emitSystemicStatePause(args, state, 'notification-reconcile', { now, logger: dependencies.logger }).exitCode;
+
+      // #183: refresh the event-scoped attention projection once while the
+      // existing scheduler lock is held. This is task-local read/reconcile
+      // work: it never changes selection, quota, claims, GitHub state or the
+      // scheduler return code, and it remains reachable before the quota-
+      // blocked early return. Dashboard/status reads never run it.
+      const reconcileAttention = dependencies.reconcileAttention || runAttentionReconciliation;
+      const attentionClient = dependencies.attentionClient || {
+        getIssue(repository, issueNumber) {
+          const raw = JSON.parse(ghRunner(['api', '--method', 'GET', `/repos/${repository}/issues/${issueNumber}`]));
+          return {
+            number: raw?.number, state: raw?.state, state_reason: raw?.state_reason ?? null,
+            updated_at: raw?.updated_at ?? null, closed_at: raw?.closed_at ?? null,
+            is_pull_request: Boolean(raw?.pull_request),
+          };
+        },
+      };
+      try {
+        await reconcileAttention({
+          argv: ['--state-db', args.stateDbPath], env,
+          config: { githubRepo: args.repo, outputDir: args.outputDir, stateDbPath: args.stateDbPath },
+          client: attentionClient, now,
+        });
+      } catch (error) {
+        state.recordTaskError('attention-reconciliation-failed', error);
+      }
     }
     // #698 round 5, finding 3: a pass that proves the store writable again
     // is exactly the condition that cleared `systemic_pause` — resolve it

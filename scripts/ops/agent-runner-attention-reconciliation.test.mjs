@@ -1,274 +1,243 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 
-import { AttentionReconciliationStore, readAttentionReconciliationsForRepository } from './agent-runner-attention-reconciliation-store.mjs';
+import { GhCliAttentionReadClient } from './agent-runner-attention-github-client.mjs';
+import { resolveAttentionReconciliationDbPath } from './agent-runner-attention-reconciliation-path.mjs';
+import { AttentionReconciliationStore, readAttentionReconciliationState } from './agent-runner-attention-reconciliation-store.mjs';
 import {
-  classifyGithubIssueState, reconcileAttentionIdentity, distinctUnresolvedAttentionIdentities,
-  reconcileAttentionEvents, attentionReconciliationLookup, effectiveAttentionReconciliationStatus,
+  attentionEventIdentity, attentionSourceSnapshotDigest, buildAttentionReconciliationProjection,
+  classifyGithubIssueState, reconcileAttentionEvents,
 } from './agent-runner-attention-reconciliation.mjs';
-import { buildRunnerOperatorStatus } from './claude-runner-dashboard-api.mjs';
-import { projectAttention } from './agent-runner-control-overview.mjs';
+import { runAttentionReconciliation } from './agent-runner-attention-reconcile-command.mjs';
 
-function fakeClient(issuesByNumber) {
+const REPO = 'TheTekTeam/modelspend';
+const NOW = '2026-08-20T01:00:00.000Z';
+const LATER = '2026-08-20T01:10:00.000Z';
+
+function row(issueNumber, overrides = {}) {
+  return {
+    id: issueNumber, repo: REPO, issue_number: issueNumber, dedupe_key: `dedupe-${issueNumber}`,
+    attempt_id: `attempt-${issueNumber}`, updated_at: NOW, resolved_at: null,
+    recovery_status: 'forbidden', policy_revision: 'runner-recovery-v1', reason: 'attention-required',
+    next_action: 'Review preserved evidence.', event_json: '{}', ...overrides,
+  };
+}
+
+function attempt(issueNumber, overrides = {}) {
+  return {
+    attempt_id: `attempt-${issueNumber}`, attention_dedupe_key: `dedupe-${issueNumber}`,
+    attention_status: 'attention_required', resolution_state: 'operator_attention_required',
+    outcome: 'failed', finished_at: NOW, ...overrides,
+  };
+}
+
+function fakeClient(byIdentity) {
   const calls = [];
   return {
     calls,
-    request(method, endpoint) {
-      calls.push({ method, endpoint });
-      const match = endpoint.match(/\/repos\/([^/]+\/[^/]+)\/issues\/(\d+)$/);
-      if (!match) throw new Error('unexpected endpoint');
-      const [, , numberText] = match;
-      const number = Number(numberText);
-      if (!(number in issuesByNumber)) return null;
-      const issue = issuesByNumber[number];
-      if (issue === 'throw') throw new Error('network unavailable');
-      return issue;
+    getIssue(repository, issueNumber) {
+      calls.push({ repository, issueNumber });
+      const value = byIdentity[`${repository}#${issueNumber}`];
+      if (value === 'throw') throw new Error('offline');
+      return value;
     },
   };
 }
 
-function attentionRow({ repo = 'TheTekTeam/modelspend', issueNumber, resolvedAt = null } = {}) {
-  return { repo, issue_number: issueNumber, resolved_at: resolvedAt };
+function tempDb(fn) {
+  const dir = mkdtempSync(join(tmpdir(), 'attention-reconciliation-v2-'));
+  try { return fn(join(dir, 'attention.sqlite'), dir); }
+  finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-function withTempDb(fn) {
-  const dir = mkdtempSync(join(tmpdir(), 'attention-reconciliation-'));
-  try {
-    return fn(join(dir, 'attention-reconciliation.sqlite'));
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+function runGeneration(store, events, attempts, client, overrides = {}) {
+  const times = [NOW, NOW, LATER];
+  return reconcileAttentionEvents({
+    repository: REPO, attentionEvents: events, attempts, store, client,
+    generationId: overrides.generationId || `generation-${Math.random().toString(16).slice(2)}`,
+    now: () => times.shift() || LATER, ...overrides,
+  });
 }
 
-test('classifyGithubIssueState: closed issue is historical regardless of close reason', () => {
+test('closed state is historical; open requires exact current runner proof', () => {
   assert.deepEqual(classifyGithubIssueState({ state: 'closed', state_reason: 'completed' }), { status: 'historical', reasonCode: 'closed-completed' });
-  assert.deepEqual(classifyGithubIssueState({ state: 'closed', state_reason: 'not_planned' }), { status: 'historical', reasonCode: 'closed-not_planned' });
-  assert.deepEqual(classifyGithubIssueState({ state: 'closed', state_reason: null }), { status: 'historical', reasonCode: 'closed-unspecified' });
+  assert.deepEqual(classifyGithubIssueState({ state: 'open' }), { status: 'unknown', reasonCode: 'open-without-current-action-proof' });
+  assert.deepEqual(classifyGithubIssueState({ state: 'open' }, { hasCurrentActionProof: true }), { status: 'actionable', reasonCode: 'current-operator-hold' });
 });
 
-test('classifyGithubIssueState: open issue is actionable', () => {
-  assert.deepEqual(classifyGithubIssueState({ state: 'open', state_reason: null }), { status: 'actionable', reasonCode: 'issue-open' });
+test('immutable event identity separates later events for the same repository issue', () => {
+  assert.notEqual(attentionEventIdentity(row(44)), attentionEventIdentity(row(44, { id: 99, dedupe_key: 'later', attempt_id: 'later' })));
 });
 
-test('classifyGithubIssueState: missing/malformed issue fails closed to unknown, never healthy', () => {
-  assert.equal(classifyGithubIssueState(null).status, 'unknown');
-  assert.equal(classifyGithubIssueState({}).status, 'unknown');
-  assert.equal(classifyGithubIssueState({ state: 'merged' }).status, 'unknown');
-});
-
-test('reconcileAttentionIdentity: GitHub lookup unavailable fails closed to unknown', () => {
-  const client = fakeClient({ 44: 'throw' });
-  const decision = reconcileAttentionIdentity({ repository: 'TheTekTeam/modelspend', issueNumber: 44, client });
-  assert.equal(decision.status, 'unknown');
-  assert.equal(decision.reasonCode, 'lookup-unavailable');
-});
-
-test('reconcileAttentionIdentity: repository-qualified -- rejects a bare/invalid repository identity', () => {
-  const client = fakeClient({});
-  const decision = reconcileAttentionIdentity({ repository: 'not-a-repo', issueNumber: 44, client });
-  assert.equal(decision.status, 'unknown');
-  assert.equal(decision.reasonCode, 'invalid-repository');
-  assert.equal(client.calls.length, 0);
-});
-
-test('distinctUnresolvedAttentionIdentities: repository-qualified de-duplication, excludes already-resolved rows', () => {
-  const rows = [
-    attentionRow({ issueNumber: 182 }),
-    attentionRow({ issueNumber: 182 }),
-    attentionRow({ repo: 'Other/repo', issueNumber: 182 }),
-    attentionRow({ issueNumber: 44, resolvedAt: '2026-01-01T00:00:00.000Z' }),
-  ];
-  const identities = distinctUnresolvedAttentionIdentities(rows);
-  assert.deepEqual(
-    identities.sort((a, b) => a.repository.localeCompare(b.repository) || a.issueNumber - b.issueNumber),
-    [
-      { repository: 'Other/repo', issueNumber: 182 },
-      { repository: 'TheTekTeam/modelspend', issueNumber: 182 },
-    ],
-  );
-});
-
-test('reconcileAttentionEvents: closed issue becomes historical without deleting the original attention evidence', () => {
-  withTempDb((dbPath) => {
+test('repository-qualified GET cache performs one read per issue and classifies every exact event', () => {
+  tempDb((dbPath) => {
     const store = new AttentionReconciliationStore(dbPath);
-    try {
-      const attentionEvents = [attentionRow({ issueNumber: 44 })];
-      const client = fakeClient({ 44: { number: 44, state: 'closed', state_reason: 'completed' } });
-      const results = reconcileAttentionEvents({ attentionEvents, store, client, now: () => '2026-08-18T00:00:00.000Z' });
-      assert.equal(results.length, 1);
-      assert.equal(results[0].status, 'historical');
-      assert.equal(results[0].reasonCode, 'closed-completed');
-
-      // Original attention_events-shaped evidence is untouched by this module.
-      assert.equal(attentionEvents[0].repo, 'TheTekTeam/modelspend');
-      assert.equal(attentionEvents[0].issue_number, 44);
-      assert.equal(attentionEvents[0].resolved_at, null);
-
-      const stored = store.get('TheTekTeam/modelspend', 44);
-      assert.equal(stored.status, 'historical');
-    } finally {
-      store.close();
-    }
+    const events = [row(44), row(44, { id: 99, dedupe_key: 'later', attempt_id: 'later' })];
+    const client = fakeClient({ [`${REPO}#44`]: { number: 44, state: 'closed', state_reason: 'completed', updated_at: NOW } });
+    const state = runGeneration(store, events, [], client);
+    assert.equal(client.calls.length, 1);
+    assert.equal(state.items.length, 2);
+    assert.ok(state.items.every((item) => item.status === 'historical'));
+    store.close();
   });
 });
 
-test('reconcileAttentionEvents: open issue remains actionable/unresolved', () => {
-  withTempDb((dbPath) => {
+test('open item is actionable only with matching attempt and dedupe evidence', () => {
+  tempDb((dbPath) => {
     const store = new AttentionReconciliationStore(dbPath);
-    try {
-      const attentionEvents = [attentionRow({ issueNumber: 182 })];
-      const client = fakeClient({ 182: { number: 182, state: 'open', state_reason: null } });
-      const results = reconcileAttentionEvents({ attentionEvents, store, client, now: () => '2026-08-18T00:00:00.000Z' });
-      assert.equal(results[0].status, 'actionable');
-    } finally {
-      store.close();
-    }
+    const client = fakeClient({ [`${REPO}#182`]: { number: 182, state: 'open', updated_at: NOW } });
+    const current = runGeneration(store, [row(182)], [attempt(182)], client, { generationId: 'proof-current' });
+    assert.equal(current.items[0].status, 'actionable');
+    const withoutProof = runGeneration(store, [row(182)], [attempt(182, { attention_dedupe_key: 'different' })], client, { generationId: 'proof-missing' });
+    assert.equal(withoutProof.items[0].status, 'unknown');
+    store.close();
   });
 });
 
-test('reconcileAttentionEvents: lookup failure records unknown, never historical', () => {
-  withTempDb((dbPath) => {
+test('lookup failure and cross-repository same-number lookup remain separate and unknown', () => {
+  tempDb((dbPath) => {
     const store = new AttentionReconciliationStore(dbPath);
-    try {
-      const attentionEvents = [attentionRow({ issueNumber: 999 })];
-      const client = fakeClient({ 999: 'throw' });
-      const results = reconcileAttentionEvents({ attentionEvents, store, client, now: () => '2026-08-18T00:00:00.000Z' });
-      assert.equal(results[0].status, 'unknown');
-    } finally {
-      store.close();
-    }
+    const client = fakeClient({ [`${REPO}#44`]: 'throw', 'Other/repo#44': { number: 44, state: 'open' } });
+    const state = runGeneration(store, [row(44)], [], client);
+    assert.equal(state.items[0].status, 'unknown');
+    assert.deepEqual(client.calls, [{ repository: REPO, issueNumber: 44 }]);
+    store.close();
   });
 });
 
-test('reconcileAttentionEvents is idempotent: repeated reconciliation against unchanged GitHub state re-verifies without changing the decision', () => {
-  withTempDb((dbPath) => {
+test('replay is idempotent and append-only transitions are not duplicated', () => {
+  tempDb((dbPath) => {
     const store = new AttentionReconciliationStore(dbPath);
-    try {
-      const attentionEvents = [attentionRow({ issueNumber: 686 })];
-      const client = fakeClient({ 686: { number: 686, state: 'closed', state_reason: 'not_planned' } });
-      reconcileAttentionEvents({ attentionEvents, store, client, now: () => '2026-08-18T00:00:00.000Z' });
-      const second = reconcileAttentionEvents({ attentionEvents, store, client, now: () => '2026-08-18T01:00:00.000Z' });
-      assert.equal(second[0].status, 'historical');
-      assert.equal(second[0].reconciliationCount, 2);
-
-      const stored = store.get('TheTekTeam/modelspend', 686);
-      assert.equal(stored.reconciliationCount, 2);
-      assert.equal(stored.status, 'historical');
-    } finally {
-      store.close();
-    }
+    const client = fakeClient({ [`${REPO}#686`]: { number: 686, state: 'closed', state_reason: 'not_planned', updated_at: NOW } });
+    const event = row(686);
+    runGeneration(store, [event], [], client, { generationId: 'replay-one' });
+    runGeneration(store, [event], [], client, { generationId: 'replay-two' });
+    assert.equal(store.transitionCount(REPO, attentionEventIdentity(event)), 1);
+    store.close();
   });
 });
 
-test('reconcileAttentionEvents performs no GitHub mutation -- every recorded call is a GET', () => {
-  withTempDb((dbPath) => {
+test('source change before atomic publication leaves the previous generation current', () => {
+  tempDb((dbPath) => {
     const store = new AttentionReconciliationStore(dbPath);
-    try {
-      const attentionEvents = [attentionRow({ issueNumber: 743 }), attentionRow({ issueNumber: 757 })];
-      const client = fakeClient({
-        743: { number: 743, state: 'closed', state_reason: 'completed' },
-        757: { number: 757, state: 'closed', state_reason: 'completed' },
-      });
-      reconcileAttentionEvents({ attentionEvents, store, client, now: () => '2026-08-18T00:00:00.000Z' });
-      assert.ok(client.calls.length > 0);
-      for (const call of client.calls) assert.equal(call.method, 'GET');
-    } finally {
-      store.close();
-    }
+    const client = fakeClient({ [`${REPO}#743`]: { number: 743, state: 'closed', updated_at: NOW } });
+    runGeneration(store, [row(743)], [], client, { generationId: 'stable-generation' });
+    assert.throws(() => runGeneration(store, [row(743)], [], client, { generationId: 'changed-generation', verifySource: () => false }), /source changed/);
+    assert.equal(store.listStateForRepository(REPO).generation.id, 'stable-generation');
+    store.close();
   });
 });
 
-test('AttentionReconciliationStore: repository identity prevents cross-repository issue-number collisions', () => {
-  withTempDb((dbPath) => {
+test('acknowledgement is exact-revision, expiring and append-only; newer evidence invalidates it', () => {
+  tempDb((dbPath) => {
     const store = new AttentionReconciliationStore(dbPath);
-    try {
-      store.upsert({ repository: 'TheTekTeam/modelspend', issueNumber: 44, status: 'historical', reasonCode: 'closed-completed', now: '2026-08-18T00:00:00.000Z' });
-      store.upsert({ repository: 'Other/repo', issueNumber: 44, status: 'actionable', reasonCode: 'issue-open', now: '2026-08-18T00:00:00.000Z' });
-      assert.equal(store.get('TheTekTeam/modelspend', 44).status, 'historical');
-      assert.equal(store.get('Other/repo', 44).status, 'actionable');
-      assert.equal(store.listForRepository('TheTekTeam/modelspend').length, 1);
-    } finally {
-      store.close();
-    }
+    const event = row(207);
+    const client = fakeClient({ [`${REPO}#207`]: { number: 207, state: 'open', updated_at: NOW } });
+    let state = runGeneration(store, [event], [], client, { generationId: 'ack-one' });
+    const item = state.items[0];
+    store.acknowledge({ repository: REPO, eventKey: item.eventKey, eventRevision: item.eventRevision,
+      githubEvidenceRevision: item.githubEvidenceRevision, status: 'actionable', reasonCode: 'manager-confirmed-actionable',
+      actor: 'operator:gp', now: NOW, expiresAt: '2026-08-21T01:00:00.000Z' });
+    state = store.listStateForRepository(REPO);
+    assert.equal(buildAttentionReconciliationProjection([event], [], state, { repository: REPO, now: LATER }).counts.actionable, 1);
+    client.getIssue = () => ({ number: 207, state: 'open', updated_at: LATER });
+    state = runGeneration(store, [event], [], client, { generationId: 'ack-two' });
+    assert.equal(buildAttentionReconciliationProjection([event], [], state, { repository: REPO, now: LATER }).counts.actionable, 0);
+    assert.equal(state.acknowledgements.filter((ack) => ack.action === 'grant').length, 1);
+    store.close();
   });
 });
 
-test('AttentionReconciliationStore: explicit operator acknowledgement is audited and overrides the automatic decision', () => {
-  withTempDb((dbPath) => {
+test('acknowledgement revocation is append-only and closed items require an explicit post-closure reason', () => {
+  tempDb((dbPath) => {
     const store = new AttentionReconciliationStore(dbPath);
-    try {
-      store.upsert({ repository: 'TheTekTeam/modelspend', issueNumber: 207, status: 'actionable', reasonCode: 'issue-open', now: '2026-08-18T00:00:00.000Z' });
-      const acknowledged = store.acknowledge({
-        repository: 'TheTekTeam/modelspend', issueNumber: 207, status: 'historical', reasonCode: 'manager-confirmed-superseded', actor: 'operator:gp', now: '2026-08-18T01:00:00.000Z',
-      });
-      assert.equal(acknowledged.acknowledgedStatus, 'historical');
-      assert.equal(acknowledged.acknowledgedBy, 'operator:gp');
-      // The automatic decision itself is preserved, not overwritten.
-      assert.equal(acknowledged.status, 'actionable');
-    } finally {
-      store.close();
-    }
+    const openEvent = row(208);
+    let state = runGeneration(store, [openEvent], [], fakeClient({
+      [`${REPO}#208`]: { number: 208, state: 'open', updated_at: NOW },
+    }), { generationId: 'revoke-one' });
+    const openItem = state.items[0];
+    const grant = store.acknowledge({ repository: REPO, eventKey: openItem.eventKey,
+      eventRevision: openItem.eventRevision, githubEvidenceRevision: openItem.githubEvidenceRevision,
+      status: 'actionable', reasonCode: 'manager-confirmed-actionable', actor: 'operator:gp',
+      now: NOW, expiresAt: '2026-08-21T01:00:00.000Z' });
+    store.revokeAcknowledgement({ acknowledgementId: grant.id, actor: 'operator:gp', now: LATER });
+    state = store.listStateForRepository(REPO);
+    assert.equal(buildAttentionReconciliationProjection([openEvent], [], state, { repository: REPO, now: LATER }).counts.actionable, 0);
+    assert.deepEqual(state.acknowledgements.map((ack) => ack.action), ['grant', 'revoke']);
+
+    const closedEvent = row(209);
+    state = runGeneration(store, [closedEvent], [], fakeClient({
+      [`${REPO}#209`]: { number: 209, state: 'closed', updated_at: NOW },
+    }), { generationId: 'closed-one' });
+    const closedItem = state.items[0];
+    assert.throws(() => store.acknowledge({ repository: REPO, eventKey: closedItem.eventKey,
+      eventRevision: closedItem.eventRevision, githubEvidenceRevision: closedItem.githubEvidenceRevision,
+      status: 'actionable', reasonCode: 'manager-confirmed-actionable', actor: 'operator:gp',
+      now: NOW, expiresAt: '2026-08-21T01:00:00.000Z' }), /post-closure action reason/);
+    assert.equal(store.acknowledge({ repository: REPO, eventKey: closedItem.eventKey,
+      eventRevision: closedItem.eventRevision, githubEvidenceRevision: closedItem.githubEvidenceRevision,
+      status: 'actionable', reasonCode: 'post-closure-action-required', actor: 'operator:gp',
+      now: NOW, expiresAt: '2026-08-21T01:00:00.000Z' }).status, 'actionable');
+    store.close();
   });
 });
 
-test('readAttentionReconciliationsForRepository: read-only, missing DB yields empty (never an error, never a write)', () => {
-  const result = readAttentionReconciliationsForRepository('/nonexistent/attention-reconciliation.sqlite', 'TheTekTeam/modelspend');
-  assert.deepEqual(result, []);
+test('missing and expired generations project as degraded unknown/stale, never attention or clear', () => {
+  const event = row(500);
+  const missing = buildAttentionReconciliationProjection([event], [], null, { repository: REPO, now: NOW });
+  assert.equal(missing.posture, 'degraded'); assert.equal(missing.counts.unknown, 1);
+  const expired = buildAttentionReconciliationProjection([event], [], {
+    generation: { id: 'old', state: 'completed', sourceSnapshotDigest: attentionSourceSnapshotDigest([event], []), expiresAt: '2026-08-20T00:00:00.000Z' },
+    items: [], acknowledgements: [],
+  }, { repository: REPO, now: NOW });
+  assert.equal(expired.counts.stale, 1); assert.equal(expired.posture, 'degraded');
 });
 
-test('effectiveAttentionReconciliationStatus: no reconciliation record yet keeps a row counted (no opinion, not resolved)', () => {
-  const map = attentionReconciliationLookup([], 'TheTekTeam/modelspend');
-  assert.equal(effectiveAttentionReconciliationStatus(attentionRow({ issueNumber: 5 }), map), null);
+test('read-only state reader creates no database or sidecar and reads a completed generation', () => {
+  tempDb((dbPath, dir) => {
+    assert.deepEqual(readAttentionReconciliationState(join(dir, 'missing.sqlite'), REPO).items, []);
+    assert.deepEqual(readdirSync(dir), []);
+    const store = new AttentionReconciliationStore(dbPath);
+    const client = fakeClient({ [`${REPO}#757`]: { number: 757, state: 'closed', updated_at: NOW } });
+    runGeneration(store, [row(757)], [], client, { generationId: 'readable' }); store.close();
+    const before = readdirSync(dir).sort();
+    assert.equal(readAttentionReconciliationState(dbPath, REPO).generation.id, 'readable');
+    assert.deepEqual(readdirSync(dir).sort(), before);
+    assert.ok(existsSync(dbPath));
+  });
 });
 
-test('canonical status projection: historical reconciliation removes closed items from attention_required count while open items remain', () => {
-  const latest = {
-    attentionEvents: [
-      attentionRow({ issueNumber: 182 }), // open, actionable
-      attentionRow({ issueNumber: 207 }), // open, actionable
-      attentionRow({ issueNumber: 44 }), // closed, historical
-      attentionRow({ issueNumber: 686 }), // closed, historical
-      attentionRow({ issueNumber: 743 }), // closed, historical
-      attentionRow({ issueNumber: 757 }), // closed, historical
-    ],
-    queueEvents: [],
-    runResults: [],
-  };
-  const reconciliations = attentionReconciliationLookup([
-    { repository: 'TheTekTeam/modelspend', issueNumber: 182, status: 'actionable', acknowledgedStatus: null },
-    { repository: 'TheTekTeam/modelspend', issueNumber: 207, status: 'actionable', acknowledgedStatus: null },
-    { repository: 'TheTekTeam/modelspend', issueNumber: 44, status: 'historical', acknowledgedStatus: null },
-    { repository: 'TheTekTeam/modelspend', issueNumber: 686, status: 'historical', acknowledgedStatus: null },
-    { repository: 'TheTekTeam/modelspend', issueNumber: 743, status: 'historical', acknowledgedStatus: null },
-    { repository: 'TheTekTeam/modelspend', issueNumber: 757, status: 'historical', acknowledgedStatus: null },
-  ], 'TheTekTeam/modelspend');
-
-  const activity = { activeIssue: null };
-  const operatorStatus = buildRunnerOperatorStatus(latest, activity, [], reconciliations);
-  assert.equal(operatorStatus.code, 'attention_required');
-  assert.equal(operatorStatus.count, 2);
-
-  const projected = projectAttention(latest.attentionEvents, reconciliations);
-  assert.equal(projected.unresolvedCount, 2);
-  assert.deepEqual(projected.events.map((event) => event.issueNumber).sort((a, b) => a - b), [182, 207]);
+test('GET-only client has no method surface and always spawns gh api --method GET', () => {
+  const calls = [];
+  const client = new GhCliAttentionReadClient({ spawn(command, args) {
+    calls.push({ command, args }); return { status: 0, stdout: JSON.stringify({ number: 44, state: 'closed' }) };
+  } });
+  assert.equal(client.getIssue(REPO, 44).state, 'closed');
+  assert.deepEqual(calls[0], { command: 'gh', args: ['api', '--method', 'GET', `/repos/${REPO}/issues/44`] });
+  assert.equal('request' in client, false);
 });
 
-test('canonical status projection: an unknown reconciliation never removes an attention row from the count', () => {
-  const latest = { attentionEvents: [attentionRow({ issueNumber: 500 })], queueEvents: [], runResults: [] };
-  const reconciliations = attentionReconciliationLookup([
-    { repository: 'TheTekTeam/modelspend', issueNumber: 500, status: 'unknown', acknowledgedStatus: null },
-  ], 'TheTekTeam/modelspend');
-  const operatorStatus = buildRunnerOperatorStatus(latest, { activeIssue: null }, [], reconciliations);
-  assert.equal(operatorStatus.code, 'attention_required');
-  assert.equal(operatorStatus.count, 1);
+test('one path resolver honors explicit, reconciliation env, output-dir env and config in order', () => {
+  assert.equal(resolveAttentionReconciliationDbPath({ explicitPath: '/explicit/db', env: {}, config: {} }), '/explicit/db');
+  assert.equal(resolveAttentionReconciliationDbPath({ env: { CLAUDE_RUNNER_ATTENTION_RECONCILIATION_DB: '/env/db', CLAUDE_RUNNER_OUTPUT_DIR: '/ignored' }, config: {} }), '/env/db');
+  assert.equal(resolveAttentionReconciliationDbPath({ env: { CLAUDE_RUNNER_OUTPUT_DIR: '/runtime' }, config: { outputDir: '/config' } }), join('/runtime', 'attention-reconciliation.sqlite'));
+  assert.equal(resolveAttentionReconciliationDbPath({ env: {}, config: { outputDir: '/config' } }), join('/config', 'attention-reconciliation.sqlite'));
 });
 
-test('canonical status projection: with no reconciliation data at all, behavior is unchanged from before #183', () => {
-  const latest = { attentionEvents: [attentionRow({ issueNumber: 44 })], queueEvents: [], runResults: [] };
-  const operatorStatus = buildRunnerOperatorStatus(latest, { activeIssue: null }, []);
-  assert.equal(operatorStatus.code, 'attention_required');
-  assert.equal(operatorStatus.count, 1);
+test('command uses output-dir override, rechecks source and writes only the dedicated store', () => {
+  tempDb((dbPath) => {
+    const event = row(44); let reads = 0; let createdPath = null;
+    const snapshotReader = () => { reads += 1; return { ok: true, latest: { attentionEvents: [event], recoveryAttempts: [] } }; };
+    const result = runAttentionReconciliation({
+      env: { CLAUDE_RUNNER_OUTPUT_DIR: '/runtime' }, config: { githubRepo: REPO, outputDir: '/config' },
+      snapshotReader, client: fakeClient({ [`${REPO}#44`]: { number: 44, state: 'closed', updated_at: NOW } }),
+      storeFactory(path) { createdPath = path; return new AttentionReconciliationStore(dbPath); },
+      now: (() => { const values = [NOW, NOW, LATER, LATER]; return () => values.shift() || LATER; })(),
+    });
+    assert.equal(result.historicalCount, 1); assert.equal(reads, 2);
+    assert.equal(createdPath, join('/runtime', 'attention-reconciliation.sqlite'));
+  });
 });

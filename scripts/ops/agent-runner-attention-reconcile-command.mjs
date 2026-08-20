@@ -5,67 +5,72 @@ import { pathToFileURL } from 'node:url';
 import { loadAgentRunnerConfig } from './agent-runner-config.mjs';
 import { readOnlyRunnerStateSnapshot } from './agent-runner-operator-doctor.mjs';
 import { defaultRunnerStateDbPath } from './claude-runner-state.mjs';
+import { GhCliAttentionReadClient } from './agent-runner-attention-github-client.mjs';
+import { resolveAttentionReconciliationDbPath, resolveRunnerOutputDir } from './agent-runner-attention-reconciliation-path.mjs';
 import { AttentionReconciliationStore } from './agent-runner-attention-reconciliation-store.mjs';
-import { GhCliReconciliationClient } from './agent-runner-issue-reconciliation.mjs';
-import { reconcileAttentionEvents } from './agent-runner-attention-reconciliation.mjs';
+import { attentionSourceSnapshotDigest, buildAttentionReconciliationProjection, reconcileAttentionEvents } from './agent-runner-attention-reconciliation.mjs';
 
-function output(value) { process.stdout.write(`${JSON.stringify(value)}\n`); }
+const output = (value, io = process.stdout) => io.write(`${JSON.stringify(value)}\n`);
 
-function parseArgs(argv) {
+export function parseArgs(argv) {
   const parsed = {};
   for (let index = 0; index < argv.length; index += 1) {
     const key = argv[index];
-    if (!key?.startsWith('--') || !argv[index + 1] || argv[index + 1].startsWith('--')) throw new Error('invalid arguments');
-    parsed[key.slice(2)] = argv[index + 1];
-    index += 1;
+    if (!key?.startsWith('--') || !argv[index + 1] || argv[index + 1].startsWith('--')) throw Object.assign(new Error('invalid arguments'), { code: 'invalid-arguments' });
+    parsed[key.slice(2)] = argv[index + 1]; index += 1;
   }
   return parsed;
 }
 
-/**
- * Read-only against the runner state DB (reuses the same private-snapshot
- * path as the operator CLI/dashboard), read-only against GitHub, and only
- * ever writes to the dedicated attention-reconciliation store -- never to
- * `attention_events` and never to GitHub issue state (#183).
- */
-export async function main(argv = process.argv.slice(2), env = process.env) {
+function scoped(snapshot, repository) {
+  const attentionEvents = (snapshot.latest.attentionEvents || []).filter((row) => row.repo === repository && !row.resolved_at);
+  const attempts = snapshot.latest.recoveryAttempts || [];
+  return { attentionEvents, attempts };
+}
+
+export function runAttentionReconciliation({
+  argv = [], env = process.env, config = loadAgentRunnerConfig({ env }),
+  snapshotReader = readOnlyRunnerStateSnapshot, client = new GhCliAttentionReadClient(),
+  storeFactory = (path) => new AttentionReconciliationStore(path), now = () => new Date().toISOString(),
+} = {}) {
   const args = parseArgs(argv);
-  const config = loadAgentRunnerConfig({ env });
-  if (!config.githubRepo) throw new Error('config.githubRepo is required for repository-qualified reconciliation');
-
-  const stateDbPath = args['state-db'] || env.CLAUDE_RUNNER_STATE_DB || config.stateDbPath || defaultRunnerStateDbPath(config.outputDir || '.var/claude-runner');
-  const reconciliationDbPath = args['reconciliation-db'] || env.CLAUDE_RUNNER_ATTENTION_RECONCILIATION_DB
-    || `${config.outputDir || '.var/claude-runner'}/attention-reconciliation.sqlite`;
-
-  const snapshot = readOnlyRunnerStateSnapshot(stateDbPath, { historyLimit: 200, includeLatest: true });
-  if (!snapshot.ok) throw Object.assign(new Error('runner state is unavailable'), { code: 'state-unavailable' });
-
-  const repositoryScopedEvents = (snapshot.latest.attentionEvents || []).filter((row) => row.repo === config.githubRepo);
-
-  const store = new AttentionReconciliationStore(reconciliationDbPath);
+  if (!config.githubRepo) throw Object.assign(new Error('repository is required'), { code: 'repository-required' });
+  const outputDir = resolveRunnerOutputDir(env, config);
+  const stateDbPath = args['state-db'] || env.CLAUDE_RUNNER_STATE_DB || config.stateDbPath || defaultRunnerStateDbPath(outputDir);
+  const reconciliationDbPath = resolveAttentionReconciliationDbPath({ explicitPath: args['reconciliation-db'], env, config });
+  const read = () => snapshotReader(stateDbPath, { historyLimit: 1000, includeLatest: true });
+  const initial = read();
+  if (!initial.ok) throw Object.assign(new Error('runner state is unavailable'), { code: 'state-unavailable' });
+  const source = scoped(initial, config.githubRepo);
+  const sourceDigest = attentionSourceSnapshotDigest(source.attentionEvents, source.attempts);
+  const store = storeFactory(reconciliationDbPath);
   try {
-    const results = reconcileAttentionEvents({
-      attentionEvents: repositoryScopedEvents,
-      store,
-      client: new GhCliReconciliationClient(),
+    const state = reconcileAttentionEvents({
+      repository: config.githubRepo, ...source, store, client, now,
+      verifySource: () => {
+        const current = read();
+        if (!current.ok) return false;
+        const latest = scoped(current, config.githubRepo);
+        return attentionSourceSnapshotDigest(latest.attentionEvents, latest.attempts) === sourceDigest;
+      },
     });
-    output({
-      schemaVersion: 1,
-      ok: true,
-      repository: config.githubRepo,
-      reconciledCount: results.length,
-      historicalCount: results.filter((row) => row.status === 'historical').length,
-      actionableCount: results.filter((row) => row.status === 'actionable').length,
-      unknownCount: results.filter((row) => row.status === 'unknown').length,
-    });
-  } finally {
-    store.close();
-  }
+    const projection = buildAttentionReconciliationProjection(source.attentionEvents, source.attempts, state, { repository: config.githubRepo, now: now() });
+    return {
+      schemaVersion: 2, ok: true, repository: config.githubRepo,
+      reconciledCount: source.attentionEvents.length,
+      actionableCount: projection.counts.actionable, historicalCount: projection.counts.historical,
+      unknownCount: projection.counts.unknown, staleCount: projection.counts.stale,
+    };
+  } finally { store.close(); }
+}
+
+export async function main(argv = process.argv.slice(2), env = process.env, io = process.stdout) {
+  output(runAttentionReconciliation({ argv, env }), io);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   main().catch((error) => {
-    output({ schemaVersion: 1, ok: false, errorCode: typeof error?.code === 'string' ? error.code : 'attention-reconciliation-failed' });
+    output({ schemaVersion: 2, ok: false, errorCode: typeof error?.code === 'string' ? error.code : 'attention-reconciliation-failed' });
     process.exitCode = 1;
   });
 }
