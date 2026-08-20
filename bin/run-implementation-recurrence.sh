@@ -33,6 +33,7 @@ ENV_FILE="${AGENT_RUNNER_ENV_FILE:-$HOME/.config/agent-runner/runner.env}"
 NODE_BIN="${AGENT_RUNNER_NODE_BIN:-node}"
 RECURRENCE_SCRIPT="$ROOT/scripts/ops/agent-runner-implementation-recurrence.mjs"
 SOURCE_ACTIVATION_CONTROLLER="$ROOT/scripts/ops/agent-runner-source-activation-authority.mjs"
+SOURCE_ACTIVATION_RECOVERY="$ROOT/scripts/ops/agent-runner-source-activation-recovery.mjs"
 CONTROL_EVIDENCE_PUBLISHER="$ROOT/scripts/ops/agent-runner-control-evidence.mjs"
 
 [ -f "$RECURRENCE_SCRIPT" ] || {
@@ -114,6 +115,10 @@ if source_activation_enabled; then
     echo "[agent-runner] ERROR: source-activation authority controller is missing" >&2
     exit 1
   }
+  [ -f "$SOURCE_ACTIVATION_RECOVERY" ] || {
+    echo "[agent-runner] ERROR: source-activation recovery helper is missing" >&2
+    exit 1
+  }
 
   SOURCE_ACTIVATION_REEXEC_DEPTH="${AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH:-0}"
   case "$SOURCE_ACTIVATION_REEXEC_DEPTH" in
@@ -123,6 +128,18 @@ if source_activation_enabled; then
       exit 1
       ;;
   esac
+
+  source_activation_reexec() {
+    if [ "$SOURCE_ACTIVATION_REEXEC_DEPTH" -ne 0 ]; then
+      echo "[agent-runner] ERROR: source-activation re-exec depth guard prevented recursion" >&2
+      exit 1
+    fi
+    export AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH=1
+    # Re-enter the canonical Bash wrapper through Bash rather than relying on
+    # the repository file's execute bit. GitHub/checkouts may preserve this
+    # entrypoint as mode 0644 even though the service invokes it via Bash.
+    exec bash "$ROOT/bin/run-implementation-recurrence.sh" "$@"
+  }
 
   set +e
   SOURCE_ACTIVATION_OUTPUT="$($NODE_BIN "$SOURCE_ACTIVATION_CONTROLLER" 2>&1)"
@@ -135,19 +152,33 @@ if source_activation_enabled; then
       # Disabled/no-new/already-applied authority: continue current recurrence.
       ;;
     10)
-      if [ "$SOURCE_ACTIVATION_REEXEC_DEPTH" -ne 0 ]; then
-        echo "[agent-runner] ERROR: source-activation re-exec depth guard prevented recursion" >&2
-        exit 1
-      fi
-      export AGENT_RUNNER_SOURCE_ACTIVATION_REEXEC_DEPTH=1
-      # Re-enter the canonical Bash wrapper through Bash rather than relying on
-      # the repository file's execute bit. GitHub/checkouts may preserve this
-      # entrypoint as mode 0644 even though the service invokes it via Bash.
-      exec bash "$ROOT/bin/run-implementation-recurrence.sh" "$@"
+      source_activation_reexec "$@"
       ;;
     3)
-      # Handled authority/activation refusal: intentionally do not inspect,
-      # claim or launch an implementation candidate in this recurrence.
+      # #281: a separately governed accepted-source change can leave the
+      # durable applied record behind the exact canonical HEAD. The normal
+      # authority controller correctly fails closed before GitHub lookup in
+      # that condition, so run one narrowly bounded recovery probe. It may
+      # replace state only after the accepted activator proves that the newer
+      # immutable authority targets this exact clean accepted HEAD and obtains
+      # the global implementation lock. Every other handled refusal remains a
+      # halt and cannot reach candidate selection.
+      set +e
+      SOURCE_RECOVERY_OUTPUT="$($NODE_BIN "$SOURCE_ACTIVATION_RECOVERY" 2>&1)"
+      SOURCE_RECOVERY_STATUS=$?
+      set -e
+      [ -z "$SOURCE_RECOVERY_OUTPUT" ] || printf '%s\n' "$SOURCE_RECOVERY_OUTPUT"
+      case "$SOURCE_RECOVERY_STATUS" in
+        10)
+          source_activation_reexec "$@"
+          ;;
+        0|3)
+          ;;
+        *)
+          echo "[agent-runner] ERROR: source-activation recovery evaluation failed" >&2
+          exit "$SOURCE_RECOVERY_STATUS"
+          ;;
+      esac
       echo "[agent-runner] source activation requires manager attention; implementation recurrence skipped"
       exit 0
       ;;
