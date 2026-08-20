@@ -227,8 +227,16 @@ restore_previous_state() {
   else
     systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
-  if (( was_enabled )); unit_enabled || rc=1; else unit_enabled && rc=1; fi
-  if (( was_active )); unit_active || rc=1; else unit_active && rc=1; fi
+  if (( was_enabled )); then
+    if ! unit_enabled; then rc=1; fi
+  else
+    if unit_enabled; then rc=1; fi
+  fi
+  if (( was_active )); then
+    if ! unit_active; then rc=1; fi
+  else
+    if unit_active; then rc=1; fi
+  fi
   set -e
   return "$rc"
 }
