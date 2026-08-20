@@ -1,5 +1,6 @@
 export const CONTROL_CLI_HOST = '127.0.0.1';
 export const DEFAULT_CONTROL_CLI_PORT = 8789;
+export const RESERVED_EVENT_INGRESS_PORT = 8787;
 
 export function parseControlCliPort(value) {
   if (typeof value !== 'string' || !/^[1-9][0-9]{0,4}$/.test(value)) {
@@ -11,6 +12,11 @@ export function parseControlCliPort(value) {
   if (port > 65535) {
     const error = new Error('control server --port must be in range 1..65535');
     error.code = 'AGENT_RUNNER_CONTROL_INVALID_PORT';
+    throw error;
+  }
+  if (port === RESERVED_EVENT_INGRESS_PORT) {
+    const error = new Error(`control server --port ${RESERVED_EVENT_INGRESS_PORT} is reserved for event ingress`);
+    error.code = 'AGENT_RUNNER_CONTROL_RESERVED_PORT';
     throw error;
   }
   return port;
@@ -51,6 +57,6 @@ export function parseControlServerCliArgs(argv = []) {
 export function controlServerHelpText() {
   return 'Usage: node scripts/ops/agent-runner-control-server.mjs [--port PORT]\n\n'
     + 'Runs the permanent authenticated control dashboard on 127.0.0.1:8789 by default.\n'
-    + 'The production CLI accepts only canonical ports 1..65535 and never accepts a host override.\n'
+    + 'The production CLI accepts only canonical ports 1..65535, reserves 8787 for event ingress, and never accepts a host override.\n'
     + 'Bootstrap the operator credential separately before first use.\n';
 }
