@@ -6,7 +6,12 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 
-import { DEFAULT_CONTROL_CLI_PORT, parseControlCliPort, parseControlServerCliArgs } from './agent-runner-control-server-cli.mjs';
+import {
+  DEFAULT_CONTROL_CLI_PORT,
+  parseControlCliPort,
+  parseControlServerCliArgs,
+  RESERVED_EVENT_INGRESS_PORT,
+} from './agent-runner-control-server-cli.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ROOT = path.resolve(HERE, '../..');
@@ -14,13 +19,15 @@ const INSTALLER = path.join(ROOT, 'scripts/install-control-dashboard.sh');
 const UNIT_SOURCE = path.join(ROOT, 'systemd/user/agent-runner-control.service.in');
 const SERVER = path.join(ROOT, 'scripts/ops/agent-runner-control-server.mjs');
 
-const invalidPorts = ['', '0', '+1', '-1', ' 1', '1 ', '01', '00001', '1x', '1.0', '65536', '99999'];
+const invalidPorts = ['', '0', '+1', '-1', ' 1', '1 ', '01', '00001', '1x', '1.0', '65536', '99999', '8787'];
 
 test('control server production CLI is fixed-loopback and uses strict port syntax', () => {
   assert.deepEqual(parseControlServerCliArgs([]), { help: false, host: '127.0.0.1', port: 8789 });
   assert.equal(DEFAULT_CONTROL_CLI_PORT, 8789);
+  assert.equal(RESERVED_EVENT_INGRESS_PORT, 8787);
   assert.equal(parseControlCliPort('1'), 1);
   assert.equal(parseControlCliPort('65535'), 65535);
+  assert.throws(() => parseControlCliPort('8787'), { code: 'AGENT_RUNNER_CONTROL_RESERVED_PORT' });
   assert.deepEqual(parseControlServerCliArgs(['--port', '8789']), { help: false, host: '127.0.0.1', port: 8789 });
   for (const value of invalidPorts) assert.throws(() => parseControlServerCliArgs(['--port', value]));
   assert.throws(() => parseControlServerCliArgs(['--port']));
@@ -34,7 +41,7 @@ test('control server production CLI is fixed-loopback and uses strict port synta
   assert.match(core, /port = 0/); // direct test/programmatic API still permits ephemeral port 0
 });
 
-test('rendered service source contains required hardening without capability transitions or secrets', () => {
+test('rendered service source contains required hardening, inherited jitless, exact writable paths, and no secrets', () => {
   const source = readFileSync(UNIT_SOURCE, 'utf8');
   for (const directive of [
     'NoNewPrivileges=true', 'PrivateTmp=true', 'ProtectSystem=strict', 'ProtectHome=read-only',
@@ -45,11 +52,30 @@ test('rendered service source contains required hardening without capability tra
     'ReadWritePaths=%h/.config/agent-runner',
     'ReadWritePaths=%h/.local/state/agent-runner/secrets',
     'ReadWritePaths=%h/.local/state/agent-runner/control-audit.jsonl',
+    'Environment=NODE_OPTIONS=--jitless',
   ]) assert.ok(source.includes(directive), `missing ${directive}`);
   assert.match(source, /ExecStart=@@NODE@@ --jitless @@SERVER@@ --port @@PORT@@/);
-  assert.doesNotMatch(source, /AmbientCapabilities|CapabilityBoundingSet|SecureBits|EnvironmentFile|Environment=/);
+  assert.doesNotMatch(source, /AmbientCapabilities|CapabilityBoundingSet|SecureBits|EnvironmentFile/);
+  const environmentLines = source.split('\n').filter((line) => line.startsWith('Environment='));
+  assert.deepEqual(environmentLines, ['Environment=NODE_OPTIONS=--jitless']);
   assert.doesNotMatch(source, /8787/);
   assert.doesNotMatch(source, /(password|bearer|api[_-]?key|token)=/i);
+});
+
+test('repository service template passes real systemd-analyze verification when available', { skip: process.platform !== 'linux' }, (t) => {
+  const available = spawnSync('systemd-analyze', ['--version'], { encoding: 'utf8' });
+  if (available.status !== 0) return t.skip('systemd-analyze unavailable');
+  const dir = mkdtempSync(path.join(tmpdir(), 'ar174-unit-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const unitPath = path.join(dir, 'agent-runner-control.service');
+  const rendered = readFileSync(UNIT_SOURCE, 'utf8')
+    .replaceAll('@@CHECKOUT@@', ROOT)
+    .replaceAll('@@SERVER@@', SERVER)
+    .replaceAll('@@NODE@@', process.execPath)
+    .replaceAll('@@PORT@@', '8789');
+  writeFileSync(unitPath, rendered);
+  const result = spawnSync('systemd-analyze', ['--user', 'verify', unitPath], { encoding: 'utf8' });
+  assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
 });
 
 function makeFixture(t) {
@@ -133,7 +159,7 @@ function assertOk(result) {
 function seedPreservedState(f) {
   const paths = [
     '.config/agent-runner/settings.json',
-    '.config/agent-runner/operator-credential.json',
+    '.local/state/agent-runner/control-operator.json',
     '.local/state/agent-runner/secrets/provider.ref',
     '.local/state/agent-runner/control-audit.jsonl',
     '.local/state/agent-runner/modelspend/runner-state.sqlite',
@@ -170,13 +196,23 @@ test('installer refuses root before mutation', { skip: process.platform !== 'lin
   assert.equal(existsSync(f.unit), false);
 });
 
-test('installer rejects malformed, zero, signed, whitespace, suffixed, leading-zero and out-of-range ports', (t) => {
+test('installer rejects malformed, zero, signed, whitespace, suffixed, leading-zero, out-of-range, and reserved ports', (t) => {
   const f = makeFixture(t);
   if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root; root refusal is covered separately');
   for (const port of invalidPorts) assert.notEqual(f.run(['status', '--port', port]).status, 0, port);
   assert.notEqual(f.run(['status', '--port']).status, 0);
   assert.notEqual(f.run(['status', '--host', '127.0.0.1']).status, 0);
   assert.notEqual(f.run(['bogus']).status, 0);
+});
+
+test('fresh install provisions only required writable control paths and never an operator credential', (t) => {
+  const f = makeFixture(t);
+  if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
+  assertOk(f.run(['install']));
+  assert.equal(existsSync(path.join(f.home, '.config/agent-runner')), true);
+  assert.equal(existsSync(path.join(f.home, '.local/state/agent-runner/secrets')), true);
+  assert.equal(existsSync(path.join(f.home, '.local/state/agent-runner/control-audit.jsonl')), true);
+  assert.equal(existsSync(path.join(f.home, '.local/state/agent-runner/control-operator.json')), false);
 });
 
 test('install is idempotent, lifecycle is bounded, and disable/remove/reinstall preserve runner state', (t) => {
@@ -187,6 +223,7 @@ test('install is idempotent, lifecycle is bounded, and disable/remove/reinstall 
   assert.equal(readFileSync(path.join(f.fakeState, 'pid'), 'utf8').trim(), '1');
   const rendered = readFileSync(f.unit, 'utf8');
   assert.match(rendered, /--jitless .*agent-runner-control-server\.mjs --port 8789/);
+  assert.match(rendered, /^Environment=NODE_OPTIONS=--jitless$/m);
   assert.doesNotMatch(rendered, /8787|EnvironmentFile|password|token=/i);
   assertOk(f.run(['install']));
   assert.equal(readFileSync(path.join(f.fakeState, 'pid'), 'utf8').trim(), '1', 'unchanged install restarted process');
@@ -206,12 +243,19 @@ test('install is idempotent, lifecycle is bounded, and disable/remove/reinstall 
   ]) assert.equal(mutations.includes(forbidden), false, `forbidden mutation evidence: ${forbidden}`);
 });
 
-test('changed upgrade validates first and rolls back prior unit plus enabled/active state after restart or health failure', (t) => {
+test('changed upgrade validates first and rolls back prior unit plus enabled/active state after activation, restart, or health failure', (t) => {
   const f = makeFixture(t);
   if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
   assertOk(f.run(['install']));
   const oldUnit = readFileSync(f.unit, 'utf8') + '# old-version-sentinel\n';
   writeFileSync(f.unit, oldUnit);
+
+  const failEnable = f.run(['install'], { FAKE_SYSTEMCTL_FAIL_ONCE: 'enable' });
+  assert.notEqual(failEnable.status, 0);
+  assert.equal(readFileSync(f.unit, 'utf8'), oldUnit);
+  assert.equal(existsSync(path.join(f.fakeState, 'enabled')), true);
+  assert.equal(existsSync(path.join(f.fakeState, 'active')), true);
+
   const failRestart = f.run(['install'], { FAKE_SYSTEMCTL_FAIL_ONCE: 'restart' });
   assert.notEqual(failRestart.status, 0);
   assert.equal(readFileSync(f.unit, 'utf8'), oldUnit);
@@ -240,4 +284,16 @@ test('activation refuses collisions and verify rejects wildcard, IPv6 and duplic
     const result = f.run(['verify'], { FAKE_LISTENER_MODE: mode });
     assert.notEqual(result.status, 0, mode);
   }
+});
+
+test('disable/remove fail closed and preserve the unit when stop fails', (t) => {
+  const f = makeFixture(t);
+  if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
+  assertOk(f.run(['install']));
+  const unitBefore = readFileSync(f.unit, 'utf8');
+  const failedRemove = f.run(['remove'], { FAKE_SYSTEMCTL_FAIL_ONCE: 'stop' });
+  assert.notEqual(failedRemove.status, 0);
+  assert.equal(readFileSync(f.unit, 'utf8'), unitBefore);
+  assert.equal(existsSync(path.join(f.fakeState, 'active')), true);
+  assert.equal(existsSync(path.join(f.fakeState, 'enabled')), true);
 });
