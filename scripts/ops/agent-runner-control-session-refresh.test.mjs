@@ -68,6 +68,14 @@ test('GET /api/session rehydrates the existing cookie-backed session without cre
 
     const protectedRead = await request(baseUrl, '/api/instances', { cookie });
     assert.equal(protectedRead.status, 200);
+
+    const protectedMutation = await request(baseUrl, '/api/instances', {
+      method: 'POST',
+      cookie,
+      csrfToken: context.json.csrfToken,
+      body: { agentId: 'claude-code-cli' },
+    });
+    assert.equal(protectedMutation.status, 201, JSON.stringify(protectedMutation.json));
   } finally {
     await closeServer(server);
     rmSync(dir, { recursive: true, force: true });
