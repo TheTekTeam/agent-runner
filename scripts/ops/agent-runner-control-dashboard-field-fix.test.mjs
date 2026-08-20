@@ -77,7 +77,7 @@ case "$cmd" in
       [[ ! -f "$FAKE_STATE/is-active-count" ]] || count=$(cat "$FAKE_STATE/is-active-count")
       count=$((count + 1))
       printf '%s' "$count" >"$FAKE_STATE/is-active-count"
-      activating_count=${FAKE_STARTUP_ACTIVATING_COUNT:-0}
+      activating_count=\${FAKE_STARTUP_ACTIVATING_COUNT:-0}
       if (( count <= activating_count )); then echo activating; exit 3; fi
       echo active; exit 0
     fi
@@ -93,7 +93,7 @@ case "$cmd" in
     touch "$FAKE_STATE/active" ;;
   stop)
     rm -f "$FAKE_STATE/active"
-    if [[ ${FAKE_STOP_STAYS_ACTIVATING:-0} == 1 ]]; then touch "$FAKE_STATE/activating-after-stop"; else rm -f "$FAKE_STATE/activating-after-stop"; fi ;;
+    if [[ \${FAKE_STOP_STAYS_ACTIVATING:-0} == 1 ]]; then touch "$FAKE_STATE/activating-after-stop"; else rm -f "$FAKE_STATE/activating-after-stop"; fi ;;
   daemon-reload) : ;;
   status) [[ -f "$FAKE_STATE/active" ]] ;;
 esac
