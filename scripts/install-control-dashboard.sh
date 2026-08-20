@@ -122,12 +122,11 @@ render_unit() {
 
 validate_rendered_unit() {
   local unit=$1
-  if ! grep -Fqx "ExecStart=$NODE_BIN --jitless $SERVER --port $PORT" "$unit"; then
+  if ! grep -Fqx "ExecStart=$NODE_BIN $SERVER --port $PORT" "$unit"; then
     printf 'ERROR: rendered ExecStart is not exact\n' >&2
     return 1
   fi
   local -a expected_environment=(
-    'Environment=NODE_OPTIONS=--jitless'
     'Environment=AGENT_RUNNER_CONFIG=%h/.config/agent-runner/modelspend.json'
     'Environment=CLAUDE_RUNNER_OUTPUT_DIR=%h/.local/state/agent-runner/modelspend'
     'Environment=CLAUDE_RUNNER_STATE_DB=%h/.local/state/agent-runner/modelspend/runner-state.sqlite'
@@ -150,8 +149,17 @@ validate_rendered_unit() {
     printf 'ERROR: unexpected service environment assignment\n' >&2
     return 1
   fi
-  if ! grep -Fqx 'MemoryDenyWriteExecute=true' "$unit"; then
-    printf 'ERROR: MemoryDenyWriteExecute requires the repository --jitless service source\n' >&2
+  # Node 22.23's built-in Undici HTTP path uses a WebAssembly llhttp parser.
+  # Dell field acceptance proved --jitless removes WebAssembly and crashes the
+  # service immediately after it binds. MemoryDenyWriteExecute therefore is
+  # deliberately incompatible with this approved Node runtime because the
+  # prior workaround required --jitless. Reject either setting if reintroduced.
+  if grep -Fq -- '--jitless' "$unit"; then
+    printf 'ERROR: --jitless is incompatible with the approved Node.js control runtime\n' >&2
+    return 1
+  fi
+  if grep -Eq '^MemoryDenyWriteExecute=' "$unit"; then
+    printf 'ERROR: MemoryDenyWriteExecute is incompatible with the approved Node.js control runtime\n' >&2
     return 1
   fi
   if grep -Eq '(^|[[:space:]])(AmbientCapabilities|CapabilityBoundingSet|SecureBits)=' "$unit"; then

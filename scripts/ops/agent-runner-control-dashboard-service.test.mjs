@@ -41,27 +41,29 @@ test('control server production CLI is fixed-loopback and uses strict port synta
   assert.match(core, /port = 0/); // direct test/programmatic API still permits ephemeral port 0
 });
 
-test('rendered service source contains required hardening, inherited jitless, exact writable paths, and no secrets', () => {
+test('rendered service source contains required compatible hardening, exact writable paths, and no secrets', () => {
   const source = readFileSync(UNIT_SOURCE, 'utf8');
   for (const directive of [
     'NoNewPrivileges=true', 'PrivateTmp=true', 'ProtectSystem=strict', 'ProtectHome=read-only',
     'RestrictAddressFamilies=AF_UNIX AF_INET', 'LockPersonality=true', 'RestrictRealtime=true',
-    'RestrictSUIDSGID=true', 'UMask=0077', 'MemoryDenyWriteExecute=true', 'TasksMax=64',
+    'RestrictSUIDSGID=true', 'UMask=0077', 'TasksMax=64',
     'MemoryMax=384M', 'TimeoutStartSec=20s', 'TimeoutStopSec=15s',
     'ReadOnlyPaths=%h/.local/state/agent-runner',
     'ReadWritePaths=%h/.config/agent-runner',
     'ReadWritePaths=%h/.local/state/agent-runner/secrets',
     'ReadWritePaths=%h/.local/state/agent-runner/control-audit.jsonl',
-    'Environment=NODE_OPTIONS=--jitless',
     'Environment=AGENT_RUNNER_CONFIG=%h/.config/agent-runner/modelspend.json',
     'Environment=CLAUDE_RUNNER_STATE_DB=%h/.local/state/agent-runner/modelspend/runner-state.sqlite',
     'Environment=AGENT_RUNNER_CONTROL_SCHEDULER_SERVICE=agent-runner-implementation.service',
     'Environment=AGENT_RUNNER_CONTROL_SCHEDULER_TIMER=agent-runner-implementation.timer',
   ]) assert.ok(source.includes(directive), `missing ${directive}`);
-  assert.match(source, /ExecStart=@@NODE@@ --jitless @@SERVER@@ --port @@PORT@@/);
+  assert.match(source, /ExecStart=@@NODE@@ @@SERVER@@ --port @@PORT@@/);
+  assert.doesNotMatch(source, /--jitless/);
+  assert.doesNotMatch(source, /^Environment=NODE_OPTIONS=/m);
+  assert.doesNotMatch(source, /^MemoryDenyWriteExecute=/m);
   assert.doesNotMatch(source, /AmbientCapabilities|CapabilityBoundingSet|SecureBits|EnvironmentFile/);
   const environmentLines = source.split('\n').filter((line) => line.startsWith('Environment='));
-  assert.equal(environmentLines.length, 10);
+  assert.equal(environmentLines.length, 9);
   assert.equal(new Set(environmentLines).size, environmentLines.length);
   assert.doesNotMatch(source, /8787/);
   assert.doesNotMatch(source, /(password|bearer|api[_-]?key|token)=/i);
@@ -285,8 +287,10 @@ test('install is idempotent, lifecycle is bounded, and disable/remove/reinstall 
   assertOk(f.run(['install']));
   assert.equal(readFileSync(path.join(f.fakeState, 'pid'), 'utf8').trim(), '1');
   const rendered = readFileSync(f.unit, 'utf8');
-  assert.match(rendered, /^ExecStart=\/usr\/bin\/node --jitless .*agent-runner-control-server\.mjs --port 8789$/m);
-  assert.match(rendered, /^Environment=NODE_OPTIONS=--jitless$/m);
+  assert.match(rendered, /^ExecStart=\/usr\/bin\/node .*agent-runner-control-server\.mjs --port 8789$/m);
+  assert.doesNotMatch(rendered, /--jitless/);
+  assert.doesNotMatch(rendered, /^Environment=NODE_OPTIONS=/m);
+  assert.doesNotMatch(rendered, /^MemoryDenyWriteExecute=/m);
   assert.doesNotMatch(rendered, /8787|EnvironmentFile|password|token=/i);
   assertOk(f.run(['install']));
   assert.equal(readFileSync(path.join(f.fakeState, 'pid'), 'utf8').trim(), '1', 'unchanged install restarted process');
