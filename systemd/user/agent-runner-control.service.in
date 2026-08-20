@@ -7,6 +7,7 @@ StartLimitBurst=3
 [Service]
 Type=simple
 WorkingDirectory=@@CHECKOUT@@
+Environment=NODE_OPTIONS=--jitless
 ExecStart=@@NODE@@ --jitless @@SERVER@@ --port @@PORT@@
 Restart=on-failure
 RestartSec=5s
