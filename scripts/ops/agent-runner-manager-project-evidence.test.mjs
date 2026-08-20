@@ -124,10 +124,11 @@ test('rejects a local-machine path smuggled into an open issue title', () => {
 });
 
 test('rejects a secret-shaped token in an open pull request title', () => {
+  const syntheticClassicToken = ['gh', 'p_', 'abcdefghijklmnopqrstuvwx1234'].join('');
   assert.throws(
     () => validateManagerProjectEvidence(
       evidenceFor(agentRunnerProfile, {
-        openPullRequests: [{ number: 2, title: 'token ghp_abcdefghijklmnopqrstuvwx1234' }],
+        openPullRequests: [{ number: 2, title: `token ${syntheticClassicToken}` }],
       }),
       { profile: agentRunnerProfile },
     ),
