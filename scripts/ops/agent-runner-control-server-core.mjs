@@ -198,6 +198,15 @@ async function handleLogin(ctx) {
   );
 }
 
+async function handleSessionContext(ctx) {
+  return sendJson(ctx.res, 200, {
+    ok: true,
+    username: ctx.session.username,
+    csrfToken: ctx.session.csrfToken,
+    expiresAtMs: ctx.session.expiresAtMs,
+  });
+}
+
 async function handleLogout(ctx) {
   ctx.sessionStore.destroy(ctx.session.id);
   return sendJson(ctx.res, 200, { ok: true }, { 'Set-Cookie': buildSessionClearCookie() });
@@ -389,6 +398,7 @@ async function handleRemoveSecret(ctx) {
 
 const ROUTES = [
   { method: 'POST', pattern: /^\/api\/session\/login$/, handler: handleLogin, requiresAuth: false, mutating: true },
+  { method: 'GET', pattern: /^\/api\/session$/, handler: handleSessionContext, requiresAuth: true, mutating: false },
   { method: 'POST', pattern: /^\/api\/session\/logout$/, handler: handleLogout, requiresAuth: true, mutating: true },
   { method: 'GET', pattern: /^\/api\/instances$/, handler: handleListInstances, requiresAuth: true, mutating: false },
   { method: 'GET', pattern: new RegExp(`^/api/instances/${INSTANCE_ID_SEGMENT}$`), handler: handleGetInstance, requiresAuth: true, mutating: false },
