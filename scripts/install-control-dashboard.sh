@@ -170,7 +170,14 @@ probe_unit_enabled_state() {
   case "$output" in
     enabled|enabled-runtime|linked|linked-runtime|alias) printf 'enabled\n' ;;
     disabled|disabled-runtime|masked|masked-runtime|static|indirect|generated|transient) printf 'disabled\n' ;;
-    not-found) printf 'absent\n' ;;
+    not-found)
+      if [[ ! -e "$TARGET_UNIT" && ! -L "$TARGET_UNIT" ]]; then
+        printf 'absent\n'
+      else
+        printf 'ERROR: %s is present on disk but systemd reports not-found (status %s)\n' "$SERVICE_NAME" "$rc" >&2
+        return 1
+      fi
+      ;;
     *) printf 'ERROR: could not determine whether %s is enabled (status %s)\n' "$SERVICE_NAME" "$rc" >&2; return 1 ;;
   esac
 }
@@ -376,7 +383,10 @@ restore_previous_state() {
   # rollback already left only a dangling control-service link, remove that
   # one exact link and nothing else.
   if [[ -f "$TARGET_UNIT" ]]; then
-    systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
+    if ! systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1; then
+      set -e
+      return 1
+    fi
   elif [[ -L "$TARGET_WANTS_LINK" ]]; then
     rm -f -- "$TARGET_WANTS_LINK" || rc=1
   fi
@@ -406,7 +416,7 @@ stop_and_disable_target() {
   if [[ "$enabled_state" == enabled ]]; then
     systemctl --user disable "$SERVICE_NAME" >/dev/null || return 1
     enabled_state=$(probe_unit_enabled_state) || return 1
-    if [[ "$enabled_state" != disabled && "$enabled_state" != absent ]]; then
+    if [[ "$enabled_state" != disabled ]]; then
       printf 'ERROR: %s remained enabled after disable\n' "$SERVICE_NAME" >&2
       return 1
     fi
