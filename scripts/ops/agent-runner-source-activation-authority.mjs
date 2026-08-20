@@ -494,11 +494,14 @@ export async function evaluateSourceActivationAuthority({
   if (state && state.sourceIssueNumber !== issueNumber) {
     authorityError('source-activation-state-control-issue-mismatch', 'Durable state is bound to a different control issue.');
   }
+
+  let appliedHeadMismatch = null;
   if (state?.status === 'applied') {
-    const currentHead = readHead();
-    if (currentHead !== state.targetCommit || state.finalHead !== state.targetCommit) {
+    if (state.finalHead !== state.targetCommit) {
       return halt('source-activation-applied-head-mismatch', { sourceCommentId: state.sourceCommentId });
     }
+    const currentHead = readHead();
+    if (currentHead !== state.targetCommit) appliedHeadMismatch = currentHead;
   }
 
   const comments = fetchComments(issueNumber, { env });
@@ -512,6 +515,69 @@ export async function evaluateSourceActivationAuthority({
     if (packetBodyDigest(String(boundComment.body || '')) !== state.bodyDigest) {
       return halt('source-activation-authority-edited-after-consumption', { sourceCommentId: state.sourceCommentId });
     }
+  }
+
+  if (appliedHeadMismatch) {
+    const newer = markerComments.filter((comment) => commentId(comment) > state.sourceCommentId);
+    if (newer.length === 0) {
+      return halt('source-activation-applied-head-mismatch', { sourceCommentId: state.sourceCommentId });
+    }
+
+    const parsedNewer = [];
+    for (const comment of newer) {
+      const parsed = parseSourceActivationAuthority(comment);
+      if (!parsed.valid) {
+        return halt('source-activation-recovery-authority-invalid', {
+          sourceCommentId: parsed.commentId || state.sourceCommentId,
+        });
+      }
+      if (!approvers.includes(parsed.author)) {
+        return halt('source-activation-recovery-author-unapproved', { sourceCommentId: parsed.commentId });
+      }
+      parsedNewer.push(parsed);
+    }
+
+    const latest = parsedNewer.at(-1);
+    if (latest.targetCommit !== appliedHeadMismatch) {
+      return halt('source-activation-recovery-target-head-mismatch', { sourceCommentId: latest.commentId });
+    }
+
+    let activation;
+    try {
+      activation = await activateSource({ target: latest.targetCommit, env });
+    } catch (error) {
+      if (error?.code === 'AGENT_RUNNER_LOCKED' || error?.reason === 'implementation-lock-unavailable') {
+        return halt('implementation-lock-unavailable', { sourceCommentId: latest.commentId });
+      }
+      if (error instanceof SourceActivationRefusal) {
+        return halt(error.reason, { sourceCommentId: latest.commentId });
+      }
+      throw error;
+    }
+
+    if (!activation?.ok || activation.result !== 'already-active' || activation.finalHead !== latest.targetCommit) {
+      authorityError(
+        'source-activation-recovery-result-invalid',
+        'Source activator did not prove the reconciled exact head was already active.',
+      );
+    }
+
+    const applied = stateFromAuthority({
+      issueNumber,
+      parsed: latest,
+      status: 'applied',
+      refusalReason: null,
+      appliedAt: now(),
+      finalHead: activation.finalHead,
+    });
+    writeState(applied);
+    return {
+      action: 'reexec',
+      reason: 'source-activation-applied-head-reconciled',
+      sourceCommentId: latest.commentId,
+      previousSourceCommentId: state.sourceCommentId,
+      targetCommit: latest.targetCommit,
+    };
   }
 
   let eligible;

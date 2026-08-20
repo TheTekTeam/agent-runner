@@ -20,9 +20,11 @@ import {
   sourceActivationFingerprint,
   writeSourceActivationState,
 } from './agent-runner-source-activation-authority.mjs';
+import { SourceActivationRefusal } from './agent-runner-source-activation.mjs';
 
 const TARGET = 'a'.repeat(40);
 const NEXT = 'b'.repeat(40);
+const THIRD = 'c'.repeat(40);
 const ISSUE = 41;
 const ENV = Object.freeze({
   AGENT_RUNNER_SOURCE_ACTIVATION_ENABLED: 'true',
@@ -152,14 +154,198 @@ test('same applied authority is deduped and does not activate or re-exec again',
   assert.equal(h.writes.length, 0);
 });
 
-test('applied state with unexpected canonical HEAD fails closed before GitHub lookup or activation', async () => {
+test('applied state with unexplained canonical HEAD drift remains fail closed after bounded authority lookup', async () => {
   const comment = authorityComment();
   const h = harness({ comments: [comment], state: stateFor(comment), head: NEXT });
   const result = await evaluateSourceActivationAuthority(h.options);
   assert.equal(result.action, 'halt');
   assert.equal(result.reason, 'source-activation-applied-head-mismatch');
-  assert.equal(h.calls.fetch, 0);
+  assert.equal(h.calls.fetch, 1);
   assert.equal(h.calls.activate, 0);
+  assert.equal(h.writes.length, 0);
+});
+
+test('stale applied state reconciles only when a newer approved authority exactly matches the already-active accepted HEAD', async () => {
+  const old = authorityComment();
+  const current = authorityComment({
+    id: 101,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+  });
+  const h = harness({
+    comments: [old, current],
+    state: stateFor(old),
+    head: NEXT,
+    activation: { ok: true, result: 'already-active', finalHead: NEXT },
+  });
+  const result = await evaluateSourceActivationAuthority(h.options);
+  assert.deepEqual(result, {
+    action: 'reexec',
+    reason: 'source-activation-applied-head-reconciled',
+    sourceCommentId: 101,
+    previousSourceCommentId: 100,
+    targetCommit: NEXT,
+  });
+  assert.equal(h.calls.fetch, 1);
+  assert.equal(h.calls.activate, 1);
+  assert.deepEqual(h.writes.map((entry) => entry.status), ['applied']);
+  assert.equal(h.writes[0].sourceCommentId, 101);
+  assert.equal(h.writes[0].targetCommit, NEXT);
+  assert.equal(h.writes[0].finalHead, NEXT);
+});
+
+test('recovery may cross valid historical authority generations but only the newest authority may match current HEAD', async () => {
+  const old = authorityComment();
+  const historical = authorityComment({
+    id: 101,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+  });
+  const current = authorityComment({
+    id: 102,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.3',
+      target_commit: THIRD,
+    },
+  });
+  const h = harness({
+    comments: [old, historical, current],
+    state: stateFor(old),
+    head: THIRD,
+    activation: { ok: true, result: 'already-active', finalHead: THIRD },
+  });
+  const result = await evaluateSourceActivationAuthority(h.options);
+  assert.equal(result.action, 'reexec');
+  assert.equal(result.sourceCommentId, 102);
+  assert.equal(result.targetCommit, THIRD);
+  assert.equal(h.calls.activate, 1);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.writes[0].sourceCommentId, 102);
+});
+
+test('recovery refuses wrong newest target and malformed or unapproved intervening authority without durable mutation', async () => {
+  const old = authorityComment();
+  const wrongNewest = authorityComment({
+    id: 101,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: THIRD,
+    },
+  });
+  const wrong = harness({ comments: [old, wrongNewest], state: stateFor(old), head: NEXT });
+  const wrongResult = await evaluateSourceActivationAuthority(wrong.options);
+  assert.equal(wrongResult.action, 'halt');
+  assert.equal(wrongResult.reason, 'source-activation-recovery-target-head-mismatch');
+  assert.equal(wrong.calls.activate, 0);
+  assert.equal(wrong.writes.length, 0);
+
+  const malformed = authorityComment({
+    id: 101,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+    fingerprint: `sha256:${'f'.repeat(64)}`,
+  });
+  const current = authorityComment({
+    id: 102,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.3',
+      target_commit: THIRD,
+    },
+  });
+  const invalid = harness({ comments: [old, malformed, current], state: stateFor(old), head: THIRD });
+  const invalidResult = await evaluateSourceActivationAuthority(invalid.options);
+  assert.equal(invalidResult.action, 'halt');
+  assert.equal(invalidResult.reason, 'source-activation-recovery-authority-invalid');
+  assert.equal(invalid.calls.activate, 0);
+  assert.equal(invalid.writes.length, 0);
+
+  const unapproved = authorityComment({
+    id: 101,
+    login: 'worker-bot',
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+  });
+  const denied = harness({ comments: [old, unapproved, current], state: stateFor(old), head: THIRD });
+  const deniedResult = await evaluateSourceActivationAuthority(denied.options);
+  assert.equal(deniedResult.action, 'halt');
+  assert.equal(deniedResult.reason, 'source-activation-recovery-author-unapproved');
+  assert.equal(denied.calls.activate, 0);
+  assert.equal(denied.writes.length, 0);
+});
+
+test('recovery preserves stale applied state on lock, source refusal or non-already-active activation result', async () => {
+  const old = authorityComment();
+  const current = authorityComment({
+    id: 101,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+  });
+
+  const lock = new Error('held');
+  lock.code = 'AGENT_RUNNER_LOCKED';
+  const locked = harness({ comments: [old, current], state: stateFor(old), head: NEXT, activation: lock });
+  const lockedResult = await evaluateSourceActivationAuthority(locked.options);
+  assert.equal(lockedResult.action, 'halt');
+  assert.equal(lockedResult.reason, 'implementation-lock-unavailable');
+  assert.equal(locked.writes.length, 0);
+
+  const dirty = harness({
+    comments: [old, current],
+    state: stateFor(old),
+    head: NEXT,
+    activation: new SourceActivationRefusal('dirty-checkout'),
+  });
+  const dirtyResult = await evaluateSourceActivationAuthority(dirty.options);
+  assert.equal(dirtyResult.action, 'halt');
+  assert.equal(dirtyResult.reason, 'dirty-checkout');
+  assert.equal(dirty.writes.length, 0);
+
+  const activated = harness({
+    comments: [old, current],
+    state: stateFor(old),
+    head: NEXT,
+    activation: { ok: true, result: 'activated', finalHead: NEXT },
+  });
+  await assert.rejects(
+    evaluateSourceActivationAuthority(activated.options),
+    /already active/,
+  );
+  assert.equal(activated.writes.length, 0);
+});
+
+test('reconciled applied state is idempotent and does not activate or rewrite on replay', async () => {
+  const old = authorityComment();
+  const current = authorityComment({
+    id: 101,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+  });
+  const first = harness({
+    comments: [old, current],
+    state: stateFor(old),
+    head: NEXT,
+    activation: { ok: true, result: 'already-active', finalHead: NEXT },
+  });
+  assert.equal((await evaluateSourceActivationAuthority(first.options)).action, 'reexec');
+  const reconciled = first.writes.at(-1);
+
+  const replay = harness({ comments: [old, current], state: reconciled, head: NEXT });
+  const replayResult = await evaluateSourceActivationAuthority(replay.options);
+  assert.deepEqual(replayResult, { action: 'continue', reason: 'source-activation-authority-already-applied' });
+  assert.equal(replay.calls.activate, 0);
+  assert.equal(replay.writes.length, 0);
 });
 
 test('edited consumed authority fails closed and cannot revoke or mutate unrelated implementation authority', async () => {
