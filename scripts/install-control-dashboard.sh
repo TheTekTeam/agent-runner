@@ -3,6 +3,7 @@ set -euo pipefail
 
 SERVICE_NAME='agent-runner-control.service'
 DEFAULT_PORT='8789'
+RESERVED_EVENT_INGRESS_PORT='8787'
 FIXED_HOST='127.0.0.1'
 
 usage() {
@@ -11,6 +12,7 @@ Usage: scripts/install-control-dashboard.sh <install|verify|status|enable|disabl
 
 Installs and manages only the Agent Runner authenticated control dashboard user service.
 The bind address is fixed at 127.0.0.1 and PORT defaults to 8789.
+Port 8787 is reserved for Agent Runner event ingress and is always rejected.
 USAGE
 }
 
@@ -24,6 +26,7 @@ validate_port() {
   [[ -n "$value" ]] || fail 'missing value for --port'
   [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] || fail "invalid port: $value"
   (( 10#$value <= 65535 )) || fail "port out of range: $value"
+  (( 10#$value != 10#$RESERVED_EVENT_INGRESS_PORT )) || fail "port $RESERVED_EVENT_INGRESS_PORT is reserved for event ingress"
   printf '%s\n' "$value"
 }
 
@@ -60,6 +63,10 @@ SOURCE_UNIT="$CHECKOUT/systemd/user/agent-runner-control.service.in"
 SERVER="$CHECKOUT/scripts/ops/agent-runner-control-server.mjs"
 TARGET_DIR="$HOME/.config/systemd/user"
 TARGET_UNIT="$TARGET_DIR/$SERVICE_NAME"
+CONTROL_CONFIG_DIR="$HOME/.config/agent-runner"
+CONTROL_STATE_ROOT="$HOME/.local/state/agent-runner"
+CONTROL_SECRET_DIR="$CONTROL_STATE_ROOT/secrets"
+CONTROL_AUDIT_FILE="$CONTROL_STATE_ROOT/control-audit.jsonl"
 NODE_BIN=$(command -v node || true)
 NODE_BIN=${NODE_BIN:+$(readlink -f -- "$NODE_BIN")}
 
@@ -85,6 +92,18 @@ validate_rendered_unit() {
   local unit=$1
   if ! grep -Fqx "ExecStart=$NODE_BIN --jitless $SERVER --port $PORT" "$unit"; then
     printf 'ERROR: rendered ExecStart is not exact\n' >&2
+    return 1
+  fi
+  if ! grep -Fqx 'Environment=NODE_OPTIONS=--jitless' "$unit"; then
+    printf 'ERROR: snapshot child processes must inherit Node --jitless mode\n' >&2
+    return 1
+  fi
+  if grep -Eq '^EnvironmentFile=' "$unit"; then
+    printf 'ERROR: environment files are forbidden in the control service\n' >&2
+    return 1
+  fi
+  if grep -E '^Environment=' "$unit" | grep -Fvx 'Environment=NODE_OPTIONS=--jitless' >/dev/null; then
+    printf 'ERROR: unexpected service environment assignment\n' >&2
     return 1
   fi
   if ! grep -Fqx 'MemoryDenyWriteExecute=true' "$unit"; then
@@ -157,27 +176,78 @@ verify_installed_service() {
   verify_shell_health || return 1
 }
 
-restore_previous_state() {
-  local backup=$1 had_unit=$2 was_enabled=$3 was_active=$4
-  set +e
-  systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1
-  if (( had_unit )); then
-    install -m 0600 "$backup" "$TARGET_UNIT"
-  else
-    rm -f -- "$TARGET_UNIT"
+ensure_private_directory() {
+  local directory=$1
+  if [[ -L "$directory" ]]; then
+    printf 'ERROR: refusing symlink for writable control directory: %s\n' "$directory" >&2
+    return 1
   fi
-  systemctl --user daemon-reload >/dev/null 2>&1
-  if (( was_enabled )); then
-    systemctl --user enable "$SERVICE_NAME" >/dev/null 2>&1
+  if [[ -e "$directory" ]]; then
+    [[ -d "$directory" ]] || { printf 'ERROR: writable control path is not a directory: %s\n' "$directory" >&2; return 1; }
+    return 0
+  fi
+  mkdir -m 0700 -- "$directory"
+}
+
+provision_writable_paths() {
+  # The hardened mount namespace requires these exact paths to exist before
+  # service start. Create only the three repository-approved writable sinks;
+  # never create/rotate the operator credential or touch execution state.
+  ensure_private_directory "$CONTROL_CONFIG_DIR" || return 1
+  ensure_private_directory "$CONTROL_STATE_ROOT" || return 1
+  ensure_private_directory "$CONTROL_SECRET_DIR" || return 1
+  if [[ -L "$CONTROL_AUDIT_FILE" ]]; then
+    printf 'ERROR: refusing symlink for control audit file: %s\n' "$CONTROL_AUDIT_FILE" >&2
+    return 1
+  fi
+  if [[ -e "$CONTROL_AUDIT_FILE" ]]; then
+    [[ -f "$CONTROL_AUDIT_FILE" ]] || { printf 'ERROR: control audit path is not a regular file: %s\n' "$CONTROL_AUDIT_FILE" >&2; return 1; }
   else
-    systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1
+    install -m 0600 /dev/null "$CONTROL_AUDIT_FILE"
+  fi
+}
+
+restore_previous_state() {
+  local backup=$1 had_unit=$2 was_enabled=$3 was_active=$4 rc=0
+  set +e
+  systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
+  if (( had_unit )); then
+    install -m 0600 "$backup" "$TARGET_UNIT" || rc=1
+  else
+    rm -f -- "$TARGET_UNIT" || rc=1
+  fi
+  systemctl --user daemon-reload >/dev/null 2>&1 || rc=1
+  if (( was_enabled )); then
+    systemctl --user enable "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
+  else
+    systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
   if (( was_active )); then
-    systemctl --user start "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl --user start "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
   else
-    systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1
+    systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
+  if (( was_enabled )); unit_enabled || rc=1; else unit_enabled && rc=1; fi
+  if (( was_active )); unit_active || rc=1; else unit_active && rc=1; fi
   set -e
+  return "$rc"
+}
+
+stop_and_disable_target() {
+  if unit_active; then
+    systemctl --user stop "$SERVICE_NAME" >/dev/null || return 1
+    if unit_active; then
+      printf 'ERROR: %s remained active after stop\n' "$SERVICE_NAME" >&2
+      return 1
+    fi
+  fi
+  if unit_enabled; then
+    systemctl --user disable "$SERVICE_NAME" >/dev/null || return 1
+    if unit_enabled; then
+      printf 'ERROR: %s remained enabled after disable\n' "$SERVICE_NAME" >&2
+      return 1
+    fi
+  fi
 }
 
 install_service() {
@@ -196,6 +266,10 @@ install_service() {
   unit_enabled && was_enabled=1 || true
   unit_active && was_active=1 || true
 
+  # Static validation has completed. Provision only the exact writable paths
+  # required for namespace setup before any activation or replacement.
+  provision_writable_paths
+
   if (( changed == 0 )); then
     # Idempotent reinstall: never restart an already-running process. This
     # preserves the process-local authenticated session store.
@@ -211,13 +285,14 @@ install_service() {
     return 0
   fi
 
-  # Validate before touching the installed unit. A changed active service is
-  # stopped only after the replacement unit has passed static verification.
+  # A changed active service is stopped only after the replacement unit has
+  # passed static verification and writable-path provisioning has succeeded.
   if (( was_active )); then
-    systemctl --user stop "$SERVICE_NAME"
+    systemctl --user stop "$SERVICE_NAME" || return 1
+    unit_active && { printf 'ERROR: %s did not stop before upgrade\n' "$SERVICE_NAME" >&2; return 1; }
   fi
   if ! preflight_port_available; then
-    restore_previous_state "$backup" "$had_unit" "$was_enabled" "$was_active"
+    restore_previous_state "$backup" "$had_unit" "$was_enabled" "$was_active" || printf 'ERROR: rollback could not fully restore previous service state\n' >&2
     return 1
   fi
 
@@ -228,36 +303,52 @@ install_service() {
     || ! systemctl --user restart "$SERVICE_NAME" \
     || ! verify_installed_service; then
     printf 'ERROR: activation or health verification failed; restoring previous service state\n' >&2
-    restore_previous_state "$backup" "$had_unit" "$was_enabled" "$was_active"
+    restore_previous_state "$backup" "$had_unit" "$was_enabled" "$was_active" || printf 'ERROR: rollback could not fully restore previous service state\n' >&2
     return 1
   fi
   printf 'INSTALLED: %s is enabled and healthy on %s:%s\n' "$SERVICE_NAME" "$FIXED_HOST" "$PORT"
 }
 
 enable_service() {
+  local was_enabled=0 was_active=0
   [[ -f "$TARGET_UNIT" ]] || fail 'service is not installed; run install first'
   validate_rendered_unit "$TARGET_UNIT"
-  if ! unit_active; then
+  provision_writable_paths
+  unit_enabled && was_enabled=1 || true
+  unit_active && was_active=1 || true
+  if (( was_active == 0 )); then
     preflight_port_available || return 1
   fi
-  systemctl --user enable "$SERVICE_NAME" >/dev/null
-  if ! unit_active; then
-    systemctl --user start "$SERVICE_NAME"
+  if ! systemctl --user enable "$SERVICE_NAME" >/dev/null \
+    || { (( was_active )) || systemctl --user start "$SERVICE_NAME"; } \
+    || ! verify_installed_service; then
+    printf 'ERROR: enable or health verification failed; restoring previous enabled/active state\n' >&2
+    if (( was_enabled == 0 )); then systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
+    if (( was_active == 0 )); then systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
+    return 1
   fi
-  verify_installed_service
   printf 'ENABLED: %s is healthy on %s:%s\n' "$SERVICE_NAME" "$FIXED_HOST" "$PORT"
 }
 
 disable_service() {
-  systemctl --user disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+  stop_and_disable_target || fail "could not safely disable $SERVICE_NAME"
   printf 'DISABLED: %s\n' "$SERVICE_NAME"
 }
 
 remove_service() {
-  systemctl --user disable --now "$SERVICE_NAME" >/dev/null 2>&1 || true
+  local backup
+  stop_and_disable_target || fail "could not safely stop and disable $SERVICE_NAME; unit preserved"
   if [[ -e "$TARGET_UNIT" ]]; then
-    rm -f -- "$TARGET_UNIT"
-    systemctl --user daemon-reload
+    backup=$(mktemp)
+    cp -- "$TARGET_UNIT" "$backup"
+    if ! rm -f -- "$TARGET_UNIT" || ! systemctl --user daemon-reload; then
+      printf 'ERROR: unit removal/reload failed; restoring unit file\n' >&2
+      install -m 0600 "$backup" "$TARGET_UNIT" >/dev/null 2>&1 || true
+      systemctl --user daemon-reload >/dev/null 2>&1 || true
+      rm -f -- "$backup"
+      return 1
+    fi
+    rm -f -- "$backup"
   fi
   printf 'REMOVED: %s unit only; Agent Runner configuration and state were preserved\n' "$SERVICE_NAME"
 }
