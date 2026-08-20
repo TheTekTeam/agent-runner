@@ -90,6 +90,7 @@ import {
 import { redactExecutableArgs } from './lib/redact.mjs';
 import { reconcileNotifications } from './agent-runner-notifications.mjs';
 import { runAttentionReconciliation } from './agent-runner-attention-reconcile-command.mjs';
+import { GhCliAttentionReadClient } from './agent-runner-attention-github-client.mjs';
 
 const DEFAULT_REPO = 'TheTekTeam/modelspend';
 const DEFAULT_LOCK = '.var/claude-runner/cron.lock';
@@ -3061,16 +3062,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       // scheduler return code, and it remains reachable before the quota-
       // blocked early return. Dashboard/status reads never run it.
       const reconcileAttention = dependencies.reconcileAttention || runAttentionReconciliation;
-      const attentionClient = dependencies.attentionClient || {
-        getIssue(repository, issueNumber) {
-          const raw = JSON.parse(ghRunner(['api', '--method', 'GET', `/repos/${repository}/issues/${issueNumber}`]));
-          return {
-            number: raw?.number, state: raw?.state, state_reason: raw?.state_reason ?? null,
-            updated_at: raw?.updated_at ?? null, closed_at: raw?.closed_at ?? null,
-            is_pull_request: Boolean(raw?.pull_request),
-          };
-        },
-      };
+      const attentionClient = dependencies.attentionClient || new GhCliAttentionReadClient({ env });
       try {
         await reconcileAttention({
           argv: ['--state-db', args.stateDbPath], env,
@@ -3078,7 +3070,9 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
           client: attentionClient, now,
         });
       } catch (error) {
-        state.recordTaskError('attention-reconciliation-failed', error);
+        const safeCode = ['attention-source-changed', 'attention-event-bound-exceeded', 'attention-issue-bound-exceeded']
+          .includes(error?.code) ? error.code : 'attention-reconciliation-failed';
+        state.recordTaskError('attention-reconciliation-failed', Object.assign(new Error(safeCode), { code: safeCode }));
       }
     }
     // #698 round 5, finding 3: a pass that proves the store writable again

@@ -212,12 +212,40 @@ test('read-only state reader creates no database or sidecar and reads a complete
 
 test('GET-only client has no method surface and always spawns gh api --method GET', () => {
   const calls = [];
-  const client = new GhCliAttentionReadClient({ spawn(command, args) {
-    calls.push({ command, args }); return { status: 0, stdout: JSON.stringify({ number: 44, state: 'closed' }) };
+  let options;
+  const client = new GhCliAttentionReadClient({ env: { PATH: '/bin', GH_TOKEN: 'allowed-for-gh-only', PRIVATE_SENTINEL: 'must-not-pass' }, spawn(command, args, spawnOptions) {
+    calls.push({ command, args }); options = spawnOptions;
+    return { status: 0, stdout: JSON.stringify({ number: 44, state: 'closed' }) };
   } });
   assert.equal(client.getIssue(REPO, 44).state, 'closed');
   assert.deepEqual(calls[0], { command: 'gh', args: ['api', '--method', 'GET', `/repos/${REPO}/issues/44`] });
+  assert.equal(options.timeout, 3_000); assert.equal(options.env.PRIVATE_SENTINEL, undefined);
   assert.equal('request' in client, false);
+});
+
+test('lookup budget stops issuing GETs and classifies remaining exact events unknown', () => {
+  tempDb((dbPath) => {
+    const store = new AttentionReconciliationStore(dbPath);
+    let clockMs = 0; let calls = 0;
+    const client = { getIssue(repository, issueNumber) {
+      calls += 1; clockMs = 16_000; return { number: issueNumber, state: 'closed', updated_at: NOW };
+    } };
+    const state = reconcileAttentionEvents({ repository: REPO, attentionEvents: [row(1), row(2)], attempts: [],
+      store, client, clock: () => clockMs, totalLookupMs: 15_000, generationId: 'budget-one' });
+    assert.equal(calls, 1);
+    assert.equal(state.items.find((item) => item.issueNumber === 2).reasonCode, 'lookup-budget-exhausted');
+    store.close();
+  });
+});
+
+test('overflow source projects exact degraded count and never clear', () => {
+  const events = Array.from({ length: 201 }, (_, index) => row(index + 1));
+  const projection = buildAttentionReconciliationProjection(events, [], null, {
+    repository: REPO, now: NOW, sourceTotal: 237, sourceOverflow: true,
+  });
+  assert.equal(projection.posture, 'degraded');
+  assert.deepEqual(projection.counts, { actionable: 0, historical: 0, unknown: 237, stale: 0, total: 237 });
+  assert.equal(projection.generation.freshness, 'overflow');
 });
 
 test('one path resolver honors explicit, reconciliation env, output-dir env and config in order', () => {
@@ -230,7 +258,11 @@ test('one path resolver honors explicit, reconciliation env, output-dir env and 
 test('command uses output-dir override, rechecks source and writes only the dedicated store', () => {
   tempDb((dbPath) => {
     const event = row(44); let reads = 0; let createdPath = null;
-    const snapshotReader = () => { reads += 1; return { ok: true, latest: { attentionEvents: [event], recoveryAttempts: [] } }; };
+    const snapshotReader = () => { reads += 1; return {
+      ok: true,
+      latest: { attentionEvents: [], recoveryAttempts: [] },
+      attentionSource: { attentionEvents: [event], recoveryAttempts: [] },
+    }; };
     const result = runAttentionReconciliation({
       env: { CLAUDE_RUNNER_OUTPUT_DIR: '/runtime' }, config: { githubRepo: REPO, outputDir: '/config' },
       snapshotReader, client: fakeClient({ [`${REPO}#44`]: { number: 44, state: 'closed', updated_at: NOW } }),
@@ -239,5 +271,38 @@ test('command uses output-dir override, rechecks source and writes only the dedi
     });
     assert.equal(result.historicalCount, 1); assert.equal(reads, 2);
     assert.equal(createdPath, join('/runtime', 'attention-reconciliation.sqlite'));
+  });
+});
+
+test('command appends bounded superseded and failed generation outcomes without moving current truth', () => {
+  tempDb((dbPath) => {
+    const first = row(44); const changed = row(45); let reads = 0;
+    const snapshotReader = () => {
+      reads += 1;
+      const event = reads === 1 ? first : changed;
+      return { ok: true, latest: {}, attentionSource: { attentionEvents: [event], recoveryAttempts: [], total: 1, overflow: false } };
+    };
+    assert.throws(() => runAttentionReconciliation({
+      argv: ['--reconciliation-db', dbPath], config: { githubRepo: REPO, outputDir: '/config' },
+      snapshotReader, client: fakeClient({ [`${REPO}#44`]: { number: 44, state: 'closed', updated_at: NOW } }),
+      now: () => NOW,
+    }), (error) => error.code === 'attention-source-changed');
+    let store = new AttentionReconciliationStore(dbPath);
+    assert.deepEqual(store.generationOutcomes(REPO).map((item) => [item.state, item.failure_code]),
+      [['superseded', 'attention-source-changed']]);
+    store.close();
+
+    const overflowEvents = Array.from({ length: 201 }, (_, index) => row(index + 1000));
+    assert.throws(() => runAttentionReconciliation({
+      argv: ['--reconciliation-db', dbPath], config: { githubRepo: REPO, outputDir: '/config' },
+      snapshotReader: () => ({ ok: true, latest: {}, attentionSource: {
+        attentionEvents: overflowEvents, recoveryAttempts: [], total: 201, overflow: true,
+      } }), client: fakeClient({}), now: () => LATER,
+    }), (error) => error.code === 'attention-event-bound-exceeded');
+    store = new AttentionReconciliationStore(dbPath);
+    assert.deepEqual(store.generationOutcomes(REPO).map((item) => [item.state, item.failure_code]),
+      [['superseded', 'attention-source-changed'], ['failed', 'attention-event-bound-exceeded']]);
+    assert.equal(store.listStateForRepository(REPO).generation, null);
+    store.close();
   });
 });

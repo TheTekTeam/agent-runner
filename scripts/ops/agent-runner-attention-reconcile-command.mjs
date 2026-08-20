@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { randomUUID } from 'node:crypto';
 import process from 'node:process';
 import { pathToFileURL } from 'node:url';
 
@@ -23,9 +24,10 @@ export function parseArgs(argv) {
 }
 
 function scoped(snapshot, repository) {
-  const attentionEvents = (snapshot.latest.attentionEvents || []).filter((row) => row.repo === repository && !row.resolved_at);
-  const attempts = snapshot.latest.recoveryAttempts || [];
-  return { attentionEvents, attempts };
+  const source = snapshot.attentionSource || snapshot.latest || {};
+  const attentionEvents = (source.attentionEvents || []).filter((row) => row.repo === repository && !row.resolved_at);
+  const attempts = source.recoveryAttempts || [];
+  return { attentionEvents, attempts, total: Number.isInteger(source.total) ? source.total : attentionEvents.length, overflow: source.overflow === true };
 }
 
 export function runAttentionReconciliation({
@@ -38,23 +40,39 @@ export function runAttentionReconciliation({
   const outputDir = resolveRunnerOutputDir(env, config);
   const stateDbPath = args['state-db'] || env.CLAUDE_RUNNER_STATE_DB || config.stateDbPath || defaultRunnerStateDbPath(outputDir);
   const reconciliationDbPath = resolveAttentionReconciliationDbPath({ explicitPath: args['reconciliation-db'], env, config });
-  const read = () => snapshotReader(stateDbPath, { historyLimit: 1000, includeLatest: true });
+  const read = () => snapshotReader(stateDbPath, { historyLimit: 50, includeLatest: true, attentionRepository: config.githubRepo });
   const initial = read();
   if (!initial.ok) throw Object.assign(new Error('runner state is unavailable'), { code: 'state-unavailable' });
   const source = scoped(initial, config.githubRepo);
   const sourceDigest = attentionSourceSnapshotDigest(source.attentionEvents, source.attempts);
   const store = storeFactory(reconciliationDbPath);
+  const generationId = randomUUID();
+  const startedAt = now();
   try {
-    const state = reconcileAttentionEvents({
-      repository: config.githubRepo, ...source, store, client, now,
-      verifySource: () => {
-        const current = read();
-        if (!current.ok) return false;
-        const latest = scoped(current, config.githubRepo);
-        return attentionSourceSnapshotDigest(latest.attentionEvents, latest.attempts) === sourceDigest;
-      },
+    let state;
+    try {
+      state = reconcileAttentionEvents({
+        repository: config.githubRepo, ...source, store, client, now, generationId,
+        verifySource: () => {
+          const current = read();
+          if (!current.ok) return false;
+          const latest = scoped(current, config.githubRepo);
+          return latest.total === source.total && latest.overflow === source.overflow
+            && attentionSourceSnapshotDigest(latest.attentionEvents, latest.attempts) === sourceDigest;
+        },
+      });
+    } catch (error) {
+      const failureCode = ['attention-source-changed', 'attention-event-bound-exceeded', 'attention-issue-bound-exceeded']
+        .includes(error?.code) ? error.code : 'attention-reconciliation-failed';
+      store.recordGenerationOutcome({ generationId, repository: config.githubRepo,
+        state: failureCode === 'attention-source-changed' ? 'superseded' : 'failed',
+        sourceSnapshotDigest: sourceDigest, sourceEventCount: source.total, startedAt,
+        completedAt: now(), failureCode, unknownCount: source.total });
+      throw Object.assign(new Error(failureCode), { code: failureCode });
+    }
+    const projection = buildAttentionReconciliationProjection(source.attentionEvents, source.attempts, state, {
+      repository: config.githubRepo, now: now(), sourceTotal: source.total, sourceOverflow: source.overflow,
     });
-    const projection = buildAttentionReconciliationProjection(source.attentionEvents, source.attempts, state, { repository: config.githubRepo, now: now() });
     return {
       schemaVersion: 2, ok: true, repository: config.githubRepo,
       reconciledCount: source.attentionEvents.length,

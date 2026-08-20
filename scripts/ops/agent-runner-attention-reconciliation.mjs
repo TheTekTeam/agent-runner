@@ -4,6 +4,8 @@ export const ATTENTION_RECONCILIATION_SCHEMA_VERSION = 2;
 export const ATTENTION_RECONCILIATION_MAX_AGE_MS = 30 * 60 * 1000;
 export const ATTENTION_RECONCILIATION_MAX_EVENTS = 200;
 export const ATTENTION_RECONCILIATION_MAX_ISSUES = 25;
+export const ATTENTION_RECONCILIATION_TOTAL_LOOKUP_MS = 15_000;
+export const ATTENTION_RECONCILIATION_PER_LOOKUP_MS = 3_000;
 
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const hash = (value) => `sha256:${createHash('sha256').update(JSON.stringify(value)).digest('hex')}`;
@@ -85,7 +87,10 @@ export function reconcileAttentionEvent({ row, attempts = [], githubResult, chec
   });
 }
 
-export function reconcileAttentionEvents({ repository, attentionEvents = [], attempts = [], store, client, now = () => new Date().toISOString(), generationId = randomUUID(), maxAgeMs = ATTENTION_RECONCILIATION_MAX_AGE_MS, verifySource = () => true } = {}) {
+export function reconcileAttentionEvents({ repository, attentionEvents = [], attempts = [], store, client,
+  now = () => new Date().toISOString(), clock = () => Date.now(), generationId = randomUUID(),
+  maxAgeMs = ATTENTION_RECONCILIATION_MAX_AGE_MS, totalLookupMs = ATTENTION_RECONCILIATION_TOTAL_LOOKUP_MS,
+  perLookupMs = ATTENTION_RECONCILIATION_PER_LOOKUP_MS, verifySource = () => true } = {}) {
   if (!REPOSITORY.test(repository || '')) throw new Error('repository is required');
   if (!store || typeof store.publishGeneration !== 'function') throw new Error('reconciliation store is required');
   if (!client || typeof client.getIssue !== 'function') throw new Error('GET-only attention client is required');
@@ -94,11 +99,14 @@ export function reconcileAttentionEvents({ repository, attentionEvents = [], att
   const identities = [...new Set(unresolved.map((row) => `${row.repo}#${row.issue_number}`))];
   if (identities.length > ATTENTION_RECONCILIATION_MAX_ISSUES) throw Object.assign(new Error('attention issue bound exceeded'), { code: 'attention-issue-bound-exceeded' });
   const startedAt = now();
+  const deadline = clock() + totalLookupMs;
   const cache = new Map();
   for (const row of unresolved) {
     const key = `${row.repo}#${row.issue_number}`;
     if (cache.has(key)) continue;
-    try { cache.set(key, { issue: client.getIssue(row.repo, row.issue_number) }); }
+    const remainingMs = deadline - clock();
+    if (remainingMs <= 0) { cache.set(key, { errorCode: 'lookup-budget-exhausted' }); continue; }
+    try { cache.set(key, { issue: client.getIssue(row.repo, row.issue_number, { timeoutMs: Math.min(perLookupMs, remainingMs) }) }); }
     catch { cache.set(key, { errorCode: 'lookup-unavailable' }); }
   }
   const decisions = unresolved.map((row) => reconcileAttentionEvent({
@@ -114,8 +122,24 @@ export function reconcileAttentionEvents({ repository, attentionEvents = [], att
   });
 }
 
-export function buildAttentionReconciliationProjection(attentionEvents = [], attempts = [], state = null, { repository = null, now = new Date().toISOString() } = {}) {
+export function buildAttentionReconciliationProjection(attentionEvents = [], attempts = [], state = null, {
+  repository = null, now = new Date().toISOString(), sourceTotal = null, sourceOverflow = false,
+} = {}) {
   const unresolved = attentionEvents.filter((row) => !row?.resolved_at && (!repository || row?.repo === repository));
+  const exactSourceTotal = Number.isInteger(sourceTotal) && sourceTotal >= unresolved.length ? sourceTotal : unresolved.length;
+  if (sourceOverflow || exactSourceTotal > ATTENTION_RECONCILIATION_MAX_EVENTS) {
+    const items = unresolved.slice(0, ATTENTION_RECONCILIATION_MAX_EVENTS).map((row) => Object.freeze({
+      eventKey: attentionEventIdentity(row), repository: row?.repo || null, issueNumber: row?.issue_number || null,
+      status: 'unknown', reasonCode: 'attention-event-bound-exceeded', checkedAt: null, acknowledged: false,
+    }));
+    return Object.freeze({
+      schemaVersion: ATTENTION_RECONCILIATION_SCHEMA_VERSION, repository, generatedAt: now,
+      generation: Object.freeze({ ...(state?.generation || { id: null }), freshness: 'overflow' }),
+      items: Object.freeze(items),
+      counts: Object.freeze({ actionable: 0, historical: 0, unknown: exactSourceTotal, stale: 0, total: exactSourceTotal }),
+      posture: 'degraded',
+    });
+  }
   const sourceDigest = attentionSourceSnapshotDigest(unresolved, attempts);
   const generationFresh = state?.generation?.state === 'completed'
     && state.generation.sourceSnapshotDigest === sourceDigest

@@ -223,6 +223,8 @@ const HISTORY_TABLES = RUNNER_STATE_TABLES.filter((table) => table !== 'runner_s
 
 const RUN_RESULTS_COLUMNS = ['id', 'created_at', 'started_at', 'finished_at', 'repo', 'issue_number', 'mode', 'exit_code', 'signal'];
 const ATTENTION_EVENTS_COLUMNS = ['id', 'created_at', 'updated_at', 'repo', 'project', 'issue_number', 'attempt_id', 'reason', 'agent', 'started_at', 'finished_at', 'recovery_status', 'next_action', 'dashboard_reference', 'policy_revision', 'notification_count', 'last_notification_at', 'resolved_at'];
+const ATTENTION_SOURCE_COLUMNS = ['id', 'dedupe_key', 'updated_at', 'repo', 'issue_number', 'attempt_id', 'reason', 'recovery_status', 'next_action', 'policy_revision', 'resolved_at', 'event_json'];
+const ATTENTION_ATTEMPT_COLUMNS = ['attempt_id', 'repo', 'outcome', 'finished_at', 'attention_status', 'attention_dedupe_key', 'resolution_state'];
 const HEALTH_CONDITIONS_COLUMNS = ['id', 'repo', 'condition_type', 'reason', 'opened_at', 'updated_at', 'resolved_at', 'safe_next_action'];
 const NOTIFICATION_EVENTS_COLUMNS = ['id', 'created_at', 'updated_at', 'repo', 'project', 'issue_number', 'event_type', 'reason_code', 'agent', 'delivery_status', 'attempt_count', 'max_attempts', 'stale_recovery_count', 'next_attempt_at', 'last_attempt_at', 'delivered_at', 'resolved_at'];
 const CLAIMS_COLUMNS = ['id', 'created_at', 'repo', 'issue_number', 'action', 'status_label', 'selection_mode'];
@@ -467,6 +469,17 @@ function fetchQueueEvents(db, limit) {
   });
 }
 
+function fetchAttentionReconciliationSource(db, repository) {
+  if (typeof repository !== 'string' || !repository) return null;
+  const total = db.prepare('SELECT COUNT(*) AS total FROM attention_events WHERE repo = ? AND resolved_at IS NULL').get(repository)?.total ?? 0;
+  const attentionEvents = db.prepare(`SELECT ${ATTENTION_SOURCE_COLUMNS.join(', ')} FROM attention_events
+    WHERE repo = ? AND resolved_at IS NULL ORDER BY id ASC LIMIT 201`).all(repository);
+  const attemptIds = [...new Set(attentionEvents.map((row) => row.attempt_id).filter(Boolean))];
+  const recoveryAttempts = attemptIds.length === 0 ? [] : db.prepare(`SELECT ${ATTENTION_ATTEMPT_COLUMNS.join(', ')}
+    FROM recovery_attempts WHERE repo = ? AND attempt_id IN (${attemptIds.map(() => '?').join(',')})`).all(repository, ...attemptIds);
+  return { attentionEvents, recoveryAttempts, total, overflow: total > 200 };
+}
+
 function unavailableSnapshot(status, reason) {
   return {
     ok: false,
@@ -477,6 +490,7 @@ function unavailableSnapshot(status, reason) {
     counts: null,
     currentHealthConditions: null,
     latest: null,
+    attentionSource: null,
   };
 }
 
@@ -488,7 +502,7 @@ function unavailableSnapshot(status, reason) {
  * additionally fetches bounded latest-N allowlisted rows per table plus
  * current (unresolved) health conditions, for agent-runner-operator-status.mjs.
  */
-export function readOnlyRunnerStateSnapshot(dbPath, { historyLimit = 10, includeLatest = false } = {}) {
+export function readOnlyRunnerStateSnapshot(dbPath, { historyLimit = 10, includeLatest = false, attentionRepository = null } = {}) {
   if (!dbPath || typeof dbPath !== 'string') {
     return unavailableSnapshot('invalid-path', 'state-db-path-invalid');
   }
@@ -517,6 +531,7 @@ export function readOnlyRunnerStateSnapshot(dbPath, { historyLimit = 10, include
     const currentHealthConditions = db
       .prepare(`SELECT ${HEALTH_CONDITIONS_COLUMNS.join(', ')} FROM runner_health_conditions WHERE resolved_at IS NULL ORDER BY opened_at LIMIT ?`)
       .all(clampLimit(50, 50));
+    const attentionSource = fetchAttentionReconciliationSource(db, attentionRepository);
 
     let latest = null;
     if (includeLatest) {
@@ -543,6 +558,7 @@ export function readOnlyRunnerStateSnapshot(dbPath, { historyLimit = 10, include
       counts,
       currentHealthConditions,
       latest,
+      attentionSource,
     };
   } catch {
     return unavailableSnapshot('error', 'state-db-unreadable');

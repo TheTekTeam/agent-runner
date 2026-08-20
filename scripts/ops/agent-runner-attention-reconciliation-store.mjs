@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 
 export const ATTENTION_RECONCILIATION_STORE_SCHEMA_VERSION = 2;
@@ -119,6 +118,24 @@ export class AttentionReconciliationStore {
     }
   }
 
+  recordGenerationOutcome({ generationId, repository, state, sourceSnapshotDigest, sourceEventCount,
+    startedAt, completedAt, failureCode, checkedIssueCount = 0, unknownCount = 0 } = {}) {
+    assertIdentifier(generationId, 'generationId');
+    assertIdentifier(repository, 'repository', /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/);
+    if (!['failed', 'superseded'].includes(state)) throw new Error('generation outcome is invalid');
+    assertIdentifier(failureCode, 'failureCode', /^[a-z][a-z0-9-]{0,79}$/);
+    this.db.prepare(`INSERT OR IGNORE INTO attention_reconciliation_generations_v2
+      (generation_id,repository,state,source_snapshot_digest,source_event_count,started_at,completed_at,expires_at,
+       failure_code,checked_issue_count,unknown_count) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+      .run(generationId, repository, state, sourceSnapshotDigest, sourceEventCount, startedAt, completedAt,
+        completedAt, failureCode, checkedIssueCount, unknownCount);
+  }
+
+  generationOutcomes(repository) {
+    return this.db.prepare(`SELECT generation_id,state,failure_code,source_event_count FROM attention_reconciliation_generations_v2
+      WHERE repository=? AND state!='completed' ORDER BY completed_at,generation_id`).all(repository);
+  }
+
   acknowledge({ repository, eventKey, eventRevision, githubEvidenceRevision, status, reasonCode, actor, expiresAt, now = this.now() } = {}) {
     if (!['actionable', 'historical'].includes(status) || !ACK_REASONS.has(reasonCode)) throw new Error('acknowledgement decision is invalid');
     assertIdentifier(eventKey, 'eventKey'); assertIdentifier(eventRevision, 'eventRevision');
@@ -178,8 +195,7 @@ export function readAttentionReconciliationState(dbPath, repository) {
   if (!dbPath || !repository || !existsSync(dbPath)) return empty;
   let db;
   try {
-    const url = pathToFileURL(dbPath); url.searchParams.set('mode', 'ro'); url.searchParams.set('immutable', '1');
-    db = new DatabaseSync(url.href, { readOnly: true });
+    db = new DatabaseSync(dbPath, { readOnly: true });
     const tables = new Set(db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map((row) => row.name));
     if (!tables.has('attention_reconciliation_current_v2')) return empty;
     const generation = db.prepare(`SELECT g.* FROM attention_reconciliation_current_v2 c

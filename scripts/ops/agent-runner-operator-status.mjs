@@ -121,7 +121,7 @@ export function requiredUnitsInstalled(service, timer) {
 
 export function buildOperatorStatus(config, env = process.env, { now = isoNow, spawn } = {}) {
   const dbPath = env.CLAUDE_RUNNER_STATE_DB || config.stateDbPath || defaultRunnerStateDbPath(config.outputDir || '.var/claude-runner');
-  const snapshot = readOnlyRunnerStateSnapshot(dbPath, { historyLimit: 10, includeLatest: true });
+  const snapshot = readOnlyRunnerStateSnapshot(dbPath, { historyLimit: 10, includeLatest: true, attentionRepository: config.githubRepo });
   const circuit = readCircuitState(env);
   const service = unitState(config.systemd.serviceName, spawn);
   const timer = unitState(config.systemd.timerName, spawn);
@@ -155,8 +155,8 @@ export function buildOperatorStatus(config, env = process.env, { now = isoNow, s
     ? readAttentionReconciliationState(reconciliationDbPath, config.githubRepo)
     : null;
   const attentionProjection = buildAttentionReconciliationProjection(
-    snapshot.latest.attentionEvents || [], snapshot.latest.recoveryAttempts || [], attentionState,
-    { repository: config.githubRepo, now: generatedAt },
+    snapshot.attentionSource?.attentionEvents || [], snapshot.attentionSource?.recoveryAttempts || [], attentionState,
+    { repository: config.githubRepo, now: generatedAt, sourceTotal: snapshot.attentionSource?.total, sourceOverflow: snapshot.attentionSource?.overflow },
   );
   const operatorStatus = buildRunnerOperatorStatus(snapshot.latest, activity, snapshot.currentHealthConditions, attentionProjection);
 

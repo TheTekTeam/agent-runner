@@ -135,13 +135,18 @@ test('#183: attention reconciliation failure is task-local and does not change s
       ghRunner: () => { throw new Error('quota-blocked pass must not inspect the queue'); },
       quotaRunner: () => ({ status: 1, stdout: '', stderr: 'synthetic quota block' }),
       reconcileNotifications: async () => ({ discovered: 0 }),
-      reconcileAttention: () => { throw new Error('synthetic attention lookup failure'); },
+      reconcileAttention: () => { throw new Error('/home/gp/private ghp_runtime_secret synthetic attention lookup failure'); },
     });
     assert.equal(exitCode, 0);
     const store = openRunnerStateStore(stateDbPath);
     const result = store.allRows('run_results').find((row) => row.mode === 'quota-blocked');
     store.close();
     assert.equal(result.exit_code, 0);
+    const serializedLogs = readdirSync(dir).filter((name) => name.startsWith('cron-'))
+      .map((name) => readFileSync(join(dir, name), 'utf8')).join('\n');
+    assert.equal(serializedLogs.includes('/home/gp/private'), false);
+    assert.equal(serializedLogs.includes('ghp_runtime_secret'), false);
+    assert.equal(serializedLogs.includes('attention-reconciliation-failed'), true);
   } finally {
     console.log = originalLog;
     rmSync(dir, { recursive: true, force: true });

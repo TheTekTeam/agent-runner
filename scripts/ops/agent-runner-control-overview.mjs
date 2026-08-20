@@ -548,7 +548,7 @@ export function buildOverviewProjection({
     runs: projectRuns(metrics),
     quota: projectQuota(metrics),
     health: projectHealth(snapshot.currentHealthConditions),
-    attention: projectAttention(latest.attentionEvents, attentionProjection),
+    attention: projectAttention(snapshot.attentionSource?.attentionEvents || latest.attentionEvents || [], attentionProjection),
     notifications: projectNotifications(latest.notifications),
     activity: projectActivity(latest),
   };
@@ -594,7 +594,7 @@ export function readControlOverview({
 
   let snapshot;
   try {
-    snapshot = readOnlyRunnerStateSnapshot(resolveStateDbPath({ env, config, dbPath }), { historyLimit: 20, includeLatest: true });
+    snapshot = readOnlyRunnerStateSnapshot(resolveStateDbPath({ env, config, dbPath }), { historyLimit: 20, includeLatest: true, attentionRepository: config.githubRepo });
   } catch {
     snapshot = { ok: false, reason: 'state-db-unreadable', safeNextAction: 'Repair or restore the runner state database; this read never creates or modifies it.' };
   }
@@ -618,8 +618,8 @@ export function readControlOverview({
   const reconciliationDbPath = resolveAttentionReconciliationDbPath({ env, config });
   const attentionState = config.githubRepo ? readAttentionReconciliationState(reconciliationDbPath, config.githubRepo) : null;
   const attentionProjection = buildAttentionReconciliationProjection(
-    snapshot?.latest?.attentionEvents || [], snapshot?.latest?.recoveryAttempts || [], attentionState,
-    { repository: config.githubRepo, now: generatedAt },
+    snapshot?.attentionSource?.attentionEvents || [], snapshot?.attentionSource?.recoveryAttempts || [], attentionState,
+    { repository: config.githubRepo, now: generatedAt, sourceTotal: snapshot?.attentionSource?.total, sourceOverflow: snapshot?.attentionSource?.overflow },
   );
 
   return buildOverviewProjection({

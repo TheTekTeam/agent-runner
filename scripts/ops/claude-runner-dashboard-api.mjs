@@ -45,13 +45,13 @@ function defaultReconciliationDbPathFromEnv(env = process.env, config = loadAgen
  * stays counted exactly as it did before this feature existed -- reading or
  * opening the dashboard never itself resolves anything.
  */
-function loadAttentionProjection(reconciliationDbPath, repository, latest, generatedAt) {
+function loadAttentionProjection(reconciliationDbPath, repository, source, generatedAt) {
   const state = reconciliationDbPath && repository
     ? readAttentionReconciliationState(reconciliationDbPath, repository)
     : null;
   return buildAttentionReconciliationProjection(
-    latest.attentionEvents || [], latest.recoveryAttempts || [], state,
-    { repository, now: generatedAt },
+    source?.attentionEvents || [], source?.recoveryAttempts || [], state,
+    { repository, now: generatedAt, sourceTotal: source?.total, sourceOverflow: source?.overflow },
   );
 }
 
@@ -630,6 +630,7 @@ export function buildRunnerDashboard(dbPath, {
     now,
     historyLimit,
     requireExisting: strict,
+    attentionRepository: config?.githubRepo || null,
   });
 
   const diagnostics = [];
@@ -656,7 +657,7 @@ export function buildRunnerDashboard(dbPath, {
   // history window.
   const currentHealthConditions = (summary.currentHealthConditions || []).map(TABLE_SERIALIZERS.runner_health_conditions);
   const resolvedReconciliationDbPath = reconciliationDbPath || defaultReconciliationDbPathFromEnv(env, config);
-  const attentionProjection = loadAttentionProjection(resolvedReconciliationDbPath, config?.githubRepo, latest, summary.generatedAt);
+  const attentionProjection = loadAttentionProjection(resolvedReconciliationDbPath, config?.githubRepo, summary.attentionSource, summary.generatedAt);
 
   const activity = buildRunnerActivity(latest);
   return {
