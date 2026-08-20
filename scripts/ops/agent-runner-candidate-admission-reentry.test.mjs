@@ -6,6 +6,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
+import {
+  candidateSelectionTimeoutMs,
+  DEFAULT_CANDIDATE_SELECTION_TIMEOUT_MS,
+} from './agent-runner-candidate-admission.mjs';
+
 const candidateAdmissionPath = fileURLToPath(new URL('./agent-runner-candidate-admission.mjs', import.meta.url));
 
 function fixtureSelection(issueNumber = 702) {
@@ -65,6 +70,18 @@ function runStandalone(moduleUrl, extraEnv = {}) {
     },
   });
 }
+
+test('blank or missing selector timeout keeps the safe default', () => {
+  assert.equal(candidateSelectionTimeoutMs({}), DEFAULT_CANDIDATE_SELECTION_TIMEOUT_MS);
+  assert.equal(
+    candidateSelectionTimeoutMs({ AGENT_RUNNER_CANDIDATE_SELECTION_TIMEOUT_MS: '' }),
+    DEFAULT_CANDIDATE_SELECTION_TIMEOUT_MS,
+  );
+  assert.equal(
+    candidateSelectionTimeoutMs({ AGENT_RUNNER_CANDIDATE_SELECTION_TIMEOUT_MS: '   ' }),
+    DEFAULT_CANDIDATE_SELECTION_TIMEOUT_MS,
+  );
+});
 
 test('standalone candidate admission uses independent parent/child observations and admits a stable candidate', () => {
   const stable = JSON.stringify(fixtureSelection());
