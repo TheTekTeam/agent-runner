@@ -21,6 +21,12 @@ This private repository is the canonical home of the reusable Agent Runner imple
 - For local Agent Runner execution, the shared label resolves only to the approved `claude-code-cli` adapter and records Claude as the actual selected agent.
 - Keep `agent:codex` for manual Codex Web-only exceptions with a specific current technical reason. Keep `agent:codex-cli` separate and disabled unless it is explicitly qualified and authorised under its paid-use controls.
 
+## Code review fallback
+
+- If Codex code-review credits, quota, or review capacity are exhausted, the programme-management coordinator performs the code review directly rather than blocking progress or requesting paid capacity.
+- This coordinator review must be rigorous, exact-head/merged-code based, recorded, and must preserve all other CI, security, merge-authorisation, deployment and field-acceptance gates.
+- Never describe the fallback as an independent Codex review. See [`docs/ops/CODE-REVIEW-FALLBACK-POLICY.md`](docs/ops/CODE-REVIEW-FALLBACK-POLICY.md).
+
 ## Safety
 
 - Preserve human merge/approval gates, manager preflight, quota controls, claim guards, state durability, redaction and fail-closed unsupported-agent behaviour.
