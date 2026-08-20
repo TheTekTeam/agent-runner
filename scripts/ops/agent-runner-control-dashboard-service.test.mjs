@@ -53,11 +53,16 @@ test('rendered service source contains required hardening, inherited jitless, ex
     'ReadWritePaths=%h/.local/state/agent-runner/secrets',
     'ReadWritePaths=%h/.local/state/agent-runner/control-audit.jsonl',
     'Environment=NODE_OPTIONS=--jitless',
+    'Environment=AGENT_RUNNER_CONFIG=%h/.config/agent-runner/modelspend.json',
+    'Environment=CLAUDE_RUNNER_STATE_DB=%h/.local/state/agent-runner/modelspend/runner-state.sqlite',
+    'Environment=AGENT_RUNNER_CONTROL_SCHEDULER_SERVICE=agent-runner-implementation.service',
+    'Environment=AGENT_RUNNER_CONTROL_SCHEDULER_TIMER=agent-runner-implementation.timer',
   ]) assert.ok(source.includes(directive), `missing ${directive}`);
   assert.match(source, /ExecStart=@@NODE@@ --jitless @@SERVER@@ --port @@PORT@@/);
   assert.doesNotMatch(source, /AmbientCapabilities|CapabilityBoundingSet|SecureBits|EnvironmentFile/);
   const environmentLines = source.split('\n').filter((line) => line.startsWith('Environment='));
-  assert.deepEqual(environmentLines, ['Environment=NODE_OPTIONS=--jitless']);
+  assert.equal(environmentLines.length, 10);
+  assert.equal(new Set(environmentLines).size, environmentLines.length);
   assert.doesNotMatch(source, /8787/);
   assert.doesNotMatch(source, /(password|bearer|api[_-]?key|token)=/i);
 });
@@ -104,6 +109,14 @@ function makeFixture(t) {
   symlinkSync(process.execPath, path.join(fakeBin, 'node'));
 
   const log = path.join(fakeState, 'mutations.log');
+  const git = `#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  *'rev-parse --show-toplevel'*) printf '%s\n' "$FAKE_CHECKOUT" ;;
+  *'remote get-url origin'*) printf '%s\n' "\${FAKE_GIT_ORIGIN:-git@github.com:TheTekTeam/agent-runner.git}" ;;
+  *) exit 1 ;;
+esac
+`;
   const systemctl = `#!/usr/bin/env bash
 set -euo pipefail
 printf 'systemctl %s\\n' "$*" >>"$FAKE_STATE/mutations.log"
@@ -129,6 +142,7 @@ esac
 `;
   const ss = `#!/usr/bin/env bash
 set -euo pipefail
+[[ \${FAKE_SS_FAIL:-0} != 1 ]] || exit 1
 port=$(printf '%s ' "$@" | sed -n 's/.*sport = :\\([0-9][0-9]*\\).*/\\1/p')
 mode=\${FAKE_LISTENER_MODE:-auto}
 if [[ "$mode" == collision ]]; then printf 'LISTEN 0 128 0.0.0.0:%s 0.0.0.0:*\\n' "$port"; exit 0; fi
@@ -136,22 +150,24 @@ if [[ "$mode" == ipv6 ]]; then printf 'LISTEN 0 128 [::1]:%s [::]:*\\n' "$port";
 if [[ "$mode" == duplicate ]]; then printf 'LISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\\nLISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\\n' "$port" "$port"; exit 0; fi
 if [[ -f "$FAKE_STATE/active" ]]; then printf 'LISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\\n' "$port"; fi
 `;
-  const curl = `#!/usr/bin/env bash
+const curl = `#!/usr/bin/env bash
 set -euo pipefail
 printf 'curl %s\\n' "$*" >>"$FAKE_STATE/mutations.log"
 [[ \${FAKE_CURL_FAIL:-0} != 1 ]]
+if [[ \${FAKE_CURL_BAD:-0} == 1 ]]; then printf 'HTTP/1.1 200 OK\r\n\r\nwrong service\n'; exit 0; fi
+printf 'HTTP/1.1 200 OK\r\nContent-Security-Policy: default-src '\''self'\''\r\n\r\n<title>Agent Runner — Operations</title>\n'
 `;
   const analyze = `#!/usr/bin/env bash
 set -euo pipefail
 printf 'systemd-analyze %s\\n' "$*" >>"$FAKE_STATE/mutations.log"
 [[ \${FAKE_ANALYZE_FAIL:-0} != 1 ]]
 `;
-  for (const [name, content] of [['systemctl', systemctl], ['ss', ss], ['curl', curl], ['systemd-analyze', analyze]]) {
+  for (const [name, content] of [['git', git], ['systemctl', systemctl], ['ss', ss], ['curl', curl], ['systemd-analyze', analyze]]) {
     writeFileSync(path.join(fakeBin, name), content);
     chmodSync(path.join(fakeBin, name), 0o755);
   }
 
-  const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), FAKE_STATE: fakeState, PATH: `${fakeBin}:${process.env.PATH}` };
+  const env = { ...process.env, HOME: home, XDG_CONFIG_HOME: path.join(home, '.config'), FAKE_STATE: fakeState, FAKE_CHECKOUT: checkout, PATH: `${fakeBin}:${process.env.PATH}` };
   const run = (args, extraEnv = {}) => spawnSync('bash', [path.join(checkout, 'scripts/install-control-dashboard.sh'), ...args], {
     env: { ...env, ...extraEnv }, encoding: 'utf8', timeout: 10_000,
   });
@@ -165,13 +181,13 @@ function assertOk(result) {
 
 function seedPreservedState(f) {
   const paths = [
-    '.config/agent-runner/settings.json',
+    '.config/agent-runner/agent-settings.json',
     '.local/state/agent-runner/control-operator.json',
     '.local/state/agent-runner/secrets/provider.ref',
     '.local/state/agent-runner/control-audit.jsonl',
     '.local/state/agent-runner/modelspend/runner-state.sqlite',
-    '.local/state/agent-runner/implementation.lock',
-    '.local/state/agent-runner/source-activation.json',
+    '.local/state/agent-runner/implementation-recurrence.lock',
+    '.local/state/agent-runner/source-activation/state.json',
   ];
   const before = new Map();
   for (const relative of paths) {
@@ -210,6 +226,14 @@ test('installer rejects malformed, zero, signed, whitespace, suffixed, leading-z
   assert.notEqual(f.run(['status', '--port']).status, 0);
   assert.notEqual(f.run(['status', '--host', '127.0.0.1']).status, 0);
   assert.notEqual(f.run(['bogus']).status, 0);
+});
+
+test('installer rejects a copied checkout with a non-canonical Git origin', (t) => {
+  const f = makeFixture(t);
+  if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
+  const result = f.run(['install'], { FAKE_GIT_ORIGIN: 'git@example.invalid:other/repository.git' });
+  assert.notEqual(result.status, 0);
+  assert.equal(existsSync(f.unit), false);
 });
 
 test('fresh install provisions only required writable control paths and never an operator credential', (t) => {
@@ -284,12 +308,55 @@ test('activation refuses collisions and verify rejects wildcard, IPv6 and duplic
   if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
   assertOk(f.run(['install']));
   assertOk(f.run(['disable']));
+  assert.notEqual(f.run(['enable'], { FAKE_SS_FAIL: '1' }).status, 0);
+  assert.equal(existsSync(path.join(f.fakeState, 'active')), false);
   assert.notEqual(f.run(['enable'], { FAKE_LISTENER_MODE: 'collision' }).status, 0);
   assert.equal(existsSync(path.join(f.fakeState, 'active')), false);
   assertOk(f.run(['enable']));
   for (const mode of ['collision', 'ipv6', 'duplicate']) {
     const result = f.run(['verify'], { FAKE_LISTENER_MODE: mode });
     assert.notEqual(result.status, 0, mode);
+  }
+  assert.notEqual(f.run(['verify'], { FAKE_CURL_BAD: '1' }).status, 0);
+});
+
+test('unchanged install and enable restore prior disabled/inactive state after health failure', (t) => {
+  const f = makeFixture(t);
+  if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
+  assertOk(f.run(['install']));
+  assertOk(f.run(['disable']));
+  assert.notEqual(f.run(['install'], { FAKE_CURL_FAIL: '1' }).status, 0);
+  assert.equal(existsSync(path.join(f.fakeState, 'active')), false);
+  assert.equal(existsSync(path.join(f.fakeState, 'enabled')), false);
+  assert.notEqual(f.run(['enable'], { FAKE_CURL_FAIL: '1' }).status, 0);
+  assert.equal(existsSync(path.join(f.fakeState, 'active')), false);
+  assert.equal(existsSync(path.join(f.fakeState, 'enabled')), false);
+});
+
+test('failed fresh-install rollback preserves the unit when the started process cannot be stopped', (t) => {
+  const f = makeFixture(t);
+  if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
+  const result = f.run(['install'], { FAKE_CURL_FAIL: '1', FAKE_SYSTEMCTL_FAIL_ON: 'stop' });
+  assert.notEqual(result.status, 0);
+  assert.equal(existsSync(f.unit), true);
+  assert.equal(existsSync(path.join(f.fakeState, 'active')), true);
+});
+
+test('unit target path refuses symlinked directories and unit files', (t) => {
+  if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
+  for (const target of ['directory', 'unit']) {
+    const f = makeFixture(t);
+    const outside = path.join(f.base, `outside-${target}`);
+    mkdirSync(outside, { recursive: true });
+    if (target === 'directory') {
+      mkdirSync(path.join(f.home, '.config'), { recursive: true });
+      symlinkSync(outside, path.join(f.home, '.config/systemd'));
+    } else {
+      mkdirSync(path.dirname(f.unit), { recursive: true });
+      symlinkSync(path.join(outside, 'redirected.service'), f.unit);
+    }
+    assert.notEqual(f.run(['install']).status, 0, target);
+    assert.equal(existsSync(path.join(outside, 'redirected.service')), false, target);
   }
 });
 

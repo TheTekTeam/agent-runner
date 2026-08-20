@@ -26,7 +26,7 @@ The repository unit uses the following hardening without capability-transition d
 - `UMask=0077`
 - bounded restart rate, start/stop timeouts, `TasksMax`, and `MemoryMax`
 
-`ExecStart` runs Node with `--jitless`, and the unit sets only the non-secret `NODE_OPTIONS=--jitless` environment assignment so short-lived Node child processes used by the private read-only SQLite snapshot path inherit the same `MemoryDenyWriteExecute`-compatible runtime mode. No environment file is used.
+`ExecStart` runs Node with `--jitless`. The unit contains a fixed allowlist of non-secret environment assignments: `NODE_OPTIONS=--jitless`, the canonical machine-local ModelSpend config/state and control-state paths, and the accepted generic `agent-runner-implementation.service/.timer` scheduler identity. This makes the permanent service independent of inherited user-manager path overrides while allowing short-lived snapshot children to inherit the same `MemoryDenyWriteExecute`-compatible runtime mode. No environment file is used.
 
 The process gets write access only to:
 
@@ -38,7 +38,7 @@ The process gets write access only to:
 
 The remainder of `~/.local/state/agent-runner` is read-only to this service, including the operator credential, runner SQLite, implementation lock, and source-activation evidence. Control load/quota reads use the existing private read-only SQLite snapshot path; they do not open the live execution database through the writable runner-state store.
 
-The unit contains no password, token, secret value, environment file, host override, or arbitrary checkout/config/state path override.
+The unit contains no password, token, secret value, environment file, host override, or operator-selectable checkout/config/state path override.
 
 ## Operator credential bootstrap
 
@@ -71,7 +71,7 @@ scripts/install-control-dashboard.sh remove
 
 All commands accept only an optional canonical decimal `--port PORT`; the default is `8789`, and `8787` is always rejected as reserved. The host is fixed at `127.0.0.1`. No host, executable, environment-file, checkout, config, state, or arbitrary path override is accepted.
 
-`install` installs only `~/.config/systemd/user/agent-runner-control.service` as a systemd unit, rendered from the repository source. After the rendered unit has passed validation and before activation, `install`/`enable` ensure only the three approved writable application sinks exist: the control config directory, protected secret-store directory, and control audit file (plus the audit/secret parent state directory needed to contain them). Existing contents are preserved. This bootstrap never creates the operator credential and never creates, opens, migrates, or modifies runner execution SQLite, locks, or source-activation evidence.
+`install` runs only from a Git checkout whose root and `origin` prove the canonical Agent Runner repository, using Node 22.23.0 or newer. It installs only `~/.config/systemd/user/agent-runner-control.service` as a systemd unit rendered from repository source. Every unit-path component and the unit itself is rejected if it is a symlink. After the rendered unit has passed validation and before activation, `install`/`enable` ensure only the three approved writable application sinks exist: the control config directory, protected secret-store directory, and control audit file (plus the audit/secret parent state directory needed to contain them). Existing contents are preserved. This bootstrap never creates the operator credential and never creates, opens, migrates, or modifies runner execution SQLite, locks, or source-activation evidence.
 
 `install` and `enable` are the only commands allowed to activate the service. `disable` and `remove` act only on `agent-runner-control.service`; `remove` deletes only the user unit and preserves Agent Runner configuration and state. If stop/disable cannot be verified, removal fails and preserves the unit file.
 
@@ -93,7 +93,7 @@ If replacement, reload, activation/restart, listener verification, or shell heal
 2. `agent-runner-control.service` is active;
 3. exactly one TCP listener exists on the requested port;
 4. that listener is exactly `127.0.0.1:<port>` — wildcard, LAN, IPv6, and duplicate listeners fail;
-5. a bounded unauthenticated `GET /` succeeds without credentials, cookies, CSRF tokens, or a request body.
+5. a proxy-bypassed, size/time-bounded unauthenticated `GET /` returns both the expected Agent Runner shell identity marker and its Content Security Policy header, without credentials, cookies, CSRF tokens, or a request body.
 
 The shell health check proves only that the static login/dashboard shell is reachable. It deliberately does not authenticate or exercise a state-changing API route.
 

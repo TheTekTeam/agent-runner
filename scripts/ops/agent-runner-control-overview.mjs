@@ -625,8 +625,8 @@ export function readControlOverview({
   return buildOverviewProjection({
     snapshot,
     circuit,
-    service: inspect(config.systemd?.serviceName),
-    timer: inspect(config.systemd?.timerName),
+    service: inspect(env.AGENT_RUNNER_CONTROL_SCHEDULER_SERVICE || config.systemd?.serviceName),
+    timer: inspect(env.AGENT_RUNNER_CONTROL_SCHEDULER_TIMER || config.systemd?.timerName),
     identity: projectIdentity(config),
     links: projectLinks(env),
     generatedAt,

@@ -5,6 +5,10 @@ SERVICE_NAME='agent-runner-control.service'
 DEFAULT_PORT='8789'
 RESERVED_EVENT_INGRESS_PORT='8787'
 FIXED_HOST='127.0.0.1'
+CANONICAL_ORIGIN_SSH='git@github.com:TheTekTeam/agent-runner.git'
+CANONICAL_ORIGIN_HTTPS='https://github.com/TheTekTeam/agent-runner.git'
+MINIMUM_NODE_MAJOR=22
+MINIMUM_NODE_MINOR=23
 
 usage() {
   cat <<'USAGE'
@@ -69,10 +73,21 @@ CONTROL_SECRET_DIR="$CONTROL_STATE_ROOT/secrets"
 CONTROL_AUDIT_FILE="$CONTROL_STATE_ROOT/control-audit.jsonl"
 NODE_BIN=$(command -v node || true)
 NODE_BIN=${NODE_BIN:+$(readlink -f -- "$NODE_BIN")}
+CHECKOUT_TOP=$(git -C "$CHECKOUT" rev-parse --show-toplevel 2>/dev/null || true)
+CHECKOUT_ORIGIN=$(git -C "$CHECKOUT" remote get-url origin 2>/dev/null || true)
+NODE_VERSION=$($NODE_BIN --eval 'process.stdout.write(process.versions.node)' 2>/dev/null || true)
 
 [[ -f "$SOURCE_UNIT" ]] || fail "repository service source is missing: $SOURCE_UNIT"
 [[ -f "$SERVER" ]] || fail "control server is missing: $SERVER"
 [[ -n "$NODE_BIN" && -x "$NODE_BIN" ]] || fail 'node executable is unavailable'
+[[ "$CHECKOUT_TOP" == "$CHECKOUT" ]] || fail 'installer must run from the canonical Agent Runner Git checkout root'
+[[ "$CHECKOUT_ORIGIN" == "$CANONICAL_ORIGIN_SSH" || "$CHECKOUT_ORIGIN" == "$CANONICAL_ORIGIN_HTTPS" ]] \
+  || fail 'checkout origin is not the canonical Agent Runner repository'
+if [[ ! "$NODE_VERSION" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]] \
+  || (( 10#${BASH_REMATCH[1]} < MINIMUM_NODE_MAJOR )) \
+  || (( 10#${BASH_REMATCH[1]} == MINIMUM_NODE_MAJOR && 10#${BASH_REMATCH[2]} < MINIMUM_NODE_MINOR )); then
+  fail 'Node.js 22.23.0 or newer is required'
+fi
 for path_value in "$CHECKOUT" "$SERVER" "$NODE_BIN"; do
   [[ "$path_value" =~ ^[-A-Za-z0-9_./]+$ ]] || fail 'checkout or executable path contains unsupported characters'
 done
@@ -94,15 +109,27 @@ validate_rendered_unit() {
     printf 'ERROR: rendered ExecStart is not exact\n' >&2
     return 1
   fi
-  if ! grep -Fqx 'Environment=NODE_OPTIONS=--jitless' "$unit"; then
-    printf 'ERROR: snapshot child processes must inherit Node --jitless mode\n' >&2
-    return 1
-  fi
+  local -a expected_environment=(
+    'Environment=NODE_OPTIONS=--jitless'
+    'Environment=AGENT_RUNNER_CONFIG=%h/.config/agent-runner/modelspend.json'
+    'Environment=CLAUDE_RUNNER_OUTPUT_DIR=%h/.local/state/agent-runner/modelspend'
+    'Environment=CLAUDE_RUNNER_STATE_DB=%h/.local/state/agent-runner/modelspend/runner-state.sqlite'
+    'Environment=AGENT_RUNNER_AGENT_SETTINGS_PATH=%h/.config/agent-runner/agent-settings.json'
+    'Environment=AGENT_RUNNER_SECRET_STORE_DIR=%h/.local/state/agent-runner/secrets'
+    'Environment=AGENT_RUNNER_CONTROL_OPERATOR_PATH=%h/.local/state/agent-runner/control-operator.json'
+    'Environment=AGENT_RUNNER_CONTROL_AUDIT_PATH=%h/.local/state/agent-runner/control-audit.jsonl'
+    'Environment=AGENT_RUNNER_CONTROL_SCHEDULER_SERVICE=agent-runner-implementation.service'
+    'Environment=AGENT_RUNNER_CONTROL_SCHEDULER_TIMER=agent-runner-implementation.timer'
+  )
+  local assignment
+  for assignment in "${expected_environment[@]}"; do
+    grep -Fqx "$assignment" "$unit" || { printf 'ERROR: required service environment assignment is missing\n' >&2; return 1; }
+  done
   if grep -Eq '^EnvironmentFile=' "$unit"; then
     printf 'ERROR: environment files are forbidden in the control service\n' >&2
     return 1
   fi
-  if grep -E '^Environment=' "$unit" | grep -Fvx 'Environment=NODE_OPTIONS=--jitless' >/dev/null; then
+  if [[ $(grep -Ec '^Environment=' "$unit") -ne ${#expected_environment[@]} ]]; then
     printf 'ERROR: unexpected service environment assignment\n' >&2
     return 1
   fi
@@ -142,12 +169,15 @@ probe_unit_active_state() {
 }
 
 listener_lines() {
-  ss -H -ltn "sport = :$PORT" 2>/dev/null || true
+  ss -H -ltn "sport = :$PORT" 2>/dev/null
 }
 
 preflight_port_available() {
   local listeners
-  listeners=$(listener_lines)
+  if ! listeners=$(listener_lines); then
+    printf 'ERROR: could not inspect TCP listeners; refusing activation\n' >&2
+    return 1
+  fi
   if [[ -n "$listeners" ]]; then
     printf 'ERROR: port %s is already in use; refusing activation\n' "$PORT" >&2
     return 1
@@ -155,8 +185,13 @@ preflight_port_available() {
 }
 
 verify_exact_listener() {
+  local listeners
   local -a locals=()
-  mapfile -t locals < <(listener_lines | awk '{print $4}')
+  if ! listeners=$(listener_lines); then
+    printf 'ERROR: could not inspect the control-service listener\n' >&2
+    return 1
+  fi
+  mapfile -t locals < <(awk '{print $4}' <<<"$listeners")
   if (( ${#locals[@]} != 1 )); then
     printf 'ERROR: expected exactly one TCP listener on %s, found %s\n' "$PORT" "${#locals[@]}" >&2
     return 1
@@ -168,10 +203,14 @@ verify_exact_listener() {
 }
 
 verify_shell_health() {
-  curl --fail --silent --show-error \
-    --connect-timeout 2 --max-time 5 \
-    --request GET --output /dev/null \
-    "http://$FIXED_HOST:$PORT/"
+  local response
+  if ! response=$(curl --fail --silent --show-error --include --noproxy '*' \
+    --connect-timeout 2 --max-time 5 --max-filesize 262144 \
+    --request GET "http://$FIXED_HOST:$PORT/"); then
+    return 1
+  fi
+  grep -Eiq '^Content-Security-Policy:' <<<"$response" \
+    && grep -Fq '<title>Agent Runner — Operations</title>' <<<"$response"
 }
 
 verify_installed_service() {
@@ -203,6 +242,35 @@ ensure_private_directory() {
   mkdir -m 0700 -- "$directory"
 }
 
+validate_unit_target_path() {
+  local component
+  for component in "$HOME/.config" "$HOME/.config/systemd" "$TARGET_DIR"; do
+    if [[ -L "$component" ]]; then
+      printf 'ERROR: refusing symlink in control-service unit path: %s\n' "$component" >&2
+      return 1
+    fi
+    if [[ -e "$component" && ! -d "$component" ]]; then
+      printf 'ERROR: control-service unit path component is not a directory: %s\n' "$component" >&2
+      return 1
+    fi
+  done
+  if [[ -L "$TARGET_UNIT" ]]; then
+    printf 'ERROR: refusing symlink for control-service unit: %s\n' "$TARGET_UNIT" >&2
+    return 1
+  fi
+  if [[ -e "$TARGET_UNIT" && ! -f "$TARGET_UNIT" ]]; then
+    printf 'ERROR: control-service unit target is not a regular file: %s\n' "$TARGET_UNIT" >&2
+    return 1
+  fi
+}
+
+provision_unit_target_path() {
+  validate_unit_target_path || return 1
+  ensure_private_directory "$HOME/.config" || return 1
+  ensure_private_directory "$HOME/.config/systemd" || return 1
+  ensure_private_directory "$TARGET_DIR" || return 1
+}
+
 provision_writable_paths() {
   # The hardened mount namespace requires these exact paths to exist before
   # service start. Bootstrap their standard parent directories one component
@@ -228,7 +296,15 @@ provision_writable_paths() {
 restore_previous_state() {
   local backup=$1 had_unit=$2 was_enabled=$3 was_active=$4 rc=0 enabled_state active_state
   set +e
-  systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
+  if ! systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1; then
+    set -e
+    return 1
+  fi
+  active_state=$(probe_unit_active_state) || rc=1
+  if [[ "$active_state" != inactive ]]; then
+    set -e
+    return 1
+  fi
   if (( had_unit )); then
     install -m 0600 "$backup" "$TARGET_UNIT" || rc=1
   else
@@ -282,6 +358,7 @@ install_service() {
   trap 'rm -f -- "$rendered" "$backup"' RETURN
   render_unit "$rendered"
   validate_rendered_unit "$rendered"
+  provision_unit_target_path
 
   if [[ -f "$TARGET_UNIT" ]]; then
     had_unit=1
@@ -300,14 +377,14 @@ install_service() {
   if (( changed == 0 )); then
     # Idempotent reinstall: never restart an already-running process. This
     # preserves the process-local authenticated session store.
-    if (( was_enabled == 0 )); then
-      systemctl --user enable "$SERVICE_NAME" >/dev/null
+    if { (( was_enabled == 0 )) && ! systemctl --user enable "$SERVICE_NAME" >/dev/null; } \
+      || { (( was_active == 0 )) && { ! preflight_port_available || ! systemctl --user start "$SERVICE_NAME"; }; } \
+      || ! verify_installed_service; then
+      printf 'ERROR: unchanged service activation or health verification failed; restoring previous state\n' >&2
+      restore_previous_state "$backup" "$had_unit" "$was_enabled" "$was_active" \
+        || printf 'ERROR: rollback could not fully restore previous service state\n' >&2
+      return 1
     fi
-    if (( was_active == 0 )); then
-      preflight_port_available || return 1
-      systemctl --user start "$SERVICE_NAME"
-    fi
-    verify_installed_service || return 1
     printf 'UNCHANGED: %s is installed and healthy on %s:%s\n' "$SERVICE_NAME" "$FIXED_HOST" "$PORT"
     return 0
   fi
@@ -315,17 +392,24 @@ install_service() {
   # A changed active service is stopped only after the replacement unit has
   # passed static verification and writable-path provisioning has succeeded.
   if (( was_active )); then
-    systemctl --user stop "$SERVICE_NAME" || return 1
-    active_state=$(probe_unit_active_state) || return 1
-    [[ "$active_state" == inactive ]] || { printf 'ERROR: %s did not stop before upgrade\n' "$SERVICE_NAME" >&2; return 1; }
+    if ! systemctl --user stop "$SERVICE_NAME"; then
+      systemctl --user start "$SERVICE_NAME" >/dev/null 2>&1 || true
+      return 1
+    fi
+    if ! active_state=$(probe_unit_active_state) || [[ "$active_state" != inactive ]]; then
+      printf 'ERROR: could not verify %s stopped before upgrade; restoring prior active state\n' "$SERVICE_NAME" >&2
+      systemctl --user start "$SERVICE_NAME" >/dev/null 2>&1 || true
+      active_state=$(probe_unit_active_state 2>/dev/null || true)
+      [[ "$active_state" == active ]] || printf 'ERROR: prior active state could not be verified after failed upgrade preparation\n' >&2
+      return 1
+    fi
   fi
   if ! preflight_port_available; then
     restore_previous_state "$backup" "$had_unit" "$was_enabled" "$was_active" || printf 'ERROR: rollback could not fully restore previous service state\n' >&2
     return 1
   fi
 
-  if ! mkdir -p -m 0700 -- "$TARGET_DIR" \
-    || ! install -m 0600 "$rendered" "$TARGET_UNIT" \
+  if ! install -m 0600 "$rendered" "$TARGET_UNIT" \
     || ! systemctl --user daemon-reload \
     || ! systemctl --user enable "$SERVICE_NAME" >/dev/null \
     || ! systemctl --user restart "$SERVICE_NAME" \
@@ -338,8 +422,12 @@ install_service() {
 }
 
 enable_service() {
-  local was_enabled=0 was_active=0 activation_failed=0 enabled_state active_state
+  local backup was_enabled=0 was_active=0 activation_failed=0 enabled_state active_state
+  provision_unit_target_path
   [[ -f "$TARGET_UNIT" ]] || fail 'service is not installed; run install first'
+  backup=$(mktemp)
+  trap 'rm -f -- "$backup"' RETURN
+  cp -- "$TARGET_UNIT" "$backup"
   validate_rendered_unit "$TARGET_UNIT"
   provision_writable_paths
   enabled_state=$(probe_unit_enabled_state) || return 1
@@ -358,8 +446,8 @@ enable_service() {
   fi
   if (( activation_failed )); then
     printf 'ERROR: enable or health verification failed; restoring previous enabled/active state\n' >&2
-    if (( was_enabled == 0 )); then systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
-    if (( was_active == 0 )); then systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
+    restore_previous_state "$backup" 1 "$was_enabled" "$was_active" \
+      || printf 'ERROR: rollback could not fully restore previous service state\n' >&2
     return 1
   fi
   printf 'ENABLED: %s is healthy on %s:%s\n' "$SERVICE_NAME" "$FIXED_HOST" "$PORT"
@@ -372,6 +460,7 @@ disable_service() {
 
 remove_service() {
   local backup
+  validate_unit_target_path
   stop_and_disable_target || fail "could not safely stop and disable $SERVICE_NAME; unit preserved"
   if [[ -e "$TARGET_UNIT" ]]; then
     backup=$(mktemp)
