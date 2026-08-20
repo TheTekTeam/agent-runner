@@ -82,7 +82,6 @@ import { DatabaseSync } from 'node:sqlite';
 import { admitMachineProfile } from './agent-runner-admission.mjs';
 import { resolveAgentForLabels } from './agent-runner-agents.mjs';
 import { getAgentSettings } from './agent-runner-agent-settings.mjs';
-import { CANDIDATE_PAUSED_EXIT_CODE } from './agent-runner-candidate-admission.mjs';
 import { loadAgentRunnerConfig, projectIdentity } from './agent-runner-config.mjs';
 // #97: the same bounded assignment-evidence guards the dashboard projection
 // uses, so an assignment label/agent id is validated once, in one place,
@@ -93,6 +92,13 @@ import { RUNNER_STATE_TABLES } from './claude-runner-state.mjs';
 export const DOCTOR_SCHEMA_VERSION = 'agent-runner-operator-doctor/v1';
 export const USAGE_ERROR_EXIT_CODE = 2;
 export const SYSTEMIC_ERROR_EXIT_CODE = 1;
+
+// Exit 3 is this operator command's handled machine-profile pause outcome.
+// Keep the read-only operator module independent from candidate admission:
+// importing candidate-admission here creates an ESM evaluation cycle when
+// the directly executed candidate-admission module dynamically imports the
+// canonical scheduler.
+const CANDIDATE_PAUSED_EXIT_CODE = 3;
 
 // Single fixed message for every state-DB-unusable case (missing,
 // unreadable, structurally incomplete, or an invalid path). Deliberately
