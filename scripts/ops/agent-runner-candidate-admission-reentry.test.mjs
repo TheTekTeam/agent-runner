@@ -83,6 +83,27 @@ test('blank or missing selector timeout keeps the safe default', () => {
   );
 });
 
+test('malformed expected-candidate handoff fails closed as bounded infrastructure evidence', () => {
+  const result = spawnSync(process.execPath, [candidateAdmissionPath], {
+    encoding: 'utf8',
+    timeout: 5_000,
+    env: {
+      ...process.env,
+      CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola',
+      AGENT_RUNNER_ATOMIC_EXPECTED_JSON: '{not-json',
+      AGENT_RUNNER_ATOMIC_ARGV_JSON: '[]',
+    },
+  });
+
+  assert.equal(result.status, 1, result.stderr);
+  assert.doesNotMatch(result.stderr, /unsettled top-level await/i);
+  const payload = JSON.parse(result.stdout.trim());
+  assert.equal(payload.admission.allowed, false);
+  assert.equal(payload.admission.scope, 'candidate_revalidation');
+  assert.equal(payload.admission.reason, 'candidate-revalidation-unavailable');
+  assert.equal(payload.current && Object.keys(payload.current).length, 0);
+});
+
 test('standalone candidate admission uses independent parent/child observations and admits a stable candidate', () => {
   const stable = JSON.stringify(fixtureSelection());
   const moduleUrl = writeSelectorModule(`
