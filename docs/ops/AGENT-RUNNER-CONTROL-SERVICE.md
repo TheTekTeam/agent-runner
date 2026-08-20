@@ -71,7 +71,9 @@ scripts/install-control-dashboard.sh remove
 
 All commands accept only an optional canonical decimal `--port PORT`; the default is `8789`, and `8787` is always rejected as reserved. The host is fixed at `127.0.0.1`. No host, executable, environment-file, checkout, config, state, or arbitrary path override is accepted.
 
-`install` runs only from a Git checkout whose root and `origin` prove the canonical Agent Runner repository, using Node 22.23.0 or newer. It installs only `~/.config/systemd/user/agent-runner-control.service` as a systemd unit rendered from repository source. Every unit-path component and the unit itself is rejected if it is a symlink. After the rendered unit has passed validation and before activation, `install`/`enable` ensure only the three approved writable application sinks exist: the control config directory, protected secret-store directory, and control audit file (plus the audit/secret parent state directory needed to contain them). Existing contents are preserved. This bootstrap never creates the operator credential and never creates, opens, migrates, or modifies runner execution SQLite, locks, or source-activation evidence.
+`install` runs only from a Git checkout whose root and `origin` prove the canonical Agent Runner repository, using the fixed `/usr/bin/node` executable at Node 22.23.0 or newer; inherited `PATH` cannot select the persistent runtime. It installs only `~/.config/systemd/user/agent-runner-control.service` as a systemd unit rendered from repository source. Every unit-path component and the unit itself is rejected if it is a symlink. After the rendered unit has passed validation and before activation, `install`/`enable` ensure only the three approved writable application sinks exist: the control config directory, protected secret-store directory, and control audit file (plus the audit/secret parent state directory needed to contain them). Existing contents are preserved. This bootstrap never creates the operator credential and never creates, opens, migrates, or modifies runner execution SQLite, locks, or source-activation evidence.
+
+Repository-source and runtime readiness are activation concerns, not teardown dependencies. `status`, `disable`, and `remove` remain available if the checkout or Node runtime is later damaged, so an operator can always inspect and safely stop/remove the installed target unit.
 
 `install` and `enable` are the only commands allowed to activate the service. `disable` and `remove` act only on `agent-runner-control.service`; `remove` deletes only the user unit and preserves Agent Runner configuration and state. If stop/disable cannot be verified, removal fails and preserves the unit file.
 
@@ -120,7 +122,7 @@ The control dashboard and Grafana are separate surfaces. Grafana continues to us
 Repository/CI completion is **not** Dell deployment acceptance. After the PR is merged, a separately authorised Dell field step must:
 
 1. confirm port `8789` is free and port `8787` remains owned by event ingress;
-2. install the unit as user `gp` from the canonical checkout;
+2. prove `/home/gp/projects/agent-runner` is the clean, current accepted `main` checkout, then install the unit there as user `gp` (exact clean/current-main proof is deliberately deferred from this PR-branch implementation phase to this authorised field gate);
 3. verify exact loopback listener and unauthenticated shell health;
 4. complete an authenticated browser walkthrough through the approved tunnel;
 5. prove unchanged reinstall keeps the same service process/session;

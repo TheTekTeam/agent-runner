@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 SERVICE_NAME='agent-runner-control.service'
 DEFAULT_PORT='8789'
@@ -9,6 +10,7 @@ CANONICAL_ORIGIN_SSH='git@github.com:TheTekTeam/agent-runner.git'
 CANONICAL_ORIGIN_HTTPS='https://github.com/TheTekTeam/agent-runner.git'
 MINIMUM_NODE_MAJOR=22
 MINIMUM_NODE_MINOR=23
+NODE_BIN='/usr/bin/node'
 
 usage() {
   cat <<'USAGE'
@@ -71,26 +73,32 @@ CONTROL_CONFIG_DIR="$HOME/.config/agent-runner"
 CONTROL_STATE_ROOT="$HOME/.local/state/agent-runner"
 CONTROL_SECRET_DIR="$CONTROL_STATE_ROOT/secrets"
 CONTROL_AUDIT_FILE="$CONTROL_STATE_ROOT/control-audit.jsonl"
-NODE_BIN=$(command -v node || true)
-NODE_BIN=${NODE_BIN:+$(readlink -f -- "$NODE_BIN")}
-CHECKOUT_TOP=$(git -C "$CHECKOUT" rev-parse --show-toplevel 2>/dev/null || true)
-CHECKOUT_ORIGIN=$(git -C "$CHECKOUT" remote get-url origin 2>/dev/null || true)
-NODE_VERSION=$($NODE_BIN --eval 'process.stdout.write(process.versions.node)' 2>/dev/null || true)
-
-[[ -f "$SOURCE_UNIT" ]] || fail "repository service source is missing: $SOURCE_UNIT"
-[[ -f "$SERVER" ]] || fail "control server is missing: $SERVER"
-[[ -n "$NODE_BIN" && -x "$NODE_BIN" ]] || fail 'node executable is unavailable'
-[[ "$CHECKOUT_TOP" == "$CHECKOUT" ]] || fail 'installer must run from the canonical Agent Runner Git checkout root'
-[[ "$CHECKOUT_ORIGIN" == "$CANONICAL_ORIGIN_SSH" || "$CHECKOUT_ORIGIN" == "$CANONICAL_ORIGIN_HTTPS" ]] \
-  || fail 'checkout origin is not the canonical Agent Runner repository'
-if [[ ! "$NODE_VERSION" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]] \
-  || (( 10#${BASH_REMATCH[1]} < MINIMUM_NODE_MAJOR )) \
-  || (( 10#${BASH_REMATCH[1]} == MINIMUM_NODE_MAJOR && 10#${BASH_REMATCH[2]} < MINIMUM_NODE_MINOR )); then
-  fail 'Node.js 22.23.0 or newer is required'
-fi
 for path_value in "$CHECKOUT" "$SERVER" "$NODE_BIN"; do
   [[ "$path_value" =~ ^[-A-Za-z0-9_./]+$ ]] || fail 'checkout or executable path contains unsupported characters'
 done
+
+validate_install_source() {
+  local checkout_top checkout_origin node_version
+  [[ -f "$SOURCE_UNIT" ]] || fail "repository service source is missing: $SOURCE_UNIT"
+  [[ -f "$SERVER" ]] || fail "control server is missing: $SERVER"
+  [[ -x "$NODE_BIN" ]] || fail 'approved /usr/bin/node executable is unavailable'
+  checkout_top=$(git -C "$CHECKOUT" rev-parse --show-toplevel 2>/dev/null || true)
+  checkout_origin=$(git -C "$CHECKOUT" remote get-url origin 2>/dev/null || true)
+  node_version=$($NODE_BIN --eval 'process.stdout.write(process.versions.node)' 2>/dev/null || true)
+  [[ "$checkout_top" == "$CHECKOUT" ]] || fail 'installer must run from the canonical Agent Runner Git checkout root'
+  [[ "$checkout_origin" == "$CANONICAL_ORIGIN_SSH" || "$checkout_origin" == "$CANONICAL_ORIGIN_HTTPS" ]] \
+    || fail 'checkout origin is not the canonical Agent Runner repository'
+  if [[ ! "$node_version" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]] \
+    || (( 10#${BASH_REMATCH[1]} < MINIMUM_NODE_MAJOR )) \
+    || (( 10#${BASH_REMATCH[1]} == MINIMUM_NODE_MAJOR && 10#${BASH_REMATCH[2]} < MINIMUM_NODE_MINOR )); then
+    fail 'Node.js 22.23.0 or newer is required'
+  fi
+}
+
+validate_installed_runtime() {
+  [[ -x "$NODE_BIN" ]] || { printf 'ERROR: approved /usr/bin/node executable is unavailable\n' >&2; return 1; }
+  [[ -f "$SERVER" ]] || { printf 'ERROR: installed control-server source is unavailable\n' >&2; return 1; }
+}
 
 render_unit() {
   local output=$1 text
@@ -203,18 +211,25 @@ verify_exact_listener() {
 }
 
 verify_shell_health() {
-  local response
-  if ! response=$(curl --fail --silent --show-error --include --noproxy '*' \
+  local headers body http_code rc=0
+  headers=$(mktemp)
+  body=$(mktemp)
+  http_code=$(curl --disable --silent --show-error --noproxy '*' --max-redirs 0 \
     --connect-timeout 2 --max-time 5 --max-filesize 262144 \
-    --request GET "http://$FIXED_HOST:$PORT/"); then
+    --request GET --dump-header "$headers" --output "$body" --write-out '%{http_code}' \
+    "http://$FIXED_HOST:$PORT/") || rc=$?
+  if (( rc != 0 )) || [[ "$http_code" != 200 ]] \
+    || ! grep -Eiq '^Content-Security-Policy:' "$headers" \
+    || ! grep -Fq '<title>Agent Runner — Operations</title>' "$body"; then
+    rm -f -- "$headers" "$body"
     return 1
   fi
-  grep -Eiq '^Content-Security-Policy:' <<<"$response" \
-    && grep -Fq '<title>Agent Runner — Operations</title>' <<<"$response"
+  rm -f -- "$headers" "$body"
 }
 
 verify_installed_service() {
   local active_state
+  validate_installed_runtime || return 1
   if [[ ! -f "$TARGET_UNIT" ]]; then
     printf 'ERROR: service is not installed: %s\n' "$TARGET_UNIT" >&2
     return 1
@@ -353,6 +368,7 @@ stop_and_disable_target() {
 
 install_service() {
   local rendered backup had_unit=0 was_enabled=0 was_active=0 changed=1 enabled_state active_state
+  validate_install_source
   rendered=$(mktemp "${TMPDIR:-/tmp}/agent-runner-control.XXXXXX.service")
   backup=$(mktemp)
   trap 'rm -f -- "$rendered" "$backup"' RETURN
@@ -425,6 +441,7 @@ enable_service() {
   local backup was_enabled=0 was_active=0 activation_failed=0 enabled_state active_state
   provision_unit_target_path
   [[ -f "$TARGET_UNIT" ]] || fail 'service is not installed; run install first'
+  validate_installed_runtime
   backup=$(mktemp)
   trap 'rm -f -- "$backup"' RETURN
   cp -- "$TARGET_UNIT" "$backup"

@@ -150,12 +150,35 @@ if [[ "$mode" == ipv6 ]]; then printf 'LISTEN 0 128 [::1]:%s [::]:*\\n' "$port";
 if [[ "$mode" == duplicate ]]; then printf 'LISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\\nLISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\\n' "$port" "$port"; exit 0; fi
 if [[ -f "$FAKE_STATE/active" ]]; then printf 'LISTEN 0 128 127.0.0.1:%s 0.0.0.0:*\\n' "$port"; fi
 `;
-const curl = `#!/usr/bin/env bash
+  const curl = `#!/usr/bin/env bash
 set -euo pipefail
 printf 'curl %s\\n' "$*" >>"$FAKE_STATE/mutations.log"
+[[ \${1-} == --disable ]]
 [[ \${FAKE_CURL_FAIL:-0} != 1 ]]
-if [[ \${FAKE_CURL_BAD:-0} == 1 ]]; then printf 'HTTP/1.1 200 OK\r\n\r\nwrong service\n'; exit 0; fi
-printf 'HTTP/1.1 200 OK\r\nContent-Security-Policy: default-src '\''self'\''\r\n\r\n<title>Agent Runner — Operations</title>\n'
+headers=''; body=''
+while (($#)); do
+  case "$1" in
+    --dump-header) headers=$2; shift 2 ;;
+    --output) body=$2; shift 2 ;;
+    --write-out) shift 2 ;;
+    *) shift ;;
+  esac
+done
+code=200
+[[ \${FAKE_CURL_REDIRECT:-0} != 1 ]] || code=302
+if [[ \${FAKE_CURL_MISSING_CSP:-0} == 1 ]]; then
+  printf 'HTTP/1.1 %s Test\\r\\n\\r\\n' "$code" >"$headers"
+else
+  printf 'HTTP/1.1 %s Test\\r\\nContent-Security-Policy: default-src self\\r\\n\\r\\n' "$code" >"$headers"
+fi
+if [[ \${FAKE_CURL_BAD:-0} == 1 ]]; then
+  printf 'wrong service\\n' >"$body"
+elif [[ \${FAKE_CURL_BODY_SPOOF:-0} == 1 ]]; then
+  printf 'Content-Security-Policy: spoofed\\n<title>Agent Runner — Operations</title>\\n' >"$body"
+else
+  printf '<title>Agent Runner — Operations</title>\\n' >"$body"
+fi
+printf '%s' "$code"
 `;
   const analyze = `#!/usr/bin/env bash
 set -euo pipefail
@@ -253,7 +276,7 @@ test('install is idempotent, lifecycle is bounded, and disable/remove/reinstall 
   assertOk(f.run(['install']));
   assert.equal(readFileSync(path.join(f.fakeState, 'pid'), 'utf8').trim(), '1');
   const rendered = readFileSync(f.unit, 'utf8');
-  assert.match(rendered, /--jitless .*agent-runner-control-server\.mjs --port 8789/);
+  assert.match(rendered, /^ExecStart=\/usr\/bin\/node --jitless .*agent-runner-control-server\.mjs --port 8789$/m);
   assert.match(rendered, /^Environment=NODE_OPTIONS=--jitless$/m);
   assert.doesNotMatch(rendered, /8787|EnvironmentFile|password|token=/i);
   assertOk(f.run(['install']));
@@ -268,6 +291,14 @@ test('install is idempotent, lifecycle is bounded, and disable/remove/reinstall 
   assertOk(f.run(['install']));
   assertPreserved();
   const mutations = readFileSync(f.log, 'utf8');
+  const curlLines = mutations.split('\n').filter((line) => line.startsWith('curl '));
+  assert.ok(curlLines.length > 0);
+  for (const line of curlLines) {
+    assert.match(line, /^curl --disable /);
+    assert.match(line, /--max-redirs 0/);
+    assert.match(line, /--dump-header .* --output .* --write-out %\{http_code\}/);
+    assert.doesNotMatch(line, /--include|--location|--user|--cookie|--data/);
+  }
   for (const forbidden of [
     'agent-runner-implementation.service', 'agent-runner-implementation.timer', 'agent-runner-modelspend.',
     'event-ingress', 'event-polling', '8787', 'runner-state.sqlite', 'implementation.lock', 'source-activation', 'github',
@@ -317,7 +348,28 @@ test('activation refuses collisions and verify rejects wildcard, IPv6 and duplic
     const result = f.run(['verify'], { FAKE_LISTENER_MODE: mode });
     assert.notEqual(result.status, 0, mode);
   }
-  assert.notEqual(f.run(['verify'], { FAKE_CURL_BAD: '1' }).status, 0);
+  writeFileSync(path.join(f.home, '.curlrc'), 'user = should-never-be-read\n');
+  assertOk(f.run(['verify']));
+  for (const env of [
+    { FAKE_CURL_BAD: '1' },
+    { FAKE_CURL_MISSING_CSP: '1' },
+    { FAKE_CURL_BODY_SPOOF: '1', FAKE_CURL_MISSING_CSP: '1' },
+    { FAKE_CURL_REDIRECT: '1' },
+  ]) assert.notEqual(f.run(['verify'], env).status, 0);
+});
+
+test('status, disable, and remove remain usable after checkout/runtime damage', (t) => {
+  const f = makeFixture(t);
+  if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
+  assertOk(f.run(['install']));
+  rmSync(path.join(f.checkout, 'systemd/user/agent-runner-control.service.in'));
+  rmSync(path.join(f.checkout, 'scripts/ops/agent-runner-control-server.mjs'));
+  rmSync(path.join(f.fakeState, 'mutations.log'));
+  assertOk(f.run(['status'], { FAKE_GIT_ORIGIN: 'unavailable' }));
+  assertOk(f.run(['disable'], { FAKE_GIT_ORIGIN: 'unavailable' }));
+  assertOk(f.run(['remove'], { FAKE_GIT_ORIGIN: 'unavailable' }));
+  assert.equal(existsSync(f.unit), false);
+  assert.doesNotMatch(readFileSync(f.log, 'utf8'), /systemctl .* (?:start|restart|enable) /);
 });
 
 test('unchanged install and enable restore prior disabled/inactive state after health failure', (t) => {
