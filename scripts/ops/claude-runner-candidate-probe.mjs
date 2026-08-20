@@ -4,17 +4,26 @@
 // the cron runner but never runs Claude /usage, claims an issue or launches an
 // agent. The systemd wrapper uses its exit status to avoid quota subprocesses
 // when the queue has no issue backed by current canonical manager authority.
+//
+// Issue #283: on success this probe also emits the exact sanitized candidate
+// snapshot that the standalone candidate-admission boundary must treat as
+// observation #1. The wrapper hands that snapshot to candidate admission,
+// which performs exactly one fresh canonical observation before any claim.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
+
+import { candidateSnapshot } from './agent-runner-candidate-admission.mjs';
 
 export const NO_RUNNABLE_CANDIDATE_EXIT_CODE = 3;
 
 export function candidateFromSelection(selected = {}) {
+  const candidate = Boolean(selected.issue);
   return {
-    candidate: Boolean(selected.issue),
+    candidate,
     selectedIssue: selected.issue?.number || null,
     selectionMode: selected.selection?.mode || null,
     skipCount: (selected.skipped || []).length,
+    candidateSnapshot: candidate ? candidateSnapshot(selected) : null,
   };
 }
 
