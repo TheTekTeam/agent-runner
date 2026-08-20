@@ -198,6 +198,16 @@ test('rejects a shell payload in a proposed issue scope', () => {
   );
 });
 
+test('rejects a pasted runtime log in a proposed issue scope', () => {
+  const brief = briefFor(agentRunnerProfile);
+  const input = proposalInput(brief);
+  input.proposedIssues[0].scope = ['2026-08-20T01:23:45Z', ' INFO planner started'].join('');
+  assert.throws(
+    () => validateManagerPlanProposal(input, { brief }),
+    /must not contain raw prompt or log content/,
+  );
+});
+
 test('rejects an invalid decisionType', () => {
   const brief = briefFor(agentRunnerProfile);
   const input = proposalInput(brief);

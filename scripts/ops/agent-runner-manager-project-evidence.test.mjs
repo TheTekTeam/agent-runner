@@ -136,6 +136,27 @@ test('rejects a secret-shaped token in an open pull request title', () => {
   );
 });
 
+test('rejects a runtime-constructed secret-shaped evidence revision', () => {
+  const syntheticClassicToken = ['gh', 'p_', 'abcdefghijklmnopqrstuvwx1234'].join('');
+  assert.throws(
+    () => validateManagerProjectEvidence(
+      evidenceFor(agentRunnerProfile, { evidenceRevision: syntheticClassicToken }),
+      { profile: agentRunnerProfile },
+    ),
+    /evidenceRevision must not contain a secret or credential-shaped token/,
+  );
+});
+
+test('rejects an evidence revision containing non-identifier syntax', () => {
+  assert.throws(
+    () => validateManagerProjectEvidence(
+      evidenceFor(agentRunnerProfile, { evidenceRevision: 'revision with spaces' }),
+      { profile: agentRunnerProfile },
+    ),
+    /evidenceRevision must be a machine-safe revision identifier/,
+  );
+});
+
 test('rejects an evidence object that was never produced by validateManagerProjectEvidence', () => {
   const real = validateManagerProjectEvidence(evidenceFor(agentRunnerProfile), { profile: agentRunnerProfile });
   const fake = Object.freeze({ ...real });

@@ -65,6 +65,16 @@ const SHELL_PAYLOAD_PATTERNS = [
   /\beval\s*\(/i,
 ];
 
+// Planner fields contain bounded, authored summaries rather than pasted
+// provider transcripts or runtime logs. Match only canonical line-start
+// markers so ordinary prose mentioning a system, user or INFO remains valid.
+const RAW_PROMPT_OR_LOG_PATTERNS = [
+  /(?:^|\n)\s*(?:system|developer|assistant|user|tool)\s*:/i,
+  /<\|(?:system|developer|assistant|user|tool)(?:_start|_end)?\|>/i,
+  /(?:^|\n)\s*(?:\d{4}-\d{2}-\d{2}[T ][0-2]\d:[0-5]\d:[0-5]\d(?:\.\d+)?Z?|\[[0-2]\d:[0-5]\d:[0-5]\d\])\s+(?:TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\b/i,
+  /(?:^|\n)\s*\[(?:TRACE|DEBUG|INFO|WARN|ERROR|FATAL)\]\s+/i,
+];
+
 // Explicit write-action verbs a read-only planner proposal must never carry,
 // even as descriptive text -- see #261 "Reject ... merge, deploy, close,
 // label, dispatch, provider-run, source-activation, or other write actions".
@@ -85,8 +95,8 @@ const WRITE_ACTION_PATTERNS = [
 /**
  * Fail-closed check for one bounded free-text field: required, bounded
  * length, no control characters, no local-machine path, no secret-shaped
- * token, no shell/executable payload and (unless explicitly disabled) no
- * write-action phrasing. Pushes onto `errors` rather than throwing so
+ * token, no shell/executable payload, no raw prompt/log content and (unless
+ * explicitly disabled) no write-action phrasing. Pushes onto `errors` rather than throwing so
  * callers can accumulate every violation before failing the whole input.
  */
 export function assertBoundedSafeText(value, label, errors, { max, allowWriteActionScan = true } = {}) {
@@ -100,6 +110,7 @@ export function assertBoundedSafeText(value, label, errors, { max, allowWriteAct
   if (LOCAL_PATH_PATTERN.test(trimmed)) errors.push(`${label} must not contain a local-machine path`);
   if (SECRET_PATTERNS.some((pattern) => pattern.test(trimmed))) errors.push(`${label} must not contain a secret or credential-shaped token`);
   if (SHELL_PAYLOAD_PATTERNS.some((pattern) => pattern.test(trimmed))) errors.push(`${label} must not contain a shell command or executable payload`);
+  if (RAW_PROMPT_OR_LOG_PATTERNS.some((pattern) => pattern.test(trimmed))) errors.push(`${label} must not contain raw prompt or log content`);
   if (allowWriteActionScan && WRITE_ACTION_PATTERNS.some((pattern) => pattern.test(trimmed))) {
     errors.push(`${label} must not describe a write action (merge/deploy/close/dispatch/source-activation/label mutation)`);
   }

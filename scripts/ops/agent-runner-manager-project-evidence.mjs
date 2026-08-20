@@ -28,6 +28,7 @@ const SHA256_HEX_PATTERN = /^[0-9a-f]{64}$/;
 const FRESHNESS_VALUES = new Set(['current', 'stale', 'unknown']);
 const LABEL_VALUE_PATTERN = /^[a-z0-9]+(?:[-_:][a-z0-9]+)*$/i;
 const EVIDENCE_TIMESTAMP_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/;
+const EVIDENCE_REVISION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 
 const MAX_INSTRUCTION_DOCUMENTS = 20;
 const MAX_TOOL_ITEMS = 20;
@@ -266,8 +267,9 @@ export function validateManagerProjectEvidence(input, { profile } = {}) {
   if (!nonEmptyString(input.sourceSha) || !SHA_PATTERN.test(String(input.sourceSha).toLowerCase())) {
     errors.push('sourceSha must be a 40-character hex commit SHA');
   }
-  if (!nonEmptyString(input.evidenceRevision) || input.evidenceRevision.length > 200) {
-    errors.push('evidenceRevision is required and must be at most 200 characters');
+  assertBoundedSafeText(input.evidenceRevision, 'evidenceRevision', errors, { max: 200, allowWriteActionScan: false });
+  if (nonEmptyString(input.evidenceRevision) && !EVIDENCE_REVISION_PATTERN.test(input.evidenceRevision)) {
+    errors.push('evidenceRevision must be a machine-safe revision identifier');
   }
   if (!nonEmptyString(input.evidenceTimestamp) || !EVIDENCE_TIMESTAMP_PATTERN.test(input.evidenceTimestamp)) {
     errors.push('evidenceTimestamp must be an ISO-8601 UTC timestamp (YYYY-MM-DDTHH:MM:SSZ)');
