@@ -78,25 +78,30 @@ for path_value in "$CHECKOUT" "$SERVER" "$NODE_BIN"; do
 done
 
 validate_install_source() {
-  local checkout_top checkout_origin node_version
+  local checkout_top checkout_origin
   [[ -f "$SOURCE_UNIT" ]] || fail "repository service source is missing: $SOURCE_UNIT"
   [[ -f "$SERVER" ]] || fail "control server is missing: $SERVER"
-  [[ -x "$NODE_BIN" ]] || fail 'approved /usr/bin/node executable is unavailable'
+  validate_node_runtime || fail 'approved Node.js runtime does not meet the repository contract'
   checkout_top=$(git -C "$CHECKOUT" rev-parse --show-toplevel 2>/dev/null || true)
   checkout_origin=$(git -C "$CHECKOUT" remote get-url origin 2>/dev/null || true)
-  node_version=$($NODE_BIN --eval 'process.stdout.write(process.versions.node)' 2>/dev/null || true)
   [[ "$checkout_top" == "$CHECKOUT" ]] || fail 'installer must run from the canonical Agent Runner Git checkout root'
   [[ "$checkout_origin" == "$CANONICAL_ORIGIN_SSH" || "$checkout_origin" == "$CANONICAL_ORIGIN_HTTPS" ]] \
     || fail 'checkout origin is not the canonical Agent Runner repository'
+}
+
+validate_node_runtime() {
+  local node_version
+  [[ -x "$NODE_BIN" ]] || return 1
+  node_version=$($NODE_BIN --eval 'process.stdout.write(process.versions.node)' 2>/dev/null || true)
   if [[ ! "$node_version" =~ ^([0-9]+)\.([0-9]+)\.[0-9]+$ ]] \
     || (( 10#${BASH_REMATCH[1]} < MINIMUM_NODE_MAJOR )) \
     || (( 10#${BASH_REMATCH[1]} == MINIMUM_NODE_MAJOR && 10#${BASH_REMATCH[2]} < MINIMUM_NODE_MINOR )); then
-    fail 'Node.js 22.23.0 or newer is required'
+    return 1
   fi
 }
 
 validate_installed_runtime() {
-  [[ -x "$NODE_BIN" ]] || { printf 'ERROR: approved /usr/bin/node executable is unavailable\n' >&2; return 1; }
+  validate_node_runtime || { printf 'ERROR: approved Node.js 22.23.0 or newer is unavailable\n' >&2; return 1; }
   [[ -f "$SERVER" ]] || { printf 'ERROR: installed control-server source is unavailable\n' >&2; return 1; }
 }
 

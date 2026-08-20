@@ -202,6 +202,15 @@ function assertOk(result) {
   assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
 }
 
+function useVersionedFixtureNode(f) {
+  const nodePath = path.join(f.base, 'approved-node');
+  writeFileSync(nodePath, '#!/usr/bin/env bash\nset -euo pipefail\nprintf "%s" "${FAKE_NODE_VERSION:-22.23.0}"\n');
+  chmodSync(nodePath, 0o755);
+  const installerPath = path.join(f.checkout, 'scripts/install-control-dashboard.sh');
+  const installer = readFileSync(installerPath, 'utf8').replace("NODE_BIN='/usr/bin/node'", `NODE_BIN='${nodePath}'`);
+  writeFileSync(installerPath, installer);
+}
+
 function seedPreservedState(f) {
   const paths = [
     '.config/agent-runner/agent-settings.json',
@@ -370,6 +379,18 @@ test('status, disable, and remove remain usable after checkout/runtime damage', 
   assertOk(f.run(['remove'], { FAKE_GIT_ORIGIN: 'unavailable' }));
   assert.equal(existsSync(f.unit), false);
   assert.doesNotMatch(readFileSync(f.log, 'utf8'), /systemctl .* (?:start|restart|enable) /);
+});
+
+test('enable and verify fail closed after the approved Node runtime is downgraded', (t) => {
+  const f = makeFixture(t);
+  if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
+  useVersionedFixtureNode(f);
+  assertOk(f.run(['install'], { FAKE_NODE_VERSION: '22.23.0' }));
+  assert.notEqual(f.run(['verify'], { FAKE_NODE_VERSION: '22.22.9' }).status, 0);
+  assertOk(f.run(['disable'], { FAKE_NODE_VERSION: '22.22.9' }));
+  assert.notEqual(f.run(['enable'], { FAKE_NODE_VERSION: '20.99.0' }).status, 0);
+  assert.equal(existsSync(path.join(f.fakeState, 'active')), false);
+  assert.equal(existsSync(path.join(f.fakeState, 'enabled')), false);
 });
 
 test('unchanged install and enable restore prior disabled/inactive state after health failure', (t) => {
