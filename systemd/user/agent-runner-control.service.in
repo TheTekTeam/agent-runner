@@ -36,10 +36,10 @@ RestrictAddressFamilies=AF_UNIX AF_INET
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-# Deliberate Node 22.23 compatibility exception: MemoryDenyWriteExecute and
-# --jitless are omitted because the built-in Undici HTTP stack requires its
-# WebAssembly llhttp parser. Dell field acceptance proved --jitless disables
-# WebAssembly and crashes the otherwise healthy loopback control service.
+# Deliberate Node 22.23 compatibility exception: executable-memory denial and
+# the corresponding JIT-disabling workaround are omitted because the built-in
+# Undici HTTP stack requires its WebAssembly llhttp parser. Dell field evidence
+# proved that disabling WebAssembly crashes the otherwise healthy loopback service.
 UMask=0077
 
 [Install]
