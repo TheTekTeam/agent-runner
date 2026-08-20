@@ -37,7 +37,9 @@ const MIN_CANDIDATE_SELECTION_TIMEOUT_MS = 50;
 const MAX_CANDIDATE_SELECTION_TIMEOUT_MS = 60_000;
 
 export function candidateSelectionTimeoutMs(env = process.env) {
-  const parsed = Number(env.AGENT_RUNNER_CANDIDATE_SELECTION_TIMEOUT_MS);
+  const raw = String(env.AGENT_RUNNER_CANDIDATE_SELECTION_TIMEOUT_MS ?? '').trim();
+  if (!raw) return DEFAULT_CANDIDATE_SELECTION_TIMEOUT_MS;
+  const parsed = Number(raw);
   if (!Number.isFinite(parsed)) return DEFAULT_CANDIDATE_SELECTION_TIMEOUT_MS;
   return Math.max(
     MIN_CANDIDATE_SELECTION_TIMEOUT_MS,
@@ -437,10 +439,10 @@ export function revalidateCandidateInChild({
 }
 
 // Issue #227: once identity/authority admits the freshly re-read candidate,
-// apply the accepted #226 evaluator and #235 circuit against that exact
-// candidate before returning `allowed: true`. A `machine_profile` refusal
-// here carries its own bounded scope/reason/fingerprint rather than being
-// folded into the issue-level `issue_not_runnable` shape.
+// apply the accepted #226 evaluator and #235 circuit against the freshly
+// re-read candidate before returning `allowed: true`. A `machine_profile`
+// refusal here carries its own bounded scope/reason/fingerprint rather than
+// being folded into the issue-level `issue_not_runnable` shape.
 function admitCandidateCost({ identityAdmission, currentSelected, env }) {
   if (identityAdmission.allowed !== true) return identityAdmission;
   const cost = evaluateCandidateCostAdmission({
