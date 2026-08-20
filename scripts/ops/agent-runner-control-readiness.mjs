@@ -3,30 +3,25 @@ import { delimiter, join } from 'node:path';
 
 import { probeOutcome } from './agent-runner-adapter-contract.mjs';
 import { loadAgentRunnerConfig } from './agent-runner-config.mjs';
-import { buildRunnerDashboard } from './claude-runner-dashboard-api.mjs';
+import { readOnlyRunnerStateSnapshot } from './agent-runner-operator-doctor.mjs';
+import { buildRunnerActivity, buildRunnerMetrics } from './claude-runner-dashboard-api.mjs';
 import { defaultRunnerStateDbPath } from './claude-runner-state.mjs';
 
 /**
- * Deterministic readiness/health/load reads (issue #46, required
- * implementation #16: "Deterministic readiness checks only; no paid or
- * live provider calls").
+ * Deterministic readiness/health/load reads (issue #46, hardened for the
+ * permanent read-only control service in issue #174).
  *
  * `probeCommandOnPath()` is a pure, synchronous filesystem walk of `PATH`
  * (`accessSync(candidate, X_OK)` per directory) — it never spawns a
- * process, never opens a socket, and never asks a model for anything. This
- * is deliberately narrower than the #40 Ollama foundation's probe set
- * (which also runs a local `--version` banner and a loopback metadata
- * fetch): this control-service foundation only needs "is the adapter
- * command resolvable", and a zero-process-spawn check removes any question
- * about whether a readiness probe could be mistaken for a live call.
+ * process, never opens a socket, and never asks a model for anything.
  *
- * `computeInstanceLoad()` is read-only: it reuses the existing
- * `buildRunnerDashboard()` (already exported by
- * `claude-runner-dashboard-api.mjs` for the static dashboard) to report
- * whether a live claim is currently outstanding for `claude-code-cli`. It
- * adds no new coupling into `claude-runner-cron.mjs` — it reads the same
- * SQLite state that module already writes, through the same read-only API
- * the dashboard already uses.
+ * Control-service load/quota reads must remain compatible with a systemd
+ * sandbox that keeps the live runner state tree read-only. They therefore
+ * use `readOnlyRunnerStateSnapshot()`, which snapshots the live database to
+ * a private temporary copy before opening SQLite, then apply the same pure
+ * dashboard activity/metrics derivations to that bounded snapshot. They do
+ * not instantiate `RunnerStateStore` or call `buildRunnerDashboard()` on
+ * the live execution database.
  */
 
 export function probeCommandOnPath({ command, pathEnv = process.env.PATH || '', accessFn = accessSync } = {}) {
@@ -65,16 +60,33 @@ function resolveDbPath({ env = process.env, dbPath } = {}) {
 }
 
 /**
+ * Small compatibility adapter for the existing `buildDashboard` injection
+ * seam used by the control-readiness tests. The default implementation is
+ * genuinely read-only: it reads a private snapshot and returns only the two
+ * bounded projections these callers need.
+ */
+export function buildReadOnlyControlSummary(dbPath, {
+  historyLimit = 5,
+  snapshotReader = readOnlyRunnerStateSnapshot,
+} = {}) {
+  const snapshot = snapshotReader(dbPath, { historyLimit, includeLatest: true });
+  const latest = snapshot?.ok ? (snapshot.latest || {}) : {};
+  const activity = buildRunnerActivity(latest);
+  const quota = snapshot?.ok ? buildRunnerMetrics({ latest }).quota : null;
+  return { activity, quota };
+}
+
+/**
  * `capacity` is always `1` here — this is a read of the existing serial
  * global execution slot, not a concurrency control; nothing in this module
  * (or anywhere else in this issue's scope) can increase it.
  */
-export function computeInstanceLoad({ agentId, env = process.env, dbPath, historyLimit = 5, buildDashboard = buildRunnerDashboard } = {}) {
+export function computeInstanceLoad({ agentId, env = process.env, dbPath, historyLimit = 5, buildDashboard = buildReadOnlyControlSummary } = {}) {
   if (agentId !== 'claude-code-cli') {
     return { capacity: 1, active: 0, note: 'load-tracking-not-available-for-this-adapter' };
   }
   const resolvedDbPath = resolveDbPath({ env, dbPath });
-  const dashboard = buildDashboard(resolvedDbPath, { historyLimit, strict: false });
+  const dashboard = buildDashboard(resolvedDbPath, { historyLimit });
   const active = dashboard?.activity?.status === 'active-or-unresolved' ? 1 : 0;
   return { capacity: 1, active, note: null };
 }
@@ -86,9 +98,10 @@ export function computeInstanceLoad({ agentId, env = process.env, dbPath, histor
  * Admission availability is quota-only. This projection never reads an
  * account balance, flexible-credit state, billing settings, paid-use
  * approval, auto-top-up state, or provider billing metadata. For the
- * accepted Claude subscription path it reuses the existing bounded,
- * read-only dashboard quota summary and reports the execution source as
- * `included-subscription` with the compatibility `paid` flag false.
+ * accepted Claude subscription path it reuses the bounded quota metrics
+ * derived from the private read-only runner-state snapshot and reports the
+ * execution source as `included-subscription` with the compatibility
+ * `paid` flag false.
  *
  * Actual scheduler admission remains governed by the canonical quota
  * preflight/profile thresholds. Missing or exhausted quota must fail closed
@@ -101,7 +114,7 @@ export function computeInstanceLoad({ agentId, env = process.env, dbPath, histor
  * qualified here. No provider call, billing lookup or settings mutation is
  * performed for any adapter.
  */
-export function computeInstanceQuota({ agentId, env = process.env, dbPath, buildDashboard = buildRunnerDashboard } = {}) {
+export function computeInstanceQuota({ agentId, env = process.env, dbPath, buildDashboard = buildReadOnlyControlSummary } = {}) {
   if (agentId === 'ollama-agent') {
     return { costClass: 'free-local-zero-spend', paid: false, quota: null };
   }
@@ -110,7 +123,7 @@ export function computeInstanceQuota({ agentId, env = process.env, dbPath, build
   }
 
   const resolvedDbPath = resolveDbPath({ env, dbPath });
-  const dashboard = buildDashboard(resolvedDbPath, { historyLimit: 1, strict: false });
+  const dashboard = buildDashboard(resolvedDbPath, { historyLimit: 1 });
   const rawQuota = dashboard?.quota || null;
   const quota = rawQuota
     ? {
