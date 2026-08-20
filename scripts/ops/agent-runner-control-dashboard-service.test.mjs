@@ -74,7 +74,14 @@ test('repository service template passes real systemd-analyze verification when 
     .replaceAll('@@NODE@@', process.execPath)
     .replaceAll('@@PORT@@', '8789');
   writeFileSync(unitPath, rendered);
-  const result = spawnSync('systemd-analyze', ['--user', 'verify', unitPath], { encoding: 'utf8' });
+  let result = spawnSync('systemd-analyze', ['--user', 'verify', unitPath], { encoding: 'utf8' });
+  if (result.status !== 0 && /Failed to (?:lookup RuntimeDirectory path|initialize manager)/.test(result.stderr)) {
+    // CI containers may have systemd-analyze without a live user manager.
+    // Still validate the unit generically so actual unit errors remain fatal.
+    result = spawnSync('systemd-analyze', ['verify', unitPath], { encoding: 'utf8' });
+    assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
+    return t.skip('user systemd manager unavailable; generic unit verification passed');
+  }
   assert.equal(result.status, 0, `stdout=${result.stdout}\nstderr=${result.stderr}`);
 });
 
@@ -110,8 +117,8 @@ fail_once=\${FAKE_SYSTEMCTL_FAIL_ONCE:-}
 [[ "$cmd" != "$fail_on" ]] || exit 1
 if [[ "$cmd" == "$fail_once" && ! -f "$FAKE_STATE/fail-once-$cmd" ]]; then touch "$FAKE_STATE/fail-once-$cmd"; exit 1; fi
 case "$cmd" in
-  is-enabled) [[ -f "$FAKE_STATE/enabled" ]] ;;
-  is-active) [[ -f "$FAKE_STATE/active" ]] ;;
+  is-enabled) if [[ -f "$FAKE_STATE/enabled" ]]; then echo enabled; else echo disabled; exit 1; fi ;;
+  is-active) if [[ -f "$FAKE_STATE/active" ]]; then echo active; else echo inactive; exit 3; fi ;;
   enable) touch "$FAKE_STATE/enabled"; if (( now )); then touch "$FAKE_STATE/active"; fi ;;
   disable) rm -f "$FAKE_STATE/enabled"; if (( now )); then rm -f "$FAKE_STATE/active"; fi ;;
   start|restart) touch "$FAKE_STATE/active"; n=0; [[ -f "$FAKE_STATE/pid" ]] && n=$(cat "$FAKE_STATE/pid"); echo $((n+1)) >"$FAKE_STATE/pid" ;;
@@ -296,4 +303,16 @@ test('disable/remove fail closed and preserve the unit when stop fails', (t) => 
   assert.equal(readFileSync(f.unit, 'utf8'), unitBefore);
   assert.equal(existsSync(path.join(f.fakeState, 'active')), true);
   assert.equal(existsSync(path.join(f.fakeState, 'enabled')), true);
+});
+
+test('disable/remove fail closed when active or enabled state is indeterminate', (t) => {
+  if (process.getuid?.() === 0) return t.skip('lifecycle fixture requires non-root');
+  for (const probe of ['is-active', 'is-enabled']) {
+    const f = makeFixture(t);
+    assertOk(f.run(['install']));
+    const unitBefore = readFileSync(f.unit, 'utf8');
+    const result = f.run(['remove'], { FAKE_SYSTEMCTL_FAIL_ON: probe });
+    assert.notEqual(result.status, 0, probe);
+    assert.equal(readFileSync(f.unit, 'utf8'), unitBefore, `${probe} error removed the unit`);
+  }
 });

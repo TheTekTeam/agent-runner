@@ -121,12 +121,24 @@ validate_rendered_unit() {
   systemd-analyze --user verify "$unit" >/dev/null
 }
 
-unit_enabled() {
-  systemctl --user is-enabled --quiet "$SERVICE_NAME" 2>/dev/null
+probe_unit_enabled_state() {
+  local output rc
+  if output=$(systemctl --user is-enabled "$SERVICE_NAME" 2>/dev/null); then rc=0; else rc=$?; fi
+  case "$output" in
+    enabled|enabled-runtime|linked|linked-runtime|alias) printf 'enabled\n' ;;
+    disabled|disabled-runtime|masked|masked-runtime|static|indirect|generated|transient) printf 'disabled\n' ;;
+    *) printf 'ERROR: could not determine whether %s is enabled (status %s)\n' "$SERVICE_NAME" "$rc" >&2; return 1 ;;
+  esac
 }
 
-unit_active() {
-  systemctl --user is-active --quiet "$SERVICE_NAME" 2>/dev/null
+probe_unit_active_state() {
+  local output rc
+  if output=$(systemctl --user is-active "$SERVICE_NAME" 2>/dev/null); then rc=0; else rc=$?; fi
+  case "$output" in
+    active) printf 'active\n' ;;
+    inactive|failed) printf 'inactive\n' ;;
+    *) printf 'ERROR: could not determine whether %s is active (status %s)\n' "$SERVICE_NAME" "$rc" >&2; return 1 ;;
+  esac
 }
 
 listener_lines() {
@@ -163,12 +175,14 @@ verify_shell_health() {
 }
 
 verify_installed_service() {
+  local active_state
   if [[ ! -f "$TARGET_UNIT" ]]; then
     printf 'ERROR: service is not installed: %s\n' "$TARGET_UNIT" >&2
     return 1
   fi
   validate_rendered_unit "$TARGET_UNIT" || return 1
-  if ! unit_active; then
+  active_state=$(probe_unit_active_state) || return 1
+  if [[ "$active_state" != active ]]; then
     printf 'ERROR: %s is not active\n' "$SERVICE_NAME" >&2
     return 1
   fi
@@ -191,8 +205,12 @@ ensure_private_directory() {
 
 provision_writable_paths() {
   # The hardened mount namespace requires these exact paths to exist before
-  # service start. Create only the three repository-approved writable sinks;
-  # never create/rotate the operator credential or touch execution state.
+  # service start. Bootstrap their standard parent directories one component
+  # at a time so a fresh home works without following a symlinked component.
+  # Never create/rotate the operator credential or touch execution state.
+  ensure_private_directory "$HOME/.config" || return 1
+  ensure_private_directory "$HOME/.local" || return 1
+  ensure_private_directory "$HOME/.local/state" || return 1
   ensure_private_directory "$CONTROL_CONFIG_DIR" || return 1
   ensure_private_directory "$CONTROL_STATE_ROOT" || return 1
   ensure_private_directory "$CONTROL_SECRET_DIR" || return 1
@@ -208,7 +226,7 @@ provision_writable_paths() {
 }
 
 restore_previous_state() {
-  local backup=$1 had_unit=$2 was_enabled=$3 was_active=$4 rc=0
+  local backup=$1 had_unit=$2 was_enabled=$3 was_active=$4 rc=0 enabled_state active_state
   set +e
   systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || rc=1
   if (( had_unit )); then
@@ -227,31 +245,30 @@ restore_previous_state() {
   else
     systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || true
   fi
-  if (( was_enabled )); then
-    if ! unit_enabled; then rc=1; fi
-  else
-    if unit_enabled; then rc=1; fi
-  fi
-  if (( was_active )); then
-    if ! unit_active; then rc=1; fi
-  else
-    if unit_active; then rc=1; fi
-  fi
+  enabled_state=$(probe_unit_enabled_state) || rc=1
+  active_state=$(probe_unit_active_state) || rc=1
+  if (( was_enabled )); then [[ "$enabled_state" == enabled ]] || rc=1; else [[ "$enabled_state" == disabled ]] || rc=1; fi
+  if (( was_active )); then [[ "$active_state" == active ]] || rc=1; else [[ "$active_state" == inactive ]] || rc=1; fi
   set -e
   return "$rc"
 }
 
 stop_and_disable_target() {
-  if unit_active; then
+  local active_state enabled_state
+  active_state=$(probe_unit_active_state) || return 1
+  if [[ "$active_state" == active ]]; then
     systemctl --user stop "$SERVICE_NAME" >/dev/null || return 1
-    if unit_active; then
+    active_state=$(probe_unit_active_state) || return 1
+    if [[ "$active_state" != inactive ]]; then
       printf 'ERROR: %s remained active after stop\n' "$SERVICE_NAME" >&2
       return 1
     fi
   fi
-  if unit_enabled; then
+  enabled_state=$(probe_unit_enabled_state) || return 1
+  if [[ "$enabled_state" == enabled ]]; then
     systemctl --user disable "$SERVICE_NAME" >/dev/null || return 1
-    if unit_enabled; then
+    enabled_state=$(probe_unit_enabled_state) || return 1
+    if [[ "$enabled_state" != disabled ]]; then
       printf 'ERROR: %s remained enabled after disable\n' "$SERVICE_NAME" >&2
       return 1
     fi
@@ -259,7 +276,7 @@ stop_and_disable_target() {
 }
 
 install_service() {
-  local rendered backup had_unit=0 was_enabled=0 was_active=0 changed=1
+  local rendered backup had_unit=0 was_enabled=0 was_active=0 changed=1 enabled_state active_state
   rendered=$(mktemp "${TMPDIR:-/tmp}/agent-runner-control.XXXXXX.service")
   backup=$(mktemp)
   trap 'rm -f -- "$rendered" "$backup"' RETURN
@@ -270,9 +287,11 @@ install_service() {
     had_unit=1
     cp -- "$TARGET_UNIT" "$backup"
     cmp -s -- "$rendered" "$TARGET_UNIT" && changed=0
+    enabled_state=$(probe_unit_enabled_state) || return 1
+    active_state=$(probe_unit_active_state) || return 1
+    if [[ "$enabled_state" == enabled ]]; then was_enabled=1; fi
+    if [[ "$active_state" == active ]]; then was_active=1; fi
   fi
-  unit_enabled && was_enabled=1 || true
-  unit_active && was_active=1 || true
 
   # Static validation has completed. Provision only the exact writable paths
   # required for namespace setup before any activation or replacement.
@@ -297,7 +316,8 @@ install_service() {
   # passed static verification and writable-path provisioning has succeeded.
   if (( was_active )); then
     systemctl --user stop "$SERVICE_NAME" || return 1
-    unit_active && { printf 'ERROR: %s did not stop before upgrade\n' "$SERVICE_NAME" >&2; return 1; }
+    active_state=$(probe_unit_active_state) || return 1
+    [[ "$active_state" == inactive ]] || { printf 'ERROR: %s did not stop before upgrade\n' "$SERVICE_NAME" >&2; return 1; }
   fi
   if ! preflight_port_available; then
     restore_previous_state "$backup" "$had_unit" "$was_enabled" "$was_active" || printf 'ERROR: rollback could not fully restore previous service state\n' >&2
@@ -318,18 +338,25 @@ install_service() {
 }
 
 enable_service() {
-  local was_enabled=0 was_active=0
+  local was_enabled=0 was_active=0 activation_failed=0 enabled_state active_state
   [[ -f "$TARGET_UNIT" ]] || fail 'service is not installed; run install first'
   validate_rendered_unit "$TARGET_UNIT"
   provision_writable_paths
-  unit_enabled && was_enabled=1 || true
-  unit_active && was_active=1 || true
+  enabled_state=$(probe_unit_enabled_state) || return 1
+  active_state=$(probe_unit_active_state) || return 1
+  if [[ "$enabled_state" == enabled ]]; then was_enabled=1; fi
+  if [[ "$active_state" == active ]]; then was_active=1; fi
   if (( was_active == 0 )); then
     preflight_port_available || return 1
   fi
-  if ! systemctl --user enable "$SERVICE_NAME" >/dev/null \
-    || { (( was_active )) || systemctl --user start "$SERVICE_NAME"; } \
-    || ! verify_installed_service; then
+  systemctl --user enable "$SERVICE_NAME" >/dev/null || activation_failed=1
+  if (( activation_failed == 0 && was_active == 0 )); then
+    systemctl --user start "$SERVICE_NAME" || activation_failed=1
+  fi
+  if (( activation_failed == 0 )); then
+    verify_installed_service || activation_failed=1
+  fi
+  if (( activation_failed )); then
     printf 'ERROR: enable or health verification failed; restoring previous enabled/active state\n' >&2
     if (( was_enabled == 0 )); then systemctl --user disable "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
     if (( was_active == 0 )); then systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1 || true; fi
