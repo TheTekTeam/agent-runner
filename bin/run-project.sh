@@ -159,10 +159,15 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
       ;;
   esac
 
+  # Observation #1: the read-only canonical candidate probe now returns the
+  # exact sanitized authority snapshot that candidate admission must compare
+  # against one fresh observation. Capture stdout so the successful probe is
+  # not discarded and then independently validate the handoff shape.
   set +e
-  "$NODE_BIN" "$ROOT/scripts/ops/claude-runner-candidate-probe.mjs" "${ARGS[@]}"
+  PROBE_OUTPUT="$("$NODE_BIN" "$ROOT/scripts/ops/claude-runner-candidate-probe.mjs" "${ARGS[@]}")"
   PROBE_STATUS=$?
   set -e
+  [ -z "$PROBE_OUTPUT" ] || printf '%s\n' "$PROBE_OUTPUT"
   case "$PROBE_STATUS" in
     0) ;;
     3)
@@ -177,14 +182,31 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
       ;;
   esac
 
-  # Re-read the selected candidate twice and require stable issue, status,
-  # agent, dispatch mode, command revision, manager-preflight revision and an
-  # approved manager author; also apply the accepted #226 candidate machine/
-  # profile cost evaluator and record/dedupe any refusal through the accepted
-  # #235 candidate-effective circuit. A handled refusal occurs before the
-  # canonical scheduler can create an attempt row or mutate GitHub.
   set +e
-  CANDIDATE_OUTPUT="$("$NODE_BIN" "$ROOT/scripts/ops/agent-runner-candidate-admission.mjs" "${ARGS[@]}")"
+  PROBE_EXPECTED_JSON="$("$NODE_BIN" -e '
+    let parsed = null;
+    try { parsed = JSON.parse(process.argv[1]); } catch { parsed = null; }
+    const snapshot = parsed?.candidateSnapshot;
+    if (parsed?.candidate !== true || !snapshot || typeof snapshot !== "object" || !Number.isInteger(snapshot.issueNumber)) process.exit(2);
+    process.stdout.write(JSON.stringify(snapshot));
+  ' "$PROBE_OUTPUT")"
+  PROBE_HANDOFF_STATUS=$?
+  set -e
+  if [ "$PROBE_HANDOFF_STATUS" -ne 0 ]; then
+    write_run_result wrapper_failure candidate-probe-handoff-invalid 1
+    echo "[agent-runner] ERROR: candidate probe did not provide a valid sanitized candidate handoff; refusing before admission/claim" >&2
+    exit 1
+  fi
+
+  # Observation #2: candidate admission receives the successful probe snapshot
+  # through the already-established expected-candidate contract and performs
+  # exactly one fresh canonical selection. All existing issue/status/agent/
+  # manager-authority/body-digest/author/profile checks remain unchanged. A
+  # handled refusal still occurs before the canonical scheduler can create an
+  # attempt row or mutate GitHub; the later atomic revalidation remains intact.
+  set +e
+  CANDIDATE_OUTPUT="$(AGENT_RUNNER_ATOMIC_EXPECTED_JSON="$PROBE_EXPECTED_JSON" \
+    "$NODE_BIN" "$ROOT/scripts/ops/agent-runner-candidate-admission.mjs" "${ARGS[@]}")"
   CANDIDATE_STATUS=$?
   set -e
   case "$CANDIDATE_STATUS" in
