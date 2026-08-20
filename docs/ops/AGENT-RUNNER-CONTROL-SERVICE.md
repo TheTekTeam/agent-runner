@@ -6,7 +6,7 @@ The authenticated Agent Runner control dashboard is a **systemd user service** b
 http://127.0.0.1:8789/
 ```
 
-Port `8787` is reserved for Agent Runner event ingress and is not used or managed by this service.
+Port `8787` is reserved for Agent Runner event ingress and is not used or managed by this service. Both the production server CLI and installer reject `8787` even when no ingress listener is currently present.
 
 ## Security boundary
 
@@ -26,6 +26,8 @@ The repository unit uses the following hardening without capability-transition d
 - `UMask=0077`
 - bounded restart rate, start/stop timeouts, `TasksMax`, and `MemoryMax`
 
+`ExecStart` runs Node with `--jitless`, and the unit sets only the non-secret `NODE_OPTIONS=--jitless` environment assignment so short-lived Node child processes used by the private read-only SQLite snapshot path inherit the same `MemoryDenyWriteExecute`-compatible runtime mode. No environment file is used.
+
 The process gets write access only to:
 
 ```text
@@ -34,7 +36,7 @@ The process gets write access only to:
 ~/.local/state/agent-runner/control-audit.jsonl
 ```
 
-The remainder of `~/.local/state/agent-runner` is read-only to this service, including the operator credential, runner SQLite, implementation lock, and source-activation evidence.
+The remainder of `~/.local/state/agent-runner` is read-only to this service, including the operator credential, runner SQLite, implementation lock, and source-activation evidence. Control load/quota reads use the existing private read-only SQLite snapshot path; they do not open the live execution database through the writable runner-state store.
 
 The unit contains no password, token, secret value, environment file, host override, or arbitrary checkout/config/state path override.
 
@@ -67,9 +69,11 @@ scripts/install-control-dashboard.sh disable
 scripts/install-control-dashboard.sh remove
 ```
 
-All commands accept only an optional canonical decimal `--port PORT`; the default is `8789`. The host is fixed at `127.0.0.1`. No host, executable, environment-file, checkout, config, state, or arbitrary path override is accepted.
+All commands accept only an optional canonical decimal `--port PORT`; the default is `8789`, and `8787` is always rejected as reserved. The host is fixed at `127.0.0.1`. No host, executable, environment-file, checkout, config, state, or arbitrary path override is accepted.
 
-`install` renders only `~/.config/systemd/user/agent-runner-control.service` from the repository source. `install` and `enable` are the only commands allowed to activate the service. `disable` and `remove` act only on `agent-runner-control.service`; `remove` deletes only the user unit and preserves Agent Runner configuration and state.
+`install` installs only `~/.config/systemd/user/agent-runner-control.service` as a systemd unit, rendered from the repository source. After the rendered unit has passed validation and before activation, `install`/`enable` ensure only the three approved writable application sinks exist: the control config directory, protected secret-store directory, and control audit file (plus the audit/secret parent state directory needed to contain them). Existing contents are preserved. This bootstrap never creates the operator credential and never creates, opens, migrates, or modifies runner execution SQLite, locks, or source-activation evidence.
+
+`install` and `enable` are the only commands allowed to activate the service. `disable` and `remove` act only on `agent-runner-control.service`; `remove` deletes only the user unit and preserves Agent Runner configuration and state. If stop/disable cannot be verified, removal fails and preserves the unit file.
 
 ### Idempotent reinstall
 
@@ -77,9 +81,9 @@ If the rendered unit is unchanged and the service is already active, `install` d
 
 ### Changed upgrade and rollback
 
-A changed unit is rendered and validated before the installed service is touched. The installer records whether the previous unit was present, enabled, and active. It then preflights the requested port, installs the replacement, reloads the user manager, activates the service, verifies the exact listener, and performs a bounded unauthenticated dashboard-shell GET.
+A changed unit is rendered and validated before the installed service is touched. The installer records whether the previous unit was present, enabled, and active. It then prepares only the approved writable sinks, stops the prior control process when necessary, preflights the requested port, installs the replacement, reloads the user manager, activates the service, verifies the exact listener, and performs a bounded unauthenticated dashboard-shell GET.
 
-If replacement, reload, activation/restart, listener verification, or shell health verification fails, the installer restores the previous unit and its enabled/active state. It never rolls back or rewrites Agent Runner application state.
+If replacement, reload, activation/restart, listener verification, or shell health verification fails, the installer restores the previous unit and its enabled/active state and verifies that restoration. It never rolls back or rewrites Agent Runner application state.
 
 ## Verification contract
 
@@ -121,6 +125,9 @@ Repository/CI completion is **not** Dell deployment acceptance. After the PR is 
 4. complete an authenticated browser walkthrough through the approved tunnel;
 5. prove unchanged reinstall keeps the same service process/session;
 6. prove a controlled changed upgrade and rollback path;
-7. confirm no runner state, execution units, event transport, Grafana/exporter, or GitHub state changed unexpectedly.
+7. confirm no runner state, execution units, event transport, Grafana/exporter, or GitHub state changed unexpectedly;
+8. reboot once and prove control-service persistence and unchanged scheduler/event topology;
+9. disable/remove/reinstall once and prove state preservation;
+10. prove Grafana/Prometheus unavailability does not affect the standalone dashboard.
 
 Issue #174 and this implementation explicitly do not perform that field step.
