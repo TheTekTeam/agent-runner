@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 
 import { acquireRecoverableCronLock } from './agent-runner-cron-lock.mjs';
 import { PROJECT_SCOPED_ENV_FIELDS } from './agent-runner-config.mjs';
+import { computeManagerProfileShadow } from './agent-runner-manager-profile-shadow.mjs';
 import {
   readProjectRegistryEntries,
   resolveProjectRegistrySelection,
@@ -164,6 +165,7 @@ export async function runImplementationRecurrence({
   acquireLock = acquireRecoverableCronLock,
   now = () => new Date().toISOString(),
   writeEvidenceFile = writeEvidence,
+  computeProfileShadow = computeManagerProfileShadow,
 } = {}) {
   const { registryPath: resolvedRegistryPath, projects } = loadEnabledProjectsWithConfigPaths({ argv, env, registryPath });
 
@@ -172,12 +174,21 @@ export async function runImplementationRecurrence({
   try {
     const { selected, probed } = selectRunnableProject(projects, { probeProject, argv, env });
 
+    // #259: a read-only comparison of the profile-resolved manager context
+    // against each enabled project's canonical registry identity. It is
+    // pure evidence -- computed after selection so it can never influence
+    // which project is probed or invoked -- and any failure inside it is
+    // already captured as a bounded `available: false` result rather than
+    // thrown, so it can never block or alter this recurrence.
+    const profileShadow = computeProfileShadow(projects);
+
     const base = {
       schemaVersion: 1,
       recordedAt: now(),
       registryPath: resolvedRegistryPath,
       lockPath,
       probed,
+      profileShadow,
     };
 
     if (!selected) {

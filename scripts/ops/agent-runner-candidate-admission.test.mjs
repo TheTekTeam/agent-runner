@@ -238,87 +238,80 @@ test('candidate disappearance creates a handled non-mutating pause', () => {
   assert.equal(payload.systemdOutcome, 'handled');
 });
 
-function preflightWithBudget(maxBudgetLine) {
+function preflightWithLegacyBudget(legacyBudgetLine = '', {
+  model = 'sonnet',
+  effort = 'low',
+  revision = 'AR-264',
+  fingerprint = `sha256:${'0'.repeat(64)}`,
+} = {}) {
   return {
-    body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: AR-226\nfingerprint: sha256:${'0'.repeat(64)}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nprofile: narrow\nmodel: sonnet\neffort: low\n${maxBudgetLine}\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\``,
+    body: `<!-- agent-runner:manager-preflight -->
+
+\`\`\`yaml
+schema_version: agent-runner-manager-preflight/v1
+revision: ${revision}
+fingerprint: ${fingerprint}
+producer_type: normal_chatgpt_manager_session
+approved_agent: claude-code-cli
+execution_phase: implementation
+profile: narrow
+model: ${model}
+effort: ${effort}
+${legacyBudgetLine}
+scope:
+  - bounded test scope
+required_validation:
+  - node --test focused
+stop_conditions:
+  - stop on scope expansion
+\`\`\``,
   };
 }
 
-test('quoted manager max_budget_usd normalizes and passes the machine cost gate', () => {
-  const decision = evaluateCandidateMachineProfileAdmission({
-    issue: { number: 5, title: 'narrow test issue', labels: [] },
-    preflight: preflightWithBudget('max_budget_usd: "1.00"'),
-    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
-  });
-  assert.equal(decision.allowed, true);
-  assert.equal(decision.scope, 'machine_profile');
-  assert.equal(decision.costAdmission.requested.maxBudgetUsd, 1.0);
-});
-
-test('unquoted manager max_budget_usd is equivalent to the quoted form', () => {
-  const decision = evaluateCandidateMachineProfileAdmission({
-    issue: { number: 5, title: 'narrow test issue', labels: [] },
-    preflight: preflightWithBudget('max_budget_usd: 1.00'),
-    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
-  });
-  assert.equal(decision.allowed, true);
-  assert.equal(decision.costAdmission.requested.maxBudgetUsd, 1.0);
-});
-
-test('genuine over-cap manager budget fails closed with machine_profile scope', () => {
-  const decision = evaluateCandidateMachineProfileAdmission({
-    issue: { number: 5, title: 'narrow test issue', labels: [] },
-    preflight: preflightWithBudget('max_budget_usd: "2.50"'),
-    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
-  });
-  assert.equal(decision.allowed, false);
-  assert.equal(decision.scope, 'machine_profile');
-  assert.equal(decision.reason, 'candidate-machine-profile-cost-denied');
-  assert.ok(decision.violations.includes('budget-cap-exceeds-machine-policy'));
-  assert.match(decision.safeNextAction, /fresh superseding immutable manager-preflight authority/);
-  assert.match(decision.safeNextAction, /existing packet must not be edited/);
-  assert.match(decision.safeNextAction, /separately authorised machine-local policy change/);
-});
-
-for (const malformed of ['max_budget_usd: "2.00\'', 'max_budget_usd: ""', 'max_budget_usd: not-a-number', 'max_budget_usd: 0', 'max_budget_usd: -1.00']) {
-  test(`malformed/zero/negative manager budget (${malformed}) fails closed without profile-default fallback`, () => {
+test('legacy manager dollar-budget fields cannot affect candidate admission', () => {
+  for (const legacy of [
+    'max_budget_usd: "1.00"',
+    'max_budget_usd: "8.00"',
+    'max_budget_usd: not-a-number',
+    'max_budget_usd: 0',
+    'max_budget_usd: -1.00',
+    '',
+  ]) {
     const decision = evaluateCandidateMachineProfileAdmission({
-      issue: { number: 5, title: 'narrow test issue', labels: [] },
-      preflight: preflightWithBudget(malformed),
-      env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
+      issue: { number: 264, title: 'narrow test issue', labels: [] },
+      preflight: preflightWithLegacyBudget(legacy),
+      env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '0.01' },
     });
-    assert.equal(decision.allowed, false);
-    assert.equal(decision.scope, 'machine_profile');
-    assert.ok(decision.violations.includes('budget-cap-exceeds-machine-policy'));
-    assert.notEqual(decision.costAdmission.requested.maxBudgetUsd, 0.5);
-  });
-}
 
-test('opus model requires explicit machine-local opt-in through the same cost gate', () => {
-  const decision = evaluateCandidateMachineProfileAdmission({
-    issue: { number: 5, title: 'narrow test issue', labels: [] },
-    preflight: preflightWithBudget('max_budget_usd: "1.00"'),
-    argsModel: 'opus',
-    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
+    assert.equal(decision.allowed, true, legacy);
+    assert.equal(Object.prototype.hasOwnProperty.call(decision.profile, 'maxBudgetUsd'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(decision.costAdmission.requested, 'maxBudgetUsd'), false);
+    assert.equal(Object.prototype.hasOwnProperty.call(decision.costAdmission.policy, 'maxBudgetUsd'), false);
+  }
+});
+
+test('Opus still requires explicit machine-local opt-in', () => {
+  const denied = evaluateCandidateMachineProfileAdmission({
+    issue: { number: 264, title: 'narrow test issue', labels: [] },
+    preflight: preflightWithLegacyBudget('max_budget_usd: "8.00"', { model: 'opus' }),
+    env: {},
   });
-  assert.equal(decision.allowed, false);
-  assert.ok(decision.violations.includes('opus-requires-explicit-machine-opt-in'));
+  assert.equal(denied.allowed, false);
+  assert.ok(denied.violations.includes('opus-requires-explicit-machine-opt-in'));
 
   const allowed = evaluateCandidateMachineProfileAdmission({
-    issue: { number: 5, title: 'narrow test issue', labels: [] },
-    preflight: preflightWithBudget('max_budget_usd: "1.00"'),
-    argsModel: 'opus',
-    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', CLAUDE_RUNNER_ALLOW_OPUS: 'true' },
+    issue: { number: 264, title: 'narrow test issue', labels: [] },
+    preflight: preflightWithLegacyBudget('max_budget_usd: "8.00"', { model: 'opus' }),
+    env: { CLAUDE_RUNNER_ALLOW_OPUS: 'true' },
   });
   assert.equal(allowed.allowed, true);
 });
 
-test('xhigh effort requires explicit machine-local opt-in through the same cost gate', () => {
+test('xhigh effort still requires explicit machine-local opt-in', () => {
   const decision = evaluateCandidateMachineProfileAdmission({
-    issue: { number: 5, title: 'narrow test issue', labels: [] },
-    preflight: preflightWithBudget('max_budget_usd: "1.00"'),
-    argsEffort: 'xhigh',
-    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' },
+    issue: { number: 264, title: 'narrow test issue', labels: [] },
+    preflight: preflightWithLegacyBudget('', { effort: 'xhigh' }),
+    env: {},
   });
   assert.equal(decision.allowed, false);
   assert.ok(decision.violations.includes('high-effort-requires-explicit-machine-opt-in'));
@@ -350,95 +343,94 @@ function tmpCircuitDbPath() {
   return join(dir, 'circuit.sqlite');
 }
 
-function selectionWithBudget({ maxBudgetLine = 'max_budget_usd: "2.50"', model = 'sonnet', effort = 'low', preflightId = 300 } = {}) {
+function selectionWithProfile({
+  model = 'opus',
+  effort = 'low',
+  preflightId = 300,
+  legacyBudgetLine = 'max_budget_usd: "8.00"',
+} = {}) {
   const preflight = {
     id: preflightId,
     databaseId: preflightId,
-    createdAt: '2026-08-17T20:00:00Z',
-    body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: AR-${preflightId}\nfingerprint: sha256:${String(preflightId).padStart(64, '0')}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nprofile: narrow\nmodel: ${model}\neffort: ${effort}\n${maxBudgetLine}\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\``,
+    createdAt: '2026-08-19T20:00:00Z',
+    body: preflightWithLegacyBudget(legacyBudgetLine, {
+      model,
+      effort,
+      revision: `AR-${preflightId}`,
+      fingerprint: `sha256:${String(preflightId).padStart(64, '0')}`,
+    }).body,
     user: { login: 'gpcola' },
   };
+
   return {
-    issue: { number: 9, labels: ['status:ready', 'agent:claude'], statusLabel: 'status:ready', agentLabel: 'agent:claude' },
+    issue: {
+      number: 264,
+      labels: ['status:ready', 'agent:claude'],
+      statusLabel: 'status:ready',
+      agentLabel: 'agent:claude',
+    },
     selection: { mode: 'preflight-direct', command: null, preflight },
     command: null,
     currentPreflight: preflight,
   };
 }
 
-test('historical #205 shape: a synthetic over-cap manager budget refuses with machine_profile scope before any attempt/claim/child side effect', async () => {
+test('candidate circuit still dedupes model/effort policy refusals without any dollar material', async () => {
   const dbPath = tmpCircuitDbPath();
-  const values = [selectionWithBudget(), selectionWithBudget()];
+  const values = [selectionWithProfile(), selectionWithProfile()];
   let calls = 0;
-  const result = await admitCurrentCandidate({
-    env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
-    select: async () => values[calls++],
-  });
-  assert.equal(result.admission.allowed, false);
-  assert.equal(result.admission.scope, 'machine_profile');
-  assert.equal(result.admission.reason, 'candidate-machine-profile-cost-denied');
-  assert.ok(result.admission.violations.includes('budget-cap-exceeds-machine-policy'));
-  assert.match(result.admission.effectiveFingerprint, /^sha256:[0-9a-f]{64}$/);
-  assert.equal(result.admission.occurrenceCount, 1);
 
-  const payload = candidatePausePayload(result.admission, result.current);
-  assert.equal(payload.failureScope, 'machine_profile');
-  assert.equal(payload.attemptCreated, false);
-  assert.equal(payload.childLaunched, false);
-  assert.equal(payload.issueMutation, false);
-  assert.equal(payload.systemdOutcome, 'handled');
-});
-
-test('same candidate profile at or below the machine cap continues past the cost gate unchanged', async () => {
-  const dbPath = tmpCircuitDbPath();
-  const values = [selectionWithBudget({ preflightId: 310, maxBudgetLine: 'max_budget_usd: "1.00"' }), selectionWithBudget({ preflightId: 310, maxBudgetLine: 'max_budget_usd: "1.00"' })];
-  let calls = 0;
-  const result = await admitCurrentCandidate({
-    env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
-    select: async () => values[calls++],
-  });
-  assert.equal(result.admission.allowed, true);
-  assert.equal(result.admission.reason, 'candidate-admitted');
-});
-
-test('a repeated identical candidate-effective refusal stays deduped as one bounded circuit incident, and a fresh compliant manager authority is not blocked by the stale entry', async () => {
-  const dbPath = tmpCircuitDbPath();
-  const overCap = [selectionWithBudget({ preflightId: 320 }), selectionWithBudget({ preflightId: 320 })];
-  let calls = 0;
   const first = await admitCurrentCandidate({
-    env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
-    select: async () => overCap[calls++],
+    env: {
+      CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola',
+      AGENT_RUNNER_CIRCUIT_DB: dbPath,
+    },
+    select: async () => values[calls++],
   });
+
+  assert.equal(first.admission.allowed, false);
   assert.equal(first.admission.scope, 'machine_profile');
+  assert.ok(first.admission.violations.includes('opus-requires-explicit-machine-opt-in'));
+  assert.match(first.admission.effectiveFingerprint, /^sha256:[0-9a-f]{64}$/);
   assert.equal(first.admission.occurrenceCount, 1);
 
   calls = 0;
   const second = await admitCurrentCandidate({
-    env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
-    select: async () => overCap[calls++],
+    env: {
+      CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola',
+      AGENT_RUNNER_CIRCUIT_DB: dbPath,
+    },
+    select: async () => values[calls++],
   });
+
   assert.equal(second.admission.effectiveFingerprint, first.admission.effectiveFingerprint);
-  assert.equal(second.admission.occurrenceCount, 2, 'the same fingerprint/reason must dedupe into one incrementing incident');
+  assert.equal(second.admission.occurrenceCount, 2);
 
   const compliant = [
-    selectionWithBudget({ preflightId: 321, maxBudgetLine: 'max_budget_usd: "1.00"' }),
-    selectionWithBudget({ preflightId: 321, maxBudgetLine: 'max_budget_usd: "1.00"' }),
+    selectionWithProfile({ model: 'sonnet', preflightId: 301 }),
+    selectionWithProfile({ model: 'sonnet', preflightId: 301 }),
   ];
   calls = 0;
+
   const third = await admitCurrentCandidate({
-    env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
+    env: {
+      CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola',
+      AGENT_RUNNER_CIRCUIT_DB: dbPath,
+    },
     select: async () => compliant[calls++],
   });
-  assert.equal(third.admission.allowed, true, 'a fresh superseding authority with a compliant budget must not be blocked by a stale candidate circuit entry');
+
+  assert.equal(third.admission.allowed, true);
 });
 
-test('evaluateCandidateCostAdmission passes through machine-admitted candidates without touching the circuit', () => {
+test('evaluateCandidateCostAdmission passes an ordinary subscription candidate without touching a budget policy', () => {
   const dbPath = tmpCircuitDbPath();
   const result = evaluateCandidateCostAdmission({
-    issue: { number: 5, title: 'narrow test issue', labels: [] },
-    preflight: { body: `<!-- agent-runner:manager-preflight -->\n\n\`\`\`yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: AR-330\nfingerprint: sha256:${'0'.repeat(64)}\nproducer_type: normal_chatgpt_manager_session\napproved_agent: claude-code-cli\nexecution_phase: implementation\nprofile: narrow\nmodel: sonnet\neffort: low\nmax_budget_usd: "1.00"\nscope:\n  - bounded test scope\nrequired_validation:\n  - node --test focused\nstop_conditions:\n  - stop on scope expansion\n\`\`\`` },
-    env: { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2', AGENT_RUNNER_CIRCUIT_DB: dbPath },
+    issue: { number: 264, title: 'narrow test issue', labels: [] },
+    preflight: preflightWithLegacyBudget('max_budget_usd: "999.00"'),
+    env: { AGENT_RUNNER_CIRCUIT_DB: dbPath },
   });
+
   assert.equal(result.allowed, true);
   assert.equal(result.decision.scope, 'machine_profile');
 });

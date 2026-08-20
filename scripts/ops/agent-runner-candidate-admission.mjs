@@ -23,7 +23,6 @@ import {
 import {
   evaluateClaudeCostAdmission,
   inferProfile,
-  managerBudgetOverride,
   resolveProfile,
 } from './claude-runner.mjs';
 
@@ -186,9 +185,9 @@ export function evaluateCandidateAdmission({ initial, current, approvers = [] } 
 /**
  * Issue #226: pure candidate machine/profile cost decision. Reuses
  * `resolveManagerPreflightExecutionMetadata()` for quote-safe profile/model/
- * effort/max_budget_usd scalars and the canonical `resolveProfile()`/
+ * effort scalars and the canonical `resolveProfile()`/
  * `evaluateClaudeCostAdmission()` semantics claude-runner.mjs already uses
- * for a real attempt -- no second cost policy. Performs no GitHub, attempt,
+ * for a real attempt -- no second model/effort policy. Performs no GitHub, attempt,
  * workspace or provider mutation; it only inspects the immutable manager
  * preflight and issue already supplied by the caller.
  */
@@ -198,7 +197,6 @@ export function evaluateCandidateMachineProfileAdmission({
   argsProfile,
   argsModel,
   argsEffort,
-  argsMaxBudgetUsd,
   env = process.env,
 } = {}) {
   const managerExecutionMeta = resolveManagerPreflightExecutionMetadata(preflight);
@@ -209,7 +207,6 @@ export function evaluateCandidateMachineProfileAdmission({
   const profile = resolveProfile(profileName, {
     model: argsModel || managerExecutionMeta.model,
     effort: argsEffort || managerExecutionMeta.effort,
-    maxBudgetUsd: argsMaxBudgetUsd || managerBudgetOverride(managerExecutionMeta.maxBudgetUsd),
   }, env);
   const costAdmission = evaluateClaudeCostAdmission(profile, env);
   if (!costAdmission.allowed) {
@@ -218,7 +215,7 @@ export function evaluateCandidateMachineProfileAdmission({
       scope: 'machine_profile',
       reason: 'candidate-machine-profile-cost-denied',
       violations: costAdmission.violations,
-      safeNextAction: 'A changed manager intent/profile/budget requires a fresh superseding immutable manager-preflight authority; the existing packet must not be edited. Where permitted, use a separately authorised machine-local policy change for Opus/xhigh. This runner will not raise the machine cost ceiling automatically.',
+      safeNextAction: 'A changed manager intent/profile requires a fresh superseding immutable manager-preflight authority; the existing packet must not be edited. Where permitted, use a separately authorised machine-local policy change for Opus/xhigh.',
       profile,
       costAdmission,
     };
@@ -258,7 +255,6 @@ export function evaluateCandidateCostAdmission({
     managerAuthority,
     profile: decision.profile,
     costAdmission: decision.costAdmission,
-    managerMaxBudgetUsd: resolveManagerPreflightExecutionMetadata(preflight).maxBudgetUsd,
   });
 
   const breaker = new CandidateProfileCircuitBreaker(circuitDbPath);

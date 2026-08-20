@@ -222,42 +222,12 @@ export function managerAuthorityApprovesAgent(authority, agentId) {
 }
 
 /**
- * Issue #221: a canonical, quote-safe budget normalizer that consumes the
- * *raw* (quote-preserved) scalar text so it can detect one-sided/mismatched
- * quoting (e.g. `"1.00`, `1.00"`, `'1.00`, `1.00'`) and fail closed instead
- * of silently dropping the unmatched quote and treating the remainder as a
- * valid number. Balanced quotes (`"1.00"`, `'1.00'`) and unquoted values
- * still resolve identically. An explicit empty/malformed/nonnumeric/
- * zero/negative value must fail closed rather than silently becoming an
- * absent value that a caller could default.
- */
-function normalizeManagerPreflightBudget(raw) {
-  if (raw === null || raw === undefined) {
-    return Object.freeze({ present: false, valid: false, value: null, raw: null });
-  }
-  const trimmed = String(raw).trim();
-  if (trimmed === '') {
-    return Object.freeze({ present: true, valid: false, value: null, raw: trimmed });
-  }
-  const leadingQuote = /^["']/.test(trimmed);
-  const trailingQuote = /["']$/.test(trimmed);
-  const matchedPair = trimmed.length >= 2 && trimmed[0] === trimmed[trimmed.length - 1];
-  if (leadingQuote !== trailingQuote || (leadingQuote && trailingQuote && !matchedPair)) {
-    return Object.freeze({ present: true, valid: false, value: null, raw: trimmed });
-  }
-  const unquoted = leadingQuote && trailingQuote ? trimmed.slice(1, -1) : trimmed;
-  const numeric = Number(unquoted);
-  const valid = Number.isFinite(numeric) && numeric > 0;
-  return Object.freeze({ present: true, valid, value: valid ? numeric : null, raw: unquoted });
-}
-
-/**
- * Issue #221: single canonical resolver for the manager-preflight
- * `profile`/`model`/`effort`/`max_budget_usd` execution scalars. Reuses the
- * existing quote-safe `scalarFromYamlBlock` path rather than adding a
- * second free-form YAML parser, so it stays a bounded/non-secret seam that
- * #208 candidate admission and child-defense can reuse without re-solving
- * scalar normalization.
+ * Resolve only execution scalars that remain authoritative for
+ * subscription-backed Claude execution.
+ *
+ * Historical immutable packets may contain `max_budget_usd`. It is
+ * deliberately ignored here: the field is compatibility data only and
+ * cannot influence admission, profile resolution or child CLI arguments.
  */
 export function resolveManagerPreflightExecutionMetadata(commentOrBody) {
   const comment = typeof commentOrBody === 'string'
@@ -268,6 +238,5 @@ export function resolveManagerPreflightExecutionMetadata(commentOrBody) {
     profile: scalarFromYamlBlock(body, 'profile') || null,
     model: scalarFromYamlBlock(body, 'model') || null,
     effort: scalarFromYamlBlock(body, 'effort') || null,
-    maxBudgetUsd: normalizeManagerPreflightBudget(rawScalarFromYamlBlock(body, 'max_budget_usd')),
   });
 }

@@ -5,7 +5,7 @@ import { DatabaseSync } from 'node:sqlite';
 
 export const CANDIDATE_PROFILE_CIRCUIT_DOMAIN = 'candidate_profile';
 export const CANDIDATE_PROFILE_EXTERNAL_FAILURE_SCOPE = 'machine_profile';
-export const CANDIDATE_PROFILE_CIRCUIT_POLICY_REVISION = 'candidate-profile-cost-circuit/v1';
+export const CANDIDATE_PROFILE_CIRCUIT_POLICY_REVISION = 'candidate-profile-policy-circuit/v2';
 
 function sha256(value) {
   return createHash('sha256').update(String(value ?? '')).digest('hex');
@@ -14,16 +14,6 @@ function sha256(value) {
 function text(value) {
   const normalized = String(value ?? '').trim();
   return normalized || null;
-}
-
-function finitePositiveNumber(value) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
-}
-
-function canonicalNumber(value) {
-  const parsed = finitePositiveNumber(value);
-  return parsed == null ? null : String(parsed);
 }
 
 function requireText(value, field) {
@@ -40,29 +30,11 @@ function requireSha256(value, field) {
   return normalized;
 }
 
-export function candidateBudgetIdentity({ managerMaxBudgetUsd = null, profileMaxBudgetUsd = null } = {}) {
-  if (managerMaxBudgetUsd?.present === true) {
-    const validValue = managerMaxBudgetUsd.valid === true
-      ? canonicalNumber(managerMaxBudgetUsd.value)
-      : null;
-    if (validValue != null) return `manager-valid:${validValue}`;
-    return `manager-invalid:sha256:${sha256(managerMaxBudgetUsd.raw ?? '')}`;
-  }
-
-  const resolved = canonicalNumber(profileMaxBudgetUsd);
-  if (resolved != null) return `profile-resolved:${resolved}`;
-  if (profileMaxBudgetUsd !== undefined && profileMaxBudgetUsd !== null && String(profileMaxBudgetUsd) !== '') {
-    return `profile-invalid:sha256:${sha256(profileMaxBudgetUsd)}`;
-  }
-  return 'absent';
-}
-
 export function candidateEffectiveCostFingerprintMaterial({
   machineConfigurationFingerprint,
   managerAuthority = {},
   profile = {},
   costAdmission = {},
-  managerMaxBudgetUsd = null,
 } = {}) {
   const machineFingerprint = requireSha256(machineConfigurationFingerprint, 'machineConfigurationFingerprint');
   const revision = requireText(managerAuthority.revision, 'managerAuthority.revision');
@@ -77,18 +49,6 @@ export function candidateEffectiveCostFingerprintMaterial({
   const resolvedProfile = requireText(profile.profile, 'profile.profile');
   const resolvedModel = requireText(profile.model, 'profile.model');
   const resolvedEffort = requireText(profile.effort, 'profile.effort');
-  const budgetIdentity = candidateBudgetIdentity({
-    managerMaxBudgetUsd,
-    profileMaxBudgetUsd: profile.maxBudgetUsd,
-  });
-  if (budgetIdentity === 'absent') {
-    throw new Error('resolved candidate budget identity is required');
-  }
-
-  const machineMaxBudgetUsd = canonicalNumber(costAdmission?.policy?.maxBudgetUsd);
-  if (machineMaxBudgetUsd == null) {
-    throw new Error('costAdmission.policy.maxBudgetUsd must be a positive finite number');
-  }
   if (typeof costAdmission?.policy?.opusAllowed !== 'boolean') {
     throw new Error('costAdmission.policy.opusAllowed must be boolean');
   }
@@ -109,10 +69,8 @@ export function candidateEffectiveCostFingerprintMaterial({
       profile: resolvedProfile,
       model: resolvedModel,
       effort: resolvedEffort,
-      budgetIdentity,
     },
     machineCostPolicy: {
-      maxBudgetUsd: machineMaxBudgetUsd,
       opusAllowed: costAdmission.policy.opusAllowed,
       highEffortAllowed: costAdmission.policy.highEffortAllowed,
     },
@@ -192,7 +150,7 @@ export class CandidateProfileCircuitBreaker {
       occurrenceCount: row.occurrence_count,
       trippedAt: row.tripped_at,
       notificationEmitted: Boolean(row.notification_emitted),
-      safeNextAction: 'If manager intent/profile/budget changes, issue a fresh superseding immutable manager authority; do not edit the existing packet. If machine policy must change, require a separately authorised machine-local policy action. Never raise budget, enable Opus/xhigh, or enable paid fallback automatically.',
+      safeNextAction: 'If manager intent/profile changes, issue a fresh superseding immutable manager authority; do not edit the existing packet. If machine policy must change, require a separately authorised machine-local policy action. Never enable Opus/xhigh or paid fallback automatically.',
     };
   }
 
@@ -252,7 +210,7 @@ export function candidateProfileCircuitPausePayload(result = {}) {
     circuitDomain: CANDIDATE_PROFILE_CIRCUIT_DOMAIN,
     failureScope: CANDIDATE_PROFILE_EXTERNAL_FAILURE_SCOPE,
     reason: result.reason || null,
-    safeNextAction: result.safeNextAction || 'Issue fresh immutable manager authority or separately authorise a machine-local policy change; never edit an existing packet or raise cost controls automatically.',
+    safeNextAction: result.safeNextAction || 'Issue fresh immutable manager authority or separately authorise a machine-local model/effort policy change; never edit an existing packet or enable paid fallback automatically.',
     candidateEffectiveFingerprint: result.effectiveFingerprint || null,
     occurrenceCount: result.occurrenceCount || 0,
     selectedIssue: null,

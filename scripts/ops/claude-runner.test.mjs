@@ -26,7 +26,6 @@ import {
   inferProfile,
   implementationProcessCwd,
   latestManagerPreflightComment,
-  managerBudgetOverride,
   nativeClaudeWorktreeName,
   parseArgs,
   parseClaudeResultEnvelope,
@@ -100,7 +99,7 @@ test('claude-runner.mjs re-exports manager preflight helpers from the shared sel
 test('buildPreflightDirectPrompt builds the prompt from issue title/body and the manager preflight packet, not a proceed command', () => {
   const issue = { number: 641, title: 'Agent Runner v2', body: 'Implement preflight-direct dispatch.' };
   const preflight = { id: 12, sourceCommentId: 12, body: '## Manager preflight packet\nFiles checked by ChatGPT.' };
-  const profile = { profile: 'complex', model: 'sonnet', effort: 'high', maxBudgetUsd: '4.00' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'high' };
 
   const prompt = buildPreflightDirectPrompt({ issue, preflight, profile, clearContext: true });
 
@@ -116,7 +115,7 @@ test('buildPreflightDirectPrompt builds the prompt from issue title/body and the
 
 test('buildClaudePrompt (compatibility mode) still relays the literal command text', () => {
   const issue = { number: 99, title: 'Legacy command issue' };
-  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50' };
+  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium' };
   const prompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext: false });
   assert.equal(prompt.startsWith('/clear'), false);
   assert.match(prompt, /Latest Claude command:/);
@@ -125,7 +124,7 @@ test('buildClaudePrompt (compatibility mode) still relays the literal command te
 
 test('buildClaudePrompt with clearContext uses a plain fresh-context instruction, not a slash command', () => {
   const issue = { number: 99, title: 'Legacy command issue' };
-  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50' };
+  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium' };
   const prompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext: true });
   assert.equal(prompt.startsWith('/clear'), false);
   assert.match(prompt, /^Start a fresh task context\./);
@@ -133,7 +132,7 @@ test('buildClaudePrompt with clearContext uses a plain fresh-context instruction
 
 test('implementation prompt consumes the manager preflight as the plan and requires repository work', () => {
   const issue = { number: 658, title: 'Portable runner entrypoints' };
-  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00', permissionMode: 'dontAsk' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium', permissionMode: 'dontAsk' };
   const prompt = buildClaudePrompt({
     issue,
     commandText: '## Claude proceed command\nPhase: implementation',
@@ -222,7 +221,7 @@ test('#686 regression: the actual fetched preflight text (no structured field) s
   const prompt = buildPreflightDirectPrompt({
     issue: { number: 686, title: 'OPS.AGENT.RUNNER.STANDALONE.REPO.1', body: 'Extract Agent Runner.' },
     preflight: { id: 5029607103, sourceCommentId: 5029607103, body: ISSUE_686_MANAGER_PREFLIGHT_BODY },
-    profile: { profile: 'complex', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00' },
+    profile: { profile: 'complex', model: 'sonnet', effort: 'medium' },
     clearContext: true,
     executionPhase: EXECUTION_PHASE_IMPLEMENTATION,
     worktreeIdentity: { name: 'agent-runner-686-5029607103', expectedBranch: 'worktree-agent-runner-686-5029607103' },
@@ -248,7 +247,7 @@ test('#686 regression: once the preflight names the runner repository explicitly
   const prompt = buildPreflightDirectPrompt({
     issue: { number: 686, title: 'OPS.AGENT.RUNNER.STANDALONE.REPO.1', body: 'Extract Agent Runner.' },
     preflight: { id: 5029607103, sourceCommentId: 5029607103, body: updatedBody },
-    profile: { profile: 'complex', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00' },
+    profile: { profile: 'complex', model: 'sonnet', effort: 'medium' },
     clearContext: true,
     executionPhase: EXECUTION_PHASE_IMPLEMENTATION,
     worktreeIdentity: { name: 'agent-runner-686-5029607103', expectedBranch: 'worktree-agent-runner-686-5029607103' },
@@ -269,7 +268,7 @@ test('buildClaudePrompt and buildPreflightDirectPrompt never say "working on Mod
     implementationInstructionPaths: ['AGENTS.md'],
   };
   const issue = { number: 5, title: 'Simplify queue admission' };
-  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.00' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'medium' };
 
   const claudePrompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext: false, repositoryContext });
   const preflightPrompt = buildPreflightDirectPrompt({ issue, preflight: { id: 1, body: 'x' }, profile, clearContext: false, repositoryContext });
@@ -282,7 +281,7 @@ test('buildClaudePrompt and buildPreflightDirectPrompt never say "working on Mod
 
 test('prompts default to the historical ModelSpend instruction set when no repository context is supplied, preserving ordinary same-repository behaviour', () => {
   const issue = { number: 99, title: 'Legacy command issue' };
-  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50' };
+  const profile = { profile: 'narrow', model: 'sonnet', effort: 'medium' };
   const prompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext: false });
   assert.match(prompt, /Follow CLAUDE\.md\./);
   assert.match(prompt, /Follow docs\/claude\/README\.md\./);
@@ -293,7 +292,7 @@ test('prompts default to the historical ModelSpend instruction set when no repos
 test('generated issue-mode prompts never start with a literal /clear slash command, with or without clearContext', () => {
   const issue = { number: 641, title: 'Agent Runner v2', body: 'Implement preflight-direct dispatch.' };
   const preflight = { id: 12, sourceCommentId: 12, body: '## Manager preflight packet\nFiles checked by ChatGPT.' };
-  const profile = { profile: 'complex', model: 'sonnet', effort: 'high', maxBudgetUsd: '4.00' };
+  const profile = { profile: 'complex', model: 'sonnet', effort: 'high' };
 
   for (const clearContext of [true, false]) {
     const claudePrompt = buildClaudePrompt({ issue, commandText: '## Claude proceed command\nDo the thing', profile, clearContext });
@@ -339,23 +338,24 @@ test('clear policy defaults to fresh context', () => {
   assert.equal(shouldUseClear({ noClear: true }), false);
 });
 
-test('Claude args include model effort and budget without interaction caps', () => {
+test('Claude args include model and effort without interaction or dollar-budget caps', () => {
   const args = buildClaudeArgs({
     prompt: 'hello',
-    profile: { model: 'sonnet', effort: 'medium', maxBudgetUsd: '1.50', permissionMode: 'plan' },
+    profile: { model: 'sonnet', effort: 'medium', permissionMode: 'plan' },
   });
-  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--max-budget-usd', '1.50', '--permission-mode', 'plan', '--output-format', 'json']);
+  assert.deepEqual(args.slice(0, -1), ['-p', '--model', 'sonnet', '--effort', 'medium', '--permission-mode', 'plan', '--output-format', 'json']);
+  assert.equal(args.includes('--max-budget-usd'), false);
 });
-
 
 test('#86: approved branches use the runner-prepared worktree and never Claude native branch generation', () => {
   const approved = { name: 'agent-runner-743-github-comment-database-5079980543', expectedBranch: 'claude/supervised-canary-743' };
   assert.equal(nativeClaudeWorktreeName(approved), undefined);
   const args = buildClaudeArgs({
     prompt: 'implement',
-    profile: { model: 'sonnet', effort: 'low', maxBudgetUsd: '0.50', permissionMode: 'dontAsk', worktreeName: nativeClaudeWorktreeName(approved) },
+    profile: { model: 'sonnet', effort: 'low', permissionMode: 'dontAsk', worktreeName: nativeClaudeWorktreeName(approved) },
   });
   assert.equal(args.includes('--worktree'), false);
+  assert.equal(args.includes('--max-budget-usd'), false);
 
   const legacy = { name: 'agent-runner-658-source', expectedBranch: 'worktree-agent-runner-658-source' };
   assert.equal(nativeClaudeWorktreeName(legacy), legacy.name);
@@ -378,102 +378,78 @@ test('#86: worker cwd uses the approved runner-owned worktree and preserves lega
   assert.equal(implementationProcessCwd(null, '/fallback'), '/fallback');
 });
 
-test('critical defaults retain monetary bounds and do not silently select Opus/xhigh', () => {
+test('critical defaults select Sonnet/high without a monetary execution limit', () => {
   const profile = resolveProfile('critical');
   assert.equal(profile.model, 'sonnet');
   assert.equal(profile.effort, 'high');
   assert.equal(Object.keys(profile).includes(['max', 'Turns'].join('')), false);
-  assert.equal(profile.maxBudgetUsd, '1.50');
+  assert.equal(Object.prototype.hasOwnProperty.call(profile, 'maxBudgetUsd'), false);
 });
 
-test('unattended cost admission rejects the observed #658 Opus/xhigh/$8 controls', () => {
-  const result = evaluateClaudeCostAdmission({ model: 'opus', effort: 'xhigh', maxBudgetUsd: '8.00' }, {});
+test('unattended admission rejects Opus/xhigh only for their explicit machine opt-ins', () => {
+  const result = evaluateClaudeCostAdmission({ model: 'opus', effort: 'xhigh' }, {});
   assert.equal(result.allowed, false);
   assert.deepEqual(result.violations, [
     'opus-requires-explicit-machine-opt-in',
     'high-effort-requires-explicit-machine-opt-in',
-    'budget-cap-exceeds-machine-policy',
   ]);
+  assert.equal(Object.prototype.hasOwnProperty.call(result.requested, 'maxBudgetUsd'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(result.policy, 'maxBudgetUsd'), false);
 });
 
-test('unattended cost admission permits the bounded critical default', () => {
+test('unattended admission permits the critical default', () => {
   const result = evaluateClaudeCostAdmission(resolveProfile('critical'), {});
   assert.equal(result.allowed, true);
   assert.deepEqual(result.violations, []);
 });
 
-test('Opus/xhigh can only be admitted with explicit machine opt-ins and raised caps', () => {
+test('Opus/xhigh can be admitted only with their explicit machine-local opt-ins', () => {
   const result = evaluateClaudeCostAdmission(
-    { model: 'opus', effort: 'xhigh', maxBudgetUsd: '8.00' },
+    { model: 'opus', effort: 'xhigh' },
     {
       CLAUDE_RUNNER_ALLOW_OPUS: 'true',
       CLAUDE_RUNNER_ALLOW_XHIGH: 'true',
-      CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '8',
     },
   );
   assert.equal(result.allowed, true);
 });
 
-test('managerBudgetOverride normalizes an absent, valid or invalid canonical manager budget', () => {
-  assert.equal(managerBudgetOverride({ present: false, valid: false, value: null, raw: null }), undefined);
-  assert.equal(managerBudgetOverride({ present: true, valid: true, value: 2, raw: '2.00' }), 2);
-  // An invalid budget keeps its raw text for diagnosis, but only behind a
-  // non-numeric prefix: evaluateClaudeCostAdmission() reads the override with
-  // Number.parseFloat(), which would otherwise recover `2` from `2.00"` and
-  // admit a packet #221's quote-safe normalizer already rejected.
-  assert.equal(
-    managerBudgetOverride({ present: true, valid: false, value: null, raw: 'not-a-number' }),
-    'invalid-manager-max-budget-usd:not-a-number',
-  );
-  assert.equal(
-    managerBudgetOverride({ present: true, valid: false, value: null, raw: '2.00"' }),
-    'invalid-manager-max-budget-usd:2.00"',
-  );
-  // Empty explicit raw text must not collapse to a falsy override --
-  // resolveProfile()'s own `||` default fallback would silently substitute
-  // the profile default instead of failing closed downstream.
-  assert.equal(
-    managerBudgetOverride({ present: true, valid: false, value: null, raw: '' }),
-    'invalid-manager-max-budget-usd',
-  );
-  // Every invalid shape must parse back to NaN, never to a number a cost
-  // ceiling comparison could admit.
-  for (const raw of ['2.00"', "2.00'", '"2.00', '0', '-1.00', '']) {
-    const override = managerBudgetOverride({ present: true, valid: false, value: null, raw });
-    assert.ok(Number.isNaN(Number.parseFloat(override)), `expected NaN parse for raw "${raw}"`);
-  }
-});
+test('legacy manager max_budget_usd values cannot affect dispatch, profile resolution or admission', () => {
+  const variants = [
+    'max_budget_usd: 1.00',
+    'max_budget_usd: 8.00',
+    'max_budget_usd: "8.00"',
+    'max_budget_usd: not-a-number',
+    'max_budget_usd: 0',
+    'max_budget_usd: -1.00',
+    '',
+  ];
 
-// #223 field evidence: #208's `.5` attempt persisted `profile.maxBudgetUsd`
-// `"\"4.00\""` and `costAdmission.requested.maxBudgetUsd` `null` because the
-// child-dispatch derivation fed the generic-parser (quote-preserving) value
-// straight into `resolveProfile()`. These fixtures reproduce that exact
-// packet shape through `resolveImplementationDispatchIdentity()`.
-const DISPATCH_FP = `sha256:${'b'.repeat(64)}`;
-const DISPATCH_BASE_COMMIT = 'a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e';
+  const fp = `sha256:${'b'.repeat(64)}`;
+  const base = 'a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3e';
 
-function dispatchPreflight({ maxBudgetUsdLine = 'max_budget_usd: 2.00' } = {}) {
-  return {
-    id: 5310303832,
-    databaseId: 5310303832,
-    user: { login: 'gpcola' },
-    body: `<!-- agent-runner:manager-preflight -->
+  for (const legacyBudgetLine of variants) {
+    const preflight = {
+      id: 5310303832,
+      databaseId: 5310303832,
+      user: { login: 'gpcola' },
+      body: `<!-- agent-runner:manager-preflight -->
 
 \`\`\`yaml
 schema_version: agent-runner-manager-preflight/v1
-revision: AR223-DISPATCH-TEST-2026-08-17.1
-fingerprint: ${DISPATCH_FP}
+revision: AR264-DISPATCH-TEST-2026-08-19.1
+fingerprint: ${fp}
 producer_type: normal_chatgpt_manager_session
 approved_agent: claude-code-cli
 execution_phase: implementation
 approved_repository_scope:
   - TheTekTeam/agent-runner
-approved_branch: claude/manager-execution-handoff-223-v1
-base_commit: ${DISPATCH_BASE_COMMIT}
+approved_branch: codex/remove-subscription-budget-caps-264
+base_commit: ${base}
 profile: complex
 model: sonnet
 effort: medium
-${maxBudgetUsdLine}
+${legacyBudgetLine}
 scope:
   - bounded scope
 required_validation:
@@ -482,93 +458,43 @@ stop_conditions:
   - stop on scope expansion
 \`\`\`
 `,
-  };
-}
+    };
 
-function dispatchEnv() {
-  return {
-    CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true',
-    CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola',
-  };
-}
+    const dispatchIdentity = resolveImplementationDispatchIdentity({
+      issue: { number: 264, title: 'Remove subscription budget caps', labels: [] },
+      currentPreflight: preflight,
+      config: { githubRepo: 'TheTekTeam/agent-runner', localRepoPath: '/workspace/agent-runner' },
+      env: {
+        CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true',
+        CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola',
+      },
+      argsRepo: 'TheTekTeam/agent-runner',
+    });
 
-function dispatchIssue() {
-  return { number: 223, title: 'RUNNER.MANAGER.EXECUTION.HANDOFF.1', labels: [] };
-}
+    assert.equal(dispatchIdentity.ok, true, dispatchIdentity.failureReason || legacyBudgetLine);
+    assert.equal(Object.prototype.hasOwnProperty.call(dispatchIdentity.managerExecutionMeta, 'maxBudgetUsd'), false);
 
-function dispatchConfig() {
-  return { githubRepo: 'TheTekTeam/agent-runner', localRepoPath: '/workspace/agent-runner' };
-}
-
-// Both production callers pass `argsRepo: args.repo`, and per #180 `parseArgs`
-// defaults `repo` to the configured repository identity. Omitting it here would
-// fail `resolveRepositoryContext()` on `issueRepository` long before the #223
-// budget derivation under test is ever reached.
-function dispatchIdentityFor(maxBudgetUsdLine) {
-  return resolveImplementationDispatchIdentity({
-    issue: dispatchIssue(),
-    currentPreflight: dispatchPreflight({ maxBudgetUsdLine }),
-    config: dispatchConfig(),
-    env: dispatchEnv(),
-    argsRepo: dispatchConfig().githubRepo,
-  });
-}
-
-test('a quoted manager budget equal to the machine cap normalizes identically to unquoted or single-quoted', () => {
-  const variants = ['max_budget_usd: 2.00', 'max_budget_usd: "2.00"', "max_budget_usd: '2.00'"];
-  const budgets = variants.map((maxBudgetUsdLine) => {
-    const dispatchIdentity = dispatchIdentityFor(maxBudgetUsdLine);
-    assert.equal(dispatchIdentity.ok, true, dispatchIdentity.failureReason || '');
-    assert.equal(dispatchIdentity.managerExecutionMeta.profile, 'complex');
-    assert.equal(dispatchIdentity.managerExecutionMeta.model, 'sonnet');
-    assert.equal(dispatchIdentity.managerExecutionMeta.effort, 'medium');
     const profile = resolveProfile(dispatchIdentity.profileName, {
       model: dispatchIdentity.managerExecutionMeta.model,
       effort: dispatchIdentity.managerExecutionMeta.effort,
-      maxBudgetUsd: managerBudgetOverride(dispatchIdentity.managerExecutionMeta.maxBudgetUsd),
     });
-    const costAdmission = evaluateClaudeCostAdmission(profile, { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' });
-    assert.equal(costAdmission.allowed, true);
-    return costAdmission.requested.maxBudgetUsd;
-  });
-  assert.deepEqual(budgets, [2, 2, 2]);
-});
 
-test('leading-only/trailing-only quoted manager budgets fail closed before provider launch', () => {
-  const malformedLines = [
-    'max_budget_usd: "2.00',
-    'max_budget_usd: 2.00"',
-    "max_budget_usd: '2.00",
-    "max_budget_usd: 2.00'",
-    'max_budget_usd: ""',
-    'max_budget_usd: not-a-number',
-    'max_budget_usd: 0',
-    'max_budget_usd: -1.00',
-  ];
-  for (const maxBudgetUsdLine of malformedLines) {
-    const dispatchIdentity = dispatchIdentityFor(maxBudgetUsdLine);
-    assert.equal(dispatchIdentity.ok, true, dispatchIdentity.failureReason || '');
-    const profile = resolveProfile(dispatchIdentity.profileName, {
-      model: dispatchIdentity.managerExecutionMeta.model,
-      effort: dispatchIdentity.managerExecutionMeta.effort,
-      maxBudgetUsd: managerBudgetOverride(dispatchIdentity.managerExecutionMeta.maxBudgetUsd),
-    });
-    const costAdmission = evaluateClaudeCostAdmission(profile, { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '2' });
-    assert.equal(costAdmission.allowed, false, `expected fail-closed for "${maxBudgetUsdLine}"`);
-    assert.ok(costAdmission.violations.includes('budget-cap-exceeds-machine-policy'));
+    assert.equal(Object.prototype.hasOwnProperty.call(profile, 'maxBudgetUsd'), false);
+
+    const admission = evaluateClaudeCostAdmission(
+      profile,
+      { CLAUDE_RUNNER_MAX_BUDGET_USD_PER_ATTEMPT: '0.01' },
+    );
+    assert.equal(admission.allowed, true);
+    assert.equal(Object.prototype.hasOwnProperty.call(admission.policy, 'maxBudgetUsd'), false);
   }
 });
 
-test('an absent manager budget still follows the existing profile-default semantics', () => {
-  const dispatchIdentity = dispatchIdentityFor('');
-  assert.equal(dispatchIdentity.ok, true, dispatchIdentity.failureReason || '');
-  assert.equal(dispatchIdentity.managerExecutionMeta.maxBudgetUsd.present, false);
-  const profile = resolveProfile(dispatchIdentity.profileName, {
-    model: dispatchIdentity.managerExecutionMeta.model,
-    effort: dispatchIdentity.managerExecutionMeta.effort,
-    maxBudgetUsd: managerBudgetOverride(dispatchIdentity.managerExecutionMeta.maxBudgetUsd),
-  });
-  assert.equal(profile.maxBudgetUsd, resolveProfile(dispatchIdentity.profileName).maxBudgetUsd);
+test('the removed --max-budget-usd runner option is rejected instead of silently restoring a cap', () => {
+  assert.throws(
+    () => parseArgs(['--max-budget-usd', '1.00']),
+    /Unknown argument: --max-budget-usd/,
+  );
 });
 
 test('Claude process env strips provider auth by default without mutating input', () => {

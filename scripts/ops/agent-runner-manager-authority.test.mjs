@@ -138,67 +138,28 @@ function packetWithExecutionScalars(extraYaml = '') {
 }
 
 test('resolveManagerPreflightExecutionMetadata extracts profile, model and effort scalars', () => {
-  const metadata = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: 0.75\n'));
+  const metadata = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars());
   assert.equal(metadata.profile, 'complex');
   assert.equal(metadata.model, 'sonnet');
   assert.equal(metadata.effort, 'medium');
 });
 
-test('resolveManagerPreflightExecutionMetadata normalizes quoted and unquoted budgets identically', () => {
-  const quoted = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: "1.00"\n'));
-  const unquoted = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: 1.00\n'));
-  assert.deepEqual(quoted.maxBudgetUsd, unquoted.maxBudgetUsd);
-  assert.equal(quoted.maxBudgetUsd.present, true);
-  assert.equal(quoted.maxBudgetUsd.valid, true);
-  assert.equal(quoted.maxBudgetUsd.value, 1);
-});
-
-test('resolveManagerPreflightExecutionMetadata distinguishes an absent budget from an invalid one', () => {
-  const absent = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars());
-  assert.equal(absent.maxBudgetUsd.present, false);
-  assert.equal(absent.maxBudgetUsd.valid, false);
-  assert.equal(absent.maxBudgetUsd.value, null);
-
-  const empty = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: ""\n'));
-  assert.equal(empty.maxBudgetUsd.present, true);
-  assert.equal(empty.maxBudgetUsd.valid, false);
-  assert.equal(empty.maxBudgetUsd.value, null);
-});
-
-test('resolveManagerPreflightExecutionMetadata fails closed on malformed, zero and negative explicit budgets', () => {
-  const malformed = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: not-a-number\n'));
-  assert.equal(malformed.maxBudgetUsd.present, true);
-  assert.equal(malformed.maxBudgetUsd.valid, false);
-  assert.equal(malformed.maxBudgetUsd.value, null);
-
-  const zero = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: 0\n'));
-  assert.equal(zero.maxBudgetUsd.present, true);
-  assert.equal(zero.maxBudgetUsd.valid, false);
-  assert.equal(zero.maxBudgetUsd.value, null);
-
-  const negative = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: -0.50\n'));
-  assert.equal(negative.maxBudgetUsd.present, true);
-  assert.equal(negative.maxBudgetUsd.valid, false);
-  assert.equal(negative.maxBudgetUsd.value, null);
-});
-
-test('resolveManagerPreflightExecutionMetadata never lets an invalid explicit budget masquerade as valid or absent', () => {
-  const malformed = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars('max_budget_usd: NaN\n'));
-  assert.notEqual(malformed.maxBudgetUsd.valid, true);
-  assert.notEqual(malformed.maxBudgetUsd.present, false);
-});
-
-test('resolveManagerPreflightExecutionMetadata fails closed on one-sided/mismatched quoted budgets', () => {
+test('resolveManagerPreflightExecutionMetadata ignores every legacy max_budget_usd shape', () => {
   const cases = [
+    'max_budget_usd: 1.00\n',
+    'max_budget_usd: "8.00"\n',
+    'max_budget_usd: not-a-number\n',
+    'max_budget_usd: 0\n',
+    'max_budget_usd: -0.50\n',
     'max_budget_usd: "1.00\n',
-    'max_budget_usd: 1.00"\n',
-    "max_budget_usd: '1.00\n",
-    "max_budget_usd: 1.00'\n",
+    '',
   ];
-  for (const yaml of cases) {
-    const result = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars(yaml));
-    assert.equal(result.maxBudgetUsd.present, true, yaml);
-    assert.equal(result.maxBudgetUsd.valid, false, yaml);
-    assert.equal(result.maxBudgetUsd.value, null, yaml);
+
+  for (const legacy of cases) {
+    const result = resolveManagerPreflightExecutionMetadata(packetWithExecutionScalars(legacy));
+    assert.equal(result.profile, 'complex');
+    assert.equal(result.model, 'sonnet');
+    assert.equal(result.effort, 'medium');
+    assert.equal(Object.prototype.hasOwnProperty.call(result, 'maxBudgetUsd'), false);
   }
 });
