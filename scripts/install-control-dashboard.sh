@@ -339,6 +339,10 @@ provision_unit_target_path() {
 }
 
 provision_writable_paths() {
+  # The hardened mount namespace requires these exact paths to exist before
+  # service start. Bootstrap their standard parent directories one component
+  # at a time so a fresh home works without following a symlinked component.
+  # Never create/rotate the operator credential or touch execution state.
   ensure_private_directory "$HOME/.config" || return 1
   ensure_private_directory "$HOME/.local" || return 1
   ensure_private_directory "$HOME/.local/state" || return 1
@@ -405,6 +409,11 @@ restore_previous_state() {
     return "$rc"
   fi
 
+  # Fresh-install rollback restores the true prior state: no target unit and
+  # no enablement link. A failure before unit installation must not call
+  # systemctl stop on a nonexistent unit. A failure after activation must
+  # first stop and verify the temporary target, then disable it while its unit
+  # still exists so systemd can remove WantedBy coherently.
   if [[ -f "$TARGET_UNIT" ]]; then
     if ! systemctl --user stop "$SERVICE_NAME" >/dev/null 2>&1; then
       set -e
@@ -480,9 +489,13 @@ install_service() {
     if [[ "$active_state" == active ]]; then was_active=1; fi
   fi
 
+  # Static validation has completed. Provision only the exact writable paths
+  # required for namespace setup before any activation or replacement.
   provision_writable_paths
 
   if (( changed == 0 )); then
+    # Idempotent reinstall: never restart an already-running process. This
+    # preserves the process-local authenticated session store.
     if { (( was_enabled == 0 )) && ! systemctl --user enable "$SERVICE_NAME" >/dev/null; } \
       || { (( was_active == 0 )) && { ! preflight_port_available || ! systemctl --user start "$SERVICE_NAME"; }; } \
       || ! verify_installed_service; then
@@ -495,6 +508,8 @@ install_service() {
     return 0
   fi
 
+  # A changed active service is stopped only after the replacement unit has
+  # passed static verification and writable-path provisioning has succeeded.
   if (( was_active )); then
     if ! systemctl --user stop "$SERVICE_NAME"; then
       systemctl --user start "$SERVICE_NAME" >/dev/null 2>&1 || true
