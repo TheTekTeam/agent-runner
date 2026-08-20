@@ -106,8 +106,12 @@ test('configured trusted HTTPS origin works through login, authenticated GET and
     });
     assert.equal(logout.status, 200);
   } finally {
-    child.kill('SIGTERM');
-    await new Promise((resolvePromise) => child.once('exit', resolvePromise));
+    const childRunning = child.exitCode === null && child.signalCode === null;
+    const exitPromise = childRunning
+      ? new Promise((resolvePromise) => child.once('exit', resolvePromise))
+      : Promise.resolve();
+    if (childRunning) child.kill('SIGTERM');
+    await exitPromise;
     rmSync(home, { recursive: true, force: true });
   }
 });
