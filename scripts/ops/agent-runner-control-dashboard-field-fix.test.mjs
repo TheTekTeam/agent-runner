@@ -92,6 +92,10 @@ count=0
 [[ ! -f "$FAKE_STATE/ss-count" ]] || count=$(cat "$FAKE_STATE/ss-count")
 count=$((count + 1))
 printf '%s' "$count" >"$FAKE_STATE/ss-count"
+if (( count == 1 )) && [[ \${FAKE_PREFLIGHT_COLLISION:-0} == 1 ]]; then
+  printf 'LISTEN 0 511 127.0.0.1:8789 0.0.0.0:*\\n'
+  exit 0
+fi
 [[ -f "$FAKE_STATE/active" ]] || exit 0
 [[ \${FAKE_ALWAYS_NO_LISTENER:-0} != 1 ]] || exit 0
 # Call 1 is preflight. Call 2 deliberately reproduces Dell's immediate
@@ -167,6 +171,18 @@ test('fresh activation failure restores the absent state without a dangling want
   assert.match(result.stderr, /activation or health verification failed/);
   assert.doesNotMatch(result.stderr, /rollback could not fully restore previous service state/);
   assert.doesNotMatch(result.stderr, /could not determine whether agent-runner-control\.service is enabled/);
+  assert.equal(existsSync(fixture.unit), false);
+  assert.equal(existsSync(fixture.wants), false);
+});
+
+test('fresh preflight collision preserves the absent state without trying to stop a nonexistent unit', (t) => {
+  if (process.platform !== 'linux') return t.skip('systemd installer contract is Linux-only');
+  if (process.getuid?.() === 0) return t.skip('installer correctly refuses root');
+  const fixture = makeFixture(t);
+  const result = fixture.run({ FAKE_PREFLIGHT_COLLISION: '1' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /port 8789 is already in use/);
+  assert.doesNotMatch(result.stderr, /rollback could not fully restore previous service state/);
   assert.equal(existsSync(fixture.unit), false);
   assert.equal(existsSync(fixture.wants), false);
 });
