@@ -7,7 +7,6 @@ StartLimitBurst=3
 [Service]
 Type=simple
 WorkingDirectory=@@CHECKOUT@@
-Environment=NODE_OPTIONS=--jitless
 Environment=AGENT_RUNNER_CONFIG=%h/.config/agent-runner/modelspend.json
 Environment=CLAUDE_RUNNER_OUTPUT_DIR=%h/.local/state/agent-runner/modelspend
 Environment=CLAUDE_RUNNER_STATE_DB=%h/.local/state/agent-runner/modelspend/runner-state.sqlite
@@ -17,7 +16,7 @@ Environment=AGENT_RUNNER_CONTROL_OPERATOR_PATH=%h/.local/state/agent-runner/cont
 Environment=AGENT_RUNNER_CONTROL_AUDIT_PATH=%h/.local/state/agent-runner/control-audit.jsonl
 Environment=AGENT_RUNNER_CONTROL_SCHEDULER_SERVICE=agent-runner-implementation.service
 Environment=AGENT_RUNNER_CONTROL_SCHEDULER_TIMER=agent-runner-implementation.timer
-ExecStart=@@NODE@@ --jitless @@SERVER@@ --port @@PORT@@
+ExecStart=@@NODE@@ @@SERVER@@ --port @@PORT@@
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=20s
@@ -37,7 +36,10 @@ RestrictAddressFamilies=AF_UNIX AF_INET
 LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-MemoryDenyWriteExecute=true
+# Deliberate Node 22.23 compatibility exception: MemoryDenyWriteExecute and
+# --jitless are omitted because the built-in Undici HTTP stack requires its
+# WebAssembly llhttp parser. Dell field acceptance proved --jitless disables
+# WebAssembly and crashes the otherwise healthy loopback control service.
 UMask=0077
 
 [Install]
