@@ -12,6 +12,7 @@ import {
   parseManagerPreflightPacket,
   resolveCurrentManagerAuthority,
   resolveManagerPreflightExecutionMetadata,
+  resolveManagerPreflightRequiredCapabilities,
 } from './agent-runner-manager-authority.mjs';
 
 const FINGERPRINT_A = `sha256:${'a'.repeat(64)}`;
@@ -162,4 +163,24 @@ test('resolveManagerPreflightExecutionMetadata ignores every legacy max_budget_u
     assert.equal(result.effort, 'medium');
     assert.equal(Object.prototype.hasOwnProperty.call(result, 'maxBudgetUsd'), false);
   }
+});
+
+test('#228: resolveManagerPreflightRequiredCapabilities extracts and normalizes the structured field', () => {
+  const withCapabilities = packetWithExecutionScalars('required_capabilities:\n  - dependency-audit-read\n  - dependency-audit-read\n  - host-fingerprint-read\n');
+  const result = resolveManagerPreflightRequiredCapabilities(withCapabilities);
+  assert.equal(result.valid, true);
+  assert.deepEqual([...result.capabilities], ['dependency-audit-read', 'host-fingerprint-read']);
+});
+
+test('#228: resolveManagerPreflightRequiredCapabilities is empty (not inferred) when the field is absent', () => {
+  const result = resolveManagerPreflightRequiredCapabilities(packetWithExecutionScalars());
+  assert.equal(result.valid, true);
+  assert.deepEqual([...result.capabilities], []);
+});
+
+test('#228: resolveManagerPreflightRequiredCapabilities fails closed on an unknown identifier', () => {
+  const withUnknown = packetWithExecutionScalars('required_capabilities:\n  - dependency-audit-read\n  - network-unrestricted\n');
+  const result = resolveManagerPreflightRequiredCapabilities(withUnknown);
+  assert.equal(result.valid, false);
+  assert.deepEqual([...result.unknown], ['network-unrestricted']);
 });

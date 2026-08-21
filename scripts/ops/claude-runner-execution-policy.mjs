@@ -4,6 +4,7 @@ import {
   commentRevision,
   normalizeCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
+import { extendImplementationToolPolicyForCapabilities } from './claude-runner-capability-model.mjs';
 
 export const EXECUTION_PHASE_PLAN = 'plan';
 export const EXECUTION_PHASE_IMPLEMENTATION = 'implementation';
@@ -179,7 +180,7 @@ export function buildWorktreeIdentity({ issueNumber, sourceCommentId, approvedBr
   };
 }
 
-export function buildImplementationToolPolicy({ expectedBranch, approvedBranch = null } = {}) {
+export function buildImplementationToolPolicy({ expectedBranch, approvedBranch = null, requiredCapabilities = [] } = {}) {
   const branch = String(expectedBranch || '').trim();
   const isApprovedBranch = Boolean(approvedBranch) && branch === approvedBranch;
   if (!isApprovedBranch && !/^worktree-agent-runner-[a-z0-9-]+$/.test(branch)) {
@@ -239,7 +240,7 @@ export function buildImplementationToolPolicy({ expectedBranch, approvedBranch =
     'Bash(wget *)',
   ];
 
-  return {
+  const basePolicy = {
     tools: 'Read,Glob,Grep,Edit,Write,Bash',
     allowedTools,
     disallowedTools,
@@ -255,6 +256,8 @@ export function buildImplementationToolPolicy({ expectedBranch, approvedBranch =
     allowedToolRuleCount: allowedTools.length,
     disallowedToolRuleCount: disallowedTools.length,
   };
+
+  return extendImplementationToolPolicyForCapabilities(basePolicy, requiredCapabilities);
 }
 
 export function inspectClaudeCliHelp(helpText = '', { exitCode = 0 } = {}) {
