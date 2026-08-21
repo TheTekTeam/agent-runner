@@ -218,7 +218,7 @@ test('recovers expired leases and dead-letters repeated claim failures without h
   assert.equal(terminal.state, 'dead-letter');
   assert.equal(terminal.outcome, 'lease-attempts-exhausted');
   assert.equal(store.claimNext({ claimToken: 'claim-token-0006', now: T3, leaseMs: 1_000 }), null);
-}), { maxAttempts: 2 }));
+}, { maxAttempts: 2 }));
 
 test('blocks an event whose bounded deadline expires before it is processed', () => withStore(({ store }) => {
   const queued = store.enqueue(event({ deadlineAt: T1 }), { now: T0 }).event;
