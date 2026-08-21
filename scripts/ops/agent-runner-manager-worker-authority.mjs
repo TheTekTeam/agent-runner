@@ -21,6 +21,7 @@
  * parser. No parallel authority format is introduced.
  */
 
+import { isValidGitBranchName } from './agent-runner-dispatch-authority.mjs';
 import {
   MANAGER_PREFLIGHT_BUILD_MANAGER_PRODUCER,
   MANAGER_PREFLIGHT_MARKER,
@@ -72,10 +73,15 @@ const IDENTITY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{2,63}$/;
 const FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const CURATION_KEY_PATTERN = /^qc:[a-z0-9]+(?:-[a-z0-9]+)*:[a-z0-9]+(?:-[a-z0-9]+)*$/;
 
-// An implementation branch is one bounded, exact, non-integration ref. Git's
-// own refname rules are applied narrowly: no leading/trailing separator, no
-// `..`, no `@{`, no control or glob characters, no lock suffix.
-const BRANCH_PATTERN = /^(?!\/)(?!.*\/\/)(?!.*\.\.)(?!.*@\{)(?!.*\.lock(?:\/|$))[A-Za-z0-9][A-Za-z0-9._/-]{2,119}$/;
+/**
+ * A *narrowing* of the accepted refname rules, not a replacement for them:
+ * this bounds the length and restricts the character set, while
+ * `isValidGitBranchName()` from the accepted dispatch-authority contract
+ * remains the authority on refname validity. Both must pass, so an authority
+ * can never bind a branch the accepted worker-dispatch path would later refuse
+ * as `branch-authority-malformed`.
+ */
+const BRANCH_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._/-]{2,119}$/;
 
 const MAX_SCOPE_ENTRIES = 12;
 const MAX_SCOPE_ENTRY = 300;
@@ -241,7 +247,7 @@ function validateValidationContract(requestedValidationChecks, profile, errors) 
 }
 
 function validateBranch(branch, profile, errors) {
-  if (!nonEmptyString(branch) || !BRANCH_PATTERN.test(branch)) {
+  if (!nonEmptyString(branch) || !BRANCH_PATTERN.test(branch) || !isValidGitBranchName(branch)) {
     errors.push('request.branch must be one bounded, exact implementation branch name');
     return null;
   }
@@ -603,7 +609,13 @@ export function renderManagerWorkerAuthorityPacket(authority) {
     `approved_agent: ${authority.adapter}`,
     `execution_phase: ${authority.executionPhase}`,
     `project_id: ${authority.projectId}`,
-    `approved_repository_scope: ${authority.repository.full}`,
+    // A canonical *list* with exactly one entry, not a scalar: the accepted
+    // `resolveDispatchAuthority()` reads this key through `canonicalList()` and
+    // requires exactly one item, so a scalar would parse as a valid
+    // manager-preflight shape and then fail dispatch as
+    // `repository-scope-missing`.
+    'approved_repository_scope:',
+    yamlList([authority.repository.full]),
     `issue: ${authority.issueNumber}`,
     `base_commit: ${authority.baseSha}`,
     `approved_branch: ${authority.branch}`,

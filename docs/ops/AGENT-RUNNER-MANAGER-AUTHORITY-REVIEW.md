@@ -67,6 +67,10 @@ before acting.
   test-support only: builds the validated curation → authority → evidence chain
   from the same public transitions production callers use.
 
+The authority module imports exactly one thing from the worker-dispatch side,
+`isValidGitBranchName()` — a pure refname predicate, not dispatch behaviour — so
+the producer cannot mint a branch the accepted consumer would reject.
+
 ## Authority identity reuses the accepted contract
 
 No parallel authority format is introduced. An issued authority is expressed
@@ -80,7 +84,35 @@ through the already accepted machinery in
 | `authorityFingerprint` | `sha256:<64 hex>` content fingerprint of the full authority payload. |
 | `authorityKey` | `managerAuthorityKey(revision, fingerprint)` — the same `manager-preflight:<revision>:<fingerprint>` claim identity. |
 | Packet body | The same `<!-- agent-runner:manager-preflight -->` marker, `schema_version`, `producer_type`, `approved_agent`, `execution_phase`, `scope`, `required_validation` and `stop_conditions`, so `parseManagerPreflightPacket()` validates it unchanged. |
+| Dispatch fields | `approved_repository_scope` (canonical single-item **list**), `approved_branch`, `base_commit`, `revision` and `fingerprint`, so `resolveDispatchAuthority()` resolves it unchanged. |
+| Branch validity | `isValidGitBranchName()` from the accepted dispatch-authority contract, applied in addition to a narrower bounded length/charset pattern. |
 | Post-publication edit detection | `packetBodyDigest(body)`. |
+
+### Producing for the accepted consumer, never weakening it
+
+A rendered packet must satisfy **both** accepted consumers, and the producer is
+the side that adapts:
+
+```
+issueManagerWorkerAuthority()
+    -> renderManagerWorkerAuthorityPacket()
+    -> parseManagerPreflightPacket()      (admission shape)
+    -> resolveDispatchAuthority()         (repository / branch / base resolution)
+```
+
+Two rules follow from that, both regression-locked in
+`agent-runner-manager-authority-review-interop.test.mjs`:
+
+- `approved_repository_scope` is emitted as a canonical **list with exactly one
+  entry**. `resolveDispatchAuthority()` reads that key through `canonicalList()`
+  and requires exactly one item, so the scalar `key: owner/repo` form would
+  parse as a perfectly valid manager-preflight shape and then fail dispatch as
+  `repository-scope-missing`. The producer emits the list; the resolver is not
+  relaxed to accept a scalar.
+- An authority can only bind a branch the accepted resolver would also accept.
+  `validateBranch()` applies `isValidGitBranchName()` in addition to its own
+  bounded pattern, so no authority can be minted for a ref that dispatch would
+  later refuse as `branch-authority-malformed`.
 
 `producer_type` gains exactly one new value,
 `build_manager_authority_transition`, for this manager-domain producer. It is
@@ -98,8 +130,9 @@ admission state and the curation identity (`curationKey`, `curationRevision`,
 
 1. **One issue, one repository, one base.** All three come from the validated
    curation, never from the request.
-2. **Exact branch.** The branch is a bounded, exact ref and can never be the
-   project's default or any other approved integration branch.
+2. **Exact branch.** The branch is a bounded, exact ref that satisfies the
+   accepted `isValidGitBranchName()` rules, and can never be the project's
+   default or any other approved integration branch.
 3. **No widening.** A request may restate the approved adapter, capability
    profile, model and effort but never change one; any mismatch fails closed.
 4. **No weakening.** The validation contract may gain checks; every check the
