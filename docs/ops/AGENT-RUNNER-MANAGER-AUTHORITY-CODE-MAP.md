@@ -13,11 +13,13 @@ Use this page when a task mentions any of the following:
 
 ## The important distinction
 
-**There is no live manager-packet generation method in this repository.**
+**The runner never generates manager authority.**
 
-That is intentional. A canonical packet may be authored only by a normal ChatGPT manager session or an approved ChatGPT scheduled task. The runner and implementation workers consume and validate existing packets; they must not create, refresh or replace manager authority.
+That is intentional, and it is unchanged. The runner and implementation workers consume and validate existing packets; they must not create, refresh or replace manager authority. Adding an automatic or worker-callable generator would violate the authority boundary documented in [`AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md`](./AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md).
 
-Do not spend time searching for a packet generator. Adding an automatic or worker-callable generator would violate the authority boundary documented in [`AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md`](./AGENT-RUNNER-DISPATCH-AUTHORITY-MIGRATION.md).
+A canonical packet may be authored by a normal ChatGPT manager session, an approved ChatGPT scheduled task, or — since `#267` — the deterministic Build Manager authority transition in `scripts/ops/agent-runner-manager-worker-authority.mjs`, which declares `producer_type: build_manager_authority_transition`. That transition lives in the manager domain: it issues authority, it can never consume the authority it issued, and it never runs a worker. See [`AGENT-RUNNER-MANAGER-AUTHORITY-REVIEW.md`](./AGENT-RUNNER-MANAGER-AUTHORITY-REVIEW.md).
+
+Outside that one transition, do not spend time searching for a packet generator.
 
 ## Fast answer matrix
 
