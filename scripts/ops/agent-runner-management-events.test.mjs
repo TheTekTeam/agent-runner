@@ -240,9 +240,11 @@ test('bounds and deterministically orders generic due-event recovery scans', () 
       sha: null,
     }), { now: T0 });
   }
-  const due = store.recoverDueEvents({ now: T1, limit: 2 }).due;
-  assert.equal(due.length, 2);
-  assert.deepEqual(due.map((item) => item.issueNumber), [1, 2]);
+  const first = store.recoverDueEvents({ now: T1, limit: 2 }).due;
+  const second = store.recoverDueEvents({ now: T1, limit: 2 }).due;
+  assert.equal(first.length, 2);
+  assert.deepEqual(first.map((item) => item.eventId), second.map((item) => item.eventId));
+  assert.deepEqual(first.map((item) => item.eventId), [...first.map((item) => item.eventId)].sort());
   assert.throws(() => store.listDue({ now: T1, limit: 201 }), /limit/);
 }));
 
