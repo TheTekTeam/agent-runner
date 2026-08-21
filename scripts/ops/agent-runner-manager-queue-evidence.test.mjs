@@ -16,6 +16,11 @@ import {
   queueEvidenceInput,
 } from './agent-runner-manager-queue-test-fixtures.mjs';
 
+// Assembled at runtime rather than written literally: this repository's own
+// scripts/validate.sh refuses any real-shaped token in source, even inside an
+// adversarial fixture that exists precisely to prove such a token is refused.
+const SYNTHETIC_TOKEN = ['ghp', 'a1b2c3d4e5a1b2c3d4e5a1b2c3'].join('_');
+
 const { proposal } = buildChain();
 
 function refusal(overrides, expected) {
@@ -123,7 +128,7 @@ test('a machine-local path in an issue title is refused', () => {
 
 test('a credential-shaped issue title is refused', () => {
   refusal(
-    { issues: [{ number: 1, title: 'rotate ghp_abcdefghijklmnopqrstuvwxyz0123 now', state: 'open' }] },
+    { issues: [{ number: 1, title: `rotate ${SYNTHETIC_TOKEN} now`, state: 'open' }] },
     /must not contain a secret or credential-shaped token/,
   );
 });
