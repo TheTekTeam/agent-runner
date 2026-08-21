@@ -23,13 +23,13 @@ export const MANAGEMENT_EVENT_STATES = Object.freeze([
   'dead-letter',
 ]);
 
-const MANAGEMENT_EVENT_TYPE_SET = new Set(MANAGEMENT_EVENT_TYPES);
-const RECONCILIATION_EVENT_TYPES = new Set([
+const TYPE_SET = new Set(MANAGEMENT_EVENT_TYPES);
+const RECONCILIATION_TYPES = new Set([
   'programme-reconcile-required',
   'execution-reconcile-required',
   'queue-assurance-required',
 ]);
-const ACTIVE_EVENT_STATES = Object.freeze(['pending', 'claimed']);
+const ACTIVE_STATES = Object.freeze(['pending', 'claimed']);
 const INPUT_KEYS = new Set([
   'eventType',
   'projectId',
@@ -47,6 +47,7 @@ const CLAIM_TOKEN_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const SHA_PATTERN = /^[0-9a-f]{40}$/i;
 const OUTCOME_PATTERN = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
 const MAX_DUE_SCAN = 200;
+const MAX_DELAY_MS = 365 * 24 * 60 * 60_000;
 const DEFAULT_LEASE_MS = 5 * 60_000;
 const DEFAULT_MAX_ATTEMPTS = 5;
 
@@ -126,10 +127,10 @@ function projectIdentity(registry, projectId, repository) {
   if (byId.projectId !== projectId || byId.githubRepo.toLowerCase() !== String(repository).toLowerCase()) {
     throw new Error('management event project/repository identity mismatch');
   }
-  return { projectId: byId.projectId, repository: byId.githubRepo };
+  return Object.freeze({ projectId: byId.projectId, repository: byId.githubRepo });
 }
 
-function eventCoalesceMaterial(event) {
+function coalesceMaterial(event) {
   const scope = {
     eventType: event.eventType,
     projectId: event.projectId,
@@ -137,7 +138,9 @@ function eventCoalesceMaterial(event) {
     issueNumber: event.issueNumber,
     pullRequestNumber: event.pullRequestNumber,
   };
-  if (!RECONCILIATION_EVENT_TYPES.has(event.eventType)) scope.correlationId = event.correlationId;
+  // Reconciliation handlers must re-read current authority/evidence, so repeated
+  // wakes for the same active object can safely coalesce across causal batches.
+  if (!RECONCILIATION_TYPES.has(event.eventType)) scope.correlationId = event.correlationId;
   return scope;
 }
 
@@ -146,7 +149,7 @@ export function normalizeManagementEvent(input, {
   now = new Date().toISOString(),
 } = {}) {
   assertOnlyAllowlistedInputKeys(input);
-  if (!MANAGEMENT_EVENT_TYPE_SET.has(input.eventType)) {
+  if (!TYPE_SET.has(input.eventType)) {
     throw new Error(`management event type is not allowlisted: ${String(input.eventType ?? '')}`);
   }
   const projectId = requiredId(input.projectId, 'management event projectId');
@@ -158,8 +161,17 @@ export function normalizeManagementEvent(input, {
   const requestedNotBefore = input.notBefore == null ? null : iso(input.notBefore, 'management event notBefore');
   const notBefore = requestedNotBefore ?? createdAt;
   const deadlineAt = input.deadlineAt == null ? null : iso(input.deadlineAt, 'management event deadlineAt');
-  if (deadlineAt && Date.parse(deadlineAt) < Date.parse(notBefore)) {
-    throw new Error('management event deadlineAt cannot be before notBefore');
+  const createdMs = Date.parse(createdAt);
+  const notBeforeMs = Date.parse(notBefore);
+  if (notBeforeMs > createdMs + MAX_DELAY_MS) {
+    throw new Error('management event notBefore exceeds the bounded horizon');
+  }
+  if (deadlineAt) {
+    const deadlineMs = Date.parse(deadlineAt);
+    if (deadlineMs < notBeforeMs) throw new Error('management event deadlineAt cannot be before notBefore');
+    if (deadlineMs > createdMs + MAX_DELAY_MS) {
+      throw new Error('management event deadlineAt exceeds the bounded horizon');
+    }
   }
 
   const event = {
@@ -175,12 +187,11 @@ export function normalizeManagementEvent(input, {
     notBefore,
     deadlineAt,
   };
-  const fingerprintMaterial = {
-    ...event,
-    notBefore: requestedNotBefore,
-  };
+  // Default "due now" should replay as the same semantic event even if the
+  // duplicate arrives later; only an explicitly requested delay participates.
+  const fingerprintMaterial = { ...event, notBefore: requestedNotBefore };
   const fingerprint = `sha256:${sha256(stableJson(fingerprintMaterial))}`;
-  const coalesceKey = `coalesce:${sha256(stableJson(eventCoalesceMaterial(event)))}`;
+  const coalesceKey = `coalesce:${sha256(stableJson(coalesceMaterial(event)))}`;
   return Object.freeze({
     ...event,
     eventId: `management-${fingerprint.slice('sha256:'.length, 'sha256:'.length + 32)}`,
@@ -355,13 +366,13 @@ export class ManagementEventStore {
     const replay = this.db.prepare('SELECT * FROM management_events WHERE fingerprint = ?').get(event.fingerprint);
     if (replay) return Object.freeze({ inserted: false, duplicate: true, coalesced: false, event: eventFromRow(replay) });
 
-    const placeholders = ACTIVE_EVENT_STATES.map(() => '?').join(', ');
+    const placeholders = ACTIVE_STATES.map(() => '?').join(', ');
     const active = this.db.prepare(`
       SELECT * FROM management_events
       WHERE coalesce_key = ? AND state IN (${placeholders})
       ORDER BY created_at ASC, event_id ASC
       LIMIT 1
-    `).get(event.coalesceKey, ...ACTIVE_EVENT_STATES);
+    `).get(event.coalesceKey, ...ACTIVE_STATES);
     if (active) return Object.freeze({ inserted: false, duplicate: false, coalesced: true, event: eventFromRow(active) });
 
     const timestamp = iso(now, 'management event enqueue timestamp');
@@ -543,37 +554,57 @@ export class ManagementEventStore {
       const currentRow = this.db.prepare('SELECT * FROM management_events WHERE event_id = ?').get(eventId);
       if (!currentRow) throw new Error(`unknown management event: ${eventId}`);
       if (currentRow.state === state && currentRow.settled_at && currentRow.claim_token_hash === tokenHash) {
-        const event = eventFromRow(currentRow);
+        if (currentRow.outcome !== normalizedResult) {
+          throw new Error('management event already settled with a different outcome');
+        }
+        const settled = eventFromRow(currentRow);
         this.db.exec('COMMIT');
-        return Object.freeze({ event, successors: Object.freeze([]), idempotent: true });
+        return Object.freeze({ event: settled, successors: Object.freeze([]), idempotent: true });
       }
       if (currentRow.state !== 'claimed' || currentRow.claim_token_hash !== tokenHash) {
         throw new Error('management event is not claimed by this claimant');
       }
+      const parent = eventFromRow(currentRow);
 
-      this.db.prepare(`
+      // Validate the whole successor set before mutating the parent. A successor
+      // may branch its correlation but can never escape the parent's project,
+      // repository or causal predecessor identity.
+      const normalizedSuccessors = successors.map((successor) => {
+        if (!isObject(successor)) throw new Error('management event successor must be an object');
+        if (successor.projectId != null && successor.projectId !== parent.projectId) {
+          throw new Error('management event successor cannot change project identity');
+        }
+        if (successor.repository != null
+          && String(successor.repository).toLowerCase() !== parent.repository.toLowerCase()) {
+          throw new Error('management event successor cannot change repository identity');
+        }
+        if (successor.predecessorEventId != null && successor.predecessorEventId !== parent.eventId) {
+          throw new Error('management event successor cannot change predecessor identity');
+        }
+        return normalizeManagementEvent({
+          ...successor,
+          projectId: parent.projectId,
+          repository: parent.repository,
+          correlationId: successor.correlationId ?? parent.correlationId,
+          predecessorEventId: parent.eventId,
+        }, { registry: this.registry, now: timestamp });
+      });
+
+      const updated = this.db.prepare(`
         UPDATE management_events
         SET state = ?, outcome = ?, claim_expires_at = NULL,
             settled_at = ?, updated_at = ?
         WHERE event_id = ? AND state = 'claimed' AND claim_token_hash = ?
       `).run(state, normalizedResult, timestamp, timestamp, eventId, tokenHash);
+      if (Number(updated.changes) !== 1) throw new Error('management event settlement lost claimant ownership');
 
-      const parent = eventFromRow(this.db.prepare('SELECT * FROM management_events WHERE event_id = ?').get(eventId));
-      const successorResults = [];
-      for (const successor of successors) {
-        if (!isObject(successor)) throw new Error('management event successor must be an object');
-        const normalized = normalizeManagementEvent({
-          ...successor,
-          projectId: successor.projectId ?? parent.projectId,
-          repository: successor.repository ?? parent.repository,
-          correlationId: successor.correlationId ?? parent.correlationId,
-          predecessorEventId: successor.predecessorEventId ?? parent.eventId,
-        }, { registry: this.registry, now: timestamp });
-        successorResults.push(this.enqueueInTransaction(normalized, { now: timestamp }));
-      }
+      const successorResults = normalizedSuccessors.map((successor) => (
+        this.enqueueInTransaction(successor, { now: timestamp })
+      ));
+      const settled = this.getEvent(eventId);
       this.db.exec('COMMIT');
       return Object.freeze({
-        event: this.getEvent(eventId),
+        event: settled,
         successors: Object.freeze(successorResults),
         idempotent: false,
       });
@@ -613,6 +644,7 @@ export function enqueueManagementEventAndWake({
 } = {}) {
   if (!(store instanceof ManagementEventStore)) throw new Error('management event store is required');
   const timestamp = now ?? store.now();
+  // Durability is deliberately completed before the best-effort wake.
   const result = store.enqueue(event, { now: timestamp });
   const current = result.event;
   const due = current.state === 'pending' && Date.parse(current.notBefore) <= Date.parse(timestamp);
