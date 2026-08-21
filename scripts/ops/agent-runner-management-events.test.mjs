@@ -300,19 +300,35 @@ test('rejects prompt/output/path-shaped payload fields instead of persisting unr
   assert.equal(store.listEvents().length, 0);
 
   store.enqueue(event({ correlationId: 'safe-correlation-1' }), { now: T0 });
+  store.claimNext({ claimToken: 'claim-token-secret-material', now: T0, leaseMs: 60_000 });
+
   const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
-    const row = db.prepare(`
-      SELECT event_type, project_id, repo, correlation_id, exact_sha
-      FROM management_events
-    `).get();
-    assert.deepEqual(row, {
-      event_type: 'programme-reconcile-required',
-      project_id: 'alpha',
-      repo: 'Owner/Alpha',
-      correlation_id: 'safe-correlation-1',
-      exact_sha: 'a'.repeat(40),
-    });
+    // node:sqlite returns null-prototype rows, so compare an own-enumerable copy
+    // rather than the raw row object.
+    const row = { ...db.prepare('SELECT * FROM management_events').get() };
+
+    // The persisted shape is an allowlist: any new column has to be a deliberate
+    // decision reviewed against the data boundary, not an incidental addition.
+    assert.deepEqual(Object.keys(row).sort(), [
+      'attempt_count', 'causal_depth', 'claim_expires_at', 'claim_token_hash', 'claimed_at',
+      'coalesce_key', 'correlation_id', 'created_at', 'deadline_at', 'event_id', 'event_type',
+      'exact_sha', 'fingerprint', 'issue_number', 'not_before', 'outcome', 'predecessor_event_id',
+      'project_id', 'pull_request_number', 'repo', 'schema_version', 'settled_at', 'state',
+      'updated_at',
+    ]);
+    assert.equal(row.event_type, 'programme-reconcile-required');
+    assert.equal(row.project_id, 'alpha');
+    assert.equal(row.repo, 'Owner/Alpha');
+    assert.equal(row.correlation_id, 'safe-correlation-1');
+    assert.equal(row.exact_sha, 'a'.repeat(40));
+
+    // The claim token itself is never recoverable from the ledger.
+    assert.match(row.claim_token_hash, /^[0-9a-f]{64}$/);
+    const persisted = Object.values(row).map((value) => String(value)).join(' ');
+    for (const secret of ['claim-token-secret-material', 'do dangerous hidden work', 'secret model output', '/home/gp']) {
+      assert.equal(persisted.includes(secret), false, `ledger must not persist ${secret}`);
+    }
   } finally {
     db.close();
   }
@@ -329,4 +345,250 @@ test('different projects do not coalesce into one active management event', () =
   assert.equal(beta.inserted, true);
   assert.notEqual(alpha.event.eventId, beta.event.eventId);
   assert.equal(store.listEvents().length, 2);
+}));
+
+test('fails closed on a contradictory repeat settlement of the same event', () => withStore(({ store }) => {
+  const queued = store.enqueue(event(), { now: T0 }).event;
+  store.claimNext({ claimToken: 'claim-token-0007', now: T0, leaseMs: 60_000 });
+  store.settle(queued.eventId, { claimToken: 'claim-token-0007', outcome: 'completed', now: T1 });
+
+  assert.throws(
+    () => store.settle(queued.eventId, { claimToken: 'claim-token-0007', outcome: 'reverted', now: T2 }),
+    /already settled with a different outcome/,
+  );
+  assert.throws(
+    () => store.settle(queued.eventId, {
+      claimToken: 'claim-token-0007', state: 'blocked', outcome: 'completed', now: T2,
+    }),
+    /not claimed by this claimant/,
+  );
+  assert.throws(
+    () => store.settle(queued.eventId, { claimToken: 'claim-token-9999', outcome: 'completed', now: T2 }),
+    /not claimed by this claimant/,
+  );
+
+  const settled = store.getEvent(queued.eventId);
+  assert.equal(settled.state, 'settled');
+  assert.equal(settled.outcome, 'completed');
+}));
+
+test('rolls the whole settlement back when any successor is rejected', () => withStore(({ store }) => {
+  const queued = store.enqueue(event(), { now: T0 }).event;
+  store.claimNext({ claimToken: 'claim-token-0008', now: T0, leaseMs: 60_000 });
+
+  const rejected = [
+    [{ eventType: 'programme-reconcile-required', projectId: 'beta' }, /cannot change project identity/],
+    [{ eventType: 'programme-reconcile-required', repository: 'Owner/Beta' }, /cannot change repository identity/],
+    [
+      { eventType: 'programme-reconcile-required', predecessorEventId: 'management-00000000000000000000000000000000' },
+      /cannot change predecessor identity/,
+    ],
+    [{ eventType: 'merge-now' }, /not allowlisted/],
+    [{ eventType: 'programme-reconcile-required', prompt: 'hidden instruction' }, /unsupported field/],
+  ];
+
+  for (const [successor, expected] of rejected) {
+    assert.throws(
+      () => store.settle(queued.eventId, {
+        claimToken: 'claim-token-0008',
+        outcome: 'completed',
+        now: T1,
+        // A valid successor is listed first to prove the predecessor is not settled
+        // and no partial successor survives when a later one is rejected.
+        successors: [{ eventType: 'queue-assurance-required', correlationId: 'valid-successor' }, successor],
+      }),
+      expected,
+    );
+    const unchanged = store.getEvent(queued.eventId);
+    assert.equal(unchanged.state, 'claimed');
+    assert.equal(unchanged.settledAt, null);
+    assert.equal(store.listEvents().length, 1);
+  }
+}));
+
+test('keeps exactly one live claimant for an event across separate connections', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-runner-management-concurrency-'));
+  const dbPath = join(dir, 'runner-state.sqlite');
+  const first = new ManagementEventStore(dbPath, { registry: REGISTRY, now: () => T0 });
+  const second = new ManagementEventStore(dbPath, { registry: REGISTRY, now: () => T0 });
+  try {
+    const queued = first.enqueue(event(), { now: T0 }).event;
+
+    // Both connections must wait for a contended writer instead of failing the
+    // caller immediately, which is what SQLite does with the default timeout of 0.
+    for (const store of [first, second]) {
+      assert.equal(Number(store.db.prepare('PRAGMA busy_timeout').get().timeout), 5_000);
+    }
+
+    const winner = first.claimNext({ claimToken: 'claim-token-0009', now: T0, leaseMs: 60_000 });
+    assert.equal(winner.eventId, queued.eventId);
+    // The second connection sees the committed claim and finds nothing to take.
+    assert.equal(second.claimNext({ claimToken: 'claim-token-0010', now: T0, leaseMs: 60_000 }), null);
+    assert.throws(
+      () => second.settle(queued.eventId, { claimToken: 'claim-token-0010', now: T1 }),
+      /not claimed by this claimant/,
+    );
+
+    // A separate connection can still write: contention serialises behind the
+    // current writer rather than failing the caller outright.
+    const other = second.enqueue(event({ correlationId: 'github-batch-99', issueNumber: 43 }), { now: T0 });
+    assert.equal(other.inserted, true);
+    assert.equal(first.listEvents().length, 2);
+
+    second.settle(queued.eventId, { claimToken: 'claim-token-0009', now: T1 });
+    assert.equal(first.getEvent(queued.eventId).state, 'settled');
+  } finally {
+    first.close();
+    second.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('recovers a claimed event after a process restart without losing evidence', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-runner-management-restart-'));
+  const dbPath = join(dir, 'runner-state.sqlite');
+  try {
+    const before = new ManagementEventStore(dbPath, { registry: REGISTRY, now: () => T0 });
+    const queued = before.enqueue(event(), { now: T0 }).event;
+    before.claimNext({ claimToken: 'claim-token-0011', now: T0, leaseMs: 60_000 });
+    before.close();
+
+    const after = new ManagementEventStore(dbPath, { registry: REGISTRY, now: () => T2 });
+    try {
+      const restored = after.getEvent(queued.eventId);
+      assert.equal(restored.state, 'claimed');
+      assert.equal(restored.attemptCount, 1);
+
+      const recovery = after.recoverDueEvents({ now: T2 });
+      assert.equal(recovery.recovery.requeued, 1);
+      assert.equal(recovery.due.length, 1);
+      const requeued = after.getEvent(queued.eventId);
+      assert.equal(requeued.state, 'pending');
+      assert.equal(requeued.outcome, 'lease-expired');
+      assert.equal(requeued.attemptCount, 1);
+      // The stale claimant must not be able to settle what it no longer owns.
+      assert.throws(
+        () => after.settle(queued.eventId, { claimToken: 'claim-token-0011', now: T3 }),
+        /not claimed by this claimant/,
+      );
+    } finally {
+      after.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('bounds the causal successor chain so settlement cannot hot loop forever', () => withStore(({ store }) => {
+  let current = store.enqueue(event({ correlationId: 'chain-0' }), { now: T0 }).event;
+  assert.equal(current.causalDepth, 0);
+
+  for (let step = 1; step <= 64; step += 1) {
+    const claimToken = `claim-token-chain-${String(step).padStart(4, '0')}`;
+    store.claimNext({ claimToken, now: T0, leaseMs: 60_000 });
+    const settled = store.settle(current.eventId, {
+      claimToken,
+      outcome: 'completed',
+      now: T0,
+      successors: [{ eventType: 'programme-reconcile-required', correlationId: `chain-${step}` }],
+    });
+    current = settled.successors[0].event;
+    assert.equal(current.causalDepth, step);
+  }
+
+  const finalToken = 'claim-token-chain-final';
+  store.claimNext({ claimToken: finalToken, now: T0, leaseMs: 60_000 });
+  const beforeCount = store.listEvents({ limit: 500 }).length;
+  assert.throws(
+    () => store.settle(current.eventId, {
+      claimToken: finalToken,
+      outcome: 'completed',
+      now: T0,
+      successors: [{ eventType: 'programme-reconcile-required', correlationId: 'chain-65' }],
+    }),
+    /causal chain exceeds the bounded depth/,
+  );
+
+  // This rejection happens after the predecessor row has already been updated, so
+  // it is the case that proves settlement is all-or-nothing rather than partial.
+  const unsettled = store.getEvent(current.eventId);
+  assert.equal(unsettled.state, 'claimed');
+  assert.equal(unsettled.settledAt, null);
+  assert.equal(unsettled.outcome, null);
+  assert.equal(store.listEvents({ limit: 500 }).length, beforeCount);
+}));
+
+test('rejects coercible non-string timestamps instead of resolving them to the epoch', () => withStore(({ store }) => {
+  for (const notBefore of [true, 0, 1_700_000_000_000, [], {}, 'not-a-date', 'x'.repeat(65)]) {
+    assert.throws(
+      () => store.enqueue(event({ notBefore }), { now: T0 }),
+      /notBefore is invalid/,
+      `notBefore ${JSON.stringify(notBefore)} must be rejected`,
+    );
+  }
+  for (const deadlineAt of [true, 0, [], {}, 'not-a-date']) {
+    assert.throws(() => store.enqueue(event({ deadlineAt }), { now: T0 }), /deadlineAt is invalid/);
+  }
+  assert.equal(store.listEvents().length, 0);
+
+  const accepted = store.enqueue(event({ notBefore: new Date(Date.parse(T2)) }), { now: T0 }).event;
+  assert.equal(accepted.notBefore, T2);
+}));
+
+test('refuses to open a newer management event schema and leaves that ledger untouched', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'agent-runner-management-schema-'));
+  const dbPath = join(dir, 'runner-state.sqlite');
+  try {
+    const seed = new DatabaseSync(dbPath);
+    seed.exec('CREATE TABLE management_event_schema (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)');
+    seed.prepare('INSERT INTO management_event_schema(version, applied_at) VALUES (?, ?)').run(2, T0);
+    seed.close();
+
+    assert.throws(
+      () => new ManagementEventStore(dbPath, { registry: REGISTRY, now: () => T0 }),
+      /unsupported management event schema version: 2/,
+    );
+
+    const check = new DatabaseSync(dbPath, { readOnly: true });
+    try {
+      const versions = check.prepare('SELECT version FROM management_event_schema ORDER BY version').all()
+        .map((row) => Number(row.version));
+      assert.deepEqual(versions, [2]);
+    } finally {
+      check.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('never resolves project identity from inherited registry object properties', () => {
+  for (const key of ['constructor', 'toString', 'valueOf', 'hasOwnProperty']) {
+    assert.throws(
+      () => normalizeManagementEvent(
+        event({ projectId: key, repository: key }),
+        { registry: REGISTRY, now: T0 },
+      ),
+      /identity/,
+      `${key} must not resolve to a registered project`,
+    );
+  }
+  assert.throws(
+    () => normalizeManagementEvent(event(), {
+      registry: { projectsById: null, projectsByRepository: null },
+      now: T0,
+    }),
+    /project registry is required/,
+  );
+});
+
+test('refuses to reuse a store connection for a nested transaction', () => withStore(({ store }) => {
+  store.enqueue(event(), { now: T0 });
+  assert.throws(
+    () => store.runInTransaction(() => store.runInTransaction(() => null)),
+    /transaction is already active/,
+  );
+  // The guard must not leave the connection stuck inside a transaction.
+  const next = store.enqueue(event({ correlationId: 'github-batch-77', issueNumber: 77 }), { now: T1 });
+  assert.equal(next.inserted, true);
 }));

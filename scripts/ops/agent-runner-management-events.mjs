@@ -48,8 +48,11 @@ const SHA_PATTERN = /^[0-9a-f]{40}$/i;
 const OUTCOME_PATTERN = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
 const MAX_DUE_SCAN = 200;
 const MAX_DELAY_MS = 365 * 24 * 60 * 60_000;
+const MAX_TIMESTAMP_LENGTH = 64;
+const MAX_CAUSAL_DEPTH = 64;
 const DEFAULT_LEASE_MS = 5 * 60_000;
 const DEFAULT_MAX_ATTEMPTS = 5;
+const DEFAULT_BUSY_TIMEOUT_MS = 5_000;
 
 function isObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -70,7 +73,17 @@ function sha256(value) {
 }
 
 function iso(value, name) {
-  const date = value instanceof Date ? value : new Date(value);
+  // Only an explicit Date or a bounded date string is accepted. Coercible values
+  // such as booleans and numbers would otherwise resolve silently to the epoch,
+  // which would make a malformed event look permanently overdue.
+  if (value instanceof Date) {
+    if (!Number.isFinite(value.getTime())) throw new Error(`${name} is invalid`);
+    return value.toISOString();
+  }
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_TIMESTAMP_LENGTH) {
+    throw new Error(`${name} is invalid`);
+  }
+  const date = new Date(value);
   if (!Number.isFinite(date.getTime())) throw new Error(`${name} is invalid`);
   return date.toISOString();
 }
@@ -117,10 +130,23 @@ function assertOnlyAllowlistedInputKeys(input) {
   }
 }
 
+// Registry lookup tables are plain objects, so an id such as `constructor` or
+// `__proto__` resolves to an inherited value rather than a registered project.
+// Only a well-formed own entry may establish canonical identity.
+function registeredProject(entry) {
+  if (!isObject(entry)) return null;
+  if (typeof entry.projectId !== 'string' || !ID_PATTERN.test(entry.projectId)) return null;
+  if (typeof entry.githubRepo !== 'string' || entry.githubRepo.length === 0) return null;
+  return entry;
+}
+
 function projectIdentity(registry, projectId, repository) {
   if (!registry || !isObject(registry)) throw new Error('management event project registry is required');
-  const byId = projectFromRegistryById(registry, projectId);
-  const byRepo = projectFromRegistryByRepository(registry, repository);
+  if (!isObject(registry.projectsById) || !isObject(registry.projectsByRepository)) {
+    throw new Error('management event project registry is required');
+  }
+  const byId = registeredProject(projectFromRegistryById(registry, projectId));
+  const byRepo = registeredProject(projectFromRegistryByRepository(registry, repository));
   if (!byId || !byRepo || byId.projectId !== byRepo.projectId) {
     throw new Error('management event project/repository identity is not enabled by the registry');
   }
@@ -215,6 +241,7 @@ function eventFromRow(row) {
     sha: row.exact_sha,
     correlationId: row.correlation_id,
     predecessorEventId: row.predecessor_event_id,
+    causalDepth: Number(row.causal_depth),
     notBefore: row.not_before,
     deadlineAt: row.deadline_at,
     state: row.state,
@@ -242,35 +269,8 @@ function normalizedOutcome(value) {
   return value;
 }
 
-export class ManagementEventStore {
-  constructor(dbPath, {
-    registry,
-    now = () => new Date().toISOString(),
-    maxAttempts = DEFAULT_MAX_ATTEMPTS,
-  } = {}) {
-    if (typeof dbPath !== 'string' || dbPath.length === 0) throw new Error('management event db path is required');
-    if (!registry || !isObject(registry)) throw new Error('management event project registry is required');
-    this.dbPath = dbPath;
-    this.registry = registry;
-    this.now = now;
-    this.maxAttempts = boundedInteger(maxAttempts, DEFAULT_MAX_ATTEMPTS, {
-      name: 'management event maxAttempts', min: 1, max: 20,
-    });
-    if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
-    this.db = new DatabaseSync(dbPath);
-    this.migrate();
-  }
-
-  migrate() {
-    this.db.exec(`
-      PRAGMA journal_mode = WAL;
-      PRAGMA foreign_keys = ON;
-
-      CREATE TABLE IF NOT EXISTS management_event_schema (
-        version INTEGER PRIMARY KEY,
-        applied_at TEXT NOT NULL
-      );
-
+const MIGRATIONS = Object.freeze({
+  1: `
       CREATE TABLE IF NOT EXISTS management_events (
         event_id TEXT PRIMARY KEY,
         schema_version INTEGER NOT NULL,
@@ -291,6 +291,8 @@ export class ManagementEventStore {
         predecessor_event_id TEXT,
         not_before TEXT NOT NULL,
         deadline_at TEXT,
+        causal_depth INTEGER NOT NULL DEFAULT 0
+          CHECK (causal_depth >= 0 AND causal_depth <= ${MAX_CAUSAL_DEPTH}),
         state TEXT NOT NULL CHECK (state IN ('pending', 'claimed', 'settled', 'blocked', 'dead-letter')),
         attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
         claim_token_hash TEXT,
@@ -312,15 +314,98 @@ export class ManagementEventStore {
 
       CREATE INDEX IF NOT EXISTS management_events_correlation_idx
         ON management_events(project_id, correlation_id, created_at, event_id);
-    `);
-    this.db.prepare(`
-      INSERT OR IGNORE INTO management_event_schema(version, applied_at)
-      VALUES (?, ?)
-    `).run(MANAGEMENT_EVENT_SCHEMA_VERSION, this.now());
-    const schema = this.db.prepare('SELECT MAX(version) AS version FROM management_event_schema').get();
-    if (Number(schema?.version) !== MANAGEMENT_EVENT_SCHEMA_VERSION) {
-      throw new Error(`unsupported management event schema version: ${String(schema?.version ?? 'missing')}`);
+  `,
+});
+
+export class ManagementEventStore {
+  constructor(dbPath, {
+    registry,
+    now = () => new Date().toISOString(),
+    maxAttempts = DEFAULT_MAX_ATTEMPTS,
+    busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS,
+  } = {}) {
+    if (typeof dbPath !== 'string' || dbPath.length === 0) throw new Error('management event db path is required');
+    if (!registry || !isObject(registry)) throw new Error('management event project registry is required');
+    this.dbPath = dbPath;
+    this.registry = registry;
+    this.now = now;
+    this.maxAttempts = boundedInteger(maxAttempts, DEFAULT_MAX_ATTEMPTS, {
+      name: 'management event maxAttempts', min: 1, max: 20,
+    });
+    // Without an explicit busy timeout SQLite fails a contended writer immediately,
+    // so a second runner process sharing the controller database would see a hard
+    // SQLITE_BUSY instead of serialising behind the current writer.
+    this.busyTimeoutMs = boundedInteger(busyTimeoutMs, DEFAULT_BUSY_TIMEOUT_MS, {
+      name: 'management event busyTimeoutMs', min: 0, max: 60_000,
+    });
+    this.transactionActive = false;
+    if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
+    this.db = new DatabaseSync(dbPath);
+    this.migrate();
+  }
+
+  // Every mutation runs through here so that a failure can never leave a partially
+  // applied transaction behind, and so a rollback failure can never mask the real
+  // cause of that failure.
+  runInTransaction(work) {
+    if (this.transactionActive) throw new Error('management event transaction is already active');
+    this.db.exec('BEGIN IMMEDIATE');
+    this.transactionActive = true;
+    let result;
+    try {
+      result = work();
+      this.db.exec('COMMIT');
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // SQLite may already have unwound the transaction itself; the original
+        // failure below is the one the caller must see.
+      }
+      this.transactionActive = false;
+      throw error;
     }
+    this.transactionActive = false;
+    return result;
+  }
+
+  migrate() {
+    this.db.exec('PRAGMA journal_mode = WAL');
+    this.db.exec('PRAGMA foreign_keys = ON');
+    this.db.exec(`PRAGMA busy_timeout = ${this.busyTimeoutMs}`);
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS management_event_schema (
+        version INTEGER PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      );
+    `);
+
+    const recorded = this.db.prepare('SELECT MAX(version) AS version FROM management_event_schema').get();
+    const applied = recorded?.version == null ? 0 : Number(recorded.version);
+    if (!Number.isInteger(applied) || applied < 0) {
+      throw new Error(`unsupported management event schema version: ${String(recorded?.version)}`);
+    }
+    // Fail closed against a ledger written by newer code before writing anything
+    // into it, so an older process can never pollute a newer schema.
+    if (applied > MANAGEMENT_EVENT_SCHEMA_VERSION) {
+      throw new Error(`unsupported management event schema version: ${applied}`);
+    }
+    if (applied === MANAGEMENT_EVENT_SCHEMA_VERSION) return;
+
+    const appliedAt = iso(this.now(), 'management event migration timestamp');
+    this.runInTransaction(() => {
+      for (let version = applied + 1; version <= MANAGEMENT_EVENT_SCHEMA_VERSION; version += 1) {
+        const migration = MIGRATIONS[version];
+        if (typeof migration !== 'string') {
+          throw new Error(`missing management event migration for version ${version}`);
+        }
+        this.db.exec(migration);
+        this.db.prepare(`
+          INSERT OR IGNORE INTO management_event_schema(version, applied_at)
+          VALUES (?, ?)
+        `).run(version, appliedAt);
+      }
+    });
   }
 
   getEvent(eventId) {
@@ -344,23 +429,25 @@ export class ManagementEventStore {
 
   enqueue(input, { now = this.now() } = {}) {
     const normalized = normalizeManagementEvent(input, { registry: this.registry, now });
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      const result = this.enqueueInTransaction(normalized, { now });
-      this.db.exec('COMMIT');
-      return result;
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
+    return this.runInTransaction(() => this.enqueueInTransaction(normalized, { now }));
   }
 
   enqueueInTransaction(normalizedOrInput, { now = this.now() } = {}) {
     const event = normalizedOrInput?.fingerprint
       ? normalizedOrInput
       : normalizeManagementEvent(normalizedOrInput, { registry: this.registry, now });
-    if (event.predecessorEventId && !this.getEvent(event.predecessorEventId)) {
-      throw new Error(`management event predecessor does not exist: ${event.predecessorEventId}`);
+    // A causal chain is bounded so that a handler which keeps settling one event
+    // into an immediately-due successor terminates instead of hot-looping forever.
+    let causalDepth = 0;
+    if (event.predecessorEventId) {
+      const predecessor = this.getEvent(event.predecessorEventId);
+      if (!predecessor) {
+        throw new Error(`management event predecessor does not exist: ${event.predecessorEventId}`);
+      }
+      causalDepth = predecessor.causalDepth + 1;
+      if (causalDepth > MAX_CAUSAL_DEPTH) {
+        throw new Error('management event causal chain exceeds the bounded depth');
+      }
     }
 
     const replay = this.db.prepare('SELECT * FROM management_events WHERE fingerprint = ?').get(event.fingerprint);
@@ -381,8 +468,8 @@ export class ManagementEventStore {
         event_id, schema_version, fingerprint, coalesce_key, event_type,
         project_id, repo, issue_number, pull_request_number, exact_sha,
         correlation_id, predecessor_event_id, not_before, deadline_at,
-        state, attempt_count, created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+        causal_depth, state, attempt_count, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
     `).run(
       event.eventId,
       event.schemaVersion,
@@ -398,6 +485,7 @@ export class ManagementEventStore {
       event.predecessorEventId,
       event.notBefore,
       event.deadlineAt,
+      causalDepth,
       timestamp,
       timestamp,
     );
@@ -453,15 +541,7 @@ export class ManagementEventStore {
   }
 
   recoverExpiredClaims({ now = this.now() } = {}) {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      const result = this.expireInTransaction(now);
-      this.db.exec('COMMIT');
-      return result;
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
+    return this.runInTransaction(() => this.expireInTransaction(now));
   }
 
   listDue({ now = this.now(), limit = 100 } = {}) {
@@ -480,16 +560,11 @@ export class ManagementEventStore {
 
   recoverDueEvents({ now = this.now(), limit = 100 } = {}) {
     const boundedLimit = boundedInteger(limit, 100, { name: 'management event recovery limit', min: 1, max: MAX_DUE_SCAN });
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    return this.runInTransaction(() => {
       const recovery = this.expireInTransaction(now);
       const due = this.listDue({ now, limit: boundedLimit });
-      this.db.exec('COMMIT');
       return Object.freeze({ recovery, due });
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
+    });
   }
 
   claimNext({
@@ -503,8 +578,7 @@ export class ManagementEventStore {
     });
     const timestamp = iso(now, 'management event claim timestamp');
     const expiresAt = new Date(Date.parse(timestamp) + boundedLeaseMs).toISOString();
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
+    return this.runInTransaction(() => {
       this.expireInTransaction(timestamp);
       const candidate = this.db.prepare(`
         SELECT event_id FROM management_events
@@ -515,10 +589,9 @@ export class ManagementEventStore {
         ORDER BY not_before ASC, created_at ASC, event_id ASC
         LIMIT 1
       `).get(this.maxAttempts, timestamp, timestamp);
-      if (!candidate) {
-        this.db.exec('COMMIT');
-        return null;
-      }
+      if (!candidate) return null;
+      // The write lock is held for the whole transaction, so the guarded UPDATE
+      // is what makes exactly one claimant the owner of this event.
       const result = this.db.prepare(`
         UPDATE management_events
         SET state = 'claimed', attempt_count = attempt_count + 1,
@@ -527,13 +600,8 @@ export class ManagementEventStore {
         WHERE event_id = ? AND state = 'pending'
       `).run(tokenHash, expiresAt, timestamp, timestamp, candidate.event_id);
       if (Number(result.changes) !== 1) throw new Error('management event claim lost its deterministic candidate');
-      const claimed = this.getEvent(candidate.event_id);
-      this.db.exec('COMMIT');
-      return claimed;
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
+      return this.getEvent(candidate.event_id);
+    });
   }
 
   settle(eventId, {
@@ -545,21 +613,26 @@ export class ManagementEventStore {
   } = {}) {
     if (!['settled', 'blocked'].includes(state)) throw new Error('management event settlement state is invalid');
     if (!Array.isArray(successors) || successors.length > 20) throw new Error('management event successors exceed the bounded limit');
+    const settlementId = requiredId(eventId, 'management event eventId');
     const tokenHash = claimTokenHash(claimToken);
     const normalizedResult = normalizedOutcome(outcome);
     const timestamp = iso(now, 'management event settlement timestamp');
 
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      const currentRow = this.db.prepare('SELECT * FROM management_events WHERE event_id = ?').get(eventId);
-      if (!currentRow) throw new Error(`unknown management event: ${eventId}`);
+    return this.runInTransaction(() => {
+      const currentRow = this.db.prepare('SELECT * FROM management_events WHERE event_id = ?').get(settlementId);
+      if (!currentRow) throw new Error(`unknown management event: ${settlementId}`);
+      // An identical repeat settlement is idempotent; a contradictory one must
+      // never silently succeed, so a differing outcome or state falls through to
+      // the claimant guard below and fails closed.
       if (currentRow.state === state && currentRow.settled_at && currentRow.claim_token_hash === tokenHash) {
         if (currentRow.outcome !== normalizedResult) {
           throw new Error('management event already settled with a different outcome');
         }
-        const settled = eventFromRow(currentRow);
-        this.db.exec('COMMIT');
-        return Object.freeze({ event: settled, successors: Object.freeze([]), idempotent: true });
+        return Object.freeze({
+          event: eventFromRow(currentRow),
+          successors: Object.freeze([]),
+          idempotent: true,
+        });
       }
       if (currentRow.state !== 'claimed' || currentRow.claim_token_hash !== tokenHash) {
         throw new Error('management event is not claimed by this claimant');
@@ -595,23 +668,20 @@ export class ManagementEventStore {
         SET state = ?, outcome = ?, claim_expires_at = NULL,
             settled_at = ?, updated_at = ?
         WHERE event_id = ? AND state = 'claimed' AND claim_token_hash = ?
-      `).run(state, normalizedResult, timestamp, timestamp, eventId, tokenHash);
+      `).run(state, normalizedResult, timestamp, timestamp, settlementId, tokenHash);
       if (Number(updated.changes) !== 1) throw new Error('management event settlement lost claimant ownership');
 
+      // A rejected successor throws here, which unwinds the whole transaction and
+      // leaves the predecessor unsettled rather than partially applied.
       const successorResults = normalizedSuccessors.map((successor) => (
         this.enqueueInTransaction(successor, { now: timestamp })
       ));
-      const settled = this.getEvent(eventId);
-      this.db.exec('COMMIT');
       return Object.freeze({
-        event: settled,
+        event: this.getEvent(settlementId),
         successors: Object.freeze(successorResults),
         idempotent: false,
       });
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
+    });
   }
 
   close() {
