@@ -14,9 +14,21 @@ export const MANAGER_PREFLIGHT_INVALID = 'manager-preflight-invalid';
 export const MANAGER_PREFLIGHT_REVOKED = 'manager-preflight-revoked';
 export const MANAGER_PREFLIGHT_ALREADY_CLAIMED = 'manager-preflight-already-claimed';
 
+/**
+ * #267: the deterministic Build Manager authority transition
+ * (`agent-runner-manager-worker-authority.mjs`) is an additional authorised
+ * producer domain alongside the existing manager sessions. It is *not* a
+ * relaxation of the runner boundary: the manager domain produces authority and
+ * the worker domain consumes it, the two identities can never be the same, and
+ * the runner-generated refusal below still applies to every packet regardless
+ * of the producer type it declares.
+ */
+export const MANAGER_PREFLIGHT_BUILD_MANAGER_PRODUCER = 'build_manager_authority_transition';
+
 const ALLOWED_PRODUCER_TYPES = new Set([
   'normal_chatgpt_manager_session',
   'chatgpt_scheduled_task',
+  MANAGER_PREFLIGHT_BUILD_MANAGER_PRODUCER,
 ]);
 const REVISION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,160}$/;
 const FINGERPRINT_PATTERN = /^sha256:[a-f0-9]{64}$/;
