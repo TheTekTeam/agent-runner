@@ -22,7 +22,9 @@ import {
   detectUnresolvedReviewFollowUp,
   findLinkedOpenPullRequests,
   linkedIssueNumberFromPr,
+  linkedIssueNumbersFromPr,
 } from './claude-runner-review-followup.mjs';
+import { resolvePrContinuationBinding } from './agent-runner-pr-continuation-binding.mjs';
 import {
   agentRunMetadata,
   buildAgentCommandArgs,
@@ -939,6 +941,109 @@ export function publishImplementationDraft({
   };
 }
 
+function parseSinglePullRequest(stdout = '') {
+  try {
+    const payload = JSON.parse(String(stdout || '').trim());
+    return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Strict same-PR publication for a bounded PR review-followup continuation
+ * (#242). Unlike `publishImplementationDraft`, this never creates a
+ * replacement PR: it pushes only the already-authorised existing branch,
+ * then re-reads the exact same open PR number/branch and requires the
+ * published head to equal the committed worktree HEAD before declaring
+ * success. Any identity drift (PR closed, reopened as a different number,
+ * head branch changed, or a head that does not match the local commit)
+ * fails closed instead of publishing a new PR.
+ */
+export function publishPrContinuation({
+  workspace,
+  worktreeIdentity,
+  repo,
+  prNumber,
+  env = process.env,
+  runner = spawnSync,
+} = {}) {
+  const branch = String(worktreeIdentity?.expectedBranch || '');
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo || ''))
+    || !Number.isInteger(prNumber) || prNumber <= 0
+    || !workspace?.worktreePath) {
+    return { published: false, failureReason: 'pr-continuation-publication-input-invalid' };
+  }
+
+  const processOptions = {
+    cwd: workspace.worktreePath,
+    encoding: 'utf8',
+    maxBuffer: 5 * 1024 * 1024,
+    env,
+  };
+  const branchFormat = runner('git', ['check-ref-format', '--branch', branch], processOptions);
+  if (branchFormat?.status !== 0) {
+    return { published: false, failureReason: 'pr-continuation-publication-branch-invalid' };
+  }
+  const actualBranch = runner('git', ['branch', '--show-current'], processOptions);
+  if (actualBranch?.status !== 0 || String(actualBranch.stdout || '').trim() !== branch) {
+    return { published: false, failureReason: 'pr-continuation-publication-branch-mismatch' };
+  }
+  const committedHeadResult = runner('git', ['rev-parse', 'HEAD'], processOptions);
+  const committedHead = committedHeadResult?.status === 0 ? String(committedHeadResult.stdout || '').trim() : null;
+  if (!committedHead) {
+    return { published: false, failureReason: 'pr-continuation-publication-head-unavailable' };
+  }
+
+  const push = runner('git', ['push', 'origin', branch], processOptions);
+  if (push?.status !== 0) {
+    return { published: false, failureReason: 'pr-continuation-branch-push-failed', stage: 'push', exitCode: push?.status ?? null };
+  }
+
+  const view = runner('gh', [
+    'pr', 'view', String(prNumber),
+    '--repo', repo,
+    '--json', 'number,state,headRefName,headRefOid,url',
+  ], processOptions);
+  if (view?.status !== 0) {
+    return { published: false, failureReason: 'pr-continuation-publication-pr-query-failed', stage: 'pr-query', exitCode: view?.status ?? null };
+  }
+  const pullRequest = parseSinglePullRequest(view.stdout);
+  if (!pullRequest?.number || !pullRequest?.url) {
+    return { published: false, failureReason: 'pr-continuation-publication-pr-evidence-missing', stage: 'pr-evidence' };
+  }
+  // Identity must be exactly preserved -- a closed/reopened/renumbered PR is
+  // never rebound to a freshly created replacement.
+  if (pullRequest.number !== prNumber) {
+    return { published: false, failureReason: 'pr-continuation-publication-pr-number-changed', stage: 'pr-evidence', prNumber: pullRequest.number };
+  }
+  if (pullRequest.state !== 'OPEN') {
+    return { published: false, failureReason: 'pr-continuation-publication-pr-not-open', stage: 'pr-evidence', prNumber: pullRequest.number };
+  }
+  if (pullRequest.headRefName !== branch) {
+    return { published: false, failureReason: 'pr-continuation-publication-branch-changed', stage: 'pr-evidence', prNumber: pullRequest.number };
+  }
+  if (pullRequest.headRefOid !== committedHead) {
+    return {
+      published: false,
+      failureReason: 'pr-continuation-publication-head-mismatch',
+      stage: 'pr-evidence',
+      prNumber: pullRequest.number,
+      expectedHeadSha: committedHead,
+      observedHeadSha: pullRequest.headRefOid || null,
+    };
+  }
+
+  return {
+    published: true,
+    failureReason: null,
+    branch,
+    prNumber: pullRequest.number,
+    prUrl: pullRequest.url,
+    headSha: committedHead,
+  };
+}
+
 async function githubJson(path, token, repo) {
   const url = `https://api.github.com/repos/${repo}${path}`;
   const response = await fetch(url, {
@@ -1259,6 +1364,7 @@ export function detectExecutionNoop({ execute, status, signal, stdout = '', stde
 export const PLAN_ONLY_EXIT_CODE = 2;
 export const COST_POLICY_EXIT_CODE = 3;
 export const EXECUTION_POLICY_EXIT_CODE = 4;
+export const PR_REVIEW_FOLLOWUP_MODE = 'pr-review-followup';
 
 const PLAN_FILE_PATH_PATTERN = /(\/\S*\.claude\/plans\/\S+\.md)/;
 const PLAN_ONLY_STDOUT_PATTERNS = [
@@ -1506,6 +1612,7 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
   }
 
   let implementationWorkspace = null;
+  const isPrContinuation = runPlan.mode === PR_REVIEW_FOLLOWUP_MODE;
   if (runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION) {
     const cliCapability = verifyClaudeImplementationCli({ claudeBin: args.claudeBin });
     planWithPrompt = { ...planWithPrompt, cliCapability };
@@ -1522,12 +1629,15 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
       );
     }
 
-    // native_resume and same_agent_continuation reconnect to the exact
-    // worktree/branch the original attempt owned — the opposite of the
+    // native_resume, same_agent_continuation, and PR review-followup
+    // continuation (#242) all reconnect to the exact worktree/branch an
+    // existing authorised attempt already owns — the opposite of the
     // fresh-attempt requirement above, which refuses to reuse one (#698
-    // finding 2).
+    // finding 2). PR follow-up continuation must never create a fresh
+    // branch/worktree, so it always uses the same reconnect path regardless
+    // of --recovery-mode.
     const implementationCheckout = runPlan.repositoryContext?.implementationCheckout;
-    implementationWorkspace = args.recoveryMode
+    implementationWorkspace = (args.recoveryMode || isPrContinuation)
       ? prepareContinuationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env })
       : prepareImplementationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env });
     planWithPrompt = {
@@ -1622,14 +1732,22 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
     && !executionCheck.noop
     && !planCheck.planProduced
     && implementationEvidence?.valid) {
-    implementationPublication = publishImplementationDraft({
-      workspace: implementationWorkspace,
-      worktreeIdentity: runPlan.worktreeIdentity,
-      repo: runPlan.repositoryContext?.implementationRepository || runPlan.repo,
-      issueNumber: runPlan.issue,
-      issueTitle: runPlan.issueTitle,
-      env,
-    });
+    implementationPublication = isPrContinuation
+      ? publishPrContinuation({
+        workspace: implementationWorkspace,
+        worktreeIdentity: runPlan.worktreeIdentity,
+        repo: runPlan.repositoryContext?.implementationRepository || runPlan.repo,
+        prNumber: runPlan.prNumber,
+        env,
+      })
+      : publishImplementationDraft({
+        workspace: implementationWorkspace,
+        worktreeIdentity: runPlan.worktreeIdentity,
+        repo: runPlan.repositoryContext?.implementationRepository || runPlan.repo,
+        issueNumber: runPlan.issue,
+        issueTitle: runPlan.issueTitle,
+        env,
+      });
     if (!implementationPublication.published) {
       implementationEvidence = {
         ...implementationEvidence,
@@ -1734,7 +1852,38 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
   return result.status === null ? 1 : result.status;
 }
 
-export async function runPrFollowUp(args, env, token) {
+/**
+ * Resolve the #241 continuation binding for a direct `--pr --execute`
+ * follow-up (#242): the linked issue must be unique and explicit before any
+ * GitHub read of it is attempted, and every other refusal path is delegated
+ * to `resolvePrContinuationBinding` itself so this wiring never duplicates
+ * its identity/authority/workspace logic.
+ */
+export async function resolvePrExecutionBinding({
+  pullRequest, repo, config, env, token,
+}) {
+  const linkedIssueNumbers = linkedIssueNumbersFromPr({ title: pullRequest.title || '', body: pullRequest.body || '' });
+  const { issue: linkedIssueRecord, comments: linkedIssueComments } = linkedIssueNumbers.length === 1
+    ? await fetchIssueAndComments({ repo, issue: linkedIssueNumbers[0], token })
+    : { issue: {}, comments: [] };
+
+  return resolvePrContinuationBinding({
+    pullRequest,
+    issue: linkedIssueRecord,
+    issueComments: linkedIssueComments,
+    repo,
+    config,
+    env,
+    resolveDispatchIdentity: resolveImplementationDispatchIdentity,
+    prepareWorkspace: prepareContinuationWorkspace,
+    captureEvidence: captureGitRepositoryEvidence,
+  });
+}
+
+export async function runPrFollowUp(args, env, token, config = {}, {
+  resolveBinding = resolvePrExecutionBinding,
+  run = runOrPlanClaude,
+} = {}) {
   const { pullRequest, reviews, comments, reviewThreads } = await fetchPullRequestReviewContext({ repo: args.repo, pr: args.pr, token });
   const unresolved = detectUnresolvedReviewFollowUp({ reviews, reviewThreads, comments });
   const branch = pullRequest.head?.ref || '(unknown branch)';
@@ -1742,7 +1891,7 @@ export async function runPrFollowUp(args, env, token) {
 
   if (!unresolved.hasUnresolvedFollowUp) {
     const payload = {
-      mode: 'pr-review-followup',
+      mode: PR_REVIEW_FOLLOWUP_MODE,
       pr: args.pr,
       repo: args.repo,
       hasUnresolvedFollowUp: false,
@@ -1760,19 +1909,88 @@ export async function runPrFollowUp(args, env, token) {
     unresolved,
     repo: args.repo,
   });
-  const profileName = inferProfile({ explicitProfile: args.profile, issue: { title: pullRequest.title, body: pullRequest.body } });
-  const profile = resolveProfile(profileName, { model: args.model, effort: args.effort }, env);
   const clearContext = shouldUseClear({ noClear: args.noClear, resumeSession: args.resumeSession });
+
+  // A write-capable direct --pr --execute run must bind to the exact
+  // existing authorised PR continuation (#241) before it can ever be
+  // treated as implementation. This is only attempted with --execute: a
+  // dry-run preview never touches GitHub for the linked issue or inspects a
+  // local worktree, matching the existing preview-only contract.
+  let continuationBinding = null;
+  if (args.execute) {
+    continuationBinding = await resolveBinding({
+      pullRequest, repo: args.repo, config, env, token,
+    });
+    if (!continuationBinding.allowed) {
+      const payload = {
+        mode: PR_REVIEW_FOLLOWUP_MODE,
+        pr: args.pr,
+        repo: args.repo,
+        dryRun: false,
+        blocked: true,
+        reason: continuationBinding.failureReason,
+        failureReason: continuationBinding.failureReason,
+        message: `Safe PR continuation binding refused this follow-up (${continuationBinding.failureReason}). No Claude process was started.`,
+      };
+      const logPath = writeRunLog({ outputDir: args.outputDir, label: `pr-${args.pr}`, payload });
+      console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+      return EXECUTION_POLICY_EXIT_CODE;
+    }
+  }
+
+  // Caller-supplied --profile/--model/--effort must never widen an
+  // authorised continuation: once bound, only the manager-approved
+  // profile/model/effort from the binding are used. They remain available
+  // for the unauthenticated dry-run preview, which carries no write
+  // capability.
+  const implementationToolPolicy = continuationBinding
+    ? buildImplementationToolPolicy({
+      expectedBranch: continuationBinding.worktreeIdentity.expectedBranch,
+      approvedBranch: continuationBinding.dispatchAuthority?.branch,
+    })
+    : null;
+  const profile = continuationBinding
+    ? resolveProfile(continuationBinding.profileName, {
+      model: continuationBinding.managerExecutionMeta?.model,
+      effort: continuationBinding.managerExecutionMeta?.effort,
+      permissionMode: continuationBinding.executionAuthorization.permissionMode,
+      tools: implementationToolPolicy?.tools,
+      allowedTools: implementationToolPolicy?.allowedTools,
+      disallowedTools: implementationToolPolicy?.disallowedTools,
+      worktreeName: nativeClaudeWorktreeName(continuationBinding.worktreeIdentity),
+      strictMcpConfig: implementationToolPolicy?.strictMcpConfig,
+      disableSlashCommands: implementationToolPolicy?.disableSlashCommands,
+      settings: implementationToolPolicy?.settings,
+      settingSources: implementationToolPolicy?.settingSources,
+    }, env)
+    : resolveProfile(
+      inferProfile({ explicitProfile: args.profile, issue: { title: pullRequest.title, body: pullRequest.body } }),
+      { model: args.model, effort: args.effort },
+      env,
+    );
   const claudeArgs = buildClaudeArgs({ prompt, profile, resumeSession: args.resumeSession });
 
   const runPlan = {
-    mode: 'pr-review-followup',
+    mode: PR_REVIEW_FOLLOWUP_MODE,
     dryRun: !args.execute,
     pr: args.pr,
+    prNumber: continuationBinding?.prNumber ?? args.pr,
     repo: args.repo,
     linkedIssue,
     branch,
     reasons: unresolved.reasons,
+    repositoryContext: continuationBinding?.repositoryContext || null,
+    executionPhase: continuationBinding ? EXECUTION_PHASE_IMPLEMENTATION : undefined,
+    executionAuthorization: continuationBinding?.executionAuthorization || null,
+    worktreeIdentity: continuationBinding?.worktreeIdentity || null,
+    implementationToolPolicy: implementationToolPolicy ? {
+      tools: implementationToolPolicy.tools,
+      allowedToolRuleCount: implementationToolPolicy.allowedToolRuleCount,
+      disallowedToolRuleCount: implementationToolPolicy.disallowedToolRuleCount,
+      strictMcpConfig: implementationToolPolicy.strictMcpConfig,
+      disableSlashCommands: implementationToolPolicy.disableSlashCommands,
+    } : null,
+    preRunHeadSha: continuationBinding?.preRunHeadSha || null,
     profile,
     costAdmission: evaluateClaudeCostAdmission(profile, env),
     agent: agentRunMetadata(resolveAgentById('claude-code-cli'), profile),
@@ -1783,7 +2001,7 @@ export async function runPrFollowUp(args, env, token) {
     claudeArgsPreview: redactExecutableArgs(claudeArgs, { redactFinalAsPrompt: true }),
   };
 
-  return runOrPlanClaude({ args, env, label: `pr-${args.pr}`, runPlan, prompt, claudeArgs });
+  return run({ args, env, label: `pr-${args.pr}`, runPlan, prompt, claudeArgs });
 }
 
 export function assertConfiguredRepositoryIdentity({ configPath, config, repo }) {
@@ -1837,7 +2055,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   }
 
   if (args.pr) {
-    return runPrFollowUp(args, env, token);
+    return runPrFollowUp(args, env, token, config);
   }
 
   if (!args.issue) throw new Error('Missing required --issue <number> (or --pr <number> for review follow-up mode)');

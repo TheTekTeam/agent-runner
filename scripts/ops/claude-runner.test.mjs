@@ -31,12 +31,15 @@ import {
   parseClaudeResultEnvelope,
   parseKeyValueBlock,
   PLAN_ONLY_EXIT_CODE,
+  PR_REVIEW_FOLLOWUP_MODE,
   prepareContinuationWorkspace,
   prepareImplementationWorkspace,
   publishImplementationDraft,
+  publishPrContinuation,
   readQuotaPauseState,
   removedClaudeProviderAuthKeys,
   resolveImplementationDispatchIdentity,
+  resolvePrExecutionBinding,
   resolveProfile,
   runOrPlanClaude,
   runPrFollowUp,
@@ -933,6 +936,289 @@ test('runPrFollowUp triggers a direct --pr follow-up plan from an unresolved rev
   assert.equal(logged.branch, 'claude/ops-claude-runner-dell-queue-629');
   assert.ok(logged.reasons.some((r) => r.startsWith('unresolved-review-threads')));
   assert.ok(existsSync(logged.logPath));
+});
+
+// #242: wire the accepted #241 PR-continuation binding into write-capable
+// direct `--pr --execute` follow-up runs.
+function mockPrFollowUpFetch({
+  prNumber = 42,
+  linkedIssue = 629,
+  branch = 'claude/pr-continuation-fixture-629',
+  reviewState = 'CHANGES_REQUESTED',
+  unresolvedThread = true,
+} = {}) {
+  return async (url) => {
+    if (url.includes(`/pulls/${prNumber}/reviews`)) {
+      return {
+        ok: true,
+        json: async () => (reviewState ? [{ user: { login: 'owner' }, state: reviewState, submitted_at: '2026-08-20T10:00:00Z', body: 'please address this' }] : []),
+      };
+    }
+    if (url.includes(`/issues/${prNumber}/comments`)) {
+      return { ok: true, json: async () => [] };
+    }
+    if (url.includes(`/pulls/${prNumber}`)) {
+      return {
+        ok: true,
+        json: async () => ({
+          number: prNumber,
+          state: 'open',
+          title: 'PR continuation fixture',
+          body: `Fixes #${linkedIssue}`,
+          html_url: `https://github.com/TheTekTeam/modelspend/pull/${prNumber}`,
+          head: { ref: branch, repo: { full_name: 'TheTekTeam/modelspend' }, sha: 'a'.repeat(40) },
+        }),
+      };
+    }
+    if (url.includes('/graphql')) {
+      return {
+        ok: true,
+        json: async () => ({
+          data: {
+            repository: {
+              pullRequest: {
+                reviewThreads: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: unresolvedThread
+                    ? [{ id: 'thread-1', isResolved: false, comments: { nodes: [{ author: { login: 'reviewer' }, body: 'unresolved inline note', createdAt: '2026-08-20T10:05:00Z' }] } }]
+                    : [],
+                },
+              },
+            },
+          },
+        }),
+      };
+    }
+    throw new Error(`unexpected fetch: ${url}`);
+  };
+}
+
+test('runPrFollowUp does not attempt continuation binding in dry-run preview', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  global.fetch = mockPrFollowUpFetch();
+  const originalLog = console.log;
+  console.log = () => {};
+  t.after(() => { console.log = originalLog; });
+
+  let bindingCalls = 0;
+  const args = parseArgs(['--pr', '42']);
+  const exitCode = await runPrFollowUp(args, {}, 'placeholder-token', {}, {
+    resolveBinding: async () => { bindingCalls += 1; return { allowed: true }; },
+  });
+  assert.equal(exitCode, 0);
+  assert.equal(bindingCalls, 0);
+});
+
+test('runPrFollowUp casual-comment no-op never attempts continuation binding even with --execute', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  global.fetch = mockPrFollowUpFetch({ reviewState: null, unresolvedThread: false });
+  const originalLog = console.log;
+  console.log = () => {};
+  t.after(() => { console.log = originalLog; });
+
+  let bindingCalls = 0;
+  const args = parseArgs(['--pr', '42', '--execute']);
+  const exitCode = await runPrFollowUp(args, {}, 'placeholder-token', {}, {
+    resolveBinding: async () => { bindingCalls += 1; return { allowed: true }; },
+  });
+  assert.equal(exitCode, 0);
+  assert.equal(bindingCalls, 0);
+});
+
+test('runPrFollowUp --execute blocks pre-provider when the #241 continuation binding refuses', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  global.fetch = mockPrFollowUpFetch();
+  const originalLog = console.log;
+  let loggedOutput = '';
+  console.log = (text) => { loggedOutput = text; };
+  t.after(() => { console.log = originalLog; });
+
+  let bindingCalls = 0;
+  let runCalls = 0;
+  const args = parseArgs(['--pr', '42', '--execute']);
+  const exitCode = await runPrFollowUp(args, {}, 'placeholder-token', {}, {
+    resolveBinding: async (input) => {
+      bindingCalls += 1;
+      assert.equal(input.pullRequest.number, 42);
+      assert.equal(input.repo, args.repo);
+      return { allowed: false, failureReason: 'pr-continuation-worktree-dirty' };
+    },
+    run: () => { runCalls += 1; return 0; },
+  });
+  assert.equal(exitCode, EXECUTION_POLICY_EXIT_CODE);
+  assert.equal(bindingCalls, 1);
+  assert.equal(runCalls, 0);
+  const logged = JSON.parse(loggedOutput);
+  assert.equal(logged.blocked, true);
+  assert.equal(logged.failureReason, 'pr-continuation-worktree-dirty');
+});
+
+test('runPrFollowUp --execute binds implementation phase to the exact authorised worktree and rejects caller widening', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  global.fetch = mockPrFollowUpFetch();
+  const originalLog = console.log;
+  console.log = () => {};
+  t.after(() => { console.log = originalLog; });
+
+  const worktreeIdentity = { name: 'pr-continuation-fixture-629', expectedBranch: 'claude/pr-continuation-fixture-629' };
+  const binding = {
+    allowed: true,
+    prNumber: 42,
+    issueNumber: 629,
+    preRunHeadSha: 'a'.repeat(40),
+    profileName: 'complex',
+    managerExecutionMeta: { profile: 'complex', model: 'sonnet', effort: 'medium' },
+    executionAuthorization: { allowed: true, phase: EXECUTION_PHASE_IMPLEMENTATION, permissionMode: 'dontAsk' },
+    repositoryContext: { implementationRepository: 'TheTekTeam/modelspend', implementationCheckout: '/repo' },
+    dispatchAuthority: { repository: 'TheTekTeam/modelspend', branch: worktreeIdentity.expectedBranch },
+    worktreeIdentity,
+  };
+
+  let bindingCalls = 0;
+  let capturedRunPlan = null;
+  // A caller override attempting to widen model/effort must never reach the
+  // bound-and-authorised runPlan.
+  const args = parseArgs(['--pr', '42', '--execute', '--model', 'opus', '--effort', 'xhigh']);
+  const exitCode = await runPrFollowUp(args, {}, 'placeholder-token', {}, {
+    resolveBinding: async () => { bindingCalls += 1; return binding; },
+    run: ({ runPlan }) => { capturedRunPlan = runPlan; return 0; },
+  });
+  assert.equal(exitCode, 0);
+  assert.equal(bindingCalls, 1);
+  assert.equal(capturedRunPlan.mode, PR_REVIEW_FOLLOWUP_MODE);
+  assert.equal(capturedRunPlan.dryRun, false);
+  assert.equal(capturedRunPlan.executionPhase, EXECUTION_PHASE_IMPLEMENTATION);
+  assert.equal(capturedRunPlan.worktreeIdentity, worktreeIdentity);
+  assert.equal(capturedRunPlan.prNumber, 42);
+  assert.equal(capturedRunPlan.preRunHeadSha, binding.preRunHeadSha);
+  // Same PR retained: the bound PR number is used, never a caller value that
+  // could drift from the authorised continuation.
+  assert.equal(capturedRunPlan.pr, 42);
+  assert.equal(capturedRunPlan.profile.model, 'sonnet');
+  assert.equal(capturedRunPlan.profile.effort, 'medium');
+  assert.notEqual(capturedRunPlan.profile.model, 'opus');
+  assert.notEqual(capturedRunPlan.profile.effort, 'xhigh');
+});
+
+test('publishPrContinuation pushes only the existing branch and preserves the exact same open PR', () => {
+  const branch = 'claude/pr-continuation-fixture-629';
+  const calls = [];
+  const runner = (command, args) => {
+    calls.push([command, ...args]);
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${'c'.repeat(40)}\n` };
+    if (command === 'git') return { status: 0, stdout: '' };
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          number: 42, state: 'OPEN', headRefName: branch, headRefOid: 'c'.repeat(40), url: 'https://github.com/TheTekTeam/modelspend/pull/42',
+        }),
+      };
+    }
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  const result = publishPrContinuation({
+    workspace: { worktreePath: '/tmp/worktree' },
+    worktreeIdentity: { expectedBranch: branch },
+    repo: 'TheTekTeam/modelspend',
+    prNumber: 42,
+    runner,
+    env: {},
+  });
+  assert.equal(result.published, true);
+  assert.equal(result.prNumber, 42);
+  assert.equal(result.headSha, 'c'.repeat(40));
+  assert.ok(calls.some((call) => call.join(' ') === `git push origin ${branch}`));
+  assert.equal(calls.some((call) => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create'), false);
+});
+
+test('publishPrContinuation fails closed instead of creating a replacement PR when the PR number changed', () => {
+  const branch = 'claude/pr-continuation-fixture-629';
+  const runner = (command, args) => {
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${'c'.repeat(40)}\n` };
+    if (command === 'git') return { status: 0, stdout: '' };
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          number: 99, state: 'OPEN', headRefName: branch, headRefOid: 'c'.repeat(40), url: 'https://github.com/TheTekTeam/modelspend/pull/99',
+        }),
+      };
+    }
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  const result = publishPrContinuation({
+    workspace: { worktreePath: '/tmp/worktree' },
+    worktreeIdentity: { expectedBranch: branch },
+    repo: 'TheTekTeam/modelspend',
+    prNumber: 42,
+    runner,
+    env: {},
+  });
+  assert.equal(result.published, false);
+  assert.equal(result.failureReason, 'pr-continuation-publication-pr-number-changed');
+});
+
+test('publishPrContinuation fails closed when the published head does not equal the committed worktree HEAD', () => {
+  const branch = 'claude/pr-continuation-fixture-629';
+  const runner = (command, args) => {
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${'c'.repeat(40)}\n` };
+    if (command === 'git') return { status: 0, stdout: '' };
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          number: 42, state: 'OPEN', headRefName: branch, headRefOid: 'd'.repeat(40), url: 'https://github.com/TheTekTeam/modelspend/pull/42',
+        }),
+      };
+    }
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  const result = publishPrContinuation({
+    workspace: { worktreePath: '/tmp/worktree' },
+    worktreeIdentity: { expectedBranch: branch },
+    repo: 'TheTekTeam/modelspend',
+    prNumber: 42,
+    runner,
+    env: {},
+  });
+  assert.equal(result.published, false);
+  assert.equal(result.failureReason, 'pr-continuation-publication-head-mismatch');
+});
+
+test('publishPrContinuation fails closed when the PR is no longer open, without creating a replacement', () => {
+  const branch = 'claude/pr-continuation-fixture-629';
+  const runner = (command, args) => {
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${'c'.repeat(40)}\n` };
+    if (command === 'git') return { status: 0, stdout: '' };
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          number: 42, state: 'CLOSED', headRefName: branch, headRefOid: 'c'.repeat(40), url: 'https://github.com/TheTekTeam/modelspend/pull/42',
+        }),
+      };
+    }
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  const result = publishPrContinuation({
+    workspace: { worktreePath: '/tmp/worktree' },
+    worktreeIdentity: { expectedBranch: branch },
+    repo: 'TheTekTeam/modelspend',
+    prNumber: 42,
+    runner,
+    env: {},
+  });
+  assert.equal(result.published, false);
+  assert.equal(result.failureReason, 'pr-continuation-publication-pr-not-open');
 });
 
 
