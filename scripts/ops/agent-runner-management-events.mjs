@@ -155,7 +155,8 @@ export function normalizeManagementEvent(input, {
   }
   const identity = projectIdentity(registry, projectId, input.repository);
   const createdAt = iso(now, 'management event timestamp');
-  const notBefore = input.notBefore == null ? createdAt : iso(input.notBefore, 'management event notBefore');
+  const requestedNotBefore = input.notBefore == null ? null : iso(input.notBefore, 'management event notBefore');
+  const notBefore = requestedNotBefore ?? createdAt;
   const deadlineAt = input.deadlineAt == null ? null : iso(input.deadlineAt, 'management event deadlineAt');
   if (deadlineAt && Date.parse(deadlineAt) < Date.parse(notBefore)) {
     throw new Error('management event deadlineAt cannot be before notBefore');
@@ -174,7 +175,11 @@ export function normalizeManagementEvent(input, {
     notBefore,
     deadlineAt,
   };
-  const fingerprint = `sha256:${sha256(stableJson(event))}`;
+  const fingerprintMaterial = {
+    ...event,
+    notBefore: requestedNotBefore,
+  };
+  const fingerprint = `sha256:${sha256(stableJson(fingerprintMaterial))}`;
   const coalesceKey = `coalesce:${sha256(stableJson(eventCoalesceMaterial(event)))}`;
   return Object.freeze({
     ...event,
@@ -607,9 +612,10 @@ export function enqueueManagementEventAndWake({
   now,
 } = {}) {
   if (!(store instanceof ManagementEventStore)) throw new Error('management event store is required');
-  const result = store.enqueue(event, { now: now ?? store.now() });
+  const timestamp = now ?? store.now();
+  const result = store.enqueue(event, { now: timestamp });
   const current = result.event;
-  const due = current.state === 'pending' && Date.parse(current.notBefore) <= Date.parse(now ?? store.now());
+  const due = current.state === 'pending' && Date.parse(current.notBefore) <= Date.parse(timestamp);
   const wakeResult = due
     ? callWake(wake, { schemaVersion: 1, reason: 'management-event-due', eventId: current.eventId })
     : Object.freeze({ attempted: false, ok: true, errorCode: null });
@@ -623,7 +629,8 @@ export function recoverDueManagementEvents({
   limit = 100,
 } = {}) {
   if (!(store instanceof ManagementEventStore)) throw new Error('management event store is required');
-  const result = store.recoverDueEvents({ now: now ?? store.now(), limit });
+  const timestamp = now ?? store.now();
+  const result = store.recoverDueEvents({ now: timestamp, limit });
   const wakeResult = result.due.length > 0
     ? callWake(wake, { schemaVersion: 1, reason: 'management-event-recovery', dueCount: result.due.length })
     : Object.freeze({ attempted: false, ok: true, errorCode: null });
