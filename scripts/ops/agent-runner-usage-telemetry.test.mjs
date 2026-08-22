@@ -125,7 +125,7 @@ test('#194: Ollama maps structured local prompt-eval/load nanoseconds without pa
       prompt_eval_duration: 2_000_000_000,
       load_duration: 500_000_000,
       total_duration: 4_000_000_000,
-      output_tokens: 20,
+      eval_count: 20,
     },
   });
 
@@ -133,6 +133,8 @@ test('#194: Ollama maps structured local prompt-eval/load nanoseconds without pa
   assert.equal(result.promptEvalDurationMs, 2000);
   assert.equal(result.modelLoadDurationMs, 500);
   assert.equal(result.totalDurationMs, 4000);
+  assert.equal(result.outputTokens, 20);
+  assert.equal(result.adapter, 'ollama-agent');
   assert.equal(result.promptEvalTokensPerSecond, 25);
   assert.equal(result.costPosture, 'free-local');
   assert.equal(result.paid, false);

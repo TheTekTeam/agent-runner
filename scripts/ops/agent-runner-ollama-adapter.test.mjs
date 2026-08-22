@@ -278,6 +278,58 @@ test('an error-status structured result is a typed task_attempt failure', () => 
   assert.equal(result.failureScope, FAILURE_SCOPES.TASK_ATTEMPT);
 });
 
+test('#194: parser maps bounded official Ollama runtime evidence when present', () => {
+  const result = parseOpenCodeResultEnvelope(JSON.stringify({
+    status: 'ok',
+    output: 'done',
+    mutated: false,
+    usage: {
+      prompt_eval_count: 50,
+      prompt_eval_duration: 2_000_000_000,
+      eval_count: 20,
+      load_duration: 500_000_000,
+      total_duration: 4_000_000_000,
+      prompt: 'must-not-survive',
+      session_id: 'restricted-session',
+      arbitrary_provider_field: 'raw-provider-data',
+    },
+  }), { model: 'qwen-example' });
+
+  assert.equal(result.usageEfficiency.provider, 'ollama-local');
+  assert.equal(result.usageEfficiency.adapter, 'ollama-agent');
+  assert.equal(result.usageEfficiency.model, 'qwen-example');
+  assert.equal(result.usageEfficiency.promptEvalTokens, 50);
+  assert.equal(result.usageEfficiency.promptEvalDurationMs, 2000);
+  assert.equal(result.usageEfficiency.outputTokens, 20);
+  assert.equal(result.usageEfficiency.modelLoadDurationMs, 500);
+  assert.equal(result.usageEfficiency.totalDurationMs, 4000);
+  assert.equal(result.usageEfficiency.costPosture, 'free-local');
+  assert.equal(result.usageEfficiency.paid, false);
+  assert.equal(result.usageEfficiency.costUsd, 0);
+
+  const serialized = JSON.stringify(result.usageEfficiency);
+  assert.equal(serialized.includes('must-not-survive'), false);
+  assert.equal(serialized.includes('restricted-session'), false);
+  assert.equal(serialized.includes('raw-provider-data'), false);
+});
+
+test('#194: parser keeps absent Ollama runtime evidence unknown rather than zero', () => {
+  const result = parseOpenCodeResultEnvelope(JSON.stringify({
+    status: 'ok',
+    output: 'done',
+    mutated: false,
+  }));
+
+  assert.equal(result.usageEfficiency.telemetryAvailability, 'unavailable');
+  assert.equal(result.usageEfficiency.promptEvalTokens, null);
+  assert.equal(result.usageEfficiency.promptEvalDurationMs, null);
+  assert.equal(result.usageEfficiency.outputTokens, null);
+  assert.equal(result.usageEfficiency.modelLoadDurationMs, null);
+  assert.equal(result.usageEfficiency.totalDurationMs, null);
+  assert.equal(result.usageEfficiency.costPosture, 'free-local');
+  assert.equal(result.usageEfficiency.costUsd, 0);
+});
+
 // --- 10. No mutation (command construction is pure, no paid fallback / concurrency / auto-pull flags) ----
 
 test('buildOpenCodeCommandArgs constructs a bounded, serial, no-fallback, no-download command', () => {

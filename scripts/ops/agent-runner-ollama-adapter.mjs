@@ -9,6 +9,7 @@ import {
   probeOutcome,
   zeroSpendEnvelope,
 } from './agent-runner-adapter-contract.mjs';
+import { normalizeOllamaUsageEfficiency } from './agent-runner-usage-telemetry.mjs';
 
 /**
  * Foundation-only OpenCode/Ollama adapter.
@@ -262,7 +263,20 @@ export function buildOpenCodeCommandArgs({ executablePath, model, endpointUrl, p
  * "Known limitations" note in docs/ops for why this has not yet been
  * verified against a live captured OpenCode payload.
  */
-export function parseOpenCodeResultEnvelope(stdout = '', { agentId = OLLAMA_AGENT_ID } = {}) {
+function extractOllamaStructuredUsage(parsed) {
+  if (!isPlainObject(parsed)) return null;
+  const source = isPlainObject(parsed.usage) ? parsed.usage : parsed;
+  const usage = {
+    prompt_eval_count: source.prompt_eval_count,
+    prompt_eval_duration: source.prompt_eval_duration,
+    eval_count: source.eval_count,
+    load_duration: source.load_duration,
+    total_duration: source.total_duration,
+  };
+  return Object.values(usage).some((value) => value !== undefined) ? usage : null;
+}
+
+export function parseOpenCodeResultEnvelope(stdout = '', { agentId = OLLAMA_AGENT_ID, model = null } = {}) {
   const text = String(stdout || '').trim();
   if (!text) {
     return normalizedAdapterResult({
@@ -297,12 +311,18 @@ export function parseOpenCodeResultEnvelope(stdout = '', { agentId = OLLAMA_AGEN
     });
   }
 
+  const structuredUsage = extractOllamaStructuredUsage(parsed);
+  const usageEfficiency = structuredUsage
+    ? normalizeOllamaUsageEfficiency({ usage: structuredUsage, model })
+    : null;
+
   if (parsed.status === 'no-op') {
     return normalizedAdapterResult({
       ok: true,
       agentId,
       resultText: String(parsed.output || ''),
       reason: 'no-op',
+      usageEfficiency,
       mutatedRepository: false,
     });
   }
@@ -312,6 +332,7 @@ export function parseOpenCodeResultEnvelope(stdout = '', { agentId = OLLAMA_AGEN
       ok: true,
       agentId,
       resultText: String(parsed.output || ''),
+      usageEfficiency,
       mutatedRepository: Boolean(parsed.mutated),
     });
   }
@@ -322,6 +343,7 @@ export function parseOpenCodeResultEnvelope(stdout = '', { agentId = OLLAMA_AGEN
     reason: String(parsed.error || 'ollama-run-failed'),
     failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
     resultText: String(parsed.output || ''),
+    usageEfficiency,
   });
 }
 

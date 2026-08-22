@@ -280,11 +280,12 @@ export function normalizeOllamaUsageEfficiency({ usage = null, model = null } = 
   const record = usage && typeof usage === 'object' && !Array.isArray(usage) ? usage : {};
   return normalizeUsageEfficiencyEnvelope({
     ...record,
+    outputTokens: record.outputTokens ?? record.output_tokens ?? record.eval_count ?? record.eval_tokens,
     costPosture: 'free-local',
     paid: false,
   }, {
     provider: 'ollama-local',
-    adapter: 'ollama-local',
+    adapter: 'ollama-agent',
     model,
     cacheStrategy: 'local-context',
     availabilityReason: usage ? null : 'structured-usage-unavailable',
