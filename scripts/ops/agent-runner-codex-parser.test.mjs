@@ -13,9 +13,6 @@ function jsonl(events) {
   return events.map((event) => JSON.stringify(event)).join('\n');
 }
 
-// Synthetic secrets/session material/prompts/paths/provider diagnostics used
-// only to prove they never survive into a returned result -- none of these
-// are real credentials.
 const SYNTHETIC_SECRETS = [
   'sk-test-EXTREMELY-SECRET-1234567890abcdef',
   'codex-session-handle-9f8e7d6c5b4a',
@@ -32,14 +29,13 @@ function assertNoLeak(value, label) {
   }
 }
 
-// --- invalid / malformed output --------------------------------------------
-
 test('invalid output: empty stdout fails closed', () => {
   const result = parseCodexResultEnvelope('');
   assert.equal(result.ok, false);
   assert.equal(result.reason, 'codex-invalid-output');
   assert.equal(result.failureScope, FAILURE_SCOPES.TASK_ATTEMPT);
   assert.equal(result.resultText, '');
+  assert.equal(result.usageEfficiency.telemetryAvailability, 'unavailable');
 });
 
 test('invalid output: non-JSON stdout fails closed and does not echo the raw stdout', () => {
@@ -70,8 +66,6 @@ test('parseCodexEventLines rejects one bad line among otherwise-good ones, not a
   assert.deepEqual(parsed.events, []);
 });
 
-// --- adversarial: malformed stdout carrying synthetic secrets --------------
-
 for (const [label, malformedStdout] of [
   ['non-JSON stdout literally containing the secrets', SYNTHETIC_SECRETS.join('\n')],
   ['stdout with a JSON line missing type, secrets embedded as field values', jsonl([{ foo: SYNTHETIC_SECRETS[0], bar: SYNTHETIC_SECRETS[1] }])],
@@ -89,8 +83,6 @@ for (const [label, malformedStdout] of [
   });
 }
 
-// --- no-op ------------------------------------------------------------------
-
 test('no-op: turn.completed with no file_change item is a success with no repository mutation', () => {
   const result = parseCodexResultEnvelope(jsonl([
     { type: 'thread.started' },
@@ -102,12 +94,43 @@ test('no-op: turn.completed with no file_change item is a success with no reposi
   assert.equal(result.reason, 'no-op');
   assert.equal(result.mutatedRepository, false);
   assert.equal(result.resultText, 'Nothing needed changing.');
-  assert.equal(result.usage.paid, true);
+  assert.equal(result.usage.paid, false);
   assert.equal(result.usage.inputTokens, 100);
   assert.equal(result.usage.outputTokens, 20);
+  assert.equal(result.usageEfficiency.costPosture, 'included-subscription');
+  assert.equal(result.usageEfficiency.inputTokens, 100);
 });
 
-// --- success with mutation ---------------------------------------------------
+test('#194: Codex conditionally maps cached/reasoning evidence from a structured terminal usage record', () => {
+  const result = parseCodexResultEnvelope(jsonl([
+    { type: 'item.completed', item: { type: 'file_change', path: 'src/foo.js' } },
+    {
+      type: 'turn.completed',
+      usage: {
+        input_tokens: 1000,
+        output_tokens: 120,
+        input_tokens_details: { cached_tokens: 600, raw: SYNTHETIC_SECRETS[0] },
+        output_tokens_details: { reasoning_tokens: 40, transcript: SYNTHETIC_SECRETS[1] },
+      },
+    },
+  ]));
+  assert.equal(result.ok, true);
+  assert.equal(result.usageEfficiency.inputTokens, 1000);
+  assert.equal(result.usageEfficiency.uncachedInputTokens, 400);
+  assert.equal(result.usageEfficiency.cacheReadTokens, 600);
+  assert.equal(result.usageEfficiency.reasoningTokens, 40);
+  assert.equal(result.usageEfficiency.cacheCreationTokens, null);
+  assertNoLeak(result.usageEfficiency, 'codex usage efficiency');
+});
+
+test('#194: absent Codex API-style detail remains unknown rather than fabricated zero', () => {
+  const result = parseCodexResultEnvelope(jsonl([
+    { type: 'turn.completed', usage: { input_tokens: 10, output_tokens: 2 } },
+  ]));
+  assert.equal(result.usageEfficiency.cacheReadTokens, null);
+  assert.equal(result.usageEfficiency.cacheCreationTokens, null);
+  assert.equal(result.usageEfficiency.reasoningTokens, null);
+});
 
 test('a turn.completed with a file_change item records mutatedRepository true', () => {
   const result = parseCodexResultEnvelope(jsonl([
@@ -121,8 +144,6 @@ test('a turn.completed with a file_change item records mutatedRepository true', 
   assert.equal(result.resultText, 'Fixed the failing test.');
 });
 
-// --- task failure --------------------------------------------------------------
-
 test('turn.failed with a generic message is a typed task_attempt failure, and the raw message is not returned', () => {
   const result = parseCodexResultEnvelope(jsonl([
     { type: 'turn.failed', error: { message: 'the model produced a malformed patch' } },
@@ -134,8 +155,6 @@ test('turn.failed with a generic message is a typed task_attempt failure, and th
   assert.equal(result.structuredFailure, 'turn.failed');
   assert.equal(JSON.stringify(result).includes('the model produced a malformed patch'), false);
 });
-
-// --- authentication failure -----------------------------------------------------
 
 test('an authentication failure message classifies as codex-auth-failed without echoing the message', () => {
   const result = parseCodexResultEnvelope(jsonl([
@@ -156,8 +175,6 @@ test('a top-level protocol error event with an unauthorized message also classif
   assert.equal(result.structuredFailure, 'error');
 });
 
-// --- quota failure -----------------------------------------------------------
-
 test('a quota/rate-limit failure message classifies as codex-quota-exceeded without echoing the message', () => {
   const result = parseCodexResultEnvelope(jsonl([
     { type: 'turn.failed', error: { message: 'rate limit exceeded, please retry later' } },
@@ -175,8 +192,6 @@ test('a 429 status message also classifies as codex-quota-exceeded', () => {
   assert.equal(result.reason, 'codex-quota-exceeded');
 });
 
-// --- adversarial: terminal error messages carrying synthetic secrets -------
-
 for (const [label, event] of [
   ['turn.failed generic error', { type: 'turn.failed', error: { message: `not logged in: ${SYNTHETIC_SECRETS.join(' ')}` } }],
   ['turn.failed quota error', { type: 'turn.failed', error: { message: `rate limit hit, session ${SYNTHETIC_SECRETS[1]}, token ${SYNTHETIC_SECRETS[0]}` } }],
@@ -188,8 +203,6 @@ for (const [label, event] of [
     assertNoLeak(result, label);
   });
 }
-
-// --- timeout / cancellation (process-level, not from stdout) -----------------
 
 test('timeout is classified distinctly from an ordinary execution error', () => {
   const result = classifyCodexExecutionError({ timedOut: true, signal: 'SIGTERM' });
@@ -213,8 +226,6 @@ test('an execution error that is neither timed out nor cancelled is classified g
   assert.equal(result.resultText, '');
 });
 
-// --- adversarial: caller-supplied process-wrapper messages carrying secrets -
-
 for (const [label, options] of [
   ['timeout with a secret-bearing message', { timedOut: true, signal: 'SIGTERM', message: `killed after timeout, cwd=${SYNTHETIC_SECRETS[3]} token=${SYNTHETIC_SECRETS[0]}` }],
   ['cancellation with a secret-bearing message', { cancelled: true, signal: 'SIGINT', message: `cancelled by user, session=${SYNTHETIC_SECRETS[1]}` }],
@@ -227,19 +238,17 @@ for (const [label, options] of [
   });
 }
 
-// --- usage envelope ------------------------------------------------------------
-
-test('codexUsageEnvelope never invents a cost figure and passes through only finite token counts', () => {
+test('codexUsageEnvelope never invents a cost figure and uses #184 included-subscription semantics', () => {
   assert.deepEqual(codexUsageEnvelope({}), {
     provider: 'codex-cli',
-    paid: true,
+    paid: false,
     costUsd: null,
     inputTokens: null,
     outputTokens: null,
   });
   assert.deepEqual(codexUsageEnvelope({ inputTokens: 10, outputTokens: 'not-a-number' }), {
     provider: 'codex-cli',
-    paid: true,
+    paid: false,
     costUsd: null,
     inputTokens: 10,
     outputTokens: null,
