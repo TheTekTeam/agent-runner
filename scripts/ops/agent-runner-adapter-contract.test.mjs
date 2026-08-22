@@ -45,10 +45,28 @@ test('#194: normalizedAdapterResult preserves legacy usage while projecting boun
   assert.equal(JSON.stringify(result.usageEfficiency).includes('do-not-copy'), false);
 });
 
-test('#194: an explicit provider-normalized efficiency projection is retained verbatim', () => {
-  const usageEfficiency = Object.freeze({ schemaVersion: 'custom-test', marker: true });
-  const result = normalizedAdapterResult({ ok: true, usageEfficiency });
-  assert.equal(result.usageEfficiency, usageEfficiency);
+test('#194: explicit usage efficiency evidence is re-normalized through the positive allowlist', () => {
+  const result = normalizedAdapterResult({
+    ok: true,
+    agentId: 'codex-cli',
+    usage: { provider: 'codex-cli', paid: false, costUsd: null },
+    usageEfficiency: {
+      schemaVersion: 'attacker-controlled-version',
+      provider: 'codex-cli',
+      adapter: 'codex-cli',
+      costPosture: 'included-subscription',
+      inputTokens: 42,
+      marker: true,
+      prompt: 'must-not-survive',
+    },
+  });
+  assert.equal(result.usageEfficiency.schemaVersion, 'agent-runner-usage-efficiency/v1');
+  assert.equal(result.usageEfficiency.provider, 'codex-cli');
+  assert.equal(result.usageEfficiency.adapter, 'codex-cli');
+  assert.equal(result.usageEfficiency.costPosture, 'included-subscription');
+  assert.equal(result.usageEfficiency.inputTokens, 42);
+  assert.equal(Object.hasOwn(result.usageEfficiency, 'marker'), false);
+  assert.equal(JSON.stringify(result.usageEfficiency).includes('must-not-survive'), false);
 });
 
 test('normalizedAdapterResult defaults a failure to machine_profile scope when none is supplied', () => {
