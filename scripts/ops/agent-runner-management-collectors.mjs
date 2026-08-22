@@ -44,7 +44,10 @@ import {
   issueManagerWorkerAuthority,
 } from './agent-runner-manager-worker-authority.mjs';
 import { MANAGER_SETTLEMENT_EVIDENCE_SCHEMA_VERSION, validateManagerSettlementEvidence } from './agent-runner-manager-settlement-evidence.mjs';
-import { settleManagerLifecycle } from './agent-runner-manager-lifecycle-settlement.mjs';
+import {
+  authorizeManagerContinuation,
+  settleManagerLifecycle,
+} from './agent-runner-manager-lifecycle-settlement.mjs';
 import {
   ensureContinuationPublished,
   ensureWorkerAuthorityPublished,
@@ -424,6 +427,39 @@ export function rebuildAuthorityFromSnapshot({ snapshot, profile, expectedAuthor
 }
 
 /**
+ * Replay a pinned continuation record back into the exact validated
+ * continuation authority.
+ *
+ * The parent authority is rebuilt from its own pinned issuance snapshot, the
+ * settlement evidence is re-validated against it, and `#267` re-derives the
+ * settlement and the continuation. Nothing new from GitHub is required, so an
+ * owed continuation publication can be resumed after a total process loss.
+ */
+export function rebuildContinuationFromSnapshot({ snapshot, parentSnapshot, profile, expectedContinuationKey }) {
+  if (!isPlainObject(snapshot) || !isPlainObject(parentSnapshot)) {
+    fail('the pinned continuation snapshot is unreadable');
+  }
+  const authority = rebuildAuthorityFromSnapshot({
+    snapshot: parentSnapshot,
+    profile,
+    expectedAuthorityKey: snapshot.parentAuthorityKey,
+  });
+  const evidence = validateManagerSettlementEvidence(snapshot.evidenceInput, { authority });
+  const settlement = settleManagerLifecycle({ evidence, previousSettlement: null });
+  const continuation = authorizeManagerContinuation({
+    authority,
+    settlement,
+    producer: snapshot.producer,
+    request: snapshot.request ?? null,
+    ownership: snapshot.ownership ?? null,
+  });
+  if (nonEmptyString(expectedContinuationKey) && continuation.continuationAuthorityKey !== expectedContinuationKey) {
+    fail('the pinned continuation snapshot no longer reproduces its continuation');
+  }
+  return continuation;
+}
+
+/**
  * Prove the returned attempt is the exact one the event named.
  *
  * Returns a bounded mismatch reason, or `null` when every identity the event
@@ -560,14 +596,53 @@ export function collectExecutionEvidence({ event, adapters, controlStore, produc
   }
 
   const persisted = controlStore.getProjection(profile.projectId);
+  const producerIdentity = { type: MANAGER_PREFLIGHT_BUILD_MANAGER_PRODUCER, domain: AUTHORITY_PRODUCER_DOMAIN, id: producerId };
+  const ownership = attempt.ownership ?? { activeLeases: [], openPullRequests: [], workspace: null };
   return {
     authority,
     settlementEvidence,
     previousSettlement,
-    ownership: attempt.ownership ?? { activeLeases: [], openPullRequests: [], workspace: null },
+    ownership,
     continuationRequest: attempt.continuationRequest ?? null,
-    producer: { type: MANAGER_PREFLIGHT_BUILD_MANAGER_PRODUCER, domain: AUTHORITY_PRODUCER_DOMAIN, id: producerId },
+    producer: producerIdentity,
     projectionContext: persisted ? persisted.payload : null,
+    // Not role-visible: retained so a continuation can be pinned exactly.
+    continuationPinning: {
+      schemaVersion: 1,
+      parentAuthorityKey: authority.authorityKey,
+      evidenceInput: evidenceInputFor(attempt, authority, profile),
+      producer: producerIdentity,
+      request: attempt.continuationRequest ?? null,
+      ownership,
+    },
+  };
+}
+
+/** The role-visible execution evidence, with the pinning-only field removed. */
+function executionEvidenceForRole(built) {
+  const { continuationPinning, ...evidence } = built;
+  return evidence;
+}
+
+/** The exact settlement-evidence input, so a continuation can be replayed. */
+function evidenceInputFor(attempt, authority, profile) {
+  return {
+    schemaVersion: MANAGER_SETTLEMENT_EVIDENCE_SCHEMA_VERSION,
+    authorityKey: authority.authorityKey,
+    authorityFingerprint: authority.authorityFingerprint,
+    attemptId: attempt.attemptId,
+    projectId: authority.projectId,
+    repository: repositoryParts(profile),
+    issueNumber: authority.issueNumber,
+    branch: authority.branch,
+    baseSha: authority.baseSha,
+    evidenceRevision: attempt.evidenceRevision,
+    evidenceSequence: attempt.evidenceSequence,
+    evidenceTimestamp: attempt.evidenceTimestamp,
+    publication: attempt.publication ?? null,
+    pullRequest: attempt.pullRequest ?? null,
+    ci: attempt.ci ?? null,
+    review: attempt.review ?? null,
   };
 }
 
@@ -740,16 +815,33 @@ export function createProductionManagementPorts({
     }
 
     if (role === 'execution') {
+      let built = null;
       const ports = {
-        collectEvidence: () => collectExecutionEvidence({
-          event, adapters, controlStore, producerId, project, profile,
-        }),
+        collectEvidence: () => {
+          built = collectExecutionEvidence({ event, adapters, controlStore, producerId, project, profile });
+          return built.noAuthorisedAttempt === true ? built : executionEvidenceForRole(built);
+        },
       };
       if (mutating) {
         assertWriteAdapters(writeAdapters);
-        ports.publishContinuationAuthority = ({ continuation }) => ensureContinuationPublished({
-          controlStore, transport: writeAdapters, continuation, now: timestamp,
-        });
+        ports.publishContinuationAuthority = ({ continuation }) => {
+          // Pin the continuation before announcing it, exactly as an authority
+          // is pinned: an owed continuation must survive a total process loss
+          // without waiting for new execution evidence to arrive.
+          if (built && isPlainObject(built.continuationPinning)) {
+            controlStore.recordAuthorityIssuance({
+              authorityKey: continuation.continuationAuthorityKey,
+              projectId: continuation.projectId,
+              issueNumber: continuation.issueNumber,
+              kind: 'continuation-authority',
+              snapshot: built.continuationPinning,
+              now: timestamp,
+            });
+          }
+          return ensureContinuationPublished({
+            controlStore, transport: writeAdapters, continuation, now: timestamp,
+          });
+        };
       }
       return ports;
     }

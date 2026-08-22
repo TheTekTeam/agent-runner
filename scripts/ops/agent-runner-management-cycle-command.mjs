@@ -37,7 +37,10 @@ import { runManagementControlCycle } from './agent-runner-management-controller.
 import { createProductionManagementPorts } from './agent-runner-management-collectors.mjs';
 import { createDellManagementAdapters } from './agent-runner-management-dell-adapters.mjs';
 import { createDellManagementWriteAdapters } from './agent-runner-management-write-adapters.mjs';
-import { rebuildAuthorityFromSnapshot } from './agent-runner-management-collectors.mjs';
+import {
+  rebuildAuthorityFromSnapshot,
+  rebuildContinuationFromSnapshot,
+} from './agent-runner-management-collectors.mjs';
 import { resumePendingPublications } from './agent-runner-management-publication.mjs';
 import { observeMaterialTransitions } from './agent-runner-management-observer.mjs';
 import { produceManagementEvents, recoverDueManagementWork } from './agent-runner-management-producers.mjs';
@@ -203,7 +206,7 @@ export async function runManagementCycleCommand({
   profileRegistry = null,
   planEntries = null,
   adapters,
-  writeAdapters = null,
+  createWriteAdapters = null,
   wake = null,
   now = () => new Date().toISOString(),
   uuid = randomUUID,
@@ -229,10 +232,15 @@ export async function runManagementCycleCommand({
     const timestamp = typeof now === 'function' ? now() : now;
     const wakeFn = wake ? wake.wake : null;
 
-    // The write transport exists only while the persisted mode is active. In
-    // every other mode it is not constructed at all, so there is nothing to
-    // suppress and nothing a role could reach.
-    const activeWriteAdapters = resolvedMode.mutating ? writeAdapters : null;
+    // The write transport is *constructed* only while the persisted mode is
+    // active. The factory is not invoked at all in shadow, fenced or disabled
+    // mode, so there is genuinely no write object in existence to suppress --
+    // withholding an already-built one would be effect-safe but would not be
+    // the structural boundary this control plane claims.
+    let activeWriteAdapters = null;
+    if (resolvedMode.mutating && typeof createWriteAdapters === 'function') {
+      activeWriteAdapters = createWriteAdapters();
+    }
     if (resolvedMode.mutating && !activeWriteAdapters) {
       return Object.freeze({
         schemaVersion: MANAGEMENT_CYCLE_SCHEMA_VERSION,
@@ -267,7 +275,7 @@ export async function runManagementCycleCommand({
           transport: activeWriteAdapters,
           projectId: project.projectId,
           now: timestamp,
-          rebuildAuthority: (record) => {
+          rebuild: (record) => {
             const issuance = stores.controlStore.getAuthorityIssuance(record.authorityKey);
             if (!issuance) return null;
             const profile = resolveRegisteredManagerProfile({
@@ -275,6 +283,18 @@ export async function runManagementCycleCommand({
               repository: project.githubRepo,
               ...(profileRegistry ? { registry: profileRegistry } : {}),
             });
+            if (issuance.kind === 'continuation-authority') {
+              // The continuation's parent authority is itself pinned, so the
+              // whole chain replays from persisted state alone.
+              const parent = stores.controlStore.getAuthorityIssuance(issuance.snapshot.parentAuthorityKey);
+              if (!parent) return null;
+              return rebuildContinuationFromSnapshot({
+                snapshot: issuance.snapshot,
+                parentSnapshot: parent.snapshot,
+                profile,
+                expectedContinuationKey: record.authorityKey,
+              });
+            }
             return rebuildAuthorityFromSnapshot({
               snapshot: issuance.snapshot, profile, expectedAuthorityKey: record.authorityKey,
             });
@@ -357,9 +377,9 @@ export async function main(argv = process.argv.slice(2), env = process.env, io =
       registry,
       profileRegistry: loadManagerProfileRegistry({ projectRegistry: registry }),
       adapters: createDellManagementAdapters({ env }),
-      // Constructed unconditionally here but handed to the cycle only when the
-      // persisted mode is active; the cycle decides, not the caller.
-      writeAdapters: createDellManagementWriteAdapters({ env }),
+      // A factory, not an instance: the cycle invokes it only after it has
+      // resolved the persisted mode as active.
+      createWriteAdapters: () => createDellManagementWriteAdapters({ env }),
       wake: resolveManagementWake({ env }),
     });
     io.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);

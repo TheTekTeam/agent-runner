@@ -55,7 +55,7 @@ function curatedBody() {
  * This is the only faked layer: the real Dell read and write adapters run
  * against it exactly as they would against `gh` and `git`.
  */
-function fakeProcess({ issues, comments = new Map(), calls } = {}) {
+function fakeProcess({ issues, comments = new Map(), calls, pulls = [], checkConclusion = 'success' } = {}) {
   return (command, args) => {
     const json = (value) => ({ status: 0, stdout: JSON.stringify(value), stderr: '' });
 
@@ -80,7 +80,15 @@ function fakeProcess({ issues, comments = new Map(), calls } = {}) {
     if (method === 'GET' && endpoint === `/repos/${REPOSITORY}/issues`) {
       return json([...issues.values()]);
     }
-    if (method === 'GET' && endpoint === `/repos/${REPOSITORY}/pulls`) return json([]);
+    if (method === 'GET' && endpoint === `/repos/${REPOSITORY}/pulls`) return json(pulls);
+    const pullMatch = /^\/repos\/.+\/pulls\/(\d+)$/.exec(endpoint);
+    if (method === 'GET' && pullMatch) {
+      return json(pulls.find((pull) => pull.number === Number(pullMatch[1])) ?? null);
+    }
+    if (method === 'GET' && /\/pulls\/\d+\/reviews/.test(endpoint)) return json([]);
+    if (method === 'GET' && /\/check-runs/.test(endpoint)) {
+      return json({ check_runs: [{ name: 'npm test', status: 'completed', conclusion: checkConclusion }] });
+    }
     const issueMatch = /^\/repos\/.+\/issues\/(\d+)$/.exec(endpoint);
     const commentsMatch = /^\/repos\/.+\/issues\/(\d+)\/comments/.exec(endpoint);
 
@@ -108,8 +116,8 @@ function fakeProcess({ issues, comments = new Map(), calls } = {}) {
  * `gh api ... --input -` sends its payload on stdin, so the emulator needs the
  * spawn options to see what was written. This wrapper records both.
  */
-function recordingProcess({ issues, comments, calls, writes }) {
-  const base = fakeProcess({ issues, comments, calls });
+function recordingProcess({ issues, comments, calls, writes, pulls, checkConclusion }) {
+  const base = fakeProcess({ issues, comments, calls, pulls, checkConclusion });
   return (command, args, options = {}) => {
     if (command === 'gh' && args[0] === 'api' && typeof options.input === 'string') {
       const payload = JSON.parse(options.input);
@@ -155,7 +163,10 @@ function projectConfig(localRepoPath) {
   };
 }
 
-async function withRealComposition(fn, { mode = 'active' } = {}) {
+async function withRealComposition(fn, { mode = 'active', pulls = [], checkConclusion = 'success' } = {}) {
+  // A live array so a test can make a pull request appear between cycles, the
+  // way a real attempt publishes one only after it has been authorised.
+  const pullsRef = [...pulls];
   const dir = mkdtempSync(join(tmpdir(), 'agent-runner-active-production-'));
   try {
     writeFileSync(join(dir, 'agent-runner.json'), JSON.stringify(projectConfig(join(dir, 'checkout'))));
@@ -187,7 +198,10 @@ async function withRealComposition(fn, { mode = 'active' } = {}) {
     const comments = new Map();
     const calls = [];
     const writes = [];
-    const spawn = recordingProcess({ issues, comments, calls, writes });
+    const spawn = recordingProcess({ issues, comments, calls, writes, pulls: pullsRef, checkConclusion });
+    // Records whether the write-adapter factory was invoked at all, so a mode
+    // that must never construct one can be proven rather than assumed.
+    const writeFactoryCalls = [];
 
     // The env a Dell deployment supplies. The lock path is deliberately absent,
     // which is the one unambiguous "slot free".
@@ -211,7 +225,10 @@ async function withRealComposition(fn, { mode = 'active' } = {}) {
       registry,
       profileRegistry,
       adapters,
-      writeAdapters: 'writeAdapters' in overrides ? overrides.writeAdapters : writeAdapters,
+      createWriteAdapters: () => {
+        writeFactoryCalls.push('constructed');
+        return 'writeAdapters' in overrides ? overrides.writeAdapters : writeAdapters;
+      },
       wake: null,
       now: () => T0,
       uuid: () => '00000000-0000-4000-8000-000000000001',
@@ -219,7 +236,7 @@ async function withRealComposition(fn, { mode = 'active' } = {}) {
     const openStores = () => openManagementStores(dbPath, { registry, now: () => T0 });
     return await fn({
       dir, registry, profileRegistry, options, dbPath, run, openStores,
-      issues, comments, calls, writes, adapters, writeAdapters, env, spawn,
+      issues, comments, calls, writes, adapters, writeAdapters, env, spawn, writeFactoryCalls, pulls: pullsRef,
     });
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -347,6 +364,108 @@ test('active mode without a write transport refuses to run rather than half-mana
   });
 });
 
+// ------------------------------------------------------------ continuation restart
+
+const BRANCH = 'claude/shadow-equivalence-evidence-900';
+const PULL_NUMBER = 42;
+const HEAD_SHA = 'd'.repeat(40);
+
+/** One open pull request for the authorised issue, as GitHub would report it. */
+function authorisedPull() {
+  return [{
+    number: PULL_NUMBER,
+    title: 'Shadow equivalence evidence',
+    head: { sha: HEAD_SHA, ref: BRANCH },
+    base: { sha: SOURCE_SHA },
+    state: 'open',
+    draft: true,
+    mergeable_state: 'clean',
+    changed_files: 2,
+    additions: 10,
+    deletions: 1,
+    comments: 0,
+    merged_at: null,
+  }];
+}
+
+function continuationNotices(comments) {
+  return [...comments.values()].flat().filter((comment) => String(comment.body).includes('<!-- agent-runner:manager-continuation -->'));
+}
+
+test('an owed continuation publication resumes after a total restart, with no new evidence', async () => {
+  // A failing required check at the exact head is what #267 settles as
+  // `continue-execution`, so the production cycle authorises a real continuation.
+  await withRealComposition(async ({ run, comments, openStores, pulls }) => {
+    // Cycle 1: no pull request yet, so the authority is granted and published.
+    await run();
+    assert.equal(publishedPackets(comments).length, 1);
+
+    // The attempt now publishes its pull request.
+    pulls.push(...authorisedPull());
+
+    // Cycle 2: the attempt has published a pull request whose required check
+    // failed, so a continuation is authorised -- but publishing it fails before
+    // any side effect, leaving the publication owed.
+    const brokenComment = {
+      createQueueMutationClient: () => ({
+        createIssue: () => ({ number: 951 }),
+        updateIssueLabels: () => ({ ok: true }),
+        updateIssueDependencies: () => ({ ok: true }),
+      }),
+      listIssueComments: ({ issueNumber }) => [...(comments.get(issueNumber) ?? [])],
+      createIssueComment: () => { throw new Error('comment transport failed'); },
+    };
+    await run({ writeAdapters: brokenComment });
+
+    const stores = openStores();
+    let owed;
+    try {
+      owed = stores.controlStore.listPendingPublications({ projectId: PROJECT_ID })
+        .filter((record) => record.kind === 'continuation-authority');
+      // The failing required check must genuinely have produced a continuation;
+      // a vacuous pass here would prove nothing about restart recovery.
+      assert.equal(owed.length, 1, 'a continuation publication must be owed');
+      // The continuation was pinned, so it can be rebuilt from persisted state.
+      const issuance = stores.controlStore.getAuthorityIssuance(owed[0].authorityKey);
+      assert.ok(issuance, 'the continuation must be pinned');
+      assert.equal(issuance.kind, 'continuation-authority');
+      assert.ok(stores.controlStore.getAuthorityIssuance(issuance.snapshot.parentAuthorityKey), 'its parent authority must be pinned too');
+    } finally {
+      stores.close();
+    }
+
+    // Cycle 3: a completely fresh process holding no continuation object, and
+    // no new GitHub evidence beyond what is already there.
+    await run();
+    assert.equal(continuationNotices(comments).length, 1, 'exactly one continuation notice');
+
+    const healed = openStores();
+    try {
+      const stillOwed = healed.controlStore.listPendingPublications({ projectId: PROJECT_ID })
+        .filter((record) => record.kind === 'continuation-authority');
+      assert.equal(stillOwed.length, 0, 'the owed continuation must have resolved');
+    } finally {
+      healed.close();
+    }
+  }, { checkConclusion: 'failure' });
+});
+
+test('a resumed continuation stays bound to the same repository, issue, pull request and head', async () => {
+  await withRealComposition(async ({ run, comments, pulls }) => {
+    await run();
+    pulls.push(...authorisedPull());
+    await run();
+    const notices = continuationNotices(comments);
+    assert.equal(notices.length, 1, 'a continuation notice must have been published');
+    const body = notices[0].body;
+    assert.ok(body.includes(`issue: ${READY_ISSUE}`));
+    assert.ok(body.includes(`pull_request: ${PULL_NUMBER}`));
+    assert.ok(body.includes(`head_commit: ${HEAD_SHA}`));
+    assert.ok(body.includes(`approved_branch: ${BRANCH}`));
+    assert.ok(body.includes('parent_authority_key: manager-preflight:'));
+  }, { checkConclusion: 'failure' });
+});
+
 // ------------------------------------------------------------ shadow / fenced / disabled
 
 test('shadow mode performs zero GitHub writes and publishes nothing', async () => {
@@ -372,6 +491,25 @@ test('fenced and disabled modes perform zero writes and claim nothing', async ()
       assert.equal(publishedPackets(comments).length, 0);
     }, { mode });
   }
+});
+
+test('the write-adapter factory is never invoked outside active mode', async () => {
+  for (const mode of ['shadow', 'fenced', 'disabled']) {
+    // eslint-disable-next-line no-await-in-loop -- each mode needs its own state
+    await withRealComposition(async ({ run, writeFactoryCalls }) => {
+      await run();
+      // Not merely withheld: never constructed. A write object that does not
+      // exist cannot be reached by any wiring mistake.
+      assert.deepEqual(writeFactoryCalls, [], `${mode} must not construct a write transport`);
+    }, { mode });
+  }
+});
+
+test('the write-adapter factory is invoked exactly once in active mode', async () => {
+  await withRealComposition(async ({ run, writeFactoryCalls }) => {
+    await run();
+    assert.deepEqual(writeFactoryCalls, ['constructed']);
+  });
 });
 
 test('assurance receives only collectEvidence, in active mode, from the real factory', async () => {

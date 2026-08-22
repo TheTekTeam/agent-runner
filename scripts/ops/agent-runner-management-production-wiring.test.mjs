@@ -139,7 +139,7 @@ function run({ options, registry, profileRegistry, adapters, writeAdapters = nul
     registry,
     profileRegistry,
     adapters,
-    writeAdapters: writeAdapters ?? fakeWriteTransport(),
+    createWriteAdapters: () => writeAdapters ?? fakeWriteTransport(),
     wake,
     now: () => T0,
     uuid: () => '00000000-0000-4000-8000-000000000001',

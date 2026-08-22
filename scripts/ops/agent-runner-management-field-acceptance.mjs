@@ -153,7 +153,10 @@ export const FIELD_ACCEPTANCE_PROBES = Object.freeze([
     id: 'exact-worker-authority',
     title: 'Exactly one exact worker authority is issued',
     evaluate: (context) => {
-      const issued = decisionsWith(context, (decision) => decision.reason === 'authority-issued');
+      // `authority-published` is the confirmed-publication reason; `authority-issued`
+      // remains the shadow-mode reason, where nothing is published.
+      const issued = decisionsWith(context, (decision) => decision.reason === 'authority-published'
+        || decision.reason === 'authority-issued');
       if (issued.length === 0) return unevidenced('no-authority-issued');
       const perIssue = new Map();
       for (const decision of issued) perIssue.set(decision.issueNumber, (perIssue.get(decision.issueNumber) ?? 0) + 1);
@@ -250,7 +253,12 @@ export const FIELD_ACCEPTANCE_PROBES = Object.freeze([
     id: 'quota-ambiguity-fails-closed',
     title: 'Quota ambiguity fails closed with no credit or paid fallback',
     evaluate: (context) => {
-      const quota = decisionsWith(context, (decision) => decision.reason === 'quota-ambiguous' || decision.reason === 'quota-unavailable');
+      // Only genuine quota evidence counts. The implementation-slot gate also
+      // fails closed on ambiguity, but it is a separate safety property: letting
+      // it satisfy this probe would report the quota requirement as proven when
+      // no quota refusal had ever been observed.
+      const quota = decisionsWith(context, (decision) => decision.reason === 'quota-ambiguous'
+        || decision.reason === 'quota-unavailable');
       if (quota.length === 0) return unevidenced('no-quota-refusal-observed');
       const escaped = quota.filter((decision) => decision.outcome !== 'delayed-retry');
       return escaped.length === 0 ? pass(`quota-refusals-${quota.length}`) : fail('quota-refusal-did-not-fail-closed');

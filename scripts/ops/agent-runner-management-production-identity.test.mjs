@@ -161,9 +161,9 @@ function run({ options, registry, profileRegistry, adapters, writeAdapters = nul
     registry,
     profileRegistry,
     adapters,
-    // The real production write transport surface; only the outermost GitHub
-    // side effect is faked.
-    writeAdapters: writeAdapters ?? fakeWriteTransport(),
+    // The real production write-transport *factory*; only the outermost GitHub
+    // side effect is faked. The cycle invokes it only when the mode is active.
+    createWriteAdapters: () => writeAdapters ?? fakeWriteTransport(),
     wake: null,
     now: () => T0,
     uuid: () => '00000000-0000-4000-8000-000000000001',

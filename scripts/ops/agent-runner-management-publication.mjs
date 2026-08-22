@@ -335,29 +335,30 @@ export function ensureContinuationPublished({ controlStore, transport, continuat
  * ensure-published reconciliation.
  */
 export function resumePendingPublications({
-  controlStore, transport, projectId, rebuildAuthority, now = new Date().toISOString(), limit = 20,
+  controlStore, transport, projectId, rebuild, now = new Date().toISOString(), limit = 20,
 } = {}) {
   if (!(controlStore instanceof ManagementControlStore)) fail('a ManagementControlStore is required');
-  if (typeof rebuildAuthority !== 'function') fail('a rebuildAuthority function is required');
+  if (typeof rebuild !== 'function') fail('a rebuild function is required');
   const pending = controlStore.listPendingPublications({ projectId, limit });
   const results = [];
   for (const record of pending) {
-    // Only worker-authority publications can be rebuilt from a pinned issuance
-    // snapshot; a continuation is republished by its own reconciliation.
-    if (record.kind !== 'worker-authority') continue;
-    let authority = null;
+    let rebuilt = null;
     try {
-      authority = rebuildAuthority(record);
+      // Both kinds are rebuilt from their pinned snapshots, so neither needs new
+      // GitHub evidence before it can be retried.
+      rebuilt = rebuild(record);
     } catch {
-      results.push(Object.freeze({ publicationKey: record.publicationKey, outcome: 'pending-retry', reason: 'authority-unrebuildable' }));
+      results.push(Object.freeze({ publicationKey: record.publicationKey, kind: record.kind, outcome: 'pending-retry', reason: 'authority-unrebuildable' }));
       continue;
     }
-    if (!authority) {
-      results.push(Object.freeze({ publicationKey: record.publicationKey, outcome: 'pending-retry', reason: 'authority-unavailable' }));
+    if (!rebuilt) {
+      results.push(Object.freeze({ publicationKey: record.publicationKey, kind: record.kind, outcome: 'pending-retry', reason: 'authority-unavailable' }));
       continue;
     }
-    const result = ensureWorkerAuthorityPublished({ controlStore, transport, authority, now });
-    results.push(Object.freeze({ publicationKey: record.publicationKey, outcome: result.outcome, reason: null }));
+    const result = record.kind === 'continuation-authority'
+      ? ensureContinuationPublished({ controlStore, transport, continuation: rebuilt, now })
+      : ensureWorkerAuthorityPublished({ controlStore, transport, authority: rebuilt, now });
+    results.push(Object.freeze({ publicationKey: record.publicationKey, kind: record.kind, outcome: result.outcome, reason: null }));
   }
   return Object.freeze({
     schemaVersion: MANAGEMENT_PUBLICATION_SCHEMA_VERSION,
