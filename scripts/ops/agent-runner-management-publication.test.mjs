@@ -165,7 +165,7 @@ test('CASE 4: a pending publication resumes automatically on the next reconcilia
       controlStore,
       transport: healthy,
       projectId: authority.projectId,
-      rebuildAuthority: () => authority,
+      rebuild: () => authority,
       now: T0,
     });
     assert.equal(resumed.pendingCount, 1);
@@ -222,7 +222,7 @@ test('a publication whose authority cannot be rebuilt is reported, never silentl
       controlStore,
       transport: fakeWriteTransport(),
       projectId: authority.projectId,
-      rebuildAuthority: () => { throw new Error('snapshot unreadable'); },
+      rebuild: () => { throw new Error('snapshot unreadable'); },
       now: T0,
     });
     assert.equal(resumed.results[0].outcome, 'pending-retry');

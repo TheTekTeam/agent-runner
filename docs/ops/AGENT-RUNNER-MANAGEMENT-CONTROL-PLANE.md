@@ -446,14 +446,20 @@ production code with bounded fakes rather than a parallel path.
 ### The write path
 
 The read adapter surface carries **no** write entry. Writes live in a separate
-`agent-runner-management-write-adapters.mjs` transport that the cycle hands on
-only when the persisted mode is `active` — in every other mode it is not passed
-at all, so there is nothing to suppress and nothing a role could reach.
-Assurance never receives it under any mode.
+`agent-runner-management-write-adapters.mjs` transport, and `main()` hands the
+cycle a **factory**, not an instance. The factory is invoked only after the
+persisted mode resolves as `active`, so in shadow, fenced or disabled mode no
+write object is ever constructed — there is nothing to suppress and nothing a
+wiring mistake could reach. A regression spies on the factory to prove it is
+never called outside active mode. Assurance never receives it under any mode.
 
 The transport is bounded to three surfaces: the `#266` client port
 (`createIssue`, `updateIssueLabels`, `updateIssueDependencies`), plus
-`listIssueComments` and `createIssueComment` for authority publication. Every
+`listIssueComments` and `createIssueComment` for authority publication.
+Comment discovery is **paginated** to a bounded ceiling, because idempotency
+depends on proving a packet is *absent* before posting — a single unpaginated
+page would miss a packet beyond it and duplicate. If the ceiling is reached with
+absence still unproven, the read fails closed rather than licensing a post. Every
 endpoint is checked against the exact declared repository. There is no method
 that closes an issue, merges, deploys, activates source, dispatches a worker or
 touches a unit. A dependency update replaces **only** the delimited managed
@@ -490,6 +496,25 @@ never overwritten, never silently accepted. A pending publication is itself
 ownership evidence, so no second authority can be issued for that issue while it
 is unresolved, and `resumePendingPublications()` resumes it automatically on the
 next cycle.
+
+**The publication result decides the programme outcome.** An authority the
+worker cannot actually read is not an issued authority, so programme
+reconciliation reports what publication achieved rather than what it attempted:
+
+| Publication | Programme outcome |
+| --- | --- |
+| `published` / `already-published` | `execution-required`, reason `authority-published` — normal execution successor |
+| `pending-retry` | `delayed-retry`, reason `authority-publication-pending` — ownership and intent retained, **no** execution successor, recovery retries |
+| `conflict` | `owner-attention`, reason `authority-publication-conflict` — **no** successor, only an owner can resolve it |
+
+A port that reports nothing is treated as unconfirmed, never as success.
+
+**Continuations recover the same way.** A continuation is pinned exactly as an
+authority is — its own bounded snapshot plus its parent authority's — so an owed
+continuation publication is rebuilt from persisted state alone after a total
+process loss. No new execution event or GitHub evidence is required to retry it,
+and the rebuilt continuation stays bound to the same repository, issue, pull
+request, branch, base, exact head and parent authority.
 
 The published body is the accepted `#267`
 `renderManagerWorkerAuthorityPacket()` rendering, so the existing Agent Runner

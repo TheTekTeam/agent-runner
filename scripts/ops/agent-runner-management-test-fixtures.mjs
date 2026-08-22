@@ -295,6 +295,10 @@ export function portFactory({
   assurance = assuranceObservation(),
   calls = { queueMutation: [], workerAuthority: [], continuation: [], appliedOperations: [] },
   queueMutationClient = null,
+  // What the publication reconciliation reports back. A port that reports
+  // nothing is deliberately treated as unconfirmed by the programme role.
+  publicationOutcome = 'published',
+  continuationOutcome = 'published',
 } = {}) {
   const client = queueMutationClient ?? recordingQueueMutationClient(calls.appliedOperations ?? []);
   const evidenceByRole = { programme, execution, assurance };
@@ -307,11 +311,13 @@ export function portFactory({
       };
       ports.publishWorkerAuthority = ({ authority }) => {
         calls.workerAuthority.push(authority.authorityKey);
+        return publicationOutcome === null ? undefined : { outcome: publicationOutcome };
       };
     }
     if (role === 'execution') {
       ports.publishContinuationAuthority = ({ continuation }) => {
         calls.continuation.push(continuation.continuationAuthorityKey);
+        return continuationOutcome === null ? undefined : { outcome: continuationOutcome };
       };
     }
     return ports;

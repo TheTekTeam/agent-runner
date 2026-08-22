@@ -203,6 +203,28 @@ function attributeSlotOwner(curation, collected) {
   };
 }
 
+/**
+ * Classify what publication actually achieved.
+ *
+ * A suppressed publication (shadow) is not a failure -- nothing was meant to be
+ * published -- but it is also not an externally available authority, so it is
+ * reported as `suppressed` and the decision records `mutationSuppressed`.
+ */
+function publicationState(publication, capabilities) {
+  if (!hasCapability(capabilities, 'publishWorkerAuthority')) return 'suppressed';
+  if (!isPlainObject(publication)) return 'pending';
+  if (publication.outcome === 'published' || publication.outcome === 'already-published') return 'confirmed';
+  if (publication.outcome === 'conflict') return 'conflict';
+  return 'pending';
+}
+
+function publicationReason(issueOutcome, state) {
+  if (state === 'suppressed') {
+    return issueOutcome === 'duplicate-no-op' ? 'authority-duplicate-no-op' : 'authority-issued';
+  }
+  return issueOutcome === 'duplicate-no-op' ? 'authority-duplicate-no-op' : 'authority-published';
+}
+
 function countInProgress(curation) {
   const profile = curation.queueEvidence.proposal.brief.evidence.profile;
   const inProgressLabel = profile.labels.inProgress ?? null;
@@ -446,17 +468,39 @@ export function runProgrammeReconciliation({
           quotaAdmission: collected.quotaAdmission,
           ledger: collected.authorityLedger ?? { issued: [] },
         });
-        if (issued.outcome === 'issued' && hasCapability(capabilities, 'publishWorkerAuthority')) {
+        identity.issueNumber = issued.authority.issueNumber;
+        identity.sha = issued.authority.baseSha;
+
+        let publication = null;
+        if (hasCapability(capabilities, 'publishWorkerAuthority')) {
           // Publication only. This role never consumes the authority it mints:
           // consumption belongs to the worker domain and is not a capability
           // any management role can hold.
-          capabilities.ports.publishWorkerAuthority({ authority: issued.authority });
+          publication = capabilities.ports.publishWorkerAuthority({ authority: issued.authority });
         }
-        identity.issueNumber = issued.authority.issueNumber;
-        identity.sha = issued.authority.baseSha;
-        outcome = 'execution-required';
-        reason = issued.outcome === 'duplicate-no-op' ? 'authority-duplicate-no-op' : 'authority-issued';
-        successors.push({ eventType: 'execution-reconcile-required', issueNumber: issued.authority.issueNumber, sha: issued.authority.baseSha });
+
+        // An authority the worker cannot actually read is not an issued
+        // authority. Reporting `execution-required` on an unresolved or
+        // conflicting publication would strand the issue: the ledger would own
+        // it, no consumable packet would exist, and the graph would believe the
+        // work had been handed over.
+        const state = publicationState(publication, capabilities);
+        if (state === 'conflict') {
+          outcome = 'owner-attention';
+          reason = 'authority-publication-conflict';
+          // Deliberately no successor: a conflicting immutable packet is never
+          // overwritten, so only an owner can resolve it.
+        } else if (state === 'pending') {
+          outcome = 'delayed-retry';
+          reason = 'authority-publication-pending';
+          // Ownership and the publication intent are both retained, so recovery
+          // retries the publication rather than re-issuing the authority.
+          successors.push({ eventType: 'programme-reconcile-required', notBefore: delayedFrom(now, delayMs) });
+        } else {
+          outcome = 'execution-required';
+          reason = publicationReason(issued.outcome, state);
+          successors.push({ eventType: 'execution-reconcile-required', issueNumber: issued.authority.issueNumber, sha: issued.authority.baseSha });
+        }
       }
     }
   }

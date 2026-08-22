@@ -49,7 +49,18 @@ const ISSUE_ENDPOINT = /^\/repos\/[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\/issues\/[1-9
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
 const MAX_BODY = 60_000;
-const MAX_COMMENTS = 100;
+const COMMENTS_PER_PAGE = 100;
+/**
+ * The bounded ceiling on comment discovery.
+ *
+ * Idempotent publication depends on being able to prove a packet is *absent*
+ * before posting. A single unpaginated page cannot prove that: a packet sitting
+ * beyond it would be invisible and the retry would post a duplicate. So the
+ * whole comment set is walked, up to this ceiling -- and if the ceiling is
+ * reached with a full final page, absence is unproven and the read fails closed
+ * rather than licensing a duplicate.
+ */
+const MAX_COMMENT_PAGES = 20;
 
 function fail(message, code = 'management-write-failed') {
   const error = new Error(`Agent Runner management write refusal: ${message}`);
@@ -213,19 +224,38 @@ export function createDellManagementWriteAdapters({
       });
     },
 
-    /** Bounded issue comments, for ensure-published reconciliation. */
+    /**
+     * The issue's comments, paginated to a bounded ceiling.
+     *
+     * Returns the whole set so publication can prove absence. Reaching the
+     * ceiling with a still-full page means absence cannot be proven, which
+     * throws rather than returning a partial set -- a partial set would look
+     * exactly like "the packet is not there".
+     */
     listIssueComments({ repository, issueNumber }) {
       const endpoint = assertEndpointRepository(
         `/repos/${repository}/issues/${issueNumber}`, repository, ISSUE_ENDPOINT,
       );
-      const payload = request('GET', `${endpoint}/comments?per_page=${MAX_COMMENTS}`);
-      if (!Array.isArray(payload)) return [];
-      return payload.filter(isPlainObject).map((comment) => ({
-        id: comment.id,
-        body: typeof comment.body === 'string' ? comment.body : '',
-        createdAt: comment.created_at ?? null,
-        author: String(comment.user?.login ?? ''),
-      }));
+      const collected = [];
+      for (let page = 1; page <= MAX_COMMENT_PAGES; page += 1) {
+        const payload = request('GET', `${endpoint}/comments?per_page=${COMMENTS_PER_PAGE}&page=${page}`);
+        if (!Array.isArray(payload)) break;
+        for (const comment of payload) {
+          if (!isPlainObject(comment)) continue;
+          collected.push({
+            id: comment.id,
+            body: typeof comment.body === 'string' ? comment.body : '',
+            createdAt: comment.created_at ?? null,
+            author: String(comment.user?.login ?? ''),
+          });
+        }
+        // A short page is the last page, so the set is complete.
+        if (payload.length < COMMENTS_PER_PAGE) return collected;
+      }
+      throw fail(
+        `issue #${issueNumber} has more comments than the bounded discovery ceiling can prove`,
+        'comment-set-unbounded',
+      );
     },
 
     /** Post exactly one bounded comment on exactly one issue. */

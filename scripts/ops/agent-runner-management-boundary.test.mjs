@@ -401,9 +401,13 @@ test('the write transport is only reachable in active mode and never by assuranc
   assert.ok(assuranceBranch > 0 && firstWritePort > assuranceBranch, 'assurance must return before any write port exists');
 
   const cycle = code('agent-runner-management-cycle-command.mjs');
-  // The cycle hands the transport on only when the persisted mode is mutating.
-  assert.match(cycle, /const activeWriteAdapters = resolvedMode\.mutating \? writeAdapters : null;/);
+  // The transport is *constructed* only after the mode resolves as mutating:
+  // the factory is guarded, not merely its result withheld.
+  assert.match(cycle, /if \(resolvedMode\.mutating && typeof createWriteAdapters === 'function'\)/);
+  assert.match(cycle, /activeWriteAdapters = createWriteAdapters\(\);/);
   assert.match(cycle, /refusal: 'write-transport-unavailable'/);
+  // main() hands over a factory, never a constructed instance.
+  assert.match(cycle, /createWriteAdapters: \(\) => createDellManagementWriteAdapters\(\{ env \}\)/);
 });
 
 test('publication is reconciled rather than fire-and-forget', () => {

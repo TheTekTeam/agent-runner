@@ -29,9 +29,9 @@ const BOTH_ISSUES = Object.freeze([
   { number: 502, title: 'Deterministic curation transition', state: 'open', labels: [LABELS.blocked], curationKey: 'qc:fixture-project:curator-transition', dependsOn: [501] },
 ]);
 
-function runProgramme({ mode = 'active', evidence = programmeEvidence(), event = EVENT, calls } = {}) {
+function runProgramme({ mode = 'active', evidence = programmeEvidence(), event = EVENT, calls, publicationOutcome = 'published' } = {}) {
   const recorded = calls ?? { queueMutation: [], workerAuthority: [], continuation: [], appliedOperations: [] };
-  const { resolvePorts } = portFactory({ programme: evidence, calls: recorded });
+  const { resolvePorts } = portFactory({ programme: evidence, calls: recorded, publicationOutcome });
   const ports = resolvePorts({ role: 'programme' });
   const collected = ports.collectEvidence();
   const capabilities = resolveRoleCapabilities({
@@ -43,7 +43,7 @@ function runProgramme({ mode = 'active', evidence = programmeEvidence(), event =
 test('a clean reconciliation with a ready record issues exactly one worker authority', () => {
   const { result, calls } = runProgramme({ evidence: programmeEvidence({ curation: curationWith({ issues: BOTH_ISSUES }) }) });
   assert.equal(result.outcome, 'execution-required');
-  assert.equal(result.reason, 'authority-issued');
+  assert.equal(result.reason, 'authority-published');
   assert.equal(calls.workerAuthority.length, 1);
   assert.equal(result.identity.issueNumber, 501);
   assert.equal(result.identity.sha, SOURCE_SHA);
@@ -234,8 +234,48 @@ test('a duplicate authority is an idempotent no-op rather than a second grant', 
   });
   assert.equal(result.outcome, 'execution-required');
   assert.equal(result.reason, 'authority-duplicate-no-op');
-  // The duplicate is never re-published: that would be a second grant of ownership.
-  assert.equal(calls.workerAuthority.length, 0);
+  // No *second grant* is made -- the ledger reconciled it to a no-op. Publication
+  // is still reconciled, because a duplicate grant whose packet never landed is
+  // exactly the stranded case: ensure-published is idempotent and heals it.
+  assert.equal(calls.workerAuthority.length, 1);
+});
+
+test('an unresolved publication is never reported as a successfully issued authority', () => {
+  const { result, calls } = runProgramme({
+    evidence: programmeEvidence({ curation: curationWith({ issues: BOTH_ISSUES }) }),
+    publicationOutcome: 'pending-retry',
+  });
+  assert.equal(result.outcome, 'delayed-retry');
+  assert.equal(result.reason, 'authority-publication-pending');
+  assert.equal(calls.workerAuthority.length, 1, 'publication was attempted');
+  // No execution successor: nothing may pretend a worker can consume this yet.
+  assert.equal(result.successors.some((entry) => entry.eventType === 'execution-reconcile-required'), false);
+  // Recovery is scheduled so the publication is retried, not re-issued.
+  assert.ok(Date.parse(result.successors[0].notBefore) > Date.parse(T0));
+  assert.equal(result.projection.nextAction.classification, 'delayed-retry');
+});
+
+test('a publication conflict fails closed to owner attention with no execution successor', () => {
+  const { result, calls } = runProgramme({
+    evidence: programmeEvidence({ curation: curationWith({ issues: BOTH_ISSUES }) }),
+    publicationOutcome: 'conflict',
+  });
+  assert.equal(result.outcome, 'owner-attention');
+  assert.equal(result.reason, 'authority-publication-conflict');
+  assert.equal(calls.workerAuthority.length, 1);
+  // A conflicting immutable packet is never overwritten, so only an owner can
+  // resolve it: no successor pretends otherwise.
+  assert.deepEqual(result.successors, []);
+  assert.equal(result.projection.ownerAttentionRequired, true);
+});
+
+test('a publication port that reports nothing is treated as unconfirmed, not as success', () => {
+  const { result } = runProgramme({
+    evidence: programmeEvidence({ curation: curationWith({ issues: BOTH_ISSUES }) }),
+    publicationOutcome: null,
+  });
+  assert.equal(result.outcome, 'delayed-retry');
+  assert.equal(result.reason, 'authority-publication-pending');
 });
 
 test('a genuine plan escalation becomes owner attention and deliberately emits no successor', () => {
