@@ -88,8 +88,14 @@ Gate order, highest first:
    attention is projected instead, and a later material transition re-wakes the
    graph.
 2. **Incomplete mutation** → bounded `delayed-retry`.
-3. **Occupied global implementation slot** → `execution-required`. Nothing new
-   is selected while work is in flight.
+3. **Occupied global implementation slot** → the owner is attributed from
+   bounded evidence before anything is emitted. Exactly one live authority for
+   this project gives `execution-required` with the **exact issue identity** (and
+   the pull request and head when positively known). No live authority means the
+   slot is held elsewhere → bounded `delayed-retry`; more than one candidate
+   owner → `assurance-required`. An unattributed execution wake is never emitted,
+   because the execution collector would correctly refuse it and nothing would
+   progress. Nothing new is selected while work is in flight either way.
 4. **Active ownership collision** → bounded `delayed-retry`.
 5. **No runnable work** → `assurance-required` if the queue moved, else
    `quiescent` with no successor.
@@ -334,8 +340,10 @@ store, no second authority format, no second queue curator, no second scheduler:
 `management_control_locks`, `management_control_decisions`,
 `management_control_findings`, `management_control_projections`,
 `management_control_observations`, `management_producer_state` (durable semantic
-dedupe) and `management_authority_ledger` (the persisted `#267` ledger, which is
-what makes duplicate-authority reconciliation survive a restart).
+dedupe), `management_authority_ledger` (the persisted `#267` ledger, which is
+what makes duplicate-authority reconciliation survive a restart),
+`management_authority_issuance` (the pinned issuance inputs) and
+`management_publication_outbox` (the publication intent/confirmation record).
 
 Event identity, claims, leases, delays, dedupe and successors remain `#289`'s.
 
@@ -434,6 +442,65 @@ so the auditor never reads the derived state it is auditing.
 `gh`, the accepted quota-only admission gate, the implementation lock, host
 identity). Every adapter is injected, so the focused tests drive this same
 production code with bounded fakes rather than a parallel path.
+
+### The write path
+
+The read adapter surface carries **no** write entry. Writes live in a separate
+`agent-runner-management-write-adapters.mjs` transport that the cycle hands on
+only when the persisted mode is `active` — in every other mode it is not passed
+at all, so there is nothing to suppress and nothing a role could reach.
+Assurance never receives it under any mode.
+
+The transport is bounded to three surfaces: the `#266` client port
+(`createIssue`, `updateIssueLabels`, `updateIssueDependencies`), plus
+`listIssueComments` and `createIssueComment` for authority publication. Every
+endpoint is checked against the exact declared repository. There is no method
+that closes an issue, merges, deploys, activates source, dispatches a worker or
+touches a unit. A dependency update replaces **only** the delimited managed
+block and fails closed if the markers are ambiguous, so human-authored body text
+is never rewritten.
+
+An `active` cycle with no write transport refuses to run
+(`write-transport-unavailable`) rather than half-managing.
+
+### Publication is reconciled, not fire-and-forget
+
+Recording a grant locally and announcing it on GitHub cannot be one atomic act,
+and both failure windows strand real work: a grant with no consumable packet
+leaves the worker nothing to claim while the issue reads as owned, and a blind
+retry after an ambiguous POST duplicates the packet.
+
+`agent-runner-management-publication.mjs` makes publication a reconciled
+transition backed by the `management_publication_outbox` table:
+
+```
+pin the issuance snapshot
+  -> persist the publication intent            (pending)
+  -> re-read the issue's comments
+  -> exact packet already present? heal to confirmed, post nothing
+  -> otherwise post exactly one canonical packet
+  -> re-read and verify the exact authority key and packet digest
+  -> only then mark confirmed
+```
+
+Every step is safe to repeat. An ambiguous result is never guessed at: the
+record stays `pending` and the next pass re-reads first. A packet carrying this
+authority's identity but a different immutable body is a terminal `conflict` —
+never overwritten, never silently accepted. A pending publication is itself
+ownership evidence, so no second authority can be issued for that issue while it
+is unresolved, and `resumePendingPublications()` resumes it automatically on the
+next cycle.
+
+The published body is the accepted `#267`
+`renderManagerWorkerAuthorityPacket()` rendering, so the existing Agent Runner
+consumer resolves it unchanged. The manager produces authority; it never
+consumes, claims or dispatches it.
+
+Continuation publication uses the same reconciliation. Its notice is
+deliberately **not** a second worker-authority format: it mints no authority and
+starts nothing, carrying only identity and bounded defect classification, while
+`#267` keeps the continuation bound to the same repository, issue, pull request,
+branch, base, exact head and parent authority.
 
 **The implementation slot is a tri-state.** "I could not read the lock" must
 never look like "the slot is free", so only a genuinely absent lock — or a
@@ -586,6 +653,8 @@ assurance independently reports a contradiction.
 | `agent-runner-management-observer.mjs` | The closed-allowlist observer that computes those transitions from live evidence |
 | `agent-runner-management-collectors.mjs` | The production `resolvePorts` factory and the three role collectors |
 | `agent-runner-management-dell-adapters.mjs` | Real Dell reads: git, `gh`, quota, implementation lock, host identity |
+| `agent-runner-management-write-adapters.mjs` | Bounded production writes, constructed only in `active` mode |
+| `agent-runner-management-publication.mjs` | Idempotent, recoverable authority and continuation publication |
 | `agent-runner-management-plan-registry.mjs` | The registered per-project management plan document |
 | `agent-runner-management-wake.mjs` | Best-effort wake of the existing generic Dell unit |
 | `agent-runner-management-cycle-command.mjs` | **The production entrypoint** (`npm run management:run`) |

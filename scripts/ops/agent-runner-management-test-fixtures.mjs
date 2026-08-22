@@ -199,6 +199,66 @@ export function assuranceObservation(overrides = {}) {
 }
 
 /**
+ * An in-memory stand-in for the production write transport.
+ *
+ * It implements exactly the surface `createDellManagementWriteAdapters()`
+ * exposes, so a test can drive the real production port composition -- the
+ * collectors, the publication state machine and the outbox -- while faking only
+ * the outermost GitHub side effect. `comments` is a live store, so a re-read
+ * genuinely observes what an earlier post wrote.
+ */
+export function fakeWriteTransport({
+  comments = new Map(),
+  firstCreatedNumber = 950,
+  failComment = null,
+  failList = null,
+} = {}) {
+  const calls = { createIssue: [], updateLabels: [], updateDependencies: [], comments: [], lists: [] };
+  let nextIssue = firstCreatedNumber;
+  const key = (repository, issueNumber) => `${repository}#${issueNumber}`;
+
+  const transport = {
+    calls,
+    comments,
+    createQueueMutationClient({ repository }) {
+      return {
+        createIssue({ curationKey, title }) {
+          calls.createIssue.push({ repository, curationKey, title });
+          nextIssue += 1;
+          return { number: nextIssue };
+        },
+        updateIssueLabels({ issueNumber, labels }) {
+          calls.updateLabels.push({ repository, issueNumber, labels: [...labels] });
+          return { ok: true };
+        },
+        updateIssueDependencies({ issueNumber, dependsOn }) {
+          calls.updateDependencies.push({ repository, issueNumber, dependsOn: [...(dependsOn ?? [])] });
+          return { ok: true };
+        },
+      };
+    },
+    listIssueComments({ repository, issueNumber }) {
+      calls.lists.push({ repository, issueNumber });
+      if (typeof failList === 'function' && failList(calls.lists.length)) throw new Error('comments unreadable');
+      return [...(comments.get(key(repository, issueNumber)) ?? [])];
+    },
+    createIssueComment({ repository, issueNumber, body }) {
+      calls.comments.push({ repository, issueNumber, body });
+      // A failure that still writes models the ambiguous-POST case; a failure
+      // that writes nothing models the transport-failed-before-side-effect case.
+      const behaviour = typeof failComment === 'function' ? failComment(calls.comments.length) : null;
+      if (behaviour === 'fail-before-write') throw new Error('comment transport failed');
+      const stored = comments.get(key(repository, issueNumber)) ?? [];
+      stored.push({ id: stored.length + 1, body, created_at: '2026-08-22T09:00:00Z', user: { login: 'build-manager' } });
+      comments.set(key(repository, issueNumber), stored);
+      if (behaviour === 'fail-after-write') throw new Error('comment transport timed out');
+      return { id: stored.length };
+    },
+  };
+  return transport;
+}
+
+/**
  * A recording queue-mutation client implementing the accepted #266 client port.
  * `createIssue` must return a real issue number or the mutation boundary
  * refuses the operation as unverifiable.

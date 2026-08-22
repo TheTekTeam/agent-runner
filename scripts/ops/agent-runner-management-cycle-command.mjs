@@ -36,6 +36,9 @@ import { resolveManagementControlMode } from './agent-runner-management-control-
 import { runManagementControlCycle } from './agent-runner-management-controller.mjs';
 import { createProductionManagementPorts } from './agent-runner-management-collectors.mjs';
 import { createDellManagementAdapters } from './agent-runner-management-dell-adapters.mjs';
+import { createDellManagementWriteAdapters } from './agent-runner-management-write-adapters.mjs';
+import { rebuildAuthorityFromSnapshot } from './agent-runner-management-collectors.mjs';
+import { resumePendingPublications } from './agent-runner-management-publication.mjs';
 import { observeMaterialTransitions } from './agent-runner-management-observer.mjs';
 import { produceManagementEvents, recoverDueManagementWork } from './agent-runner-management-producers.mjs';
 import { resolveManagementWake } from './agent-runner-management-wake.mjs';
@@ -200,6 +203,7 @@ export async function runManagementCycleCommand({
   profileRegistry = null,
   planEntries = null,
   adapters,
+  writeAdapters = null,
   wake = null,
   now = () => new Date().toISOString(),
   uuid = randomUUID,
@@ -225,6 +229,22 @@ export async function runManagementCycleCommand({
     const timestamp = typeof now === 'function' ? now() : now;
     const wakeFn = wake ? wake.wake : null;
 
+    // The write transport exists only while the persisted mode is active. In
+    // every other mode it is not constructed at all, so there is nothing to
+    // suppress and nothing a role could reach.
+    const activeWriteAdapters = resolvedMode.mutating ? writeAdapters : null;
+    if (resolvedMode.mutating && !activeWriteAdapters) {
+      return Object.freeze({
+        schemaVersion: MANAGEMENT_CYCLE_SCHEMA_VERSION,
+        ran: false,
+        mode: resolvedMode.mode,
+        refusal: 'write-transport-unavailable',
+        observations: Object.freeze([]),
+        recovery: null,
+        cycle: null,
+      });
+    }
+
     // ---- 1. observe material transitions and durably enqueue what moved ----
     const observations = [];
     if (options.observe) {
@@ -236,14 +256,45 @@ export async function runManagementCycleCommand({
       }
     }
 
-    // ---- 2. generic recovery: lost wakes, expired leases, delayed eligibility ----
+    // ---- 2. resume any publication interrupted by an earlier crash ----
+    // A grant recorded locally but never announced would otherwise strand its
+    // attempt: the issue reads as owned while the worker has nothing to claim.
+    const publications = [];
+    if (activeWriteAdapters) {
+      for (const project of registry.projects) {
+        const resumed = resumePendingPublications({
+          controlStore: stores.controlStore,
+          transport: activeWriteAdapters,
+          projectId: project.projectId,
+          now: timestamp,
+          rebuildAuthority: (record) => {
+            const issuance = stores.controlStore.getAuthorityIssuance(record.authorityKey);
+            if (!issuance) return null;
+            const profile = resolveRegisteredManagerProfile({
+              projectId: project.projectId,
+              repository: project.githubRepo,
+              ...(profileRegistry ? { registry: profileRegistry } : {}),
+            });
+            return rebuildAuthorityFromSnapshot({
+              snapshot: issuance.snapshot, profile, expectedAuthorityKey: record.authorityKey,
+            });
+          },
+        });
+        if (resumed.pendingCount > 0) {
+          publications.push({ projectId: project.projectId, pending: resumed.pendingCount, results: resumed.results });
+        }
+      }
+    }
+
+    // ---- 3. generic recovery: lost wakes, expired leases, delayed eligibility ----
     const recovery = recoverDueManagementWork({ store: stores.eventStore, now: timestamp, limit: 100 });
 
-    // ---- 3. drain due events through the real collectors ----
+    // ---- 4. drain due events through the real collectors ----
     let cycle = null;
     if (options.drain) {
       const resolvePorts = createProductionManagementPorts({
         adapters,
+        writeAdapters: activeWriteAdapters,
         controlStore: stores.controlStore,
         ...(profileRegistry ? { profileRegistry } : {}),
         ...(planEntries ? { planEntries } : {}),
@@ -272,7 +323,9 @@ export async function runManagementCycleCommand({
       refusal: null,
       controllerId: identity.controllerId,
       wakeEnabled: Boolean(wake?.enabled),
+      writeTransportEnabled: Boolean(activeWriteAdapters),
       observations: Object.freeze(observations),
+      publications: Object.freeze(publications),
       recovery: Object.freeze({ ...recovery.recovery, dueCount: recovery.due.length }),
       cycle,
     });
@@ -304,6 +357,9 @@ export async function main(argv = process.argv.slice(2), env = process.env, io =
       registry,
       profileRegistry: loadManagerProfileRegistry({ projectRegistry: registry }),
       adapters: createDellManagementAdapters({ env }),
+      // Constructed unconditionally here but handed to the cycle only when the
+      // persisted mode is active; the cycle decides, not the caller.
+      writeAdapters: createDellManagementWriteAdapters({ env }),
       wake: resolveManagementWake({ env }),
     });
     io.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);

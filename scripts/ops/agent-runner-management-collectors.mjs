@@ -45,6 +45,10 @@ import {
 } from './agent-runner-manager-worker-authority.mjs';
 import { MANAGER_SETTLEMENT_EVIDENCE_SCHEMA_VERSION, validateManagerSettlementEvidence } from './agent-runner-manager-settlement-evidence.mjs';
 import { settleManagerLifecycle } from './agent-runner-manager-lifecycle-settlement.mjs';
+import {
+  ensureContinuationPublished,
+  ensureWorkerAuthorityPublished,
+} from './agent-runner-management-publication.mjs';
 import { isPlainObject, nonEmptyString } from './agent-runner-manager-planner-safety.mjs';
 
 export const MANAGEMENT_COLLECTORS_SCHEMA_VERSION = 'agent-runner-management-collectors/v1';
@@ -71,12 +75,14 @@ export const OPTIONAL_READ_ADAPTERS = Object.freeze([
   'readSourceActivationEvidence',
 ]);
 
-/** Write surfaces. Optional, and only ever wired in `active` mode. */
-export const OPTIONAL_ADAPTERS = Object.freeze([
-  'applyQueueMutationClient',
-  'publishWorkerAuthority',
-  'publishContinuationAuthority',
-]);
+/**
+ * The read adapter surface carries **no** write entry.
+ *
+ * Writes live in a separate `writeAdapters` transport that is constructed only
+ * when the persisted mode is `active`, so a shadow, fenced or disabled control
+ * plane has no write surface in scope at all rather than a suppressed one.
+ */
+export const OPTIONAL_ADAPTERS = Object.freeze([]);
 
 const CURATION_KEY_MARKER = /<!--\s*agent-runner:queue-curation-key:\s*(qc:[a-z0-9-]+:[a-z0-9-]+)\s*-->/;
 const DEPENDENCY_LINE = /^-\s*#(\d+)\s*$/;
@@ -88,12 +94,26 @@ function fail(message) {
   throw new Error(`Refusing agent runner management evidence collection: ${message}`);
 }
 
+/**
+ * The write transport is required in `active` mode and must never be reachable
+ * outside it. Assurance is never handed it under any mode.
+ */
+function assertWriteAdapters(writeAdapters) {
+  if (!isPlainObject(writeAdapters)
+    || typeof writeAdapters.createQueueMutationClient !== 'function'
+    || typeof writeAdapters.listIssueComments !== 'function'
+    || typeof writeAdapters.createIssueComment !== 'function') {
+    fail('active mode requires the production write transport');
+  }
+  return writeAdapters;
+}
+
 function assertAdapters(adapters) {
   if (!isPlainObject(adapters)) fail('adapters must be an object');
   for (const name of REQUIRED_ADAPTERS) {
     if (typeof adapters[name] !== 'function') fail(`adapters.${name} is required`);
   }
-  const known = new Set([...REQUIRED_ADAPTERS, ...OPTIONAL_READ_ADAPTERS, ...OPTIONAL_ADAPTERS]);
+  const known = new Set([...REQUIRED_ADAPTERS, ...OPTIONAL_READ_ADAPTERS]);
   for (const name of Object.keys(adapters)) {
     if (!known.has(name)) fail(`adapters contains an unrecognised entry '${name}'`);
   }
@@ -639,6 +659,7 @@ export function collectAssuranceObservation({ project, profile, adapters, contro
  */
 export function createProductionManagementPorts({
   adapters,
+  writeAdapters = null,
   controlStore,
   profileRegistry = undefined,
   planEntries = undefined,
@@ -683,13 +704,8 @@ export function createProductionManagementPorts({
     if (role === 'programme') {
       const ports = { collectEvidence: () => programme };
       if (mutating) {
-        if (typeof adapters.applyQueueMutationClient !== 'function') {
-          fail('active mode requires the applyQueueMutationClient adapter');
-        }
-        if (typeof adapters.publishWorkerAuthority !== 'function') {
-          fail('active mode requires the publishWorkerAuthority adapter');
-        }
-        ports.applyQueueMutation = () => adapters.applyQueueMutationClient({ project, profile });
+        assertWriteAdapters(writeAdapters);
+        ports.applyQueueMutation = () => writeAdapters.createQueueMutationClient({ repository: profile.repository.full });
         ports.publishWorkerAuthority = ({ authority }) => {
           // Pin the exact issuance inputs first: an announced authority that
           // could never be rebuilt would strand its own attempt.
@@ -713,7 +729,11 @@ export function createProductionManagementPorts({
             state: 'issued',
             now: timestamp,
           });
-          adapters.publishWorkerAuthority({ authority, project, profile });
+          // Reconciled, not fire-and-forget: an interrupted publication stays
+          // pending and resumes on the next reconciliation.
+          return ensureWorkerAuthorityPublished({
+            controlStore, transport: writeAdapters, authority, now: timestamp,
+          });
         };
       }
       return ports;
@@ -726,12 +746,10 @@ export function createProductionManagementPorts({
         }),
       };
       if (mutating) {
-        if (typeof adapters.publishContinuationAuthority !== 'function') {
-          fail('active mode requires the publishContinuationAuthority adapter');
-        }
-        ports.publishContinuationAuthority = ({ continuation }) => {
-          adapters.publishContinuationAuthority({ continuation, project, profile });
-        };
+        assertWriteAdapters(writeAdapters);
+        ports.publishContinuationAuthority = ({ continuation }) => ensureContinuationPublished({
+          controlStore, transport: writeAdapters, continuation, now: timestamp,
+        });
       }
       return ports;
     }

@@ -169,6 +169,40 @@ function assertIdentityBinding(event, queueEvidence) {
   }
 }
 
+/**
+ * Attribute the occupied global implementation slot to exactly one authorised
+ * attempt of *this* project.
+ *
+ * Ownership is read from durable evidence only: the live authority ledger, plus
+ * whatever pull-request identity the queue evidence can prove. Exactly one live
+ * authority attributes; none or several does not. Selecting an arbitrary ledger
+ * record would reconcile the wrong attempt, so that is never done.
+ */
+function attributeSlotOwner(curation, collected) {
+  const live = (collected.authorityLedger?.issued ?? [])
+    .filter((entry) => entry.state === 'issued' || entry.state === 'consumed');
+  if (live.length === 0) {
+    // Something holds the slot but this project granted nothing, so it belongs
+    // to another registered project or to work outside the control plane.
+    return { attributed: false, reason: 'owned-by-another-project' };
+  }
+  if (live.length > 1) return { attributed: false, reason: 'ambiguous-owner' };
+
+  const owner = live[0];
+  const pulls = curation.queueEvidence.ownership.openPullRequests
+    .filter((pull) => pull.issueNumber === owner.issueNumber);
+  if (pulls.length > 1) return { attributed: false, reason: 'ambiguous-owner' };
+  const pull = pulls[0] ?? null;
+  return {
+    attributed: true,
+    issueNumber: owner.issueNumber,
+    // Included only when positively known: an attempt before publication has
+    // no pull request or head yet, and inventing one would fail closed later.
+    pullRequestNumber: pull ? pull.number : null,
+    headSha: pull ? pull.headSha : null,
+  };
+}
+
 function countInProgress(curation) {
   const profile = curation.queueEvidence.proposal.brief.evidence.profile;
   const inProgressLabel = profile.labels.inProgress ?? null;
@@ -329,9 +363,38 @@ export function runProgrammeReconciliation({
     // Work is already in flight globally. Follow it through rather than
     // selecting anything new: the one-global-implementation-slot invariant is
     // never widened here.
-    outcome = 'execution-required';
-    reason = 'implementation-slot-occupied';
-    successors.push({ eventType: 'execution-reconcile-required' });
+    //
+    // An execution wake must name the attempt it belongs to, so the owner is
+    // attributed from bounded ownership evidence. An unattributed wake would be
+    // refused downstream as ambiguous and make no progress, so it is never
+    // emitted: the graph waits for the identified evidence instead.
+    const owner = attributeSlotOwner(curation, collected);
+    if (owner.attributed) {
+      outcome = 'execution-required';
+      reason = 'implementation-slot-occupied';
+      successors.push({
+        eventType: 'execution-reconcile-required',
+        issueNumber: owner.issueNumber,
+        pullRequestNumber: owner.pullRequestNumber,
+        sha: owner.headSha,
+      });
+    } else if (owner.reason === 'owned-by-another-project') {
+      // The slot is held elsewhere. This project claims nothing and simply
+      // waits for capacity rather than inventing an attempt of its own.
+      outcome = 'delayed-retry';
+      reason = 'implementation-slot-owned-elsewhere';
+      successors.push({ eventType: 'programme-reconcile-required', notBefore: delayedFrom(now, delayMs) });
+    } else if (owner.reason === 'ambiguous-owner') {
+      // More than one candidate owner is a real discrepancy: hand it to the
+      // read-only auditor rather than guessing which attempt is live.
+      outcome = 'assurance-required';
+      reason = 'implementation-slot-owner-ambiguous';
+      successors.push({ eventType: 'queue-assurance-required' });
+    } else {
+      outcome = 'delayed-retry';
+      reason = 'implementation-slot-owner-unattributed';
+      successors.push({ eventType: 'programme-reconcile-required', notBefore: delayedFrom(now, delayMs) });
+    }
   } else if (slotState === 'ambiguous') {
     // The slot could not be proven free. Issuing an authority here could put a
     // second implementation into a slot that is already held, so this fails

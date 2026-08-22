@@ -38,6 +38,7 @@ const RUNTIME_MODULES = [
   'agent-runner-management-collectors.mjs',
   'agent-runner-management-observer.mjs',
   'agent-runner-management-cycle-command.mjs',
+  'agent-runner-management-publication.mjs',
 ];
 
 /**
@@ -46,6 +47,7 @@ const RUNTIME_MODULES = [
  */
 const PRODUCTION_IO_MODULES = new Set([
   'agent-runner-management-dell-adapters.mjs',
+  'agent-runner-management-write-adapters.mjs',
   'agent-runner-management-wake.mjs',
 ]);
 
@@ -367,6 +369,69 @@ test('an execution wake can never be resolved to an arbitrary ledger authority',
   assert.match(body, /live\.length > 1/);
   assert.match(body, /rebuildAuthorityFromSnapshot/);
   assert.match(body, /attempt-identity-mismatch/);
+});
+
+test('the production write transport is a positive allowlist with no forbidden capability', () => {
+  const body = code('agent-runner-management-write-adapters.mjs');
+  // Exactly three exported surfaces, and none of them can close, merge, deploy,
+  // activate source, dispatch a worker or touch a unit.
+  assert.match(body, /createQueueMutationClient\(/);
+  assert.match(body, /listIssueComments\(/);
+  assert.match(body, /createIssueComment\(/);
+  for (const forbidden of ['closeIssue', 'mergePullRequest', 'activateSource', 'dispatchWorker', 'enableTimer', 'restartService']) {
+    assert.ok(!new RegExp(`\\b${forbidden}\\b`).test(body), `the write transport must not expose ${forbidden}`);
+  }
+  assert.ok(!/\bsystemctl\b/.test(body), 'the write transport must never touch a unit');
+  // An issue is never closed: no state/state_reason payload is ever built.
+  assert.ok(!/state_reason/.test(body));
+  assert.ok(!/state:\s*'closed'/.test(body));
+  // Every endpoint is checked against the exact declared repository.
+  assert.match(body, /does not target the declared repository/);
+});
+
+test('the write transport is only reachable in active mode and never by assurance', () => {
+  const collectors = code('agent-runner-management-collectors.mjs');
+  // The read adapter surface carries no write entry at all.
+  assert.match(collectors, /export const OPTIONAL_ADAPTERS = Object\.freeze\(\[\]\)/);
+  // Write ports are constructed only under the mutating branch.
+  assert.match(collectors, /if \(mutating\) \{\s*\n\s*assertWriteAdapters\(writeAdapters\);/);
+  // Assurance returns before any write port could be constructed.
+  const assuranceBranch = collectors.indexOf("if (role === 'assurance')");
+  const firstWritePort = collectors.indexOf('ports.applyQueueMutation');
+  assert.ok(assuranceBranch > 0 && firstWritePort > assuranceBranch, 'assurance must return before any write port exists');
+
+  const cycle = code('agent-runner-management-cycle-command.mjs');
+  // The cycle hands the transport on only when the persisted mode is mutating.
+  assert.match(cycle, /const activeWriteAdapters = resolvedMode\.mutating \? writeAdapters : null;/);
+  assert.match(cycle, /refusal: 'write-transport-unavailable'/);
+});
+
+test('publication is reconciled rather than fire-and-forget', () => {
+  const body = code('agent-runner-management-publication.mjs');
+  // Intent first, re-read before posting, verify after posting, confirm last.
+  // Scoped to the reconciliation itself so the type guard's mention of the same
+  // method name earlier in the file cannot satisfy the ordering.
+  const start = body.indexOf('function ensurePublished(');
+  assert.ok(start > 0, 'the reconciliation must be one inspectable function');
+  const reconciliation = body.slice(start);
+  const intent = reconciliation.indexOf('recordPublicationIntent(');
+  const firstRead = reconciliation.indexOf('transport.listIssueComments');
+  const post = reconciliation.indexOf('transport.createIssueComment');
+  assert.ok(intent > 0 && intent < firstRead, 'the intent must be persisted before any read');
+  assert.ok(firstRead < post, 'comments must be re-read before posting');
+  assert.ok(reconciliation.indexOf('transport.listIssueComments', post) > post, 'the post must be verified by re-reading');
+  // A conflicting immutable body is never overwritten.
+  assert.match(body, /state: 'conflict'/);
+  assert.ok(!/updateComment|editComment|deleteComment/.test(body));
+});
+
+test('the manager never consumes or dispatches the authority it publishes', () => {
+  for (const name of ['agent-runner-management-publication.mjs', 'agent-runner-management-collectors.mjs']) {
+    const body = code(name);
+    assert.ok(!/authorizeWorkerAuthorityConsumption/.test(body), name);
+    assert.ok(!/resolveDispatchAuthority/.test(body), name);
+    assert.ok(!/runner-started|claimAuthority/.test(body), name);
+  }
 });
 
 test('no management module persists a machine-local path or a claim token', () => {

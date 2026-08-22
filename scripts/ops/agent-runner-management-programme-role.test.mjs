@@ -103,14 +103,89 @@ test('a queue change with no runnable work asks for independent assurance', () =
   assert.deepEqual(result.successors.map((entry) => entry.eventType), ['queue-assurance-required']);
 });
 
-test('an occupied global implementation slot follows the attempt through and authorises nothing', () => {
+/** A live ledger entry for the ready record, as a granted authority leaves. */
+function liveLedger(issueNumber = 501) {
+  const authority = buildAuthority();
+  return {
+    issued: [{
+      authorityKey: authority.authorityKey,
+      authorityFingerprint: authority.authorityFingerprint,
+      issueNumber,
+      branch: authority.branch,
+      baseSha: authority.baseSha,
+      state: 'issued',
+    }],
+  };
+}
+
+test('an occupied slot attributed to one live authority wakes execution with exact identity', () => {
   const { result, calls } = runProgramme({
-    evidence: programmeEvidence({ implementationSlot: { occupied: true } }),
+    evidence: programmeEvidence({
+      implementationSlot: { state: 'occupied', occupied: true },
+      authorityLedger: liveLedger(501),
+    }),
   });
   assert.equal(result.outcome, 'execution-required');
   assert.equal(result.reason, 'implementation-slot-occupied');
+  assert.equal(calls.workerAuthority.length, 0, 'nothing new is authorised while the slot is held');
+  const execution = result.successors.find((entry) => entry.eventType === 'execution-reconcile-required');
+  // The successor names the attempt, so the execution collector can resolve it
+  // rather than refusing it as ambiguous.
+  assert.equal(execution.issueNumber, 501);
+});
+
+test('an occupied slot this project cannot attribute never emits an unresolvable execution wake', () => {
+  const { result, calls } = runProgramme({
+    // Occupied, but this project has granted nothing: the slot belongs to
+    // another registered project or to work outside the control plane.
+    evidence: programmeEvidence({ implementationSlot: { state: 'occupied', occupied: true } }),
+  });
+  assert.equal(result.outcome, 'delayed-retry');
+  assert.equal(result.reason, 'implementation-slot-owned-elsewhere');
   assert.equal(calls.workerAuthority.length, 0);
-  assert.deepEqual(result.successors.map((entry) => entry.eventType), ['execution-reconcile-required', 'queue-assurance-required']);
+  assert.equal(result.successors.some((entry) => entry.eventType === 'execution-reconcile-required'), false);
+  assert.ok(Date.parse(result.successors[0].notBefore) > Date.parse(T0));
+});
+
+test('an occupied slot with more than one live owner is handed to the read-only auditor', () => {
+  const authority = buildAuthority();
+  const { result } = runProgramme({
+    evidence: programmeEvidence({
+      implementationSlot: { state: 'occupied', occupied: true },
+      authorityLedger: {
+        issued: [
+          {
+            authorityKey: authority.authorityKey,
+            authorityFingerprint: authority.authorityFingerprint,
+            issueNumber: 501,
+            branch: authority.branch,
+            baseSha: authority.baseSha,
+            state: 'issued',
+          },
+          {
+            authorityKey: 'mwa:another-live-authority',
+            authorityFingerprint: `sha256:${'7'.repeat(64)}`,
+            issueNumber: 502,
+            branch: 'agent/other-502',
+            baseSha: SOURCE_SHA,
+            state: 'issued',
+          },
+        ],
+      },
+    }),
+  });
+  assert.equal(result.outcome, 'assurance-required');
+  assert.equal(result.reason, 'implementation-slot-owner-ambiguous');
+  assert.deepEqual(result.successors.map((entry) => entry.eventType), ['queue-assurance-required']);
+});
+
+test('an unprovable slot state blocks new authority rather than admitting one', () => {
+  const { result, calls } = runProgramme({
+    evidence: programmeEvidence({ implementationSlot: { state: 'ambiguous', occupied: false } }),
+  });
+  assert.equal(result.outcome, 'delayed-retry');
+  assert.equal(result.reason, 'implementation-slot-ambiguous');
+  assert.equal(calls.workerAuthority.length, 0);
 });
 
 test('an active ownership collision defers with a bounded delayed retry', () => {

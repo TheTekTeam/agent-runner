@@ -12,6 +12,7 @@ import {
   MANAGEMENT_PLAN_REGISTRY,
   resolveRegisteredManagementPlan,
 } from './agent-runner-management-plan-registry.mjs';
+import { fakeWriteTransport } from './agent-runner-management-test-fixtures.mjs';
 import { loadManagerProfileRegistry } from './agent-runner-manager-profile-registry.mjs';
 import { loadProjectRegistry } from './agent-runner-project-registry.mjs';
 
@@ -115,13 +116,6 @@ function fakeAdapters(overrides = {}) {
     readOwnership: () => ({ activeLeases: [], openPullRequests: [] }),
     readAttempt: () => null,
     readHosts: () => ({ controllerHost: 'dell', schedulerHost: 'dell', nonSchedulerHosts: [] }),
-    applyQueueMutationClient: () => ({
-      createIssue: (request) => { calls.mutation.push(request.curationKey); return { number: 951 }; },
-      updateIssueLabels: (request) => { calls.mutation.push(`labels-${request.issueNumber}`); return { ok: true }; },
-      updateIssueDependencies: (request) => { calls.mutation.push(`deps-${request.issueNumber}`); return { ok: true }; },
-    }),
-    publishWorkerAuthority: ({ authority }) => calls.authority.push(authority.authorityKey),
-    publishContinuationAuthority: ({ continuation }) => calls.continuation.push(continuation.continuationAuthorityKey),
   };
   return { adapters: { ...base, ...overrides }, calls };
 }
@@ -161,12 +155,15 @@ async function withProduction(fn, { projects = [[PROJECT_ID, REPOSITORY]] } = {}
   }
 }
 
-function run({ options, registry, profileRegistry, adapters, overrides = {} }) {
+function run({ options, registry, profileRegistry, adapters, writeAdapters = null, overrides = {} }) {
   return runManagementCycleCommand({
     options: { ...options, ...overrides },
     registry,
     profileRegistry,
     adapters,
+    // The real production write transport surface; only the outermost GitHub
+    // side effect is faked.
+    writeAdapters: writeAdapters ?? fakeWriteTransport(),
     wake: null,
     now: () => T0,
     uuid: () => '00000000-0000-4000-8000-000000000001',
@@ -180,9 +177,10 @@ test('the full causal chain binds the exact issue, pull request and head end to 
     context.setMode('active');
 
     // 1. An authority is issued for the ready issue.
+    const writeTransport = fakeWriteTransport();
     const first = fakeAdapters();
-    await run({ ...context, adapters: first.adapters });
-    assert.equal(first.calls.authority.length, 1, 'one worker authority is granted');
+    await run({ ...context, adapters: first.adapters, writeAdapters: writeTransport });
+    assert.equal(writeTransport.calls.comments.length, 1, 'exactly one worker authority packet is published');
 
     // 2. The attempt publishes a pull request at an exact head.
     const published = fakeAdapters({
@@ -196,7 +194,7 @@ test('the full causal chain binds the exact issue, pull request and head end to 
         return attemptFor({ pullRequestNumber: pullRequestNumber ?? PULL_NUMBER });
       },
     });
-    const second = await run({ ...context, adapters: published.adapters });
+    const second = await run({ ...context, adapters: published.adapters, writeAdapters: writeTransport });
 
     // 3. The execution collector read the exact pull request the event named.
     assert.ok(published.calls.attemptReads.includes(PULL_NUMBER), 'the exact PR number must reach readAttempt');
@@ -232,8 +230,9 @@ test('the full causal chain binds the exact issue, pull request and head end to 
 test('an execution event that cannot name its issue is blocked, never resolved by guesswork', async () => {
   await withProduction(async (context) => {
     context.setMode('active');
+    const writeTransport = fakeWriteTransport();
     const { adapters } = fakeAdapters();
-    await run({ ...context, adapters });
+    await run({ ...context, adapters, writeAdapters: writeTransport });
 
     const stores = context.openStores();
     try {
@@ -248,7 +247,7 @@ test('an execution event that cannot name its issue is blocked, never resolved b
       stores.close();
     }
 
-    const summary = await run({ ...context, adapters, overrides: { observe: false } });
+    const summary = await run({ ...context, adapters, writeAdapters: writeTransport, overrides: { observe: false } });
     const execution = summary.cycle.results.find((entry) => entry.role === 'execution');
     assert.equal(execution.outcome, 'blocked');
     assert.equal(execution.reason, 'ambiguous-attempt-identity');
@@ -258,8 +257,9 @@ test('an execution event that cannot name its issue is blocked, never resolved b
 test('with several historical authorities an event reconciles only its own attempt', async () => {
   await withProduction(async (context) => {
     context.setMode('active');
+    const writeTransport = fakeWriteTransport();
     const { adapters } = fakeAdapters();
-    await run({ ...context, adapters });
+    await run({ ...context, adapters, writeAdapters: writeTransport });
 
     const stores = context.openStores();
     try {
@@ -294,7 +294,7 @@ test('with several historical authorities an event reconciles only its own attem
     const bound = fakeAdapters({
       readAttempt: ({ pullRequestNumber }) => { reads.push(pullRequestNumber); return null; },
     });
-    const summary = await run({ ...context, adapters: bound.adapters, overrides: { observe: false } });
+    const summary = await run({ ...context, adapters: bound.adapters, writeAdapters: writeTransport, overrides: { observe: false } });
     const execution = summary.cycle.results.find((entry) => entry.role === 'execution');
     // Issue 111's authority cannot be reproduced from current evidence, so the
     // event fails closed instead of reconciling issue 900's attempt.
@@ -307,7 +307,8 @@ test('an attempt read that returns a different pull request is refused', async (
   await withProduction(async (context) => {
     context.setMode('active');
     const first = fakeAdapters();
-    await run({ ...context, adapters: first.adapters });
+    const writeTransport = fakeWriteTransport();
+    await run({ ...context, adapters: first.adapters, writeAdapters: writeTransport });
 
     const wrongPull = fakeAdapters({
       listOpenPullRequests: () => [{ number: PULL_NUMBER, title: 'x', headSha: HEAD_SHA, branch: BRANCH, issueNumber: READY_ISSUE, labels: [] }],
@@ -318,7 +319,7 @@ test('an attempt read that returns a different pull request is refused', async (
       // Returns a *different* pull request than the one asked for.
       readAttempt: () => attemptFor({ pullRequestNumber: 999 }),
     });
-    const summary = await run({ ...context, adapters: wrongPull.adapters });
+    const summary = await run({ ...context, adapters: wrongPull.adapters, writeAdapters: writeTransport });
     const execution = summary.cycle.results.find((entry) => entry.role === 'execution' && entry.reason === 'attempt-identity-mismatch');
     assert.ok(execution, 'a substituted pull request must be refused');
     assert.equal(execution.outcome, 'blocked');
@@ -329,7 +330,8 @@ test('an attempt read at a head other than the event head is refused', async () 
   await withProduction(async (context) => {
     context.setMode('active');
     const first = fakeAdapters();
-    await run({ ...context, adapters: first.adapters });
+    const writeTransport = fakeWriteTransport();
+    await run({ ...context, adapters: first.adapters, writeAdapters: writeTransport });
 
     const stale = fakeAdapters({
       listOpenPullRequests: () => [{ number: PULL_NUMBER, title: 'x', headSha: HEAD_SHA, branch: BRANCH, issueNumber: READY_ISSUE, labels: [] }],
@@ -340,7 +342,7 @@ test('an attempt read at a head other than the event head is refused', async () 
       // Evidence read at an older head than the one the event names.
       readAttempt: () => attemptFor({ headSha: OTHER_HEAD_SHA }),
     });
-    const summary = await run({ ...context, adapters: stale.adapters });
+    const summary = await run({ ...context, adapters: stale.adapters, writeAdapters: writeTransport });
     const execution = summary.cycle.results.find((entry) => entry.role === 'execution' && entry.reason === 'attempt-identity-mismatch');
     assert.ok(execution, 'a head mismatch must be refused');
   });
@@ -351,11 +353,12 @@ test('an attempt read at a head other than the event head is refused', async () 
 test('an ambiguous implementation slot blocks new authority and retries later', async () => {
   await withProduction(async (context) => {
     context.setMode('active');
-    const { adapters, calls } = fakeAdapters({
+    const writeTransport = fakeWriteTransport();
+    const { adapters } = fakeAdapters({
       readImplementationSlot: () => ({ state: 'ambiguous', occupied: false, reason: 'lock-unreadable' }),
     });
-    await run({ ...context, adapters });
-    assert.deepEqual(calls.authority, [], 'an unprovable slot must never admit a new authority');
+    await run({ ...context, adapters, writeAdapters: writeTransport });
+    assert.deepEqual(writeTransport.calls.comments, [], 'an unprovable slot must never admit a new authority');
 
     const stores = context.openStores();
     try {
@@ -371,14 +374,15 @@ test('an ambiguous implementation slot blocks new authority and retries later', 
 test('an active worker holds its issue before any pull request exists', async () => {
   await withProduction(async (context) => {
     context.setMode('active');
+    const writeTransport = fakeWriteTransport();
     const first = fakeAdapters();
-    await run({ ...context, adapters: first.adapters });
-    assert.equal(first.calls.authority.length, 1);
+    await run({ ...context, adapters: first.adapters, writeAdapters: writeTransport });
+    assert.equal(writeTransport.calls.comments.length, 1);
 
     // Second cycle: still no pull request, but the ledger proves the lease.
     const second = fakeAdapters();
-    await run({ ...context, adapters: second.adapters });
-    assert.deepEqual(second.calls.authority, [], 'the held issue is never handed to a second attempt');
+    await run({ ...context, adapters: second.adapters, writeAdapters: writeTransport });
+    assert.equal(writeTransport.calls.comments.length, 1, 'the held issue is never handed to a second attempt');
   });
 });
 
@@ -631,12 +635,13 @@ test('every registered management plan validates against its registered profile'
 test('a shadow cycle processes both registered projects', async () => {
   await withProduction(async (context) => {
     context.setMode('shadow');
-    const { adapters, calls } = fakeAdapters({
+    const writeTransport = fakeWriteTransport();
+    const { adapters } = fakeAdapters({
       listOpenIssues: ({ profile }) => (profile.projectId === PROJECT_ID
         ? readyIssues()
         : readyIssues('qc:modelspend:shadow-equivalence-evidence', 700, 'Record bounded ModelSpend shadow equivalence evidence')),
     });
-    const summary = await run({ ...context, adapters });
+    const summary = await run({ ...context, adapters, writeAdapters: writeTransport });
 
     assert.equal(summary.observations.length, 2, 'both registered projects are observed');
     for (const observation of summary.observations) {
@@ -651,7 +656,7 @@ test('a shadow cycle processes both registered projects', async () => {
     } finally {
       stores.close();
     }
-    assert.deepEqual(calls.mutation, []);
-    assert.deepEqual(calls.authority, []);
+    assert.deepEqual(writeTransport.calls.createIssue, []);
+    assert.deepEqual(writeTransport.calls.comments, []);
   }, { projects: [[PROJECT_ID, REPOSITORY], ['modelspend', 'TheTekTeam/modelspend']] });
 });

@@ -43,7 +43,7 @@ import {
   stableJson,
 } from './agent-runner-manager-planner-safety.mjs';
 
-export const MANAGEMENT_CONTROL_STORE_SCHEMA_VERSION = 3;
+export const MANAGEMENT_CONTROL_STORE_SCHEMA_VERSION = 4;
 
 /** The bounded signals the control plane records for operators and the dashboard. */
 export const MANAGEMENT_OBSERVATION_SIGNALS = Object.freeze([
@@ -84,6 +84,25 @@ const SIGNAL_SET = new Set(MANAGEMENT_OBSERVATION_SIGNALS);
 const SEVERITY_SET = new Set(MANAGEMENT_FINDING_SEVERITIES);
 const MODE_SET = new Set(MANAGEMENT_CONTROL_MODES);
 const ROLE_SET = new Set(MANAGEMENT_ROLES);
+
+function publicationFromRow(row) {
+  return Object.freeze({
+    publicationKey: row.publication_key,
+    kind: row.kind,
+    projectId: row.project_id,
+    repository: row.repo,
+    issueNumber: Number(row.issue_number),
+    pullRequestNumber: row.pull_request_number,
+    authorityKey: row.authority_key,
+    packetDigest: row.packet_digest,
+    state: row.state,
+    attempts: Number(row.attempts),
+    detail: row.detail,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    confirmedAt: row.confirmed_at,
+  });
+}
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -304,6 +323,38 @@ const MIGRATIONS = Object.freeze({
 
       CREATE INDEX IF NOT EXISTS management_authority_issuance_project_idx
         ON management_authority_issuance(project_id, issue_number, authority_key);
+  `,
+  4: `
+      -- The publication outbox.
+      --
+      -- Recording a grant locally and announcing it on GitHub cannot be one
+      -- atomic act, so the intent is written first and the announcement is
+      -- reconciled afterwards. That makes publication recoverable: an
+      -- interrupted attempt is still 'pending' on the next reconciliation and
+      -- is resumed, while an attempt whose side effect landed before the
+      -- process died is discovered by re-reading and healed without a duplicate.
+      --
+      -- 'conflict' is terminal and needs an owner: a packet carrying this
+      -- authority identity but a different immutable body is never overwritten.
+      CREATE TABLE IF NOT EXISTS management_publication_outbox (
+        publication_key TEXT PRIMARY KEY,
+        kind TEXT NOT NULL CHECK (kind IN ('worker-authority', 'continuation-authority')),
+        project_id TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        issue_number INTEGER NOT NULL,
+        pull_request_number INTEGER,
+        authority_key TEXT NOT NULL,
+        packet_digest TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('pending', 'confirmed', 'conflict')),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+        detail TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        confirmed_at TEXT
+      );
+
+      CREATE INDEX IF NOT EXISTS management_publication_outbox_pending_idx
+        ON management_publication_outbox(state, project_id, created_at, publication_key);
   `,
 });
 
@@ -914,6 +965,94 @@ export class ManagementControlStore {
       baseSha: row.base_sha,
       state: row.state,
     })));
+  }
+
+  // ---------------------------------------------------------------- publication outbox
+
+  /**
+   * Record the intent to publish, before any side effect is attempted.
+   *
+   * Writing the intent first is what makes an interrupted publication
+   * recoverable: whatever happens next, the next reconciliation can see that a
+   * publication was owed and reconcile it against GitHub.
+   */
+  recordPublicationIntent({
+    publicationKey, kind, projectId, repository, issueNumber, pullRequestNumber = null,
+    authorityKey, packetDigest, now = this.now(),
+  } = {}) {
+    const key = requiredId(publicationKey, 'management publication key');
+    if (!['worker-authority', 'continuation-authority'].includes(kind)) {
+      throw new Error(`unknown management publication kind: ${String(kind)}`);
+    }
+    const issue = optionalPositiveInteger(issueNumber, 'management publication issueNumber');
+    if (issue === null) throw new Error('management publication issueNumber is required');
+    const timestamp = iso(now, 'management publication timestamp');
+    this.db.prepare(`
+      INSERT INTO management_publication_outbox(
+        publication_key, kind, project_id, repo, issue_number, pull_request_number,
+        authority_key, packet_digest, state, attempts, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+      ON CONFLICT(publication_key) DO NOTHING
+    `).run(
+      key, kind,
+      requiredId(projectId, 'management publication projectId'),
+      requiredRepository(repository),
+      issue,
+      optionalPositiveInteger(pullRequestNumber, 'management publication pullRequestNumber'),
+      requiredId(authorityKey, 'management publication authorityKey'),
+      requiredFingerprint(packetDigest, 'management publication packetDigest'),
+      timestamp, timestamp,
+    );
+    return this.getPublication(key);
+  }
+
+  /** Move one publication to a terminal or retryable state. */
+  setPublicationState({ publicationKey, state, detail = null, now = this.now() } = {}) {
+    const key = requiredId(publicationKey, 'management publication key');
+    if (!['pending', 'confirmed', 'conflict'].includes(state)) {
+      throw new Error(`unknown management publication state: ${String(state)}`);
+    }
+    const timestamp = iso(now, 'management publication timestamp');
+    this.db.prepare(`
+      UPDATE management_publication_outbox
+      SET state = ?, detail = ?, attempts = attempts + 1, updated_at = ?,
+          confirmed_at = CASE WHEN ? = 'confirmed' THEN ? ELSE confirmed_at END
+      WHERE publication_key = ?
+    `).run(state, detail === null ? null : requiredToken(detail, 'management publication detail'), timestamp, state, timestamp, key);
+    return this.getPublication(key);
+  }
+
+  getPublication(publicationKey) {
+    const key = requiredId(publicationKey, 'management publication key');
+    const row = this.db.prepare('SELECT * FROM management_publication_outbox WHERE publication_key = ?').get(key);
+    return row === undefined ? null : publicationFromRow(row);
+  }
+
+  /**
+   * Publications that are still owed. A pending publication is also ownership
+   * evidence: the issue it names is not free until it resolves.
+   */
+  listPendingPublications({ projectId = null, limit = 50 } = {}) {
+    const bounded = Number.isInteger(limit) && limit >= 1 && limit <= 200 ? limit : 50;
+    const rows = projectId
+      ? this.db.prepare(`
+          SELECT * FROM management_publication_outbox WHERE state = 'pending' AND project_id = ?
+          ORDER BY created_at ASC, publication_key ASC LIMIT ?
+        `).all(requiredId(projectId, 'management publication projectId'), bounded)
+      : this.db.prepare(`
+          SELECT * FROM management_publication_outbox WHERE state = 'pending'
+          ORDER BY created_at ASC, publication_key ASC LIMIT ?
+        `).all(bounded);
+    return Object.freeze(rows.map(publicationFromRow));
+  }
+
+  listPublications({ projectId = null, limit = 100 } = {}) {
+    const bounded = Number.isInteger(limit) && limit >= 1 && limit <= 200 ? limit : 100;
+    const rows = projectId
+      ? this.db.prepare('SELECT * FROM management_publication_outbox WHERE project_id = ? ORDER BY created_at ASC LIMIT ?')
+        .all(requiredId(projectId, 'management publication projectId'), bounded)
+      : this.db.prepare('SELECT * FROM management_publication_outbox ORDER BY created_at ASC LIMIT ?').all(bounded);
+    return Object.freeze(rows.map(publicationFromRow));
   }
 
   close() {

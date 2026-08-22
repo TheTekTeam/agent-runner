@@ -17,6 +17,7 @@ import {
   MANAGEMENT_WAKE_UNIT_ENV,
   createSystemdManagementWake,
 } from './agent-runner-management-wake.mjs';
+import { fakeWriteTransport } from './agent-runner-management-test-fixtures.mjs';
 import { loadManagerProfileRegistry } from './agent-runner-manager-profile-registry.mjs';
 import { loadProjectRegistry } from './agent-runner-project-registry.mjs';
 
@@ -87,21 +88,14 @@ function fakeAdapters(overrides = {}) {
   return { adapters: { ...base, ...overrides }, calls };
 }
 
+/**
+ * Active mode composes the *real* write transport surface; only the outermost
+ * GitHub side effect is faked.
+ */
 function activeAdapters(overrides = {}) {
   const { adapters, calls } = fakeAdapters(overrides);
-  return {
-    calls,
-    adapters: {
-      ...adapters,
-      applyQueueMutationClient: () => ({
-        createIssue: (request) => { calls.mutation.push(request.curationKey); return { number: 951 }; },
-        updateIssueLabels: (request) => { calls.mutation.push(`labels-${request.issueNumber}`); return { ok: true }; },
-        updateIssueDependencies: (request) => { calls.mutation.push(`deps-${request.issueNumber}`); return { ok: true }; },
-      }),
-      publishWorkerAuthority: ({ authority }) => calls.authority.push(authority.authorityKey),
-      publishContinuationAuthority: ({ continuation }) => calls.continuation.push(continuation.continuationAuthorityKey),
-    },
-  };
+  const writeAdapters = fakeWriteTransport();
+  return { calls, adapters, writeAdapters };
 }
 
 async function withProduction(fn) {
@@ -139,12 +133,13 @@ async function withProduction(fn) {
   }
 }
 
-function run({ options, registry, profileRegistry, adapters, wake = null, overrides = {} }) {
+function run({ options, registry, profileRegistry, adapters, writeAdapters = null, wake = null, overrides = {} }) {
   return runManagementCycleCommand({
     options: { ...options, ...overrides },
     registry,
     profileRegistry,
     adapters,
+    writeAdapters: writeAdapters ?? fakeWriteTransport(),
     wake,
     now: () => T0,
     uuid: () => '00000000-0000-4000-8000-000000000001',
@@ -321,11 +316,11 @@ test('the assurance collector is independent and structurally read-only', async 
 test('active mode applies the bounded mutation and records the granted authority durably', async () => {
   await withProduction(async (context) => {
     context.setMode('active');
-    const { adapters, calls } = activeAdapters();
-    const summary = await run({ ...context, adapters });
+    const { adapters, writeAdapters } = activeAdapters();
+    const summary = await run({ ...context, adapters, writeAdapters });
 
     assert.equal(summary.mode, 'active');
-    assert.equal(calls.authority.length, 1, 'exactly one worker authority is published');
+    assert.equal(writeAdapters.calls.comments.length, 1, 'exactly one worker authority packet is published');
     const stores = context.openStores();
     try {
       const ledger = stores.controlStore.listIssuedAuthorities({ projectId: PROJECT_ID });
@@ -341,10 +336,10 @@ test('active mode applies the bounded mutation and records the granted authority
 test('a second active cycle does not grant a second authority for the same work', async () => {
   await withProduction(async (context) => {
     context.setMode('active');
-    const { adapters, calls } = activeAdapters();
-    await run({ ...context, adapters });
-    await run({ ...context, adapters });
-    assert.equal(calls.authority.length, 1, 'the persisted ledger makes the duplicate an idempotent no-op');
+    const { adapters, writeAdapters } = activeAdapters();
+    await run({ ...context, adapters, writeAdapters });
+    await run({ ...context, adapters, writeAdapters });
+    assert.equal(writeAdapters.calls.comments.length, 1, 'the persisted ledger makes the duplicate an idempotent no-op');
   });
 });
 
@@ -576,8 +571,8 @@ test('quota ambiguity fails closed into a bounded delayed retry with no credit c
 test('an occupied global implementation slot authorises nothing new', async () => {
   await withProduction(async (context) => {
     context.setMode('active');
-    const { adapters, calls } = activeAdapters({ readImplementationSlot: () => ({ state: 'occupied', occupied: true }) });
-    await run({ ...context, adapters });
-    assert.deepEqual(calls.authority, [], 'the one global implementation slot is never widened');
+    const { adapters, writeAdapters } = activeAdapters({ readImplementationSlot: () => ({ state: 'occupied', occupied: true }) });
+    await run({ ...context, adapters, writeAdapters });
+    assert.deepEqual(writeAdapters.calls.comments, [], 'the one global implementation slot is never widened');
   });
 });
