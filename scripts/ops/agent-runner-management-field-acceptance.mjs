@@ -253,9 +253,12 @@ export const FIELD_ACCEPTANCE_PROBES = Object.freeze([
     id: 'quota-ambiguity-fails-closed',
     title: 'Quota ambiguity fails closed with no credit or paid fallback',
     evaluate: (context) => {
+      // Only genuine quota evidence counts. The implementation-slot gate also
+      // fails closed on ambiguity, but it is a separate safety property: letting
+      // it satisfy this probe would report the quota requirement as proven when
+      // no quota refusal had ever been observed.
       const quota = decisionsWith(context, (decision) => decision.reason === 'quota-ambiguous'
-        || decision.reason === 'quota-unavailable'
-        || decision.reason === 'implementation-slot-ambiguous');
+        || decision.reason === 'quota-unavailable');
       if (quota.length === 0) return unevidenced('no-quota-refusal-observed');
       const escaped = quota.filter((decision) => decision.outcome !== 'delayed-retry');
       return escaped.length === 0 ? pass(`quota-refusals-${quota.length}`) : fail('quota-refusal-did-not-fail-closed');

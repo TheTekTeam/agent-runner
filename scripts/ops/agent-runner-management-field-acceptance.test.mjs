@@ -145,6 +145,88 @@ test('the rollback-fencing probe recognises a recorded fence', async () => {
   assert.equal(report.probes.find((probe) => probe.id === 'rollback-fencing').status, 'pass');
 });
 
+/**
+ * Record one bounded decision so a probe can be driven to an exact state.
+ * The quota probe reads recorded decisions, so this is how each case is proven.
+ */
+function recordDecision(controlStore, { eventId, reason, outcome }) {
+  controlStore.recordDecision({
+    eventId,
+    projectId: PROJECT_ID,
+    repository: REPOSITORY,
+    role: 'programme',
+    eventType: 'programme-reconcile-required',
+    controlMode: 'active',
+    outcome,
+    reason,
+    mutationSuppressed: false,
+    correlationId: 'quota-probe-correlation',
+    successorCount: 1,
+  });
+}
+
+async function quotaProbeFor(decisions) {
+  const report = await reportFor({
+    prepare: ({ controlStore }) => {
+      decisions.forEach((decision, index) => {
+        recordDecision(controlStore, { eventId: `management-quota-probe-${index}`, ...decision });
+      });
+    },
+  });
+  return report.probes.find((probe) => probe.id === 'quota-ambiguity-fails-closed');
+}
+
+test('implementation-slot ambiguity alone does not evidence the quota requirement', async () => {
+  // The slot gate also fails closed on ambiguity, but it is a different safety
+  // property. Treating it as quota evidence would report the quota requirement
+  // as proven when no quota refusal was ever observed.
+  const probe = await quotaProbeFor([
+    { reason: 'implementation-slot-ambiguous', outcome: 'delayed-retry' },
+  ]);
+  assert.equal(probe.status, 'not-evidenced');
+  assert.equal(probe.detail, 'no-quota-refusal-observed');
+});
+
+test('an ambiguous quota refusal that fails closed evidences the requirement', async () => {
+  const probe = await quotaProbeFor([{ reason: 'quota-ambiguous', outcome: 'delayed-retry' }]);
+  assert.equal(probe.status, 'pass');
+  assert.equal(probe.detail, 'quota-refusals-1');
+});
+
+test('an unavailable quota refusal that fails closed evidences the requirement', async () => {
+  const probe = await quotaProbeFor([{ reason: 'quota-unavailable', outcome: 'delayed-retry' }]);
+  assert.equal(probe.status, 'pass');
+  assert.equal(probe.detail, 'quota-refusals-1');
+});
+
+test('a quota refusal that did not fail closed is a probe failure', async () => {
+  for (const reason of ['quota-ambiguous', 'quota-unavailable']) {
+    for (const outcome of ['execution-required', 'quiescent', 'blocked']) {
+      // eslint-disable-next-line no-await-in-loop -- each case needs its own store
+      const probe = await quotaProbeFor([{ reason, outcome }]);
+      assert.equal(probe.status, 'fail', `${reason}/${outcome}`);
+      assert.equal(probe.detail, 'quota-refusal-did-not-fail-closed');
+    }
+  }
+});
+
+test('slot ambiguity alongside a real quota refusal neither helps nor hides it', async () => {
+  // Both gates observed: the quota refusal is what the probe reports on, and a
+  // non-failing quota decision is still caught even when a slot refusal is present.
+  const healthy = await quotaProbeFor([
+    { reason: 'implementation-slot-ambiguous', outcome: 'delayed-retry' },
+    { reason: 'quota-ambiguous', outcome: 'delayed-retry' },
+  ]);
+  assert.equal(healthy.status, 'pass');
+  assert.equal(healthy.detail, 'quota-refusals-1', 'only the quota decision is counted');
+
+  const escaping = await quotaProbeFor([
+    { reason: 'implementation-slot-ambiguous', outcome: 'delayed-retry' },
+    { reason: 'quota-unavailable', outcome: 'execution-required' },
+  ]);
+  assert.equal(escaping.status, 'fail');
+});
+
 test('the cutover gate set is explicit and never satisfied by inference', () => {
   const empty = buildCutoverReadiness({});
   assert.equal(empty.readyForExternalRetirement, false);
