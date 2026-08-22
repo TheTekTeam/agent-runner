@@ -93,13 +93,15 @@ function ttlCacheCreation(value = {}) {
   }
   return {
     fiveMinute: tokenCount(
-      value.fiveMinute
+      value.ephemeral_5m_input_tokens
+      ?? value.fiveMinute
       ?? value.five_minute
       ?? value.cache_creation_5m_input_tokens
       ?? value.cacheCreation5mInputTokens,
     ),
     oneHour: tokenCount(
-      value.oneHour
+      value.ephemeral_1h_input_tokens
+      ?? value.oneHour
       ?? value.one_hour
       ?? value.cache_creation_1h_input_tokens
       ?? value.cacheCreation1hInputTokens,
