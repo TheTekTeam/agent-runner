@@ -287,6 +287,80 @@ test('live-style collector output passes the accepted planner, curator and autho
   });
 });
 
+
+test('production collector bounds #261 summaries without truncating the richer #266 queue evidence', async () => {
+  await withProduction(async (context) => {
+    const issues = Array.from({ length: 40 }, (unused, index) => ({
+      number: 1000 + index,
+      title: `Open issue ${index + 1}`,
+      state: 'open',
+      labels: index === 0 ? ['priority:P0'] : [],
+      body: '',
+    }));
+
+    const pulls = Array.from({ length: 30 }, (unused, index) => ({
+      number: 2000 + index,
+      title: `Open pull request ${index + 1}`,
+      headSha: (index + 1).toString(16).padStart(40, '0'),
+      labels: [],
+    }));
+
+    const { adapters } = fakeAdapters({
+      listOpenIssues: () => issues,
+      listOpenPullRequests: () => pulls,
+      readOwnership: () => ({
+        activeLeases: [],
+        openPullRequests: pulls.map((pull, index) => ({
+          number: pull.number,
+          issueNumber: issues[index].number,
+          headSha: pull.headSha,
+        })),
+      }),
+    });
+
+    const stores = context.openStores();
+    try {
+      const resolvePorts = createProductionManagementPorts({
+        adapters,
+        controlStore: stores.controlStore,
+        profileRegistry: context.profileRegistry,
+        producerId: 'test-management-controller',
+        now: () => T0,
+      });
+
+      const ports = await resolvePorts({
+        role: 'programme',
+        mode: 'shadow',
+        event: { projectId: PROJECT_ID, repository: REPOSITORY },
+        project: context.registry.projectsById[PROJECT_ID],
+      });
+
+      const collected = ports.collectEvidence();
+      const plannerEvidence = collected.queueEvidence.proposal.brief.evidence;
+
+      // #261 is a bounded summary contract.
+      assert.equal(plannerEvidence.openIssues.length, 25);
+      assert.equal(plannerEvidence.openPullRequests.length, 25);
+
+      // Truncation is deterministic over the single live read.
+      assert.deepEqual(
+        plannerEvidence.openIssues.map((issue) => issue.number),
+        issues.slice(0, 25).map((issue) => issue.number),
+      );
+      assert.deepEqual(
+        plannerEvidence.openPullRequests.map((pull) => pull.number),
+        pulls.slice(0, 25).map((pull) => pull.number),
+      );
+
+      // #266 still receives its deliberately larger bounded evidence set.
+      assert.equal(collected.queueEvidence.issues.length, 40);
+      assert.equal(collected.queueEvidence.ownership.openPullRequests.length, 30);
+    } finally {
+      stores.close();
+    }
+  });
+});
+
 test('the assurance collector is independent and structurally read-only', async () => {
   await withProduction(async (context) => {
     const { adapters } = fakeAdapters();

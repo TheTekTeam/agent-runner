@@ -232,14 +232,16 @@ function collectProgrammeSnapshot({ project, profile, plan, adapters, controlSto
   const rawIssues = adapters.listOpenIssues({ project, profile }) ?? [];
   const rawPulls = adapters.listOpenPullRequests({ project, profile }) ?? [];
 
-  // #261 evidence carries a bounded *summary* of open work; #266 queue evidence
-  // carries the curated queue records. Both are derived from the same read.
-  const openIssues = rawIssues.slice(0, 200).map((issue) => ({
+  // #261 evidence carries a schema-bounded *summary* of open work: its
+  // accepted contract permits at most 25 issues and 25 pull requests.
+  // #266 queue evidence is intentionally separate and retains its larger
+  // bounded working set (up to 200 issues / 50 pull requests).
+  const openIssues = rawIssues.slice(0, 25).map((issue) => ({
     number: issue.number,
     title: issue.title,
     labels: Array.isArray(issue.labels) ? issue.labels : [],
   }));
-  const openPullRequests = rawPulls.slice(0, 50).map((pull) => ({
+  const openPullRequests = rawPulls.slice(0, 25).map((pull) => ({
     number: pull.number,
     title: pull.title,
     headSha: pull.headSha,
