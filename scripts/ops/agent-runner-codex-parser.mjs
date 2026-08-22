@@ -45,12 +45,6 @@ export function codexUsageEnvelope({ inputTokens = null, outputTokens = null } =
   });
 }
 
-/**
- * Parse raw `--json` stdout into an ordered array of event objects. Fails
- * closed (`ok: false`) on empty input, any line that is not valid JSON, or
- * any line missing a string `type` field — there is no partial/best-effort
- * parse.
- */
 export function parseCodexEventLines(stdout = '') {
   const text = String(stdout || '');
   const lines = text.split('\n').map((line) => line.trim()).filter(Boolean);
@@ -91,6 +85,7 @@ function extractMutatedRepository(events) {
 }
 
 function finiteStructuredNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
   const number = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(number) ? number : null;
 }
@@ -103,8 +98,6 @@ function extractStructuredUsage(event) {
   return {
     input_tokens: finiteStructuredNumber(usage.input_tokens),
     output_tokens: finiteStructuredNumber(usage.output_tokens),
-    // These fields are mapped only when the CLI's structured record actually
-    // supplies them. Their absence remains null and does not imply a miss.
     cached_tokens: finiteStructuredNumber(usage.cached_tokens ?? inputDetails?.cached_tokens),
     cache_write_tokens: finiteStructuredNumber(usage.cache_write_tokens),
     reasoning_tokens: finiteStructuredNumber(usage.reasoning_tokens ?? outputDetails?.reasoning_tokens),
@@ -122,12 +115,6 @@ function efficiencyUsage(structuredUsage) {
   return normalizeCodexUsageEfficiency({ usage: structuredUsage });
 }
 
-/**
- * Parse a full `codex exec --json` stdout capture into the shared
- * `normalizedAdapterResult` contract. Classifies malformed output,
- * authentication/quota/task failures, structured no-op, and success with a
- * repository mutation. Raw failure/provider text is never returned.
- */
 export function parseCodexResultEnvelope(stdout = '', { agentId = 'codex-cli' } = {}) {
   const parsed = parseCodexEventLines(stdout);
   if (!parsed.ok) {
@@ -184,12 +171,6 @@ export function parseCodexResultEnvelope(stdout = '', { agentId = 'codex-cli' } 
   });
 }
 
-/**
- * Classify a process-level execution outcome that never produced a parseable
- * terminal event. Arbitrary caller messages are discarded; only bounded
- * signal/code fields used by the pre-existing contract may classify the
- * structured failure.
- */
 export function classifyCodexExecutionError({ timedOut = false, cancelled = false, signal = null, code = null, message = '' } = {}) {
   void message;
   const common = {
