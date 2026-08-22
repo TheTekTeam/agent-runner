@@ -1,4 +1,5 @@
 import { FAILURE_SCOPES } from './agent-runner-admission.mjs';
+import { normalizeUsageEfficiencyEnvelope } from './agent-runner-usage-telemetry.mjs';
 
 export { FAILURE_SCOPES };
 
@@ -7,6 +8,10 @@ export { FAILURE_SCOPES };
  * runtime. `paid` is always `false` and `costUsd` is always the literal `0`
  * (never `null`/omitted) so downstream cost accounting can rely on a
  * concrete zero rather than treating a missing field as unknown spend.
+ *
+ * This legacy envelope remains intentionally small for compatibility. #194
+ * adds `usageEfficiency` beside it in `normalizedAdapterResult()` rather than
+ * changing every historical `usage` consumer at once.
  */
 export function zeroSpendEnvelope({ provider = 'ollama-local' } = {}) {
   return Object.freeze({
@@ -16,6 +21,12 @@ export function zeroSpendEnvelope({ provider = 'ollama-local' } = {}) {
     inputTokens: null,
     outputTokens: null,
   });
+}
+
+function inferLegacyCostPosture(usage) {
+  if (usage?.paid === true) return 'separately-metered';
+  if (usage?.paid === false && usage?.costUsd === 0) return 'free-local';
+  return 'unknown';
 }
 
 /**
@@ -30,6 +41,12 @@ export function zeroSpendEnvelope({ provider = 'ollama-local' } = {}) {
  * provider's token-quota exhaustion (which is `task_attempt` /
  * `quota_paused`-style outcomes elsewhere in this runner and never applies
  * to a free local adapter).
+ *
+ * #194 keeps the pre-existing `usage` field readable and adds the versioned,
+ * positive-allowlisted `usageEfficiency` projection beside it. An adapter
+ * with richer structured evidence should pass an explicit `usageEfficiency`;
+ * otherwise this helper can derive only the bounded facts present in the
+ * legacy usage object and leaves everything else unknown.
  */
 export function normalizedAdapterResult({
   ok,
@@ -40,9 +57,22 @@ export function normalizedAdapterResult({
   failureScope = null,
   reason = null,
   usage = null,
+  usageEfficiency = null,
   mutatedRepository = false,
   mutatedGitHub = false,
 } = {}) {
+  const legacyUsage = usage || zeroSpendEnvelope();
+  const normalizedEfficiency = usageEfficiency || normalizeUsageEfficiencyEnvelope({
+    ...legacyUsage,
+    costPosture: inferLegacyCostPosture(legacyUsage),
+    telemetryAvailability: usage ? undefined : 'unavailable',
+    availabilityReason: usage ? null : 'structured-usage-unavailable',
+  }, {
+    adapter: agentId || null,
+    provider: legacyUsage?.provider || null,
+    cacheStrategy: legacyUsage?.provider === 'ollama-local' ? 'local-context' : 'unknown',
+  });
+
   return {
     ok: Boolean(ok),
     agentId: agentId || null,
@@ -51,7 +81,8 @@ export function normalizedAdapterResult({
     structuredFailure,
     failureScope: ok ? null : (failureScope || FAILURE_SCOPES.MACHINE_PROFILE),
     reason,
-    usage: usage || zeroSpendEnvelope(),
+    usage: legacyUsage,
+    usageEfficiency: normalizedEfficiency,
     mutatedRepository: Boolean(mutatedRepository),
     mutatedGitHub: Boolean(mutatedGitHub),
   };
