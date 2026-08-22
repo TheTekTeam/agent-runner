@@ -74,10 +74,6 @@ import {
   joinSections,
   PROMPT_SCHEMA_VERSION,
 } from './claude-runner-prompt-compiler.mjs';
-import {
-  buildClaudeUsageAccounting,
-  sanitizeClaudeStructuredUsage,
-} from './agent-runner-usage-telemetry.mjs';
 
 export {
   buildPromptCacheMetadata,
@@ -150,12 +146,23 @@ export const DEFAULT_PROFILES = {
   },
   critical: {
     modelEnv: 'CLAUDE_RUNNER_MODEL_CRITICAL',
+    // Unattended planning must not opt into Opus/xhigh implicitly. Operators
+    // can still approve those controls explicitly through the cost policy.
     defaultModel: 'sonnet',
     effort: 'high',
     permissionMode: 'plan',
   }
 };
 
+// The bounded canonical model-identifier vocabulary this runner ever passes
+// to the `claude` CLI's `--model` flag: every `DEFAULT_PROFILES` entry's
+// `defaultModel`, plus `opus` (only reachable via an explicit machine-local
+// `CLAUDE_RUNNER_ALLOW_OPUS` opt-in, see `evaluateClaudeCostAdmission`
+// below). Membership is exact and case-sensitive -- a merely syntactically
+// safe token, or a differently-cased/trimmed alias, is not evidence a
+// captured or operator-supplied model is one this runner actually supports
+// (#148); historical-reconciliation and identity-guard callers must never
+// normalize a value before checking it against this list.
 export const SUPPORTED_MODEL_IDS = Object.freeze(['haiku', 'sonnet', 'opus']);
 
 export function isSupportedModelId(model) {
@@ -166,6 +173,14 @@ function truthy(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
 }
 
+
+/**
+ * Fail-closed admission for unattended subscription-backed Claude controls.
+ *
+ * Provider availability is governed by the mandatory live quota/headroom
+ * path. This admission gate deliberately contains no dollar-denominated
+ * attempt limit. It only protects model/effort escalation.
+ */
 export function evaluateClaudeCostAdmission(profile = {}, env = process.env) {
   const model = String(profile.model || '').trim().toLowerCase();
   const effort = String(profile.effort || '').trim().toLowerCase();
@@ -262,7 +277,47 @@ export function parseArgs(argv = process.argv.slice(2), { defaultRepo = process.
 }
 
 export function printHelp() {
-  console.log(`Claude runner\n\nUsage:\n  node scripts/ops/claude-runner.mjs --issue <number> [--execute]\n  node scripts/ops/claude-runner.mjs --pr <number> [--execute]\n  node scripts/ops/claude-runner.mjs --check-quota\n\nIssue execution phases:\n  implementation  Default for docs/narrow/complex issues with a current manager preflight. Requires machine-local opt-in and an allowlisted preflight author. Uses dontAsk, an explicit tool allowlist, and an isolated Git worktree bound to manager branch authority.\n  plan            Default only for critical profiles, or when the current command/preflight says Phase: plan. Never counts as implementation.\n\nRequired implementation policy:\n  CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=true\n  CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS=<comma-separated GitHub logins>\n\nIssue text cannot override permission mode or tool policy. The runner never enables bypassPermissions.\n\nOptions:\n  --issue <number>          GitHub issue with a current canonical immutable manager preflight packet\n  --pr <number>             Generate (and optionally run) a PR review follow-up prompt instead of issue work\n  --repo <owner/name>       GitHub repository, defaults to ${DEFAULT_REPO}\n  --execute                 Actually run Claude. Default is dry-run.\n  --profile <name>          docs | narrow | complex | critical\n  --model <model>           Override profile model. Prefer env vars for durable config.\n  --effort <level>          low | medium | high | xhigh | max\n  --resume-session <name>   Resume a matching Claude session; skips clear by default\n  --no-clear                Skip clear-context instruction for new task. Not recommended.\n  --inherit-provider-auth   Pass Anthropic/Bedrock/Vertex provider auth env vars through to Claude. Default is to strip them.\n  --output-dir <path>       Local log output directory\n  --check-quota             Run a conservative /quota check and update the local pause state. Does not touch GitHub issues/PRs.\n  --force-quota-check       Bypass the 10-minute minimum spacing between --check-quota invocations (operator override; still a check, never a limit bypass)\n  --quota-state-path <path> Override the local quota pause-state file (default: <output-dir>/quota-state.json)\n  --skip-pr-followup-check  Operator override to skip the linked-PR unresolved-review-followup gate before starting --issue work\n\nExit codes (--execute mode):\n  0    Claude produced verified repository-change evidence.\n  1    Execution failed, produced no implementation artifact, or returned another plan during implementation.\n  ${PLAN_ONLY_EXIT_CODE}    Explicit plan-only run completed; awaiting approval/continuation.\n  ${COST_POLICY_EXIT_CODE}    Machine-local model/effort policy blocked the run before Claude started.\n  ${EXECUTION_POLICY_EXIT_CODE}    Authorization, CLI capability, or isolated-worktree policy blocked the run before Claude started.\n`);
+  console.log(`Claude runner
+
+Usage:
+  node scripts/ops/claude-runner.mjs --issue <number> [--execute]
+  node scripts/ops/claude-runner.mjs --pr <number> [--execute]
+  node scripts/ops/claude-runner.mjs --check-quota
+
+Issue execution phases:
+  implementation  Default for docs/narrow/complex issues with a current manager preflight. Requires machine-local opt-in and an allowlisted preflight author. Uses dontAsk, an explicit tool allowlist, and an isolated Git worktree bound to manager branch authority.
+  plan            Default only for critical profiles, or when the current command/preflight says Phase: plan. Never counts as implementation.
+
+Required implementation policy:
+  CLAUDE_RUNNER_ALLOW_IMPLEMENTATION=true
+  CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS=<comma-separated GitHub logins>
+
+Issue text cannot override permission mode or tool policy. The runner never enables bypassPermissions.
+
+Options:
+  --issue <number>          GitHub issue with a current canonical immutable manager preflight packet
+  --pr <number>             Generate (and optionally run) a PR review follow-up prompt instead of issue work
+  --repo <owner/name>       GitHub repository, defaults to ${DEFAULT_REPO}
+  --execute                 Actually run Claude. Default is dry-run.
+  --profile <name>          docs | narrow | complex | critical
+  --model <model>           Override profile model. Prefer env vars for durable config.
+  --effort <level>          low | medium | high | xhigh | max
+  --resume-session <name>   Resume a matching Claude session; skips clear by default
+  --no-clear                Skip clear-context instruction for new task. Not recommended.
+  --inherit-provider-auth   Pass Anthropic/Bedrock/Vertex provider auth env vars through to Claude. Default is to strip them.
+  --output-dir <path>       Local log output directory
+  --check-quota             Run a conservative /quota check and update the local pause state. Does not touch GitHub issues/PRs.
+  --force-quota-check       Bypass the 10-minute minimum spacing between --check-quota invocations (operator override; still a check, never a limit bypass)
+  --quota-state-path <path> Override the local quota pause-state file (default: <output-dir>/quota-state.json)
+  --skip-pr-followup-check  Operator override to skip the linked-PR unresolved-review-followup gate before starting --issue work
+
+Exit codes (--execute mode):
+  0    Claude produced verified repository-change evidence.
+  1    Execution failed, produced no implementation artifact, or returned another plan during implementation.
+  ${PLAN_ONLY_EXIT_CODE}    Explicit plan-only run completed; awaiting approval/continuation.
+  ${COST_POLICY_EXIT_CODE}    Machine-local model/effort policy blocked the run before Claude started.
+  ${EXECUTION_POLICY_EXIT_CODE}    Authorization, CLI capability, or isolated-worktree policy blocked the run before Claude started.
+`);
 }
 
 export function parseKeyValueBlock(markdown = '') {
@@ -285,6 +340,12 @@ export function inferProfile({ explicitProfile, commandText = '', issue = {} } =
     return profile;
   }
 
+  // Infer only from the durable title/labels. Bodies and preflight packets
+  // routinely contain negative guardrail prose such as "do not touch
+  // production/security"; treating those words as positive risk signals
+  // promoted #658 to the most expensive profile. Proceed commands can still
+  // choose a profile through explicit `Profile:` metadata before this
+  // fallback runs.
   void commandText;
   const title = String(issue.title || '').toLowerCase();
   const labels = (issue.labels || [])
@@ -339,6 +400,15 @@ function repositoryInstructionPaths(repositoryContext) {
     : DEFAULT_PROJECT_REPOSITORY_INSTRUCTIONS;
 }
 
+/**
+ * #193 stable-prefix compiler: builds each of the compiled prompt's logical
+ * sections in the required order (safety/authority invariants; repository
+ * instruction contract; execution-phase invariants; evidence schema;
+ * adapter-specific stable instructions; dynamic task identity/profile; issue
+ * body/manager-packet mutable evidence; final task-specific request) and
+ * returns both the assembled prompt and its stable/dynamic halves so callers
+ * can derive bounded cache metadata without re-parsing the prompt text.
+ */
 function buildClaudePromptSections({
   issue, commandText, currentPreflight = null, preflight = null, selectionMode = 'compat',
   profile, clearContext, executionPhase, worktreeIdentity = null, repositoryContext = null,
@@ -389,12 +459,22 @@ export function buildClaudePrompt({ issue, commandText, currentPreflight = null,
   }).prompt;
 }
 
+/**
+ * Canonical manager-packet prompt. The runner constructs the execution
+ * envelope from the issue plus the exact immutable packet; historical
+ * proceed/continue comments are not relayed as authority.
+ */
 export function buildPreflightDirectPrompt({ issue, preflight, profile, clearContext, executionPhase = profile?.permissionMode === 'plan' ? EXECUTION_PHASE_PLAN : EXECUTION_PHASE_IMPLEMENTATION, worktreeIdentity = null, repositoryContext = null }) {
   return buildClaudePromptSections({
     issue, preflight, selectionMode: 'preflight-direct', profile, clearContext, executionPhase, worktreeIdentity, repositoryContext,
   }).prompt;
 }
 
+/**
+ * #193 bounded cache-aware metadata for the exact prompt a run compiled.
+ * Never persists prompt text -- only content-addressed fingerprints and
+ * locally measurable size estimates (see claude-runner-prompt-compiler.mjs).
+ */
 export function claudePromptCacheMetadata({
   issue, commandText, currentPreflight = null, preflight = null, selectionMode = 'compat',
   profile, clearContext, executionPhase, worktreeIdentity = null, repositoryContext = null,
@@ -412,6 +492,16 @@ export function claudePromptCacheMetadata({
   });
 }
 
+/**
+ * Single derivation boundary for the implementation dispatch identity a
+ * fresh (non-recovery) attempt is built from: repository context, execution
+ * phase/authorization and the deterministic worktree/branch identity. Both
+ * this module's own `main()` (which actually runs Claude) and
+ * `claude-runner-cron.mjs`'s scheduler pre-claim workspace-ownership check
+ * (#686) call this exact function so they can never derive two different
+ * `worktreeIdentity` values for the same command/preflight pair — a
+ * scheduler check that inspected the wrong worktree would guard nothing.
+ */
 export function resolveImplementationDispatchIdentity({
   issue,
   command = null,
@@ -432,9 +522,19 @@ export function resolveImplementationDispatchIdentity({
   const preflight = currentPreflight;
   const selectionMode = 'preflight-direct';
   const referenceText = preflight.body;
+  // Legacy generic-parser metadata: kept only for `resolveDispatchAuthority()`'s
+  // repository/branch conflict detection and `evaluateExecutionAuthorization()`'s
+  // `execution_phase`/`permission_mode` checks below, neither of which #221's
+  // canonical resolver covers. Profile/model/effort must come from
+  // the canonical resolver (#223) instead of this free-form parser.
   const executionMeta = parseKeyValueBlock(currentPreflight.body || '');
   const managerExecutionMeta = resolveManagerPreflightExecutionMetadata(currentPreflight);
 
+  // Repository and branch authority (#56) are resolved and verified before
+  // anything else in this function -- profile inference, execution
+  // authorization, and worktree identity all depend on (or are superseded
+  // by) this result, and every caller of this function gates claim/attempt/
+  // mutation/worker-launch on `ok` before using any of them.
   const dispatchAuthority = resolveDispatchAuthority({
     preflight: currentPreflight,
     legacyMetadata: executionMeta,
@@ -635,117 +735,329 @@ export function prepareImplementationWorkspace(input = {}) {
   const { worktreeIdentity, runner = spawnSync } = input;
   const availability = inspectImplementationWorkspaceAvailability(input);
   if (availability.allowed !== true) return availability;
-  const { baseRef, baseHead, rootPath, rootBefore, worktreePath } = availability;
+
+  const {
+    baseRef, baseHead, rootPath, rootBefore, worktreePath,
+  } = availability;
   const expectedBranch = String(worktreeIdentity?.expectedBranch || '').trim();
   const nativeWorktreeName = nativeClaudeWorktreeName(worktreeIdentity);
   if (!nativeWorktreeName) {
     const branchFormat = runGit(['check-ref-format', '--branch', expectedBranch], { cwd: rootPath, runner });
-    if (branchFormat?.status !== 0) return { allowed: false, failureReason: 'implementation-approved-branch-invalid', baseRef, baseHead, rootPath };
+    if (branchFormat?.status !== 0) {
+      return { allowed: false, failureReason: 'implementation-approved-branch-invalid', baseRef, baseHead, rootPath };
+    }
     mkdirSync(dirname(worktreePath), { recursive: true });
     const createResult = runGit(['worktree', 'add', '--quiet', '-b', expectedBranch, worktreePath, baseHead], { cwd: rootPath, runner });
-    if (createResult?.status !== 0) return { allowed: false, failureReason: 'implementation-worktree-create-failed', baseRef, baseHead, rootPath, worktreePath };
+    if (createResult?.status !== 0) {
+      return { allowed: false, failureReason: 'implementation-worktree-create-failed', baseRef, baseHead, rootPath, worktreePath };
+    }
     const worktreeBefore = captureGitRepositoryEvidence({ cwd: worktreePath, includeUntracked: true, runner });
-    if (!worktreeBefore) return { allowed: false, failureReason: 'implementation-worktree-evidence-unavailable', baseRef, baseHead, rootPath, worktreePath };
-    if (worktreeBefore.branch !== expectedBranch) return { allowed: false, failureReason: 'implementation-worktree-branch-mismatch', baseRef, baseHead, rootPath, worktreePath };
-    if (worktreeBefore.head !== baseHead) return { allowed: false, failureReason: 'implementation-worktree-base-mismatch', baseRef, baseHead, rootPath, worktreePath };
-    if (worktreeBefore.dirtyEntryCount !== 0) return { allowed: false, failureReason: 'implementation-worktree-dirty-before-launch', baseRef, baseHead, rootPath, worktreePath };
+    if (!worktreeBefore) {
+      return { allowed: false, failureReason: 'implementation-worktree-evidence-unavailable', baseRef, baseHead, rootPath, worktreePath };
+    }
+    if (worktreeBefore.branch !== expectedBranch) {
+      return { allowed: false, failureReason: 'implementation-worktree-branch-mismatch', baseRef, baseHead, rootPath, worktreePath };
+    }
+    if (worktreeBefore.head !== baseHead) {
+      return { allowed: false, failureReason: 'implementation-worktree-base-mismatch', baseRef, baseHead, rootPath, worktreePath };
+    }
+    if (worktreeBefore.dirtyEntryCount !== 0) {
+      return { allowed: false, failureReason: 'implementation-worktree-dirty-before-launch', baseRef, baseHead, rootPath, worktreePath };
+    }
   }
-  return { ...availability, workspacePreparedByRunner: !nativeWorktreeName };
+
+  return {
+    ...availability,
+    workspacePreparedByRunner: !nativeWorktreeName,
+  };
 }
 
+/**
+ * The `native_resume`/`same_agent_continuation` counterpart to
+ * `prepareImplementationWorkspace`. A fresh attempt must refuse an existing
+ * branch/worktree (see above); a recovery re-invocation must require the
+ * opposite — the exact preserved worktree/branch from the original attempt,
+ * matching the deterministic identity derived from the same issue/comment
+ * (#698 finding 2). Never creates a new worktree or branch.
+ */
 export function prepareContinuationWorkspace({ worktreeIdentity, implementationCheckout, env = process.env, runner = spawnSync } = {}) {
   const baseRef = String(env.CLAUDE_RUNNER_BASE_REF || 'origin/main').trim();
-  if (!/^origin\/[A-Za-z0-9._/-]+$/.test(baseRef)) return { allowed: false, failureReason: 'continuation-base-ref-invalid', baseRef };
+  if (!/^origin\/[A-Za-z0-9._/-]+$/.test(baseRef)) {
+    return { allowed: false, failureReason: 'continuation-base-ref-invalid', baseRef };
+  }
+
   const searchCwd = implementationCheckout ? resolve(implementationCheckout) : resolve('.');
   const rootResult = runGit(['rev-parse', '--show-toplevel'], { cwd: searchCwd, runner });
   const rootPath = rootResult?.status === 0 ? String(rootResult.stdout || '').trim() : '';
   if (!rootPath) return { allowed: false, failureReason: 'continuation-repository-root-unavailable', baseRef };
+
   const expectedBranch = worktreeIdentity?.expectedBranch;
   const branchResult = runGit(['show-ref', '--verify', '--quiet', `refs/heads/${expectedBranch}`], { cwd: rootPath, runner });
-  if (branchResult?.status !== 0) return { allowed: false, failureReason: 'continuation-branch-missing', baseRef, rootPath };
+  if (branchResult?.status !== 0) {
+    return { allowed: false, failureReason: 'continuation-branch-missing', baseRef, rootPath };
+  }
   const worktreeList = successfulGitText(['worktree', 'list', '--porcelain'], { cwd: rootPath, runner }) || '';
-  const worktreeEntryPresent = worktreeList.split(/\n\s*\n/).some((entry) => entry.includes(`/.claude/worktrees/${worktreeIdentity?.name}`) && entry.includes(`branch refs/heads/${expectedBranch}`));
-  if (!worktreeEntryPresent) return { allowed: false, failureReason: 'continuation-worktree-missing', baseRef, rootPath };
+  const worktreeEntryPresent = worktreeList.split(/\n\s*\n/)
+    .some((entry) => entry.includes(`/.claude/worktrees/${worktreeIdentity?.name}`) && entry.includes(`branch refs/heads/${expectedBranch}`));
+  if (!worktreeEntryPresent) {
+    return { allowed: false, failureReason: 'continuation-worktree-missing', baseRef, rootPath };
+  }
+
   const worktreePath = join(rootPath, '.claude', 'worktrees', worktreeIdentity.name);
   const worktreeBefore = captureGitRepositoryEvidence({ cwd: worktreePath, includeUntracked: true, runner });
-  if (!worktreeBefore) return { allowed: false, failureReason: 'continuation-worktree-evidence-unavailable', baseRef, rootPath, worktreePath };
-  if (worktreeBefore.branch !== expectedBranch) return { allowed: false, failureReason: 'continuation-worktree-branch-mismatch', baseRef, rootPath, worktreePath };
+  if (!worktreeBefore) {
+    return { allowed: false, failureReason: 'continuation-worktree-evidence-unavailable', baseRef, rootPath, worktreePath };
+  }
+  if (worktreeBefore.branch !== expectedBranch) {
+    return { allowed: false, failureReason: 'continuation-worktree-branch-mismatch', baseRef, rootPath, worktreePath };
+  }
+
+  // rootBefore/rootAfter must be a matching outer-checkout pair (see
+  // evaluateImplementationEvidence) — captured at rootPath exactly like the
+  // fresh-attempt flow, so a mutation outside the owned worktree is
+  // detected the same way. baseHead is the worktree's own HEAD at
+  // continuation start, proving a *new* commit happens during this resume
+  // rather than merely inheriting the prior attempt's work.
   const rootBefore = captureGitRepositoryEvidence({ cwd: rootPath, includeUntracked: false, runner });
-  if (!rootBefore) return { allowed: false, failureReason: 'runner-checkout-evidence-unavailable', baseRef, rootPath, worktreePath };
-  return { allowed: true, failureReason: null, baseRef, baseHead: worktreeBefore.head, rootPath, rootBefore, worktreePath, workspacePreparedByRunner: !nativeClaudeWorktreeName(worktreeIdentity) };
+  if (!rootBefore) {
+    return { allowed: false, failureReason: 'runner-checkout-evidence-unavailable', baseRef, rootPath, worktreePath };
+  }
+
+  return {
+    allowed: true,
+    failureReason: null,
+    baseRef,
+    baseHead: worktreeBefore.head,
+    rootPath,
+    rootBefore,
+    worktreePath,
+    workspacePreparedByRunner: !nativeClaudeWorktreeName(worktreeIdentity),
+  };
 }
 
 export function collectImplementationEvidence({ workspace, worktreeIdentity, runner = spawnSync } = {}) {
   const rootAfter = captureGitRepositoryEvidence({ cwd: workspace?.rootPath, includeUntracked: false, runner });
   const worktree = captureGitRepositoryEvidence({ cwd: workspace?.worktreePath, includeUntracked: true, runner });
-  const evaluation = evaluateImplementationEvidence({ baseHead: workspace?.baseHead, rootBefore: workspace?.rootBefore, rootAfter, worktree, expectedBranch: worktreeIdentity?.expectedBranch });
-  return { ...evaluation, baseRef: workspace?.baseRef || null, baseHead: workspace?.baseHead || null, rootBefore: workspace?.rootBefore || null, rootAfter, worktree };
+  const evaluation = evaluateImplementationEvidence({
+    baseHead: workspace?.baseHead,
+    rootBefore: workspace?.rootBefore,
+    rootAfter,
+    worktree,
+    expectedBranch: worktreeIdentity?.expectedBranch,
+  });
+  return {
+    ...evaluation,
+    baseRef: workspace?.baseRef || null,
+    baseHead: workspace?.baseHead || null,
+    rootBefore: workspace?.rootBefore || null,
+    rootAfter,
+    worktree,
+  };
 }
 
 function parsePullRequestList(stdout = '') {
-  try { const payload = JSON.parse(String(stdout || '').trim()); return Array.isArray(payload) ? payload[0] || null : null; } catch { return null; }
+  try {
+    const payload = JSON.parse(String(stdout || '').trim());
+    return Array.isArray(payload) ? payload[0] || null : null;
+  } catch {
+    return null;
+  }
 }
 
-export function publishImplementationDraft({ workspace, worktreeIdentity, repo, issueNumber, issueTitle, env = process.env, runner = spawnSync } = {}) {
+export function publishImplementationDraft({
+  workspace,
+  worktreeIdentity,
+  repo,
+  issueNumber,
+  issueTitle,
+  env = process.env,
+  runner = spawnSync,
+} = {}) {
   const branch = String(worktreeIdentity?.expectedBranch || '');
   const base = String(workspace?.baseRef || '').replace(/^origin\//, '');
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo || '')) || !/^[A-Za-z0-9._/-]+$/.test(base) || !workspace?.worktreePath) return { published: false, failureReason: 'implementation-publication-input-invalid' };
-  const processOptions = { cwd: workspace.worktreePath, encoding: 'utf8', maxBuffer: 5 * 1024 * 1024, env };
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo || ''))
+    || !/^[A-Za-z0-9._/-]+$/.test(base)
+    || !workspace?.worktreePath) {
+    return { published: false, failureReason: 'implementation-publication-input-invalid' };
+  }
+
+  const processOptions = {
+    cwd: workspace.worktreePath,
+    encoding: 'utf8',
+    maxBuffer: 5 * 1024 * 1024,
+    env,
+  };
   const branchFormat = runner('git', ['check-ref-format', '--branch', branch], processOptions);
-  if (branchFormat?.status !== 0) return { published: false, failureReason: 'implementation-publication-branch-invalid' };
+  if (branchFormat?.status !== 0) {
+    return { published: false, failureReason: 'implementation-publication-branch-invalid' };
+  }
   const actualBranch = runner('git', ['branch', '--show-current'], processOptions);
-  if (actualBranch?.status !== 0 || String(actualBranch.stdout || '').trim() !== branch) return { published: false, failureReason: 'implementation-publication-branch-mismatch' };
+  if (actualBranch?.status !== 0 || String(actualBranch.stdout || '').trim() !== branch) {
+    return { published: false, failureReason: 'implementation-publication-branch-mismatch' };
+  }
   const push = runner('git', ['push', '--set-upstream', 'origin', branch], processOptions);
-  if (push?.status !== 0) return { published: false, failureReason: 'implementation-branch-push-failed', stage: 'push', exitCode: push?.status ?? null };
+  if (push?.status !== 0) {
+    return { published: false, failureReason: 'implementation-branch-push-failed', stage: 'push', exitCode: push?.status ?? null };
+  }
+
   const listArgs = ['pr', 'list', '--repo', repo, '--head', branch, '--state', 'open', '--json', 'number,url,isDraft', '--limit', '1'];
   let listed = runner('gh', listArgs, processOptions);
-  if (listed?.status !== 0) return { published: false, failureReason: 'implementation-pr-query-failed', stage: 'pr-query', exitCode: listed?.status ?? null };
+  if (listed?.status !== 0) {
+    return { published: false, failureReason: 'implementation-pr-query-failed', stage: 'pr-query', exitCode: listed?.status ?? null };
+  }
   let pullRequest = parsePullRequestList(listed.stdout);
   if (!pullRequest) {
     const title = `${String(issueTitle || `Issue #${issueNumber}`).slice(0, 210)} (#${issueNumber})`;
     const body = `Implements #${issueNumber} from an allowlisted manager preflight.\n\nCreated as a draft by the ModelSpend agent runner after isolated-worktree, clean-commit, model/effort and permission-policy checks. Human review, merge and issue closure are required.`;
-    const created = runner('gh', ['pr', 'create', '--repo', repo, '--base', base, '--head', branch, '--draft', '--title', title, '--body', body], processOptions);
-    if (created?.status !== 0) return { published: false, failureReason: 'implementation-draft-pr-create-failed', stage: 'pr-create', exitCode: created?.status ?? null };
+    const created = runner('gh', [
+      'pr', 'create',
+      '--repo', repo,
+      '--base', base,
+      '--head', branch,
+      '--draft',
+      '--title', title,
+      '--body', body,
+    ], processOptions);
+    if (created?.status !== 0) {
+      return { published: false, failureReason: 'implementation-draft-pr-create-failed', stage: 'pr-create', exitCode: created?.status ?? null };
+    }
     listed = runner('gh', listArgs, processOptions);
     pullRequest = listed?.status === 0 ? parsePullRequestList(listed.stdout) : null;
   }
-  if (!pullRequest?.number || !pullRequest?.url) return { published: false, failureReason: 'implementation-draft-pr-evidence-missing', stage: 'pr-evidence' };
-  if (pullRequest.isDraft !== true) return { published: false, failureReason: 'implementation-pr-not-draft', stage: 'pr-evidence', prNumber: pullRequest.number, prUrl: pullRequest.url };
-  return { published: true, failureReason: null, branch, prNumber: pullRequest.number, prUrl: pullRequest.url, draft: true };
+
+  if (!pullRequest?.number || !pullRequest?.url) {
+    return { published: false, failureReason: 'implementation-draft-pr-evidence-missing', stage: 'pr-evidence' };
+  }
+  if (pullRequest.isDraft !== true) {
+    return { published: false, failureReason: 'implementation-pr-not-draft', stage: 'pr-evidence', prNumber: pullRequest.number, prUrl: pullRequest.url };
+  }
+  return {
+    published: true,
+    failureReason: null,
+    branch,
+    prNumber: pullRequest.number,
+    prUrl: pullRequest.url,
+    draft: true,
+  };
 }
 
 function parseSinglePullRequest(stdout = '') {
-  try { const payload = JSON.parse(String(stdout || '').trim()); return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null; } catch { return null; }
+  try {
+    const payload = JSON.parse(String(stdout || '').trim());
+    return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null;
+  } catch {
+    return null;
+  }
 }
 
-export function publishPrContinuation({ workspace, worktreeIdentity, repo, prNumber, env = process.env, runner = spawnSync } = {}) {
+/**
+ * Strict same-PR publication for a bounded PR review-followup continuation
+ * (#242). Unlike `publishImplementationDraft`, this never creates a
+ * replacement PR: it pushes only the already-authorised existing branch,
+ * then re-reads the exact same open PR number/branch and requires the
+ * published head to equal the committed worktree HEAD before declaring
+ * success. Any identity drift (PR closed, reopened as a different number,
+ * head branch changed, or a head that does not match the local commit)
+ * fails closed instead of publishing a new PR.
+ */
+export function publishPrContinuation({
+  workspace,
+  worktreeIdentity,
+  repo,
+  prNumber,
+  env = process.env,
+  runner = spawnSync,
+} = {}) {
   const branch = String(worktreeIdentity?.expectedBranch || '');
-  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo || '')) || !Number.isInteger(prNumber) || prNumber <= 0 || !workspace?.worktreePath) return { published: false, failureReason: 'pr-continuation-publication-input-invalid' };
-  const processOptions = { cwd: workspace.worktreePath, encoding: 'utf8', maxBuffer: 5 * 1024 * 1024, env };
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo || ''))
+    || !Number.isInteger(prNumber) || prNumber <= 0
+    || !workspace?.worktreePath) {
+    return { published: false, failureReason: 'pr-continuation-publication-input-invalid' };
+  }
+
+  const processOptions = {
+    cwd: workspace.worktreePath,
+    encoding: 'utf8',
+    maxBuffer: 5 * 1024 * 1024,
+    env,
+  };
   const branchFormat = runner('git', ['check-ref-format', '--branch', branch], processOptions);
-  if (branchFormat?.status !== 0) return { published: false, failureReason: 'pr-continuation-publication-branch-invalid' };
+  if (branchFormat?.status !== 0) {
+    return { published: false, failureReason: 'pr-continuation-publication-branch-invalid' };
+  }
   const actualBranch = runner('git', ['branch', '--show-current'], processOptions);
-  if (actualBranch?.status !== 0 || String(actualBranch.stdout || '').trim() !== branch) return { published: false, failureReason: 'pr-continuation-publication-branch-mismatch' };
+  if (actualBranch?.status !== 0 || String(actualBranch.stdout || '').trim() !== branch) {
+    return { published: false, failureReason: 'pr-continuation-publication-branch-mismatch' };
+  }
   const committedHeadResult = runner('git', ['rev-parse', 'HEAD'], processOptions);
   const committedHead = committedHeadResult?.status === 0 ? String(committedHeadResult.stdout || '').trim() : null;
-  if (!committedHead) return { published: false, failureReason: 'pr-continuation-publication-head-unavailable' };
+  if (!committedHead) {
+    return { published: false, failureReason: 'pr-continuation-publication-head-unavailable' };
+  }
+
   const push = runner('git', ['push', 'origin', branch], processOptions);
-  if (push?.status !== 0) return { published: false, failureReason: 'pr-continuation-branch-push-failed', stage: 'push', exitCode: push?.status ?? null };
-  const view = runner('gh', ['pr', 'view', String(prNumber), '--repo', repo, '--json', 'number,state,headRefName,headRefOid,url'], processOptions);
-  if (view?.status !== 0) return { published: false, failureReason: 'pr-continuation-publication-pr-query-failed', stage: 'pr-query', exitCode: view?.status ?? null };
+  if (push?.status !== 0) {
+    return { published: false, failureReason: 'pr-continuation-branch-push-failed', stage: 'push', exitCode: push?.status ?? null };
+  }
+
+  const view = runner('gh', [
+    'pr', 'view', String(prNumber),
+    '--repo', repo,
+    '--json', 'number,state,headRefName,headRefOid,url',
+  ], processOptions);
+  if (view?.status !== 0) {
+    return { published: false, failureReason: 'pr-continuation-publication-pr-query-failed', stage: 'pr-query', exitCode: view?.status ?? null };
+  }
   const pullRequest = parseSinglePullRequest(view.stdout);
-  if (!pullRequest?.number || !pullRequest?.url) return { published: false, failureReason: 'pr-continuation-publication-pr-evidence-missing', stage: 'pr-evidence' };
-  if (pullRequest.number !== prNumber) return { published: false, failureReason: 'pr-continuation-publication-pr-number-changed', stage: 'pr-evidence', prNumber: pullRequest.number };
-  if (pullRequest.state !== 'OPEN') return { published: false, failureReason: 'pr-continuation-publication-pr-not-open', stage: 'pr-evidence', prNumber: pullRequest.number };
-  if (pullRequest.headRefName !== branch) return { published: false, failureReason: 'pr-continuation-publication-branch-changed', stage: 'pr-evidence', prNumber: pullRequest.number };
-  if (pullRequest.headRefOid !== committedHead) return { published: false, failureReason: 'pr-continuation-publication-head-mismatch', stage: 'pr-evidence', prNumber: pullRequest.number, expectedHeadSha: committedHead, observedHeadSha: pullRequest.headRefOid || null };
-  return { published: true, failureReason: null, branch, prNumber: pullRequest.number, prUrl: pullRequest.url, headSha: committedHead };
+  if (!pullRequest?.number || !pullRequest?.url) {
+    return { published: false, failureReason: 'pr-continuation-publication-pr-evidence-missing', stage: 'pr-evidence' };
+  }
+  // Identity must be exactly preserved -- a closed/reopened/renumbered PR is
+  // never rebound to a freshly created replacement.
+  if (pullRequest.number !== prNumber) {
+    return { published: false, failureReason: 'pr-continuation-publication-pr-number-changed', stage: 'pr-evidence', prNumber: pullRequest.number };
+  }
+  if (pullRequest.state !== 'OPEN') {
+    return { published: false, failureReason: 'pr-continuation-publication-pr-not-open', stage: 'pr-evidence', prNumber: pullRequest.number };
+  }
+  if (pullRequest.headRefName !== branch) {
+    return { published: false, failureReason: 'pr-continuation-publication-branch-changed', stage: 'pr-evidence', prNumber: pullRequest.number };
+  }
+  if (pullRequest.headRefOid !== committedHead) {
+    return {
+      published: false,
+      failureReason: 'pr-continuation-publication-head-mismatch',
+      stage: 'pr-evidence',
+      prNumber: pullRequest.number,
+      expectedHeadSha: committedHead,
+      observedHeadSha: pullRequest.headRefOid || null,
+    };
+  }
+
+  return {
+    published: true,
+    failureReason: null,
+    branch,
+    prNumber: pullRequest.number,
+    prUrl: pullRequest.url,
+    headSha: committedHead,
+  };
 }
 
 async function githubJson(path, token, repo) {
   const url = `https://api.github.com/repos/${repo}${path}`;
-  const response = await fetch(url, { headers: { Accept: 'application/vnd.github+json', Authorization: `Bearer ${token}`, 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'modelspend-claude-runner' } });
-  if (!response.ok) { const body = await response.text(); throw new Error(`GitHub request failed ${response.status} ${response.statusText}: ${body.slice(0, 500)}`); }
+  const response = await fetch(url, {
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'modelspend-claude-runner',
+    },
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`GitHub request failed ${response.status} ${response.statusText}: ${body.slice(0, 500)}`);
+  }
   return response.json();
 }
 
@@ -755,20 +1067,65 @@ export async function fetchIssueAndComments({ repo, issue, token }) {
   return { issue: issuePayload, comments };
 }
 
-async function fetchOpenPullRequests({ repo, token }) { return githubJson('/pulls?state=open&per_page=50', token, repo); }
+async function fetchOpenPullRequests({ repo, token }) {
+  return githubJson('/pulls?state=open&per_page=50', token, repo);
+}
 
 async function githubGraphQL(query, variables, token) {
-  const response = await fetch('https://api.github.com/graphql', { method: 'POST', headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', 'User-Agent': 'modelspend-claude-runner' }, body: JSON.stringify({ query, variables }) });
-  if (!response.ok) { const body = await response.text(); throw new Error(`GitHub GraphQL request failed ${response.status} ${response.statusText}: ${body.slice(0, 500)}`); }
+  const response = await fetch('https://api.github.com/graphql', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+      'User-Agent': 'modelspend-claude-runner',
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`GitHub GraphQL request failed ${response.status} ${response.statusText}: ${body.slice(0, 500)}`);
+  }
   const payload = await response.json();
-  if (Array.isArray(payload.errors) && payload.errors.length > 0) throw new Error(`GitHub GraphQL request returned errors: ${JSON.stringify(payload.errors).slice(0, 500)}`);
+  if (Array.isArray(payload.errors) && payload.errors.length > 0) {
+    throw new Error(`GitHub GraphQL request returned errors: ${JSON.stringify(payload.errors).slice(0, 500)}`);
+  }
   return payload.data;
 }
 
+// Hard bounds on review-thread fetching, enforced fail-closed: a single
+// fixed page of threads and comments per thread, with every comment body
+// truncated before it enters detector/prompt context. There is no
+// cursor-progress loop — if GitHub reports more pages than this bound
+// allows, fetchPullRequestReviewThreads() throws rather than truncating
+// silently or paginating indefinitely.
 const REVIEW_THREADS_PAGE_LIMIT = 50;
 const REVIEW_THREAD_COMMENTS_LIMIT = 20;
 const REVIEW_THREAD_COMMENT_BODY_MAX_CHARS = 2000;
-const REVIEW_THREADS_QUERY = `\nquery($owner: String!, $name: String!, $pr: Int!) {\n  repository(owner: $owner, name: $name) {\n    pullRequest(number: $pr) {\n      reviewThreads(first: ${REVIEW_THREADS_PAGE_LIMIT}) {\n        pageInfo { hasNextPage }\n        nodes {\n          id\n          isResolved\n          comments(last: ${REVIEW_THREAD_COMMENTS_LIMIT}) {\n            nodes { author { login } body createdAt }\n          }\n        }\n      }\n    }\n  }\n}`;
+
+// Fixed, bounded GraphQL query: positively selects only the review-thread
+// resolution state and bounded comment context the follow-up detector/prompt
+// needs. No arbitrary/parameterized query surface is exposed to callers.
+const REVIEW_THREADS_QUERY = `
+query($owner: String!, $name: String!, $pr: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: ${REVIEW_THREADS_PAGE_LIMIT}) {
+        pageInfo { hasNextPage }
+        nodes {
+          id
+          isResolved
+          comments(last: ${REVIEW_THREAD_COMMENTS_LIMIT}) {
+            nodes {
+              author { login }
+              body
+              createdAt
+            }
+          }
+        }
+      }
+    }
+  }
+}`;
 
 function boundCommentBody(body) {
   const text = String(body || '');
@@ -778,37 +1135,100 @@ function boundCommentBody(body) {
   return `${text.slice(0, retainedChars)}${marker}`;
 }
 
+/**
+ * Fetch review-thread resolution state via a single fixed, bounded GraphQL
+ * page. Throws on any failure (network, HTTP, GraphQL errors, a missing
+ * reviewThreads field, or a PR reporting more threads than the single
+ * allowed page can hold) so callers fail closed rather than silently
+ * treating an unavailable or truncated thread query as "no unresolved
+ * threads".
+ */
 async function fetchPullRequestReviewThreads({ repo, pr, token }) {
   const [owner, name] = String(repo).split('/');
   if (!owner || !name) throw new Error(`Invalid repo "${repo}" for review-thread query`);
   const data = await githubGraphQL(REVIEW_THREADS_QUERY, { owner, name, pr }, token);
   const reviewThreads = data?.repository?.pullRequest?.reviewThreads;
-  if (!reviewThreads || !Array.isArray(reviewThreads.nodes) || typeof reviewThreads.pageInfo?.hasNextPage !== 'boolean') throw new Error(`GitHub GraphQL response missing bounded reviewThreads state for ${repo}#${pr}`);
-  if (reviewThreads.pageInfo.hasNextPage) throw new Error(`GitHub reports more than ${REVIEW_THREADS_PAGE_LIMIT} review threads for ${repo}#${pr}, exceeding the hard bounded-fetch limit; refusing to paginate`);
+  if (
+    !reviewThreads
+    || !Array.isArray(reviewThreads.nodes)
+    || typeof reviewThreads.pageInfo?.hasNextPage !== 'boolean'
+  ) {
+    throw new Error(`GitHub GraphQL response missing bounded reviewThreads state for ${repo}#${pr}`);
+  }
+  if (reviewThreads.pageInfo.hasNextPage) {
+    throw new Error(
+      `GitHub reports more than ${REVIEW_THREADS_PAGE_LIMIT} review threads for ${repo}#${pr}, exceeding the hard bounded-fetch limit; refusing to paginate`,
+    );
+  }
+
   return reviewThreads.nodes.map((node, threadIndex) => {
-    if (!node || typeof node.id !== 'string' || node.id.length === 0 || typeof node.isResolved !== 'boolean' || !Array.isArray(node.comments?.nodes)) throw new Error(`GitHub GraphQL response contains malformed review thread at index ${threadIndex} for ${repo}#${pr}`);
+    if (
+      !node
+      || typeof node.id !== 'string'
+      || node.id.length === 0
+      || typeof node.isResolved !== 'boolean'
+      || !Array.isArray(node.comments?.nodes)
+    ) {
+      throw new Error(
+        `GitHub GraphQL response contains malformed review thread at index ${threadIndex} for ${repo}#${pr}`,
+      );
+    }
+
     const comments = node.comments.nodes.map((comment, commentIndex) => {
-      if (!comment || typeof comment.body !== 'string' || typeof comment.createdAt !== 'string' || (comment.author !== null && typeof comment.author !== 'object')) throw new Error(`GitHub GraphQL response contains malformed review-thread comment at thread ${threadIndex}, comment ${commentIndex} for ${repo}#${pr}`);
-      return { author: { login: comment.author?.login || 'unknown' }, body: boundCommentBody(comment.body), createdAt: comment.createdAt };
+      if (
+        !comment
+        || typeof comment.body !== 'string'
+        || typeof comment.createdAt !== 'string'
+        || (comment.author !== null && typeof comment.author !== 'object')
+      ) {
+        throw new Error(
+          `GitHub GraphQL response contains malformed review-thread comment at thread ${threadIndex}, comment ${commentIndex} for ${repo}#${pr}`,
+        );
+      }
+
+      return {
+        author: { login: comment.author?.login || 'unknown' },
+        body: boundCommentBody(comment.body),
+        createdAt: comment.createdAt,
+      };
     });
-    return { id: node.id, isResolved: node.isResolved, comments };
+
+    return {
+      id: node.id,
+      isResolved: node.isResolved,
+      comments,
+    };
   });
 }
 
 async function fetchPullRequestReviewContext({ repo, pr, token }) {
   const [pullRequest, reviews, comments, reviewThreads] = await Promise.all([
-    githubJson(`/pulls/${pr}`, token, repo), githubJson(`/pulls/${pr}/reviews?per_page=100`, token, repo), githubJson(`/issues/${pr}/comments?per_page=100`, token, repo), fetchPullRequestReviewThreads({ repo, pr, token }),
+    githubJson(`/pulls/${pr}`, token, repo),
+    githubJson(`/pulls/${pr}/reviews?per_page=100`, token, repo),
+    githubJson(`/issues/${pr}/comments?per_page=100`, token, repo),
+    fetchPullRequestReviewThreads({ repo, pr, token }),
   ]);
   return { pullRequest, reviews, comments, reviewThreads };
 }
 
+/**
+ * Check whether an open PR plausibly linked to `issue` has unresolved review
+ * follow-up. Returns null when no linked PR is blocking, otherwise details
+ * for the blocking PR so the caller can refuse to start new issue work.
+ */
 export async function findBlockingPrFollowUp({ repo, issue, token }) {
   const openPrs = await fetchOpenPullRequests({ repo, token });
-  const candidates = findLinkedOpenPullRequests({ issueNumber: issue, pullRequests: openPrs.map((pr) => ({ number: pr.number, title: pr.title, body: pr.body, headRefName: pr.head?.ref, url: pr.html_url })) });
+  const candidates = findLinkedOpenPullRequests({
+    issueNumber: issue,
+    pullRequests: openPrs.map((pr) => ({ number: pr.number, title: pr.title, body: pr.body, headRefName: pr.head?.ref, url: pr.html_url })),
+  });
+
   for (const candidate of candidates) {
     const { reviews, comments, reviewThreads } = await fetchPullRequestReviewContext({ repo, pr: candidate.number, token });
     const unresolved = detectUnresolvedReviewFollowUp({ reviews, reviewThreads, comments });
-    if (unresolved.hasUnresolvedFollowUp) return { pr: candidate, unresolved };
+    if (unresolved.hasUnresolvedFollowUp) {
+      return { pr: candidate, unresolved };
+    }
   }
   return null;
 }
@@ -821,52 +1241,138 @@ function writeRunLog({ outputDir, label, issueNumber, payload }) {
   return logPath;
 }
 
-export function defaultQuotaStatePath(outputDir) { return join(outputDir, 'quota-state.json'); }
-export function readQuotaPauseState(statePath) { try { return JSON.parse(readFileSync(statePath, 'utf8')); } catch { return null; } }
-export function writeQuotaPauseState(statePath, state) { mkdirSync(dirname(statePath), { recursive: true }); writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`); }
+export function defaultQuotaStatePath(outputDir) {
+  return join(outputDir, 'quota-state.json');
+}
 
+export function readQuotaPauseState(statePath) {
+  try {
+    return JSON.parse(readFileSync(statePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+export function writeQuotaPauseState(statePath, state) {
+  mkdirSync(dirname(statePath), { recursive: true });
+  writeFileSync(statePath, `${JSON.stringify(state, null, 2)}\n`);
+}
+
+/**
+ * Run a conservative /quota check and update the local pause state file.
+ * Fails closed: ambiguous output keeps (or starts) a pause rather than
+ * assuming quota is available.
+ */
 export async function runQuotaCheck(args, env = process.env) {
   const quotaStatePath = args.quotaStatePath || defaultQuotaStatePath(args.outputDir);
   const now = new Date();
   const previousState = readQuotaPauseState(quotaStatePath);
+
   if (!args.forceQuotaCheck && previousState?.lastCheckedAt) {
     const elapsedMs = now.getTime() - new Date(previousState.lastCheckedAt).getTime();
     if (Number.isFinite(elapsedMs) && elapsedMs < 10 * 60 * 1000) {
-      const payload = { checked: false, reason: 'too-soon', lastCheckedAt: previousState.lastCheckedAt, minIntervalMs: 10 * 60 * 1000, quotaStatePath };
-      console.log(JSON.stringify(payload, null, 2)); return 0;
+      const payload = {
+        checked: false,
+        reason: 'too-soon',
+        lastCheckedAt: previousState.lastCheckedAt,
+        minIntervalMs: 10 * 60 * 1000,
+        quotaStatePath,
+      };
+      console.log(JSON.stringify(payload, null, 2));
+      return 0;
     }
   }
+
   const claudeEnv = buildClaudeProcessEnv(env, { inheritProviderAuth: args.inheritProviderAuth });
   const quotaArgs = buildQuotaCheckArgs({});
-  const result = spawnSync(args.claudeBin, quotaArgs, { cwd: resolve('.'), encoding: 'utf8', maxBuffer: 5 * 1024 * 1024, env: claudeEnv });
+  const result = spawnSync(args.claudeBin, quotaArgs, {
+    cwd: resolve('.'),
+    encoding: 'utf8',
+    maxBuffer: 5 * 1024 * 1024,
+    env: claudeEnv,
+  });
+
   const combinedOutput = `${result.stdout || ''}\n${result.stderr || ''}`;
-  const parsed = parseQuotaCheckOutput(combinedOutput, { now, maxSessionUsageBeforeStartPercent: env.CLAUDE_RUNNER_MAX_SESSION_USAGE_BEFORE_START_PERCENT });
-  const usageState = { quotaUsage: parsed.quotaUsage || null, sessionPercentUsed: parsed.sessionPercentUsed ?? null, weeklyPercentUsed: parsed.weeklyPercentUsed ?? null, modelWeekPercentUsed: parsed.modelWeekPercentUsed || {}, maxSessionUsageBeforeStartPercent: parsed.maxSessionUsageBeforeStartPercent ?? null };
+  const parsed = parseQuotaCheckOutput(combinedOutput, {
+    now,
+    maxSessionUsageBeforeStartPercent: env.CLAUDE_RUNNER_MAX_SESSION_USAGE_BEFORE_START_PERCENT,
+  });
+  const usageState = {
+    quotaUsage: parsed.quotaUsage || null,
+    sessionPercentUsed: parsed.sessionPercentUsed ?? null,
+    weeklyPercentUsed: parsed.weeklyPercentUsed ?? null,
+    modelWeekPercentUsed: parsed.modelWeekPercentUsed || {},
+    maxSessionUsageBeforeStartPercent: parsed.maxSessionUsageBeforeStartPercent ?? null,
+  };
+
   let nextState;
-  if (parsed.status === 'available') nextState = { status: 'available', lastCheckedAt: now.toISOString(), pausedUntil: null, reason: null, ...usageState };
-  else {
-    const pause = recordQuotaPause({ reason: parsed.status === 'exhausted' ? 'quota-exhausted' : 'ambiguous-quota-check', matchedPattern: parsed.matchedPattern, resetAt: parsed.resetAt, now });
+  if (parsed.status === 'available') {
+    nextState = { status: 'available', lastCheckedAt: now.toISOString(), pausedUntil: null, reason: null, ...usageState };
+  } else {
+    // 'exhausted' or 'ambiguous' both fail closed to a conservative pause.
+    const pause = recordQuotaPause({
+      reason: parsed.status === 'exhausted' ? 'quota-exhausted' : 'ambiguous-quota-check',
+      matchedPattern: parsed.matchedPattern,
+      resetAt: parsed.resetAt,
+      now,
+    });
     nextState = { ...pause, status: parsed.status, lastCheckedAt: now.toISOString(), ...usageState };
   }
+
   writeQuotaPauseState(quotaStatePath, nextState);
-  const payload = { checked: true, status: parsed.status, exitCode: result.status, signal: result.signal, spawnError: result.error ? String(result.error.message || result.error) : null, output: redactSensitiveText(combinedOutput).trim(), quotaStatePath, state: nextState };
-  console.log(JSON.stringify(payload, null, 2)); return 0;
+
+  const payload = {
+    checked: true,
+    status: parsed.status,
+    exitCode: result.status,
+    signal: result.signal,
+    spawnError: result.error ? String(result.error.message || result.error) : null,
+    output: redactSensitiveText(combinedOutput).trim(),
+    quotaStatePath,
+    state: nextState,
+  };
+  console.log(JSON.stringify(payload, null, 2));
+  return 0;
 }
 
+/**
+ * Detect the "silent no-op" contract violation: --execute was passed, the
+ * spawned Claude process exited 0, but produced no stdout/stderr at all.
+ * A real Claude print-mode run always emits response text; empty output
+ * with a clean exit code means Claude was never actually launched/did
+ * nothing, not that the task trivially succeeded.
+ */
 export function detectExecutionNoop({ execute, status, signal, stdout = '', stderr = '', spawnError = null }) {
   if (!execute) return { noop: false, reason: null };
   if (spawnError) return { noop: true, reason: 'claude-spawn-error' };
   if (signal) return { noop: true, reason: 'claude-killed-by-signal' };
-  if (status === 0 && !String(stdout).trim() && !String(stderr).trim()) return { noop: true, reason: 'claude-exited-zero-with-no-output' };
+  if (status === 0 && !String(stdout).trim() && !String(stderr).trim()) {
+    return { noop: true, reason: 'claude-exited-zero-with-no-output' };
+  }
   return { noop: false, reason: null };
 }
 
+/**
+ * A plan-only Claude print-mode run (all runner profiles currently use
+ * `--permission-mode plan`, see #660) exits 0 and emits real response text,
+ * so it passes `detectExecutionNoop`. But it never edited any code — Claude
+ * only wrote a plan file and is waiting for approval/continuation. Detect
+ * that signature from the observed #580 stdout (a plan file path under
+ * `.claude/plans/` and/or an explicit "no code edits" statement) so the
+ * runner can refuse to treat it as completed implementation work.
+ */
 export const PLAN_ONLY_EXIT_CODE = 2;
 export const COST_POLICY_EXIT_CODE = 3;
 export const EXECUTION_POLICY_EXIT_CODE = 4;
 export const PR_REVIEW_FOLLOWUP_MODE = 'pr-review-followup';
+
 const PLAN_FILE_PATH_PATTERN = /(\/\S*\.claude\/plans\/\S+\.md)/;
-const PLAN_ONLY_STDOUT_PATTERNS = [/have not made any code edits/i, /no code edits (?:were|have been) made/i, /only the plan file was written/i, /awaiting plan approval/i];
+const PLAN_ONLY_STDOUT_PATTERNS = [
+  /have not made any code edits/i,
+  /no code edits (?:were|have been) made/i,
+  /only the plan file was written/i,
+  /awaiting plan approval/i,
+];
 
 export function detectPlanOnlyResult({ stdout = '', stderr = '' } = {}) {
   const combined = `${stdout}\n${stderr}`;
@@ -882,118 +1388,391 @@ function finiteNumberOrNull(value) {
 }
 
 function sanitizeUsageRecord(value = {}) {
-  return sanitizeClaudeStructuredUsage(value);
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const normalized = {
+    inputTokens: finiteNumberOrNull(value.inputTokens ?? value.input_tokens),
+    outputTokens: finiteNumberOrNull(value.outputTokens ?? value.output_tokens),
+    cacheReadInputTokens: finiteNumberOrNull(value.cacheReadInputTokens ?? value.cache_read_input_tokens),
+    cacheCreationInputTokens: finiteNumberOrNull(value.cacheCreationInputTokens ?? value.cache_creation_input_tokens),
+  };
+  return Object.values(normalized).some((entry) => entry !== null) ? normalized : null;
 }
 
 function sanitizeModelUsage(value = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return Object.fromEntries(Object.entries(value).flatMap(([model, usage]) => {
     const tokens = sanitizeUsageRecord(usage);
-    const normalized = { ...(tokens || {}), costUsd: finiteNumberOrNull(usage?.costUSD ?? usage?.cost_usd), contextWindow: finiteNumberOrNull(usage?.contextWindow ?? usage?.context_window), maxOutputTokens: finiteNumberOrNull(usage?.maxOutputTokens ?? usage?.max_output_tokens) };
+    const normalized = {
+      ...(tokens || {}),
+      costUsd: finiteNumberOrNull(usage?.costUSD ?? usage?.cost_usd),
+      contextWindow: finiteNumberOrNull(usage?.contextWindow ?? usage?.context_window),
+      maxOutputTokens: finiteNumberOrNull(usage?.maxOutputTokens ?? usage?.max_output_tokens),
+    };
     if (!Object.values(normalized).some((entry) => entry !== null)) return [];
     return [[String(model).slice(0, 160), normalized]];
   }));
 }
 
+/**
+ * Parse Claude's print-mode JSON result into an allowlisted accounting
+ * envelope. Never return the resumable session id or raw provider payload;
+ * the local log needs bounded result text plus numeric usage/cost evidence.
+ */
 export function parseClaudeResultEnvelope(stdout = '') {
-  const fallback = { parsed: false, subtype: null, isError: false, resultText: String(stdout || ''), errors: [], numTurns: null, totalCostUsd: null, usage: null, modelUsage: {}, hasSessionId: false, accountingAvailable: false };
+  const fallback = {
+    parsed: false,
+    subtype: null,
+    isError: false,
+    resultText: String(stdout || ''),
+    errors: [],
+    numTurns: null,
+    totalCostUsd: null,
+    usage: null,
+    modelUsage: {},
+    hasSessionId: false,
+    accountingAvailable: false,
+  };
+
   const terminalResult = (records) => [...records].reverse().find((record) => record && typeof record === 'object' && !Array.isArray(record) && record.type === 'result') || null;
   let payload;
-  const records = String(stdout || '').split(/\r?\n/).filter((line) => line.trim()).flatMap((line) => { try { const parsed = JSON.parse(line); return Array.isArray(parsed) ? parsed : [parsed]; } catch { return []; } });
-  try { payload = JSON.parse(String(stdout || '').trim()); if (Array.isArray(payload)) payload = terminalResult(payload); } catch { payload = terminalResult(records); }
+  const records = String(stdout || '').split(/\r?\n/).filter((line) => line.trim()).flatMap((line) => {
+    try {
+      const parsed = JSON.parse(line);
+      return Array.isArray(parsed) ? parsed : [parsed];
+    } catch { return []; }
+  });
+  try {
+    payload = JSON.parse(String(stdout || '').trim());
+    if (Array.isArray(payload)) payload = terminalResult(payload);
+  } catch {
+    payload = terminalResult(records);
+  }
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return fallback;
+
+  // Only a terminal CLI result may classify provider state. Intermediate
+  // assistant/tool/rate_limit_event records are deliberately ignored: their
+  // content routinely contains repository strings such as 429 and
+  // billing_quota_exceeded (#299/#550).
   if (payload.type && payload.type !== 'result') return fallback;
+
   const usage = sanitizeUsageRecord(payload.usage);
   const modelUsage = sanitizeModelUsage(payload.modelUsage ?? payload.model_usage);
   const numTurns = finiteNumberOrNull(payload.num_turns ?? payload.numTurns);
   const totalCostUsd = finiteNumberOrNull(payload.total_cost_usd ?? payload.totalCostUsd);
-  const errors = Array.isArray(payload.errors) ? payload.errors.filter((entry) => typeof entry === 'string').slice(0, 10).map((entry) => entry.slice(0, 500)) : [];
-  const providerError = payload.provider_error && typeof payload.provider_error === 'object' ? payload.provider_error : payload.error && typeof payload.error === 'object' ? payload.error : null;
+  const errors = Array.isArray(payload.errors)
+    ? payload.errors.filter((entry) => typeof entry === 'string').slice(0, 10).map((entry) => entry.slice(0, 500))
+    : [];
+  const providerError = payload.provider_error && typeof payload.provider_error === 'object'
+    ? payload.provider_error
+    : payload.error && typeof payload.error === 'object' ? payload.error : null;
   const providerErrorCode = typeof providerError?.code === 'string' ? providerError.code : null;
   const terminalProviderFailure = payload.is_error === true || payload.isError === true;
-  const structuredFailure = terminalProviderFailure && ['quota_exhausted', 'billing_quota_exceeded', 'rate_limited'].includes(providerErrorCode) ? providerErrorCode : null;
-  return { parsed: true, subtype: typeof payload.subtype === 'string' ? payload.subtype.slice(0, 120) : null, isError: payload.is_error === true || payload.isError === true, resultText: typeof payload.result === 'string' ? payload.result : '', errors, numTurns, totalCostUsd, usage, modelUsage, hasSessionId: Boolean(payload.session_id || payload.sessionId), accountingAvailable: numTurns !== null || totalCostUsd !== null || usage !== null || Object.keys(modelUsage).length > 0, structuredFailure, retryAt: typeof providerError?.retry_at === 'string' ? providerError.retry_at : null };
+  const structuredFailure = terminalProviderFailure && ['quota_exhausted', 'billing_quota_exceeded', 'rate_limited'].includes(providerErrorCode)
+    ? providerErrorCode
+    : null;
+
+  return {
+    parsed: true,
+    subtype: typeof payload.subtype === 'string' ? payload.subtype.slice(0, 120) : null,
+    isError: payload.is_error === true || payload.isError === true,
+    resultText: typeof payload.result === 'string' ? payload.result : '',
+    errors,
+    numTurns,
+    totalCostUsd,
+    usage,
+    modelUsage,
+    hasSessionId: Boolean(payload.session_id || payload.sessionId),
+    accountingAvailable: numTurns !== null || totalCostUsd !== null || usage !== null || Object.keys(modelUsage).length > 0,
+    structuredFailure,
+    retryAt: typeof providerError?.retry_at === 'string' ? providerError.retry_at : null,
+  };
 }
 
+/**
+ * Extract the raw resumable session id from the same terminal `type:
+ * "result"` record `parseClaudeResultEnvelope` reduces JSON/JSONL/array
+ * output to — but, unlike that function, actually return the id instead of
+ * just a boolean. This is the ONLY place the real session id is read out of
+ * Claude's stdout; the caller must write it straight to the restricted
+ * recovery store and never assign it to anything that reaches ordinary
+ * state, logs, or GitHub (#698 finding 2).
+ */
 function extractRestrictedSessionId(stdout = '') {
   const terminalResult = (records) => [...records].reverse().find((record) => record && typeof record === 'object' && !Array.isArray(record) && record.type === 'result') || null;
-  const records = String(stdout || '').split(/\r?\n/).filter((line) => line.trim()).flatMap((line) => { try { const parsed = JSON.parse(line); return Array.isArray(parsed) ? parsed : [parsed]; } catch { return []; } });
+  const records = String(stdout || '').split(/\r?\n/).filter((line) => line.trim()).flatMap((line) => {
+    try {
+      const parsed = JSON.parse(line);
+      return Array.isArray(parsed) ? parsed : [parsed];
+    } catch { return []; }
+  });
   let payload;
-  try { payload = JSON.parse(String(stdout || '').trim()); if (Array.isArray(payload)) payload = terminalResult(payload); } catch { payload = terminalResult(records); }
+  try {
+    payload = JSON.parse(String(stdout || '').trim());
+    if (Array.isArray(payload)) payload = terminalResult(payload);
+  } catch {
+    payload = terminalResult(records);
+  }
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
   if (payload.type && payload.type !== 'result') return null;
   const sessionId = payload.session_id || payload.sessionId;
   return typeof sessionId === 'string' && sessionId ? sessionId : null;
 }
 
-export function classifyClaudeRunFailure({ status, signal, stdout = '', stderr = '', spawnError = null, executionNoopReason = null, planProduced = false, resultEnvelope = null, executionPhase = EXECUTION_PHASE_PLAN, implementationEvidence = null } = {}) {
+/**
+ * Convert provider/process output into a stable failure code for the cron
+ * scheduler. Raw provider text stays in the redacted local run log; GitHub
+ * receives only this bounded reason.
+ */
+export function classifyClaudeRunFailure({
+  status,
+  signal,
+  stdout = '',
+  stderr = '',
+  spawnError = null,
+  executionNoopReason = null,
+  planProduced = false,
+  resultEnvelope = null,
+  executionPhase = EXECUTION_PHASE_PLAN,
+  implementationEvidence = null,
+} = {}) {
   if (spawnError) return 'claude-spawn-error';
   if (signal) return 'claude-killed-by-signal';
-  if (planProduced) return executionPhase === EXECUTION_PHASE_IMPLEMENTATION ? 'implementation-returned-plan-only' : 'awaiting-plan-approval';
+  if (planProduced) {
+    return executionPhase === EXECUTION_PHASE_IMPLEMENTATION
+      ? 'implementation-returned-plan-only'
+      : 'awaiting-plan-approval';
+  }
+
   if (resultEnvelope?.subtype === 'error_max_turns') return 'provider-execution-limit';
   if (resultEnvelope?.subtype === 'error_max_budget_usd') return 'budget-limit-exhausted';
   if (['quota_exhausted', 'billing_quota_exceeded'].includes(resultEnvelope?.structuredFailure)) return 'quota_paused';
   if (resultEnvelope?.structuredFailure === 'rate_limited') return 'rate_limited';
-  if (resultEnvelope?.isError && resultEnvelope?.subtype) return 'unknown_failure';
+  if (resultEnvelope?.isError && resultEnvelope?.subtype) {
+    return 'unknown_failure';
+  }
+
   const combined = `${stdout}\n${stderr}`;
   if (/reached max turns\s*\(\s*\d+\s*\)/i.test(combined)) return 'provider-execution-limit';
   if (/(?:reached|exceeded|exhausted)\s+(?:the\s+)?max(?:imum)? budget|max(?:imum)? budget(?: usd)?\s+(?:reached|exceeded|exhausted)/i.test(combined)) return 'budget-limit-exhausted';
   if (executionNoopReason) return executionNoopReason;
   if (status !== 0) return `claude-exit-${status ?? 'unknown'}`;
-  if (executionPhase === EXECUTION_PHASE_IMPLEMENTATION && implementationEvidence?.failureReason) return implementationEvidence.failureReason;
+  if (executionPhase === EXECUTION_PHASE_IMPLEMENTATION && implementationEvidence?.failureReason) {
+    return implementationEvidence.failureReason;
+  }
   return null;
 }
 
+/**
+ * Run Claude (dry-run or --execute) with a prebuilt prompt/profile and
+ * persist a redacted run log. Shared by issue mode and PR follow-up mode.
+ */
 export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs, processRunner = spawnSync }) {
   let planWithPrompt = { ...runPlan, prompt: redactSensitiveText(prompt) };
-  if (!args.execute) { const logPath = writeRunLog({ outputDir: args.outputDir, label, payload: planWithPrompt }); console.log(JSON.stringify({ ...planWithPrompt, logPath }, null, 2)); return 0; }
-  const policyBlock = (reason, message, details = {}) => {
-    const payload = { ...planWithPrompt, ...details, dryRun: false, blocked: true, reason, failureReason: reason, message };
-    const logPath = writeRunLog({ outputDir: args.outputDir, label, payload }); console.log(JSON.stringify({ ...payload, logPath }, null, 2)); return EXECUTION_POLICY_EXIT_CODE;
-  };
-  if (runPlan.executionAuthorization && !runPlan.executionAuthorization.allowed) return policyBlock('execution-authorization-blocked', 'The issue did not satisfy the machine-local manager-preflight authorization policy (and, for implementation, the write opt-in). No Claude process was started.');
-  if (!runPlan.costAdmission?.allowed) {
-    const payload = { ...planWithPrompt, dryRun: false, blocked: true, reason: 'cost-policy-blocked', failureReason: 'cost-policy-blocked', message: 'The requested model/effort controls exceed this machine\'s unattended policy. No Claude process was started.' };
-    const logPath = writeRunLog({ outputDir: args.outputDir, label, payload }); console.log(JSON.stringify({ ...payload, logPath }, null, 2)); return COST_POLICY_EXIT_CODE;
+
+  if (!args.execute) {
+    const logPath = writeRunLog({ outputDir: args.outputDir, label, payload: planWithPrompt });
+    console.log(JSON.stringify({ ...planWithPrompt, logPath }, null, 2));
+    return 0;
   }
+
+  const policyBlock = (reason, message, details = {}) => {
+    const payload = {
+      ...planWithPrompt,
+      ...details,
+      dryRun: false,
+      blocked: true,
+      reason,
+      failureReason: reason,
+      message,
+    };
+    const logPath = writeRunLog({ outputDir: args.outputDir, label, payload });
+    console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+    return EXECUTION_POLICY_EXIT_CODE;
+  };
+
+  if (runPlan.executionAuthorization && !runPlan.executionAuthorization.allowed) {
+    return policyBlock(
+      'execution-authorization-blocked',
+      'The issue did not satisfy the machine-local manager-preflight authorization policy (and, for implementation, the write opt-in). No Claude process was started.',
+    );
+  }
+
+  if (!runPlan.costAdmission?.allowed) {
+    const payload = {
+      ...planWithPrompt,
+      dryRun: false,
+      blocked: true,
+      reason: 'cost-policy-blocked',
+      failureReason: 'cost-policy-blocked',
+      message: 'The requested model/effort controls exceed this machine\'s unattended policy. No Claude process was started.',
+    };
+    const logPath = writeRunLog({ outputDir: args.outputDir, label, payload });
+    console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+    return COST_POLICY_EXIT_CODE;
+  }
+
   let implementationWorkspace = null;
   const isPrContinuation = runPlan.mode === PR_REVIEW_FOLLOWUP_MODE;
   if (runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION) {
     const cliCapability = verifyClaudeImplementationCli({ claudeBin: args.claudeBin });
     planWithPrompt = { ...planWithPrompt, cliCapability };
-    if (!cliCapability.compatible) return policyBlock('implementation-cli-capability-mismatch', 'The installed Claude CLI does not meet the required minimum implementation-runner version. Upgrade/repair Claude before retrying; no paid process was started.');
-    if (args.recoveryMode === 'native_resume' && !args.resumeSession) return policyBlock('native-resume-session-missing', 'native_resume was requested without a --resume-session value. No paid process was started.');
+    if (!cliCapability.compatible) {
+      return policyBlock(
+        'implementation-cli-capability-mismatch',
+        'The installed Claude CLI does not meet the required minimum implementation-runner version. Upgrade/repair Claude before retrying; no paid process was started.',
+      );
+    }
+    if (args.recoveryMode === 'native_resume' && !args.resumeSession) {
+      return policyBlock(
+        'native-resume-session-missing',
+        'native_resume was requested without a --resume-session value. No paid process was started.',
+      );
+    }
+
+    // native_resume, same_agent_continuation, and PR review-followup
+    // continuation (#242) all reconnect to the exact worktree/branch an
+    // existing authorised attempt already owns — the opposite of the
+    // fresh-attempt requirement above, which refuses to reuse one (#698
+    // finding 2). PR follow-up continuation must never create a fresh
+    // branch/worktree, so it always uses the same reconnect path regardless
+    // of --recovery-mode.
     const implementationCheckout = runPlan.repositoryContext?.implementationCheckout;
-    implementationWorkspace = (args.recoveryMode || isPrContinuation) ? prepareContinuationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env }) : prepareImplementationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env });
-    planWithPrompt = { ...planWithPrompt, workspacePreparation: { allowed: implementationWorkspace.allowed, failureReason: implementationWorkspace.failureReason, baseRef: implementationWorkspace.baseRef || null, baseHead: implementationWorkspace.baseHead || null } };
-    if (!implementationWorkspace.allowed) return policyBlock(implementationWorkspace.failureReason || 'implementation-workspace-policy-blocked', 'The runner could not prove exclusive, current worktree ownership. No Claude process was started.');
+    implementationWorkspace = (args.recoveryMode || isPrContinuation)
+      ? prepareContinuationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env })
+      : prepareImplementationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env });
+    planWithPrompt = {
+      ...planWithPrompt,
+      workspacePreparation: {
+        allowed: implementationWorkspace.allowed,
+        failureReason: implementationWorkspace.failureReason,
+        baseRef: implementationWorkspace.baseRef || null,
+        baseHead: implementationWorkspace.baseHead || null,
+      },
+    };
+    if (!implementationWorkspace.allowed) {
+      return policyBlock(
+        implementationWorkspace.failureReason || 'implementation-workspace-policy-blocked',
+        'The runner could not prove exclusive, current worktree ownership. No Claude process was started.',
+      );
+    }
   }
+
   const claudeEnv = buildClaudeProcessEnv(env, { inheritProviderAuth: args.inheritProviderAuth });
   const startedAt = new Date().toISOString();
-  const result = processRunner(args.claudeBin, claudeArgs, { cwd: implementationProcessCwd(implementationWorkspace), encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, env: claudeEnv });
+  const result = processRunner(args.claudeBin, claudeArgs, {
+    cwd: implementationProcessCwd(implementationWorkspace),
+    encoding: 'utf8',
+    maxBuffer: 20 * 1024 * 1024,
+    env: claudeEnv,
+  });
+
   const resultEnvelope = parseClaudeResultEnvelope(result.stdout || '');
-  const resultText = resultEnvelope.parsed ? [resultEnvelope.resultText, ...resultEnvelope.errors].filter(Boolean).join('\n') : String(result.stdout || '');
-  const usageAccounting = buildClaudeUsageAccounting({ resultEnvelope, model: runPlan.profile?.model || null, promptCacheMetadata: runPlan.promptCacheMetadata || null, startedAt, finishedAt: new Date().toISOString() });
+  const resultText = resultEnvelope.parsed
+    ? [resultEnvelope.resultText, ...resultEnvelope.errors].filter(Boolean).join('\n')
+    : String(result.stdout || '');
+  const usageAccounting = {
+    source: resultEnvelope.parsed ? 'claude-cli-result-envelope' : 'unavailable',
+    accountingAvailable: resultEnvelope.accountingAvailable,
+    subtype: resultEnvelope.subtype,
+    isError: resultEnvelope.isError,
+    numTurns: resultEnvelope.numTurns,
+    totalCostUsd: resultEnvelope.totalCostUsd,
+    usage: resultEnvelope.usage,
+    modelUsage: resultEnvelope.modelUsage,
+    sessionIdPresentButNotStored: resultEnvelope.hasSessionId,
+  };
   if (['quota_exhausted', 'billing_quota_exceeded'].includes(resultEnvelope.structuredFailure)) {
-    const implementationEvidence = runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION ? collectImplementationEvidence({ workspace: implementationWorkspace, worktreeIdentity: runPlan.worktreeIdentity }) : null;
+    const implementationEvidence = runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION
+      ? collectImplementationEvidence({ workspace: implementationWorkspace, worktreeIdentity: runPlan.worktreeIdentity })
+      : null;
     const quotaStatePath = args.quotaStatePath || defaultQuotaStatePath(args.outputDir);
     const resetAt = resultEnvelope.retryAt;
     const pause = recordQuotaPause({ reason: 'quota_paused', matchedPattern: resultEnvelope.structuredFailure, resetAt, now: new Date() });
     writeQuotaPauseState(quotaStatePath, { ...pause, status: 'exhausted', lastCheckedAt: new Date().toISOString() });
-    const payload = { ...planWithPrompt, dryRun: false, startedAt, finishedAt: new Date().toISOString(), blocked: true, reason: 'quota_paused', failureReason: 'quota_paused', quotaPaused: true, quotaPauseState: pause, quotaStatePath, exitCode: result.status, signal: result.signal, stdout: redactSensitiveText(resultText), stderr: redactSensitiveText(result.stderr || ''), usageAccounting, implementationEvidence, spawnError: result.error ? String(result.error.message || result.error) : null };
-    const logPath = writeRunLog({ outputDir: args.outputDir, label, payload }); console.log(JSON.stringify({ ...payload, stdout: '<see log>', stderr: '<see log>', logPath }, null, 2)); return 1;
+    const payload = {
+      ...planWithPrompt,
+      dryRun: false,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      blocked: true,
+      reason: 'quota_paused',
+      failureReason: 'quota_paused',
+      quotaPaused: true,
+      quotaPauseState: pause,
+      quotaStatePath,
+      exitCode: result.status,
+      signal: result.signal,
+      stdout: redactSensitiveText(resultText),
+      stderr: redactSensitiveText(result.stderr || ''),
+      usageAccounting,
+      implementationEvidence,
+      spawnError: result.error ? String(result.error.message || result.error) : null,
+    };
+    const logPath = writeRunLog({ outputDir: args.outputDir, label, payload });
+    console.log(JSON.stringify({ ...payload, stdout: '<see log>', stderr: '<see log>', logPath }, null, 2));
+    return 1;
   }
-  const executionCheck = detectExecutionNoop({ execute: true, status: result.status, signal: result.signal, stdout: result.stdout || '', stderr: result.stderr || '', spawnError: result.error });
+
+  const executionCheck = detectExecutionNoop({
+    execute: true,
+    status: result.status,
+    signal: result.signal,
+    stdout: result.stdout || '',
+    stderr: result.stderr || '',
+    spawnError: result.error,
+  });
   const planCheck = detectPlanOnlyResult({ stdout: resultText, stderr: result.stderr || '' });
-  let implementationEvidence = runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION ? collectImplementationEvidence({ workspace: implementationWorkspace, worktreeIdentity: runPlan.worktreeIdentity }) : null;
+  let implementationEvidence = runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION
+    ? collectImplementationEvidence({ workspace: implementationWorkspace, worktreeIdentity: runPlan.worktreeIdentity })
+    : null;
   let implementationPublication = null;
-  if (runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION && result.status === 0 && !resultEnvelope.isError && !executionCheck.noop && !planCheck.planProduced && implementationEvidence?.valid) {
+  if (runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION
+    && result.status === 0
+    && !resultEnvelope.isError
+    && !executionCheck.noop
+    && !planCheck.planProduced
+    && implementationEvidence?.valid) {
     implementationPublication = isPrContinuation
-      ? publishPrContinuation({ workspace: implementationWorkspace, worktreeIdentity: runPlan.worktreeIdentity, repo: runPlan.repositoryContext?.implementationRepository || runPlan.repo, prNumber: runPlan.prNumber, env })
-      : publishImplementationDraft({ workspace: implementationWorkspace, worktreeIdentity: runPlan.worktreeIdentity, repo: runPlan.repositoryContext?.implementationRepository || runPlan.repo, issueNumber: runPlan.issue, issueTitle: runPlan.issueTitle, env });
-    if (!implementationPublication.published) implementationEvidence = { ...implementationEvidence, valid: false, failureReason: implementationPublication.failureReason || 'implementation-draft-publication-failed' };
+      ? publishPrContinuation({
+        workspace: implementationWorkspace,
+        worktreeIdentity: runPlan.worktreeIdentity,
+        repo: runPlan.repositoryContext?.implementationRepository || runPlan.repo,
+        prNumber: runPlan.prNumber,
+        env,
+      })
+      : publishImplementationDraft({
+        workspace: implementationWorkspace,
+        worktreeIdentity: runPlan.worktreeIdentity,
+        repo: runPlan.repositoryContext?.implementationRepository || runPlan.repo,
+        issueNumber: runPlan.issue,
+        issueTitle: runPlan.issueTitle,
+        env,
+      });
+    if (!implementationPublication.published) {
+      implementationEvidence = {
+        ...implementationEvidence,
+        valid: false,
+        failureReason: implementationPublication.failureReason || 'implementation-draft-publication-failed',
+      };
+    }
   }
-  const failureReason = classifyClaudeRunFailure({ status: result.status, signal: result.signal, stdout: resultText, stderr: result.stderr || '', spawnError: result.error, executionNoopReason: executionCheck.reason, planProduced: planCheck.planProduced, resultEnvelope, executionPhase: runPlan.executionPhase, implementationEvidence });
+  const failureReason = classifyClaudeRunFailure({
+    status: result.status,
+    signal: result.signal,
+    stdout: resultText,
+    stderr: result.stderr || '',
+    spawnError: result.error,
+    executionNoopReason: executionCheck.reason,
+    planProduced: planCheck.planProduced,
+    resultEnvelope,
+    executionPhase: runPlan.executionPhase,
+    implementationEvidence,
+  });
+
+  // Restricted recovery evidence (#698 finding 2). The raw session id is
+  // written straight to the restricted store and never assigned to a
+  // variable that reaches `payload`; only an opaque digest and ordinary
+  // booleans do.
   let restrictedRecoveryHandleDigest = null;
   let restrictedHandleBindingDigestValue = null;
   if (args.attemptId && runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION && runPlan.worktreeIdentity && implementationWorkspace?.allowed) {
@@ -1003,112 +1782,438 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
       const handleHarness = runPlan.agent?.agentType || 'claude';
       const checkpointHead = implementationEvidence?.worktree?.head || null;
       const checkpointStatusFingerprint = implementationEvidence?.worktree?.statusFingerprint || null;
-      const written = writeRestrictedRecoveryHandle(args.outputDir, args.attemptId, { attemptId: args.attemptId, sessionId: extractRestrictedSessionId(result.stdout || ''), worktreeName: runPlan.worktreeIdentity.name, expectedBranch: runPlan.worktreeIdentity.expectedBranch, checkpointHead, checkpointStatusFingerprint, agent: handleAgent, model: handleModel, harness: handleHarness, capturedAt: new Date().toISOString() });
+      const written = writeRestrictedRecoveryHandle(args.outputDir, args.attemptId, {
+        attemptId: args.attemptId,
+        sessionId: extractRestrictedSessionId(result.stdout || ''),
+        worktreeName: runPlan.worktreeIdentity.name,
+        expectedBranch: runPlan.worktreeIdentity.expectedBranch,
+        // The exact checkpoint this attempt can resume from — not merely
+        // "some commit exists". verifyPreservedWorktree() requires HEAD to
+        // still equal checkpointHead exactly, and (when captured) the
+        // working-tree status fingerprint to still match, before treating
+        // the checkpoint as current (#698 finding 2 re-review).
+        checkpointHead,
+        checkpointStatusFingerprint,
+        agent: handleAgent,
+        model: handleModel,
+        harness: handleHarness,
+        capturedAt: new Date().toISOString(),
+      });
       restrictedRecoveryHandleDigest = written.digest;
-      restrictedHandleBindingDigestValue = restrictedHandleBindingDigest({ attemptId: args.attemptId, agent: handleAgent, model: handleModel, harness: handleHarness, checkpointHead, checkpointStatusFingerprint });
-    } catch {}
+      // A dedicated digest binding this handle to the attempt's identity
+      // (agent/model/harness/checkpoint) at capture time — persisted to a
+      // write-once column, distinct from the generic handle-tamper digest
+      // above, and independently recomputed/verified at revalidation time
+      // (#698 finding 8).
+      restrictedHandleBindingDigestValue = restrictedHandleBindingDigest({
+        attemptId: args.attemptId, agent: handleAgent, model: handleModel, harness: handleHarness,
+        checkpointHead, checkpointStatusFingerprint,
+      });
+    } catch { /* restricted capture is best-effort; recovery simply stays unavailable */ }
   }
   const checkpointAvailable = Boolean(implementationEvidence?.worktree?.head);
   const sessionAvailable = resultEnvelope.hasSessionId;
-  const recoveryEvidence = { sameProfileAvailable: Boolean(runPlan.profile?.model && runPlan.profile?.effort) };
-  const payload = { ...planWithPrompt, dryRun: false, startedAt, finishedAt: new Date().toISOString(), exitCode: result.status, signal: result.signal, stdout: redactSensitiveText(resultText), stderr: redactSensitiveText(result.stderr || ''), usageAccounting, spawnError: result.error ? String(result.error.message || result.error) : null, executionNoop: executionCheck.noop, executionNoopReason: executionCheck.reason, failureReason, planProduced: planCheck.planProduced, planPath: planCheck.planPath, awaitingPlanApproval: runPlan.executionPhase === EXECUTION_PHASE_PLAN && planCheck.planProduced, implementationEvidence, implementationPublication, checkpointAvailable, sessionAvailable, recoveryEvidence, restrictedRecoveryHandleDigest, restrictedHandleBindingDigest: restrictedHandleBindingDigestValue };
+  const recoveryEvidence = {
+    sameProfileAvailable: Boolean(runPlan.profile?.model && runPlan.profile?.effort),
+  };
+
+  const payload = {
+    ...planWithPrompt,
+    dryRun: false,
+    startedAt,
+    finishedAt: new Date().toISOString(),
+    exitCode: result.status,
+    signal: result.signal,
+    stdout: redactSensitiveText(resultText),
+    stderr: redactSensitiveText(result.stderr || ''),
+    usageAccounting,
+    spawnError: result.error ? String(result.error.message || result.error) : null,
+    executionNoop: executionCheck.noop,
+    executionNoopReason: executionCheck.reason,
+    failureReason,
+    planProduced: planCheck.planProduced,
+    planPath: planCheck.planPath,
+    awaitingPlanApproval: runPlan.executionPhase === EXECUTION_PHASE_PLAN && planCheck.planProduced,
+    implementationEvidence,
+    implementationPublication,
+    checkpointAvailable,
+    sessionAvailable,
+    recoveryEvidence,
+    restrictedRecoveryHandleDigest,
+    restrictedHandleBindingDigest: restrictedHandleBindingDigestValue,
+  };
   const logPath = writeRunLog({ outputDir: args.outputDir, label, payload });
   console.log(JSON.stringify({ ...payload, stdout: '<see log>', stderr: '<see log>', logPath }, null, 2));
   if (executionCheck.noop) return 1;
-  if (planCheck.planProduced) return runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION ? 1 : PLAN_ONLY_EXIT_CODE;
+  if (planCheck.planProduced) {
+    return runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION ? 1 : PLAN_ONLY_EXIT_CODE;
+  }
   if (failureReason) return result.status && result.status !== 0 ? result.status : 1;
   return result.status === null ? 1 : result.status;
 }
 
-export async function resolvePrExecutionBinding({ pullRequest, repo, config, env, token }) {
+/**
+ * Resolve the #241 continuation binding for a direct `--pr --execute`
+ * follow-up (#242): the linked issue must be unique and explicit before any
+ * GitHub read of it is attempted, and every other refusal path is delegated
+ * to `resolvePrContinuationBinding` itself so this wiring never duplicates
+ * its identity/authority/workspace logic.
+ */
+export async function resolvePrExecutionBinding({
+  pullRequest, repo, config, env, token,
+}) {
   const linkedIssueNumbers = linkedIssueNumbersFromPr({ title: pullRequest.title || '', body: pullRequest.body || '' });
-  const { issue: linkedIssueRecord, comments: linkedIssueComments } = linkedIssueNumbers.length === 1 ? await fetchIssueAndComments({ repo, issue: linkedIssueNumbers[0], token }) : { issue: {}, comments: [] };
-  return resolvePrContinuationBinding({ pullRequest, issue: linkedIssueRecord, issueComments: linkedIssueComments, repo, config, env, resolveDispatchIdentity: resolveImplementationDispatchIdentity, prepareWorkspace: prepareContinuationWorkspace, captureEvidence: captureGitRepositoryEvidence });
+  const { issue: linkedIssueRecord, comments: linkedIssueComments } = linkedIssueNumbers.length === 1
+    ? await fetchIssueAndComments({ repo, issue: linkedIssueNumbers[0], token })
+    : { issue: {}, comments: [] };
+
+  return resolvePrContinuationBinding({
+    pullRequest,
+    issue: linkedIssueRecord,
+    issueComments: linkedIssueComments,
+    repo,
+    config,
+    env,
+    resolveDispatchIdentity: resolveImplementationDispatchIdentity,
+    prepareWorkspace: prepareContinuationWorkspace,
+    captureEvidence: captureGitRepositoryEvidence,
+  });
 }
 
-export async function runPrFollowUp(args, env, token, config = {}, { resolveBinding = resolvePrExecutionBinding, run = runOrPlanClaude } = {}) {
+export async function runPrFollowUp(args, env, token, config = {}, {
+  resolveBinding = resolvePrExecutionBinding,
+  run = runOrPlanClaude,
+} = {}) {
   const { pullRequest, reviews, comments, reviewThreads } = await fetchPullRequestReviewContext({ repo: args.repo, pr: args.pr, token });
   const unresolved = detectUnresolvedReviewFollowUp({ reviews, reviewThreads, comments });
   const branch = pullRequest.head?.ref || '(unknown branch)';
   const linkedIssue = linkedIssueNumberFromPr({ body: pullRequest.body, title: pullRequest.title });
+
   if (!unresolved.hasUnresolvedFollowUp) {
-    const payload = { mode: PR_REVIEW_FOLLOWUP_MODE, pr: args.pr, repo: args.repo, hasUnresolvedFollowUp: false, message: `No unresolved review/manager feedback detected on PR #${args.pr}. Nothing to follow up on.` };
-    const logPath = writeRunLog({ outputDir: args.outputDir, label: `pr-${args.pr}`, payload }); console.log(JSON.stringify({ ...payload, logPath }, null, 2)); return 0;
+    const payload = {
+      mode: PR_REVIEW_FOLLOWUP_MODE,
+      pr: args.pr,
+      repo: args.repo,
+      hasUnresolvedFollowUp: false,
+      message: `No unresolved review/manager feedback detected on PR #${args.pr}. Nothing to follow up on.`,
+    };
+    const logPath = writeRunLog({ outputDir: args.outputDir, label: `pr-${args.pr}`, payload });
+    console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+    return 0;
   }
-  const prompt = buildReviewFollowUpPrompt({ pr: { number: args.pr, title: pullRequest.title, url: pullRequest.html_url }, issueNumber: linkedIssue, branch, unresolved, repo: args.repo });
+
+  const prompt = buildReviewFollowUpPrompt({
+    pr: { number: args.pr, title: pullRequest.title, url: pullRequest.html_url },
+    issueNumber: linkedIssue,
+    branch,
+    unresolved,
+    repo: args.repo,
+  });
   const clearContext = shouldUseClear({ noClear: args.noClear, resumeSession: args.resumeSession });
+
+  // A write-capable direct --pr --execute run must bind to the exact
+  // existing authorised PR continuation (#241) before it can ever be
+  // treated as implementation. This is only attempted with --execute: a
+  // dry-run preview never touches GitHub for the linked issue or inspects a
+  // local worktree, matching the existing preview-only contract.
   let continuationBinding = null;
   if (args.execute) {
-    continuationBinding = await resolveBinding({ pullRequest, repo: args.repo, config, env, token });
+    continuationBinding = await resolveBinding({
+      pullRequest, repo: args.repo, config, env, token,
+    });
     if (!continuationBinding.allowed) {
-      const payload = { mode: PR_REVIEW_FOLLOWUP_MODE, pr: args.pr, repo: args.repo, dryRun: false, blocked: true, reason: continuationBinding.failureReason, failureReason: continuationBinding.failureReason, message: `Safe PR continuation binding refused this follow-up (${continuationBinding.failureReason}). No Claude process was started.` };
-      const logPath = writeRunLog({ outputDir: args.outputDir, label: `pr-${args.pr}`, payload }); console.log(JSON.stringify({ ...payload, logPath }, null, 2)); return EXECUTION_POLICY_EXIT_CODE;
+      const payload = {
+        mode: PR_REVIEW_FOLLOWUP_MODE,
+        pr: args.pr,
+        repo: args.repo,
+        dryRun: false,
+        blocked: true,
+        reason: continuationBinding.failureReason,
+        failureReason: continuationBinding.failureReason,
+        message: `Safe PR continuation binding refused this follow-up (${continuationBinding.failureReason}). No Claude process was started.`,
+      };
+      const logPath = writeRunLog({ outputDir: args.outputDir, label: `pr-${args.pr}`, payload });
+      console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+      return EXECUTION_POLICY_EXIT_CODE;
     }
   }
-  const implementationToolPolicy = continuationBinding ? buildImplementationToolPolicy({ expectedBranch: continuationBinding.worktreeIdentity.expectedBranch, approvedBranch: continuationBinding.dispatchAuthority?.branch }) : null;
+
+  // Caller-supplied --profile/--model/--effort must never widen an
+  // authorised continuation: once bound, only the manager-approved
+  // profile/model/effort from the binding are used. They remain available
+  // for the unauthenticated dry-run preview, which carries no write
+  // capability.
+  const implementationToolPolicy = continuationBinding
+    ? buildImplementationToolPolicy({
+      expectedBranch: continuationBinding.worktreeIdentity.expectedBranch,
+      approvedBranch: continuationBinding.dispatchAuthority?.branch,
+    })
+    : null;
   const profile = continuationBinding
-    ? resolveProfile(continuationBinding.profileName, { model: continuationBinding.managerExecutionMeta?.model, effort: continuationBinding.managerExecutionMeta?.effort, permissionMode: continuationBinding.executionAuthorization.permissionMode, tools: implementationToolPolicy?.tools, allowedTools: implementationToolPolicy?.allowedTools, disallowedTools: implementationToolPolicy?.disallowedTools, worktreeName: nativeClaudeWorktreeName(continuationBinding.worktreeIdentity), strictMcpConfig: implementationToolPolicy?.strictMcpConfig, disableSlashCommands: implementationToolPolicy?.disableSlashCommands, settings: implementationToolPolicy?.settings, settingSources: implementationToolPolicy?.settingSources }, env)
-    : resolveProfile(inferProfile({ explicitProfile: args.profile, issue: { title: pullRequest.title, body: pullRequest.body } }), { model: args.model, effort: args.effort }, env);
+    ? resolveProfile(continuationBinding.profileName, {
+      model: continuationBinding.managerExecutionMeta?.model,
+      effort: continuationBinding.managerExecutionMeta?.effort,
+      permissionMode: continuationBinding.executionAuthorization.permissionMode,
+      tools: implementationToolPolicy?.tools,
+      allowedTools: implementationToolPolicy?.allowedTools,
+      disallowedTools: implementationToolPolicy?.disallowedTools,
+      worktreeName: nativeClaudeWorktreeName(continuationBinding.worktreeIdentity),
+      strictMcpConfig: implementationToolPolicy?.strictMcpConfig,
+      disableSlashCommands: implementationToolPolicy?.disableSlashCommands,
+      settings: implementationToolPolicy?.settings,
+      settingSources: implementationToolPolicy?.settingSources,
+    }, env)
+    : resolveProfile(
+      inferProfile({ explicitProfile: args.profile, issue: { title: pullRequest.title, body: pullRequest.body } }),
+      { model: args.model, effort: args.effort },
+      env,
+    );
   const claudeArgs = buildClaudeArgs({ prompt, profile, resumeSession: args.resumeSession });
-  const runPlan = { mode: PR_REVIEW_FOLLOWUP_MODE, dryRun: !args.execute, pr: args.pr, prNumber: continuationBinding?.prNumber ?? args.pr, repo: args.repo, linkedIssue, branch, reasons: unresolved.reasons, repositoryContext: continuationBinding?.repositoryContext || null, executionPhase: continuationBinding ? EXECUTION_PHASE_IMPLEMENTATION : undefined, executionAuthorization: continuationBinding?.executionAuthorization || null, worktreeIdentity: continuationBinding?.worktreeIdentity || null, implementationToolPolicy: implementationToolPolicy ? { tools: implementationToolPolicy.tools, allowedToolRuleCount: implementationToolPolicy.allowedToolRuleCount, disallowedToolRuleCount: implementationToolPolicy.disallowedToolRuleCount, strictMcpConfig: implementationToolPolicy.strictMcpConfig, disableSlashCommands: implementationToolPolicy.disableSlashCommands } : null, preRunHeadSha: continuationBinding?.preRunHeadSha || null, profile, costAdmission: evaluateClaudeCostAdmission(profile, env), agent: agentRunMetadata(resolveAgentById('claude-code-cli'), profile), clearContext, claudeCommand: args.claudeBin, inheritProviderAuth: args.inheritProviderAuth, removedClaudeProviderAuthKeys: removedClaudeProviderAuthKeys(env, { inheritProviderAuth: args.inheritProviderAuth }), claudeArgsPreview: redactExecutableArgs(claudeArgs, { redactFinalAsPrompt: true }) };
+
+  const runPlan = {
+    mode: PR_REVIEW_FOLLOWUP_MODE,
+    dryRun: !args.execute,
+    pr: args.pr,
+    prNumber: continuationBinding?.prNumber ?? args.pr,
+    repo: args.repo,
+    linkedIssue,
+    branch,
+    reasons: unresolved.reasons,
+    repositoryContext: continuationBinding?.repositoryContext || null,
+    executionPhase: continuationBinding ? EXECUTION_PHASE_IMPLEMENTATION : undefined,
+    executionAuthorization: continuationBinding?.executionAuthorization || null,
+    worktreeIdentity: continuationBinding?.worktreeIdentity || null,
+    implementationToolPolicy: implementationToolPolicy ? {
+      tools: implementationToolPolicy.tools,
+      allowedToolRuleCount: implementationToolPolicy.allowedToolRuleCount,
+      disallowedToolRuleCount: implementationToolPolicy.disallowedToolRuleCount,
+      strictMcpConfig: implementationToolPolicy.strictMcpConfig,
+      disableSlashCommands: implementationToolPolicy.disableSlashCommands,
+    } : null,
+    preRunHeadSha: continuationBinding?.preRunHeadSha || null,
+    profile,
+    costAdmission: evaluateClaudeCostAdmission(profile, env),
+    agent: agentRunMetadata(resolveAgentById('claude-code-cli'), profile),
+    clearContext,
+    claudeCommand: args.claudeBin,
+    inheritProviderAuth: args.inheritProviderAuth,
+    removedClaudeProviderAuthKeys: removedClaudeProviderAuthKeys(env, { inheritProviderAuth: args.inheritProviderAuth }),
+    claudeArgsPreview: redactExecutableArgs(claudeArgs, { redactFinalAsPrompt: true }),
+  };
+
   return run({ args, env, label: `pr-${args.pr}`, runPlan, prompt, claudeArgs });
 }
 
 export function assertConfiguredRepositoryIdentity({ configPath, config, repo }) {
   if (!configPath) return;
-  if (repo !== config.githubRepo) throw new Error(`Repository override ${repo} does not match configured repository ${config.githubRepo}`);
+  if (repo !== config.githubRepo) {
+    throw new Error(
+      `Repository override ${repo} does not match configured repository ${config.githubRepo}`,
+    );
+  }
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
   const configPath = resolveConfigPath(argv, env);
   const config = loadAgentRunnerConfig({ argv, env, configPath });
+  // Fails closed before any GitHub/model/repository mutation when ambient
+  // GITHUB_REPOSITORY disagrees with the selected project config (#169).
   assertProjectScopedEnv({ config, configPath, env });
-  const args = parseArgs(stripConfigArgs(argv), { defaultRepo: configPath ? config.githubRepo : (env.GITHUB_REPOSITORY || DEFAULT_REPO) });
+  // A selected project config owns repository identity; an explicit --repo
+  // still wins, but the default must never fall back to the ModelSpend
+  // DEFAULT_REPO when a non-ModelSpend config was supplied (#180).
+  const args = parseArgs(stripConfigArgs(argv), {
+    defaultRepo: configPath ? config.githubRepo : (env.GITHUB_REPOSITORY || DEFAULT_REPO),
+  });
+  // A selected project config is authoritative. An explicit --repo may
+  // restate that exact identity but must never redirect configured execution.
   assertConfiguredRepositoryIdentity({ configPath, config, repo: args.repo });
-  if (args.help) { printHelp(); return 0; }
-  if (args.checkQuota) return runQuotaCheck(args, env);
+  if (args.help) {
+    printHelp();
+    return 0;
+  }
+
+  if (args.checkQuota) {
+    return runQuotaCheck(args, env);
+  }
+
   const token = env.GITHUB_TOKEN || env.GH_TOKEN;
   if (!token) throw new Error('Missing GITHUB_TOKEN or GH_TOKEN environment variable');
+
   const quotaStatePath = args.quotaStatePath || defaultQuotaStatePath(args.outputDir);
   const pauseEval = evaluateQuotaPauseState(readQuotaPauseState(quotaStatePath), {});
   if (pauseEval.paused) {
-    const payload = { blocked: true, reason: 'quota-paused', pausedUntil: pauseEval.pausedUntil.toISOString(), quotaStatePath, message: 'Claude quota is paused after a detected exhaustion/rate-limit signal. Resume is automatic once pausedUntil passes, or run --check-quota (at least 10 minutes after the last check) to re-check now. This never bypasses the underlying limit.' };
-    console.log(JSON.stringify(payload, null, 2)); return 0;
+    const payload = {
+      blocked: true,
+      reason: 'quota-paused',
+      pausedUntil: pauseEval.pausedUntil.toISOString(),
+      quotaStatePath,
+      message: 'Claude quota is paused after a detected exhaustion/rate-limit signal. Resume is automatic once pausedUntil passes, or run --check-quota (at least 10 minutes after the last check) to re-check now. This never bypasses the underlying limit.',
+    };
+    console.log(JSON.stringify(payload, null, 2));
+    return 0;
   }
-  if (args.pr) return runPrFollowUp(args, env, token, config);
+
+  if (args.pr) {
+    return runPrFollowUp(args, env, token, config);
+  }
+
   if (!args.issue) throw new Error('Missing required --issue <number> (or --pr <number> for review follow-up mode)');
+
   if (!args.skipPrFollowUpCheck) {
     const blockingPr = await findBlockingPrFollowUp({ repo: args.repo, issue: args.issue, token });
     if (blockingPr) {
-      const payload = { blocked: true, reason: 'unresolved-pr-review-followup', issue: args.issue, pr: blockingPr.pr.number, prUrl: blockingPr.pr.url || null, reasons: blockingPr.unresolved.reasons, message: `PR #${blockingPr.pr.number} linked to issue #${args.issue} has unresolved review/manager feedback. Run --pr ${blockingPr.pr.number} to generate a follow-up prompt before starting new issue work. Pass --skip-pr-followup-check to override.` };
-      console.log(JSON.stringify(payload, null, 2)); return 0;
+      const payload = {
+        blocked: true,
+        reason: 'unresolved-pr-review-followup',
+        issue: args.issue,
+        pr: blockingPr.pr.number,
+        prUrl: blockingPr.pr.url || null,
+        reasons: blockingPr.unresolved.reasons,
+        message: `PR #${blockingPr.pr.number} linked to issue #${args.issue} has unresolved review/manager feedback. Run --pr ${blockingPr.pr.number} to generate a follow-up prompt before starting new issue work. Pass --skip-pr-followup-check to override.`,
+      };
+      console.log(JSON.stringify(payload, null, 2));
+      return 0;
     }
   }
+
   const { issue, comments } = await fetchIssueAndComments({ repo: args.repo, issue: args.issue, token });
   const managerAuthority = resolveCurrentManagerAuthority(comments);
-  if (!managerAuthority.allowed) throw new Error(`No current canonical manager preflight authority found on issue #${args.issue}: ${managerAuthority.reason}`);
+  if (!managerAuthority.allowed) {
+    throw new Error(`No current canonical manager preflight authority found on issue #${args.issue}: ${managerAuthority.reason}`);
+  }
   const command = null;
   const currentPreflight = managerAuthority.authority.comment;
-  const dispatchIdentity = resolveImplementationDispatchIdentity({ issue, command, currentPreflight, config, env, argsRepo: args.repo, argsProfile: args.profile, argsModel: args.model, argsEffort: args.effort });
+
+  // Single derivation boundary (#686): the scheduler's pre-claim
+  // workspace-ownership check in claude-runner-cron.mjs calls this exact
+  // function too, so it can never guard a different worktreeIdentity than
+  // the one this run actually dispatches against.
+  const dispatchIdentity = resolveImplementationDispatchIdentity({
+    issue, command, currentPreflight, config, env,
+    argsRepo: args.repo, argsProfile: args.profile, argsModel: args.model,
+    argsEffort: args.effort,
+  });
   if (!dispatchIdentity.ok) {
-    const payload = { blocked: true, reason: dispatchIdentity.failureReason, issue: args.issue, message: `The dispatch authority (repository/branch) for issue #${args.issue} could not be resolved unambiguously (${dispatchIdentity.failureReason}). No Claude process was started.` };
-    console.log(JSON.stringify(payload, null, 2)); return EXECUTION_POLICY_EXIT_CODE;
+    const payload = {
+      blocked: true,
+      reason: dispatchIdentity.failureReason,
+      issue: args.issue,
+      message: `The dispatch authority (repository/branch) for issue #${args.issue} could not be resolved unambiguously (${dispatchIdentity.failureReason}). No Claude process was started.`,
+    };
+    console.log(JSON.stringify(payload, null, 2));
+    return EXECUTION_POLICY_EXIT_CODE;
   }
-  const { preflight, selectionMode, managerExecutionMeta, dispatchAuthority, repositoryContext, profileName, executionAuthorization, sourceCommentIdentity, sourcePreflightCommentIdentity, worktreeIdentity } = dispatchIdentity;
-  const implementationToolPolicy = worktreeIdentity ? buildImplementationToolPolicy({ expectedBranch: worktreeIdentity.expectedBranch, approvedBranch: dispatchAuthority?.branch }) : null;
-  const profile = resolveProfile(profileName, { model: args.model || managerExecutionMeta.model, effort: args.effort || managerExecutionMeta.effort, permissionMode: executionAuthorization.permissionMode, tools: implementationToolPolicy?.tools, allowedTools: implementationToolPolicy?.allowedTools, disallowedTools: implementationToolPolicy?.disallowedTools, worktreeName: nativeClaudeWorktreeName(worktreeIdentity), strictMcpConfig: implementationToolPolicy?.strictMcpConfig, disableSlashCommands: implementationToolPolicy?.disableSlashCommands, settings: implementationToolPolicy?.settings, settingSources: implementationToolPolicy?.settingSources }, env);
+  const {
+    preflight, selectionMode, managerExecutionMeta, dispatchAuthority, repositoryContext, profileName,
+    executionAuthorization, sourceCommentIdentity, sourcePreflightCommentIdentity, worktreeIdentity,
+  } = dispatchIdentity;
+  const implementationToolPolicy = worktreeIdentity
+    ? buildImplementationToolPolicy({ expectedBranch: worktreeIdentity.expectedBranch, approvedBranch: dispatchAuthority?.branch })
+    : null;
+  const profile = resolveProfile(profileName, {
+    model: args.model || managerExecutionMeta.model,
+    effort: args.effort || managerExecutionMeta.effort,
+    permissionMode: executionAuthorization.permissionMode,
+    tools: implementationToolPolicy?.tools,
+    allowedTools: implementationToolPolicy?.allowedTools,
+    disallowedTools: implementationToolPolicy?.disallowedTools,
+    worktreeName: nativeClaudeWorktreeName(worktreeIdentity),
+    strictMcpConfig: implementationToolPolicy?.strictMcpConfig,
+    disableSlashCommands: implementationToolPolicy?.disableSlashCommands,
+    settings: implementationToolPolicy?.settings,
+    settingSources: implementationToolPolicy?.settingSources,
+  }, env);
+
   const clearContext = shouldUseClear({ noClear: args.noClear, resumeSession: args.resumeSession });
   const prompt = command
-    ? buildClaudePrompt({ issue: { number: args.issue, title: issue.title }, commandText: command.body, currentPreflight, profile, clearContext, executionPhase: executionAuthorization.phase, worktreeIdentity, repositoryContext })
-    : buildPreflightDirectPrompt({ issue: { number: args.issue, title: issue.title, body: issue.body }, preflight, profile, clearContext, executionPhase: executionAuthorization.phase, worktreeIdentity, repositoryContext });
+    ? buildClaudePrompt({
+      issue: { number: args.issue, title: issue.title },
+      commandText: command.body,
+      currentPreflight,
+      profile,
+      clearContext,
+      executionPhase: executionAuthorization.phase,
+      worktreeIdentity,
+      repositoryContext,
+    })
+    : buildPreflightDirectPrompt({
+      issue: { number: args.issue, title: issue.title, body: issue.body },
+      preflight,
+      profile,
+      clearContext,
+      executionPhase: executionAuthorization.phase,
+      worktreeIdentity,
+      repositoryContext,
+    });
   const claudeArgs = buildClaudeArgs({ prompt, profile, resumeSession: args.resumeSession });
   const promptCacheMetadata = command
-    ? claudePromptCacheMetadata({ issue: { number: args.issue, title: issue.title }, commandText: command.body, currentPreflight, profile, clearContext, executionPhase: executionAuthorization.phase, worktreeIdentity, repositoryContext })
-    : claudePromptCacheMetadata({ issue: { number: args.issue, title: issue.title, body: issue.body }, preflight, selectionMode: 'preflight-direct', profile, clearContext, executionPhase: executionAuthorization.phase, worktreeIdentity, repositoryContext });
-  const runPlan = { dryRun: !args.execute, issue: args.issue, issueTitle: issue.title, repo: args.repo, repositoryContext, selectionMode, promptCacheMetadata, commandKind: command?.kind || null, commandHeading: command?.heading || null, sourceCommentId: command?.sourceCommentId || null, sourceCommentIdentity, sourcePreflightCommentIdentity, sourcePreflightRevision: managerAuthority.authority.revision, sourcePreflightFingerprint: managerAuthority.authority.fingerprint, sourcePreflightAuthorityKey: managerAuthority.authority.authorityKey, sourcePreflightCommentId: commentRevision(sourcePreflightCommentIdentity), executionPhase: executionAuthorization.phase, executionAuthorization, worktreeIdentity, implementationToolPolicy: implementationToolPolicy ? { tools: implementationToolPolicy.tools, allowedToolRuleCount: implementationToolPolicy.allowedToolRuleCount, disallowedToolRuleCount: implementationToolPolicy.disallowedToolRuleCount, strictMcpConfig: implementationToolPolicy.strictMcpConfig, disableSlashCommands: implementationToolPolicy.disableSlashCommands } : null, profile, costAdmission: evaluateClaudeCostAdmission(profile, env), agent: agentRunMetadata(resolveAgentById('claude-code-cli'), profile), clearContext, claudeCommand: args.claudeBin, inheritProviderAuth: args.inheritProviderAuth, removedClaudeProviderAuthKeys: removedClaudeProviderAuthKeys(env, { inheritProviderAuth: args.inheritProviderAuth }), claudeArgsPreview: redactExecutableArgs(claudeArgs, { redactFinalAsPrompt: true }) };
+    ? claudePromptCacheMetadata({
+      issue: { number: args.issue, title: issue.title },
+      commandText: command.body,
+      currentPreflight,
+      profile,
+      clearContext,
+      executionPhase: executionAuthorization.phase,
+      worktreeIdentity,
+      repositoryContext,
+    })
+    : claudePromptCacheMetadata({
+      issue: { number: args.issue, title: issue.title, body: issue.body },
+      preflight,
+      selectionMode: 'preflight-direct',
+      profile,
+      clearContext,
+      executionPhase: executionAuthorization.phase,
+      worktreeIdentity,
+      repositoryContext,
+    });
+
+  const runPlan = {
+    dryRun: !args.execute,
+    issue: args.issue,
+    issueTitle: issue.title,
+    repo: args.repo,
+    repositoryContext,
+    selectionMode,
+    promptCacheMetadata,
+    commandKind: command?.kind || null,
+    commandHeading: command?.heading || null,
+    sourceCommentId: command?.sourceCommentId || null,
+    sourceCommentIdentity,
+    sourcePreflightCommentIdentity,
+    sourcePreflightRevision: managerAuthority.authority.revision,
+    sourcePreflightFingerprint: managerAuthority.authority.fingerprint,
+    sourcePreflightAuthorityKey: managerAuthority.authority.authorityKey,
+    sourcePreflightCommentId: commentRevision(sourcePreflightCommentIdentity),
+    executionPhase: executionAuthorization.phase,
+    executionAuthorization,
+    worktreeIdentity,
+    implementationToolPolicy: implementationToolPolicy ? {
+      tools: implementationToolPolicy.tools,
+      allowedToolRuleCount: implementationToolPolicy.allowedToolRuleCount,
+      disallowedToolRuleCount: implementationToolPolicy.disallowedToolRuleCount,
+      strictMcpConfig: implementationToolPolicy.strictMcpConfig,
+      disableSlashCommands: implementationToolPolicy.disableSlashCommands,
+    } : null,
+    profile,
+    costAdmission: evaluateClaudeCostAdmission(profile, env),
+    agent: agentRunMetadata(resolveAgentById('claude-code-cli'), profile),
+    clearContext,
+    claudeCommand: args.claudeBin,
+    inheritProviderAuth: args.inheritProviderAuth,
+    removedClaudeProviderAuthKeys: removedClaudeProviderAuthKeys(env, { inheritProviderAuth: args.inheritProviderAuth }),
+    claudeArgsPreview: redactExecutableArgs(claudeArgs, { redactFinalAsPrompt: true }),
+  };
+
   return runOrPlanClaude({ args, env, label: `issue-${args.issue}`, runPlan, prompt, claudeArgs });
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  main().then((code) => { process.exitCode = code; }).catch((error) => { console.error(error.message || error); process.exitCode = 1; });
+  main().then((code) => {
+    process.exitCode = code;
+  }).catch((error) => {
+    console.error(error.message || error);
+    process.exitCode = 1;
+  });
 }
