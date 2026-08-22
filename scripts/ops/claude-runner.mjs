@@ -74,6 +74,11 @@ import {
   joinSections,
   PROMPT_SCHEMA_VERSION,
 } from './claude-runner-prompt-compiler.mjs';
+import {
+  buildClaudeUsageAccounting,
+  sanitizeClaudeModelUsage,
+  sanitizeClaudeStructuredUsage,
+} from './agent-runner-usage-telemetry.mjs';
 
 export {
   buildPromptCacheMetadata,
@@ -1388,29 +1393,11 @@ function finiteNumberOrNull(value) {
 }
 
 function sanitizeUsageRecord(value = {}) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const normalized = {
-    inputTokens: finiteNumberOrNull(value.inputTokens ?? value.input_tokens),
-    outputTokens: finiteNumberOrNull(value.outputTokens ?? value.output_tokens),
-    cacheReadInputTokens: finiteNumberOrNull(value.cacheReadInputTokens ?? value.cache_read_input_tokens),
-    cacheCreationInputTokens: finiteNumberOrNull(value.cacheCreationInputTokens ?? value.cache_creation_input_tokens),
-  };
-  return Object.values(normalized).some((entry) => entry !== null) ? normalized : null;
+  return sanitizeClaudeStructuredUsage(value);
 }
 
 function sanitizeModelUsage(value = {}) {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
-  return Object.fromEntries(Object.entries(value).flatMap(([model, usage]) => {
-    const tokens = sanitizeUsageRecord(usage);
-    const normalized = {
-      ...(tokens || {}),
-      costUsd: finiteNumberOrNull(usage?.costUSD ?? usage?.cost_usd),
-      contextWindow: finiteNumberOrNull(usage?.contextWindow ?? usage?.context_window),
-      maxOutputTokens: finiteNumberOrNull(usage?.maxOutputTokens ?? usage?.max_output_tokens),
-    };
-    if (!Object.values(normalized).some((entry) => entry !== null)) return [];
-    return [[String(model).slice(0, 160), normalized]];
-  }));
+  return sanitizeClaudeModelUsage(value);
 }
 
 /**
@@ -1670,17 +1657,14 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
   const resultText = resultEnvelope.parsed
     ? [resultEnvelope.resultText, ...resultEnvelope.errors].filter(Boolean).join('\n')
     : String(result.stdout || '');
-  const usageAccounting = {
-    source: resultEnvelope.parsed ? 'claude-cli-result-envelope' : 'unavailable',
-    accountingAvailable: resultEnvelope.accountingAvailable,
-    subtype: resultEnvelope.subtype,
-    isError: resultEnvelope.isError,
-    numTurns: resultEnvelope.numTurns,
-    totalCostUsd: resultEnvelope.totalCostUsd,
-    usage: resultEnvelope.usage,
-    modelUsage: resultEnvelope.modelUsage,
-    sessionIdPresentButNotStored: resultEnvelope.hasSessionId,
-  };
+  const telemetryFinishedAt = new Date().toISOString();
+  const usageAccounting = buildClaudeUsageAccounting({
+    resultEnvelope,
+    model: runPlan.profile?.model || runPlan.agent?.model || null,
+    promptCacheMetadata: runPlan.promptCacheMetadata || null,
+    startedAt,
+    finishedAt: telemetryFinishedAt,
+  });
   if (['quota_exhausted', 'billing_quota_exceeded'].includes(resultEnvelope.structuredFailure)) {
     const implementationEvidence = runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION
       ? collectImplementationEvidence({ workspace: implementationWorkspace, worktreeIdentity: runPlan.worktreeIdentity })
