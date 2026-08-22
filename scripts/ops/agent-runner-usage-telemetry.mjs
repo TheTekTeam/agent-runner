@@ -148,10 +148,6 @@ export function normalizeUsageEfficiencyEnvelope(value = {}, defaults = {}) {
     ?? source.prompt_eval_tokens,
   );
 
-  // Provider semantics differ. Callers can explicitly provide a truthful
-  // logical input total or uncached count. We never guess by adding cache
-  // fields unless the caller positively declares Claude-style partitioned
-  // input semantics.
   let inputTokens = tokenCount(source.totalInputTokens ?? source.total_input_tokens);
   let uncachedInputTokens = tokenCount(source.uncachedInputTokens ?? source.uncached_input_tokens);
   if (inputTokens === null) inputTokens = rawInputTokens;
@@ -293,4 +289,78 @@ export function normalizeOllamaUsageEfficiency({ usage = null, model = null } = 
     cacheStrategy: 'local-context',
     availabilityReason: usage ? null : 'structured-usage-unavailable',
   });
+}
+
+/**
+ * Allowlist Claude's structured usage object before it enters ordinary run
+ * state. This is the #194 extension of the runner's existing sanitizer: the
+ * only newly retained structure is the numeric cache-creation TTL breakdown.
+ */
+export function sanitizeClaudeStructuredUsage(value = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const ttl = ttlCacheCreation(value.cacheCreationByTtl ?? value.cache_creation ?? value.cache_creation_by_ttl);
+  const hasTtl = ttl.fiveMinute !== null || ttl.oneHour !== null;
+  const normalized = {
+    inputTokens: tokenCount(value.inputTokens ?? value.input_tokens),
+    outputTokens: tokenCount(value.outputTokens ?? value.output_tokens),
+    cacheReadInputTokens: tokenCount(value.cacheReadInputTokens ?? value.cache_read_input_tokens),
+    cacheCreationInputTokens: tokenCount(value.cacheCreationInputTokens ?? value.cache_creation_input_tokens),
+    ...(hasTtl ? {
+      cacheCreationByTtl: {
+        ephemeral_5m_input_tokens: ttl.fiveMinute,
+        ephemeral_1h_input_tokens: ttl.oneHour,
+      },
+    } : {}),
+  };
+  return Object.values(normalized).some((entry) => entry !== null) ? normalized : null;
+}
+
+function elapsedDurationMs(startedAt, finishedAt) {
+  if (!startedAt || !finishedAt) return null;
+  const started = Date.parse(startedAt);
+  const finished = Date.parse(finishedAt);
+  if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started) return null;
+  return durationMs(finished - started);
+}
+
+/**
+ * Build Claude's existing accounting shape plus the #194 adapter-neutral
+ * efficiency projection. Raw result/provider/session content is not accepted
+ * by this contract; only the pre-sanitized result-envelope fields are copied.
+ */
+export function buildClaudeUsageAccounting({
+  resultEnvelope = null,
+  model = null,
+  promptCacheMetadata = null,
+  startedAt = null,
+  finishedAt = null,
+} = {}) {
+  const envelope = resultEnvelope && typeof resultEnvelope === 'object' && !Array.isArray(resultEnvelope)
+    ? resultEnvelope
+    : {};
+  const usage = envelope.usage && typeof envelope.usage === 'object' && !Array.isArray(envelope.usage)
+    ? envelope.usage
+    : null;
+  const modelUsage = envelope.modelUsage && typeof envelope.modelUsage === 'object' && !Array.isArray(envelope.modelUsage)
+    ? envelope.modelUsage
+    : {};
+  const runDurationMs = elapsedDurationMs(startedAt, finishedAt);
+
+  return {
+    source: envelope.parsed ? 'claude-cli-result-envelope' : 'unavailable',
+    accountingAvailable: envelope.accountingAvailable === true,
+    subtype: typeof envelope.subtype === 'string' ? envelope.subtype.slice(0, 120) : null,
+    isError: envelope.isError === true,
+    numTurns: boundedNumber(envelope.numTurns),
+    totalCostUsd: boundedNumber(envelope.totalCostUsd, { max: 10 ** 9 }),
+    usage,
+    modelUsage,
+    sessionIdPresentButNotStored: envelope.hasSessionId === true,
+    efficiency: normalizeClaudeUsageEfficiency({
+      usage,
+      model,
+      promptCacheMetadata,
+      totalDurationMs: runDurationMs,
+    }),
+  };
 }
