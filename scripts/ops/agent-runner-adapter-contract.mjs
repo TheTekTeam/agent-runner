@@ -43,10 +43,9 @@ function inferLegacyCostPosture(usage) {
  * to a free local adapter).
  *
  * #194 keeps the pre-existing `usage` field readable and adds the versioned,
- * positive-allowlisted `usageEfficiency` projection beside it. An adapter
- * with richer structured evidence should pass an explicit `usageEfficiency`;
- * otherwise this helper can derive only the bounded facts present in the
- * legacy usage object and leaves everything else unknown.
+ * positive-allowlisted `usageEfficiency` projection beside it. Rich provider
+ * evidence is always passed through the same canonical normalizer; adapters
+ * cannot bypass the closed schema by supplying a pre-built object.
  */
 export function normalizedAdapterResult({
   ok,
@@ -62,14 +61,19 @@ export function normalizedAdapterResult({
   mutatedGitHub = false,
 } = {}) {
   const legacyUsage = usage || zeroSpendEnvelope();
-  const normalizedEfficiency = usageEfficiency || normalizeUsageEfficiencyEnvelope({
+  const explicitEfficiency = usageEfficiency && typeof usageEfficiency === 'object' && !Array.isArray(usageEfficiency)
+    ? usageEfficiency
+    : null;
+  const efficiencySource = explicitEfficiency || {
     ...legacyUsage,
     costPosture: inferLegacyCostPosture(legacyUsage),
     telemetryAvailability: usage ? undefined : 'unavailable',
     availabilityReason: usage ? null : 'structured-usage-unavailable',
-  }, {
+  };
+  const normalizedEfficiency = normalizeUsageEfficiencyEnvelope(efficiencySource, {
     adapter: agentId || null,
     provider: legacyUsage?.provider || null,
+    costPosture: explicitEfficiency ? inferLegacyCostPosture(legacyUsage) : undefined,
     cacheStrategy: legacyUsage?.provider === 'ollama-local' ? 'local-context' : 'unknown',
   });
 
