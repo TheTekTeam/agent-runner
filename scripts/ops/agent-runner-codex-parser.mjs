@@ -1,4 +1,5 @@
 import { FAILURE_SCOPES, normalizedAdapterResult } from './agent-runner-adapter-contract.mjs';
+import { normalizeCodexUsageEfficiency } from './agent-runner-usage-telemetry.mjs';
 
 /**
  * Bounded structured-output parsing for `codex exec --json` (issue #48).
@@ -14,19 +15,12 @@ import { FAILURE_SCOPES, normalizedAdapterResult } from './agent-runner-adapter-
  * function here is a pure parser: none of them spawn a process or make a
  * network/model call.
  *
- * Sink-safety contract (manager review on PR #62): raw stdout, provider
- * error text, prompt content, session/credential material, restricted
- * handles, and arbitrary process-wrapper messages are classification
- * *inputs* only — they are read to pick a bounded, machine-readable
- * `reason`/enum value and are never themselves placed into the returned
- * `normalizedAdapterResult` (`resultText`, `structuredFailure`, or any
- * other field). Every non-success path below returns `resultText: ''` and
- * either `structuredFailure: null` or a bounded, closed-vocabulary token
- * (an event `type`, an OS signal name, an error `code`) — never a raw,
- * unbounded string an attacker- or provider-controlled payload could fill
- * with secrets. `agent-runner-codex-adapter.test.mjs` and this module's own
- * test file prove this by serializing full results seeded with synthetic
- * credentials/session handles/local paths and asserting their absence.
+ * Sink-safety contract: raw stdout, provider error text, prompt content,
+ * session/credential material, restricted handles, and arbitrary process-
+ * wrapper messages are classification inputs only. They never enter the
+ * returned normalized result. #194 additionally permits cache/reasoning
+ * fields only when they are positively present in the structured terminal
+ * usage object; it does not assume API-only fields exist in Codex CLI.
  */
 
 const AUTH_FAILURE_PATTERN = /not logged in|log in|authentication|unauthoriz|401/i;
@@ -36,11 +30,15 @@ function isPlainObject(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-/** Zero-inference paid-usage envelope: token counts pass through verbatim; cost pricing lookup is explicitly out of scope for this foundation. */
+/**
+ * Compatibility usage envelope for normal ChatGPT-auth Codex execution.
+ * #184 defines this route as included-subscription (`paid:false`): token
+ * counts are resource evidence, never proof of separately metered spend.
+ */
 export function codexUsageEnvelope({ inputTokens = null, outputTokens = null } = {}) {
   return Object.freeze({
     provider: 'codex-cli',
-    paid: true,
+    paid: false,
     costUsd: null,
     inputTokens: Number.isFinite(inputTokens) ? inputTokens : null,
     outputTokens: Number.isFinite(outputTokens) ? outputTokens : null,
@@ -92,26 +90,43 @@ function extractMutatedRepository(events) {
   return events.some((event) => event.type === 'item.completed' && isPlainObject(event.item) && event.item.type === 'file_change');
 }
 
-function extractUsage(event) {
+function finiteStructuredNumber(value) {
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function extractStructuredUsage(event) {
   const usage = isPlainObject(event?.usage) ? event.usage : null;
+  if (!usage) return null;
+  const inputDetails = isPlainObject(usage.input_tokens_details) ? usage.input_tokens_details : null;
+  const outputDetails = isPlainObject(usage.output_tokens_details) ? usage.output_tokens_details : null;
+  return {
+    input_tokens: finiteStructuredNumber(usage.input_tokens),
+    output_tokens: finiteStructuredNumber(usage.output_tokens),
+    // These fields are mapped only when the CLI's structured record actually
+    // supplies them. Their absence remains null and does not imply a miss.
+    cached_tokens: finiteStructuredNumber(usage.cached_tokens ?? inputDetails?.cached_tokens),
+    cache_write_tokens: finiteStructuredNumber(usage.cache_write_tokens),
+    reasoning_tokens: finiteStructuredNumber(usage.reasoning_tokens ?? outputDetails?.reasoning_tokens),
+  };
+}
+
+function legacyUsage(structuredUsage) {
   return codexUsageEnvelope({
-    inputTokens: usage ? Number(usage.input_tokens) : null,
-    outputTokens: usage ? Number(usage.output_tokens) : null,
+    inputTokens: structuredUsage?.input_tokens ?? null,
+    outputTokens: structuredUsage?.output_tokens ?? null,
   });
+}
+
+function efficiencyUsage(structuredUsage) {
+  return normalizeCodexUsageEfficiency({ usage: structuredUsage });
 }
 
 /**
  * Parse a full `codex exec --json` stdout capture into the shared
- * `normalizedAdapterResult` contract. Classifies, in order: malformed
- * output (unparseable/no terminal event), authentication failure, quota
- * failure, generic task failure, structured no-op (turn completed without a
- * `file_change` item), and success-with-mutation.
- *
- * Malformed/failure paths never echo raw stdout or the raw terminal error
- * message back out: `resultText` is the empty string and `structuredFailure`
- * is either `null` or a closed-vocabulary event-type token, never
- * provider-controlled free text. `errorMessage` below is read only to pick
- * `reason` (via `classifyFailureMessage`) and is otherwise discarded.
+ * `normalizedAdapterResult` contract. Classifies malformed output,
+ * authentication/quota/task failures, structured no-op, and success with a
+ * repository mutation. Raw failure/provider text is never returned.
  */
 export function parseCodexResultEnvelope(stdout = '', { agentId = 'codex-cli' } = {}) {
   const parsed = parseCodexEventLines(stdout);
@@ -122,6 +137,8 @@ export function parseCodexResultEnvelope(stdout = '', { agentId = 'codex-cli' } 
       reason: 'codex-invalid-output',
       failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
       resultText: '',
+      usage: codexUsageEnvelope({}),
+      usageEfficiency: normalizeCodexUsageEfficiency({ usage: null }),
     });
   }
 
@@ -133,18 +150,22 @@ export function parseCodexResultEnvelope(stdout = '', { agentId = 'codex-cli' } 
       reason: 'codex-invalid-output',
       failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
       resultText: '',
+      usage: codexUsageEnvelope({}),
+      usageEfficiency: normalizeCodexUsageEfficiency({ usage: null }),
     });
   }
 
   if (terminal.type === 'turn.completed') {
     const mutated = extractMutatedRepository(parsed.events);
+    const structuredUsage = extractStructuredUsage(terminal);
     return normalizedAdapterResult({
       ok: true,
       agentId,
       resultText: extractAgentMessageText(parsed.events),
       reason: mutated ? null : 'no-op',
       mutatedRepository: mutated,
-      usage: extractUsage(terminal),
+      usage: legacyUsage(structuredUsage),
+      usageEfficiency: efficiencyUsage(structuredUsage),
     });
   }
 
@@ -159,26 +180,30 @@ export function parseCodexResultEnvelope(stdout = '', { agentId = 'codex-cli' } 
     resultText: '',
     structuredFailure: terminal.type,
     usage: codexUsageEnvelope({}),
+    usageEfficiency: normalizeCodexUsageEfficiency({ usage: null }),
   });
 }
 
 /**
- * Classify a process-level execution outcome (timeout/cancellation) that
- * never produced a parseable terminal event. No child-process spawning
- * lives in this foundation-only module — callers normalize their own
- * process wrapper's outcome into this shape. `message` is an arbitrary,
- * caller-supplied string (a raised error's `.message`, which can embed a
- * full command line, a path, or provider diagnostic text) and is discarded
- * entirely rather than echoed; only `signal`/`code` — short, closed-
- * vocabulary OS-level tokens (`SIGTERM`, `ENOENT`, ...) — ever reach
- * `structuredFailure`.
+ * Classify a process-level execution outcome that never produced a parseable
+ * terminal event. Arbitrary caller messages are discarded; only bounded
+ * signal/code fields used by the pre-existing contract may classify the
+ * structured failure.
  */
 export function classifyCodexExecutionError({ timedOut = false, cancelled = false, signal = null, code = null, message = '' } = {}) {
+  void message;
+  const common = {
+    ok: false,
+    failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
+    resultText: '',
+    usage: codexUsageEnvelope({}),
+    usageEfficiency: normalizeCodexUsageEfficiency({ usage: null }),
+  };
   if (cancelled) {
-    return normalizedAdapterResult({ ok: false, reason: 'codex-cancelled', failureScope: FAILURE_SCOPES.TASK_ATTEMPT, resultText: '', structuredFailure: signal || code || null, usage: codexUsageEnvelope({}) });
+    return normalizedAdapterResult({ ...common, reason: 'codex-cancelled', structuredFailure: signal || code || null });
   }
   if (timedOut) {
-    return normalizedAdapterResult({ ok: false, reason: 'codex-timeout', failureScope: FAILURE_SCOPES.TASK_ATTEMPT, resultText: '', structuredFailure: signal || code || null, usage: codexUsageEnvelope({}) });
+    return normalizedAdapterResult({ ...common, reason: 'codex-timeout', structuredFailure: signal || code || null });
   }
-  return normalizedAdapterResult({ ok: false, reason: 'codex-execution-error', failureScope: FAILURE_SCOPES.TASK_ATTEMPT, resultText: '', structuredFailure: code || signal || null, usage: codexUsageEnvelope({}) });
+  return normalizedAdapterResult({ ...common, reason: 'codex-execution-error', structuredFailure: code || signal || null });
 }
