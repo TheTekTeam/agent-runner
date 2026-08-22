@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   buildClaudeUsageAccounting,
+  sanitizeClaudeModelUsage,
   sanitizeClaudeStructuredUsage,
 } from './agent-runner-usage-telemetry.mjs';
 
@@ -55,6 +56,38 @@ test('#194: Claude usage sanitizer leaves absent TTL detail absent and null metr
   });
 });
 
+test('#194: Claude per-model sanitizer drops unsafe model ids and arbitrary nested fields', () => {
+  const usage = sanitizeClaudeModelUsage({
+    'claude-sonnet-4': {
+      input_tokens: 10,
+      output_tokens: 4,
+      cache_read_input_tokens: 20,
+      costUSD: 0.25,
+      contextWindow: 200000,
+      maxOutputTokens: 8192,
+      session_id: 'restricted-model-session',
+      raw: { prompt: 'restricted-model-prompt' },
+    },
+    'bad model id with spaces': { input_tokens: 999 },
+  });
+
+  assert.deepEqual(usage, {
+    'claude-sonnet-4': {
+      inputTokens: 10,
+      outputTokens: 4,
+      cacheReadInputTokens: 20,
+      cacheCreationInputTokens: null,
+      costUsd: 0.25,
+      contextWindow: 200000,
+      maxOutputTokens: 8192,
+    },
+  });
+  const serialized = JSON.stringify(usage);
+  assert.equal(serialized.includes('restricted-model-session'), false);
+  assert.equal(serialized.includes('restricted-model-prompt'), false);
+  assert.equal(serialized.includes('bad model id with spaces'), false);
+});
+
 test('#194: Claude usage accounting preserves legacy fields and adds bounded included-subscription efficiency', () => {
   const accounting = buildClaudeUsageAccounting({
     resultEnvelope: {
@@ -72,9 +105,21 @@ test('#194: Claude usage accounting preserves legacy fields and adds bounded inc
         cacheCreationByTtl: {
           ephemeral_5m_input_tokens: 11,
           ephemeral_1h_input_tokens: 19,
+          raw: 'must-not-be-copied-from-ttl',
+        },
+        session_id: 'must-not-be-copied-from-usage',
+        raw: { prompt: 'must-not-be-copied-from-usage-raw' },
+      },
+      modelUsage: {
+        sonnet: {
+          inputTokens: 10,
+          outputTokens: 4,
+          costUSD: 0.4,
+          contextWindow: 200000,
+          maxOutputTokens: 8192,
+          providerRecord: 'must-not-be-copied-from-model-usage',
         },
       },
-      modelUsage: { sonnet: { inputTokens: 10 } },
       hasSessionId: true,
       resultText: 'must-not-be-copied',
       rawProviderRecord: 'must-not-be-copied-either',
@@ -92,6 +137,27 @@ test('#194: Claude usage accounting preserves legacy fields and adds bounded inc
   assert.equal(accounting.numTurns, 3);
   assert.equal(accounting.totalCostUsd, 1.25);
   assert.equal(accounting.sessionIdPresentButNotStored, true);
+  assert.deepEqual(accounting.usage, {
+    inputTokens: 10,
+    outputTokens: 4,
+    cacheReadInputTokens: 20,
+    cacheCreationInputTokens: 30,
+    cacheCreationByTtl: {
+      ephemeral_5m_input_tokens: 11,
+      ephemeral_1h_input_tokens: 19,
+    },
+  });
+  assert.deepEqual(accounting.modelUsage, {
+    sonnet: {
+      inputTokens: 10,
+      outputTokens: 4,
+      cacheReadInputTokens: null,
+      cacheCreationInputTokens: null,
+      costUsd: 0.4,
+      contextWindow: 200000,
+      maxOutputTokens: 8192,
+    },
+  });
   assert.equal(accounting.efficiency.provider, 'claude-code');
   assert.equal(accounting.efficiency.adapter, 'claude-code-cli');
   assert.equal(accounting.efficiency.model, 'sonnet');
