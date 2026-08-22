@@ -315,6 +315,27 @@ export function sanitizeClaudeStructuredUsage(value = {}) {
   return Object.values(normalized).some((entry) => entry !== null) ? normalized : null;
 }
 
+/**
+ * Allowlist Claude's per-model accounting without retaining arbitrary nested
+ * provider/session fields. Model ids and every retained metric are bounded.
+ */
+export function sanitizeClaudeModelUsage(value = {}) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).flatMap(([model, modelRecord]) => {
+    const modelId = boundedId(model);
+    if (!modelId || !modelRecord || typeof modelRecord !== 'object' || Array.isArray(modelRecord)) return [];
+    const tokens = sanitizeClaudeStructuredUsage(modelRecord);
+    const normalized = {
+      ...(tokens || {}),
+      costUsd: boundedNumber(modelRecord.costUsd ?? modelRecord.costUSD ?? modelRecord.cost_usd, { max: 10 ** 9 }),
+      contextWindow: tokenCount(modelRecord.contextWindow ?? modelRecord.context_window),
+      maxOutputTokens: tokenCount(modelRecord.maxOutputTokens ?? modelRecord.max_output_tokens),
+    };
+    if (!Object.values(normalized).some((entry) => entry !== null)) return [];
+    return [[modelId, normalized]];
+  }));
+}
+
 function elapsedDurationMs(startedAt, finishedAt) {
   if (!startedAt || !finishedAt) return null;
   const started = Date.parse(startedAt);
@@ -325,8 +346,9 @@ function elapsedDurationMs(startedAt, finishedAt) {
 
 /**
  * Build Claude's existing accounting shape plus the #194 adapter-neutral
- * efficiency projection. Raw result/provider/session content is not accepted
- * by this contract; only the pre-sanitized result-envelope fields are copied.
+ * efficiency projection. The helper sanitizes its own nested structured input
+ * so callers cannot bypass the telemetry boundary by supplying a richer raw
+ * result envelope than the production parser normally returns.
  */
 export function buildClaudeUsageAccounting({
   resultEnvelope = null,
@@ -338,12 +360,8 @@ export function buildClaudeUsageAccounting({
   const envelope = resultEnvelope && typeof resultEnvelope === 'object' && !Array.isArray(resultEnvelope)
     ? resultEnvelope
     : {};
-  const usage = envelope.usage && typeof envelope.usage === 'object' && !Array.isArray(envelope.usage)
-    ? envelope.usage
-    : null;
-  const modelUsage = envelope.modelUsage && typeof envelope.modelUsage === 'object' && !Array.isArray(envelope.modelUsage)
-    ? envelope.modelUsage
-    : {};
+  const usage = sanitizeClaudeStructuredUsage(envelope.usage);
+  const modelUsage = sanitizeClaudeModelUsage(envelope.modelUsage ?? envelope.model_usage);
   const runDurationMs = elapsedDurationMs(startedAt, finishedAt);
 
   return {
