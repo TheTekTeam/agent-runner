@@ -25,8 +25,30 @@ test('normalizedAdapterResult defaults a successful result to a zero-spend envel
   assert.equal(result.ok, true);
   assert.equal(result.failureScope, null);
   assert.equal(result.usage.costUsd, 0);
+  assert.equal(result.usageEfficiency.costPosture, 'free-local');
+  assert.equal(result.usageEfficiency.telemetryAvailability, 'unavailable');
+  assert.equal(result.usageEfficiency.inputTokens, null);
   assert.equal(result.mutatedRepository, false);
   assert.equal(result.mutatedGitHub, false);
+});
+
+test('#194: normalizedAdapterResult preserves legacy usage while projecting bounded efficiency evidence', () => {
+  const usage = { provider: 'metered-example', paid: true, costUsd: 1.25, inputTokens: 100, outputTokens: 10, raw: 'do-not-copy' };
+  const result = normalizedAdapterResult({ ok: true, agentId: 'example-cli', usage });
+  assert.equal(result.usage, usage);
+  assert.equal(result.usageEfficiency.provider, 'metered-example');
+  assert.equal(result.usageEfficiency.adapter, 'example-cli');
+  assert.equal(result.usageEfficiency.costPosture, 'separately-metered');
+  assert.equal(result.usageEfficiency.costUsd, 1.25);
+  assert.equal(result.usageEfficiency.inputTokens, 100);
+  assert.equal(result.usageEfficiency.outputTokens, 10);
+  assert.equal(JSON.stringify(result.usageEfficiency).includes('do-not-copy'), false);
+});
+
+test('#194: an explicit provider-normalized efficiency projection is retained verbatim', () => {
+  const usageEfficiency = Object.freeze({ schemaVersion: 'custom-test', marker: true });
+  const result = normalizedAdapterResult({ ok: true, usageEfficiency });
+  assert.equal(result.usageEfficiency, usageEfficiency);
 });
 
 test('normalizedAdapterResult defaults a failure to machine_profile scope when none is supplied', () => {
