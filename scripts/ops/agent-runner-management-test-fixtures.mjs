@@ -12,8 +12,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { ManagementControlStore } from './agent-runner-management-control-store.mjs';
-import { ManagementEventStore } from './agent-runner-management-events.mjs';
+import { openManagementStores } from './agent-runner-management-control-store.mjs';
 import {
   ATTEMPT_ID,
   HEAD_SHA,
@@ -105,13 +104,13 @@ export const REGISTRY = Object.freeze({
 export async function withStores(fn, { now = () => T0, maxAttempts = 5, dbPath: suppliedPath = null, dir: suppliedDir = null } = {}) {
   const dir = suppliedDir ?? (suppliedPath ? null : mkdtempSync(join(tmpdir(), 'agent-runner-management-')));
   const dbPath = suppliedPath ?? join(dir, 'runner-state.sqlite');
-  const eventStore = new ManagementEventStore(dbPath, { registry: REGISTRY, now, maxAttempts });
-  const controlStore = new ManagementControlStore(dbPath, { now });
+  // The same shared-connection helper production uses, so the durable producer
+  // dedupe transaction is exercised by the tests rather than only in production.
+  const stores = openManagementStores(dbPath, { registry: REGISTRY, now, maxAttempts });
   try {
-    return await fn({ eventStore, controlStore, dbPath, dir });
+    return await fn({ eventStore: stores.eventStore, controlStore: stores.controlStore, dbPath, dir });
   } finally {
-    eventStore.close();
-    controlStore.close();
+    stores.close();
     // A caller that supplied its own directory owns its lifetime: leaving it in
     // place is what lets a restart-recovery test reopen the same database.
     if (dir && !suppliedDir && !suppliedPath) rmSync(dir, { recursive: true, force: true });

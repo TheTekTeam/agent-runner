@@ -34,7 +34,20 @@ const RUNTIME_MODULES = [
   'agent-runner-management-field-acceptance.mjs',
   'agent-runner-management-cutover.mjs',
   'agent-runner-management-control-command.mjs',
+  'agent-runner-management-plan-registry.mjs',
+  'agent-runner-management-collectors.mjs',
+  'agent-runner-management-observer.mjs',
+  'agent-runner-management-cycle-command.mjs',
 ];
+
+/**
+ * The production wiring modules that legitimately reach the outside world.
+ * They are exempt from the no-I/O rule but from nothing else.
+ */
+const PRODUCTION_IO_MODULES = new Set([
+  'agent-runner-management-dell-adapters.mjs',
+  'agent-runner-management-wake.mjs',
+]);
 
 const ROLE_MODULES = [
   'agent-runner-management-programme-role.mjs',
@@ -260,12 +273,74 @@ test('the role modules perform no I/O of their own', () => {
   }
 });
 
+test('the production wiring introduces no new unit, timer or scheduler', () => {
+  const units = readdirSync(join(REPO_ROOT, 'systemd'), { recursive: true, withFileTypes: true })
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name);
+  // The management cycle runs from the one pre-existing generic polling unit.
+  assert.ok(units.includes('agent-runner-event-polling.service'));
+  assert.equal(units.filter((unit) => unit.endsWith('.timer')).length, 2, 'no management timer may be added');
+  const polling = readFileSync(join(REPO_ROOT, 'systemd/user/agent-runner-event-polling.service'), 'utf8');
+  assert.match(polling, /agent-runner-management-cycle-command\.mjs/, 'the management cycle must run from the generic polling unit');
+  // A management refusal must never fail the generic cycle it shares.
+  assert.match(polling, /ExecStart=-\/usr\/bin\/env node .*agent-runner-management-cycle-command\.mjs/);
+});
+
+test('the production entrypoint and observer contain no loop, sleep or schedule of their own', () => {
+  for (const name of ['agent-runner-management-cycle-command.mjs', 'agent-runner-management-observer.mjs']) {
+    const body = code(name);
+    assert.ok(!/\bwhile\s*\(true\)/.test(body), name);
+    assert.ok(!/\bsleep\b/i.test(body), name);
+    assert.ok(!/\bsetInterval\(/.test(body), name);
+  }
+});
+
+test('only the two declared production wiring modules perform I/O', () => {
+  for (const name of RUNTIME_MODULES) {
+    if (PRODUCTION_IO_MODULES.has(name)) continue;
+    const imported = importsOf(name);
+    for (const forbidden of ['node:child_process', 'node:https', 'node:http', 'node:net']) {
+      assert.ok(!imported.includes(forbidden), `${name} must not import ${forbidden}`);
+    }
+  }
+});
+
+test('the wake can only ever start an allowlisted generic unit', () => {
+  const body = code('agent-runner-management-wake.mjs');
+  // One spawn, one verb, and the unit is checked against the allowlist first.
+  assert.match(body, /ALLOWED_WAKE_UNITS\.includes\(unit\)/);
+  assert.match(body, /'--user', 'start', '--no-block', unit/);
+  assert.ok(!/\benable\b/.test(body), 'a wake must never enable a unit');
+  assert.ok(!/\bdisable\b/.test(body), 'a wake must never disable a unit');
+  assert.ok(!/\bstop\b/.test(body), 'a wake must never stop a unit');
+});
+
+test('the production collectors never publish an authority the ledger did not record', () => {
+  const body = code('agent-runner-management-collectors.mjs');
+  // Reconstruction is gated on a persisted ledger entry, and publication
+  // records the grant before announcing it.
+  assert.match(body, /recordIssuedAuthority\(/);
+  assert.match(body, /listIssuedAuthorities\(/);
+  assert.ok(!/\bmerge\(|\bcloseIssue\(|\bactivateSource\(/.test(body));
+});
+
+test('the Dell adapters read only and never mutate a repository or a service', () => {
+  const body = code('agent-runner-management-dell-adapters.mjs');
+  assert.ok(!/\bsystemctl\b/.test(body), 'an adapter must never touch a unit');
+  assert.ok(!/--method',\s*'(?:POST|PATCH|PUT|DELETE)/.test(body), 'GitHub adapters are read-only');
+  assert.ok(!/\bgit',\s*\['(?:push|commit|merge|checkout|reset|clean)/.test(body), 'git adapters are read-only');
+});
+
 test('no management module persists a machine-local path or a claim token', () => {
   for (const name of RUNTIME_MODULES) {
     const body = code(name);
     assert.ok(!/\bworktreePath\b/.test(body), name);
     assert.ok(!/\blocalRepoPath\b/.test(body), name);
-    assert.ok(!/\bhomedir\(\)\s*,\s*['"]\.\w/.test(body) || name === 'agent-runner-management-control-command.mjs', name);
+    // The two CLI entrypoints resolve the default XDG state path at runtime;
+    // that is a location, never persisted management state.
+    const isEntrypoint = name === 'agent-runner-management-control-command.mjs'
+      || name === 'agent-runner-management-cycle-command.mjs';
+    assert.ok(!/\bhomedir\(\)\s*,\s*['"]\.\w/.test(body) || isEntrypoint, name);
   }
   // The one place a claim token is handled hashes it rather than storing it.
   const store = code('agent-runner-management-control-store.mjs');

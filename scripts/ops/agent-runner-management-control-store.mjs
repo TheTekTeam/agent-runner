@@ -35,6 +35,7 @@ import {
   MANAGEMENT_CONTROL_MODES,
   MANAGEMENT_ROLES,
 } from './agent-runner-management-control-mode.mjs';
+import { ManagementEventStore } from './agent-runner-management-events.mjs';
 import {
   assertBoundedSafeText,
   isPlainObject,
@@ -42,7 +43,7 @@ import {
   stableJson,
 } from './agent-runner-manager-planner-safety.mjs';
 
-export const MANAGEMENT_CONTROL_STORE_SCHEMA_VERSION = 1;
+export const MANAGEMENT_CONTROL_STORE_SCHEMA_VERSION = 2;
 
 /** The bounded signals the control plane records for operators and the dashboard. */
 export const MANAGEMENT_OBSERVATION_SIGNALS = Object.freeze([
@@ -239,6 +240,50 @@ const MIGRATIONS = Object.freeze({
       CREATE INDEX IF NOT EXISTS management_control_observations_recent_idx
         ON management_control_observations(recorded_at, observation_id);
   `,
+  2: `
+      -- The durable, producer-owned semantic dedupe state. One row per bounded
+      -- producer scope holds the last semantic evidence fingerprint that was
+      -- successfully turned into a durable management event. Suppression is
+      -- therefore a property of persisted state rather than of a caller
+      -- remembering what it observed last, and it survives settlement, a
+      -- different caller correlation and a restart.
+      CREATE TABLE IF NOT EXISTS management_producer_state (
+        scope_key TEXT PRIMARY KEY,
+        producer_kind TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        issue_number INTEGER,
+        pull_request_number INTEGER,
+        evidence_fingerprint TEXT NOT NULL,
+        event_id TEXT NOT NULL,
+        observed_count INTEGER NOT NULL DEFAULT 1 CHECK (observed_count >= 1),
+        first_observed_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS management_producer_state_project_idx
+        ON management_producer_state(project_id, producer_kind, scope_key);
+
+      -- The persisted #267 authority ledger. Issuance reconciles against this,
+      -- so a duplicate authority is an idempotent no-op across process
+      -- restarts rather than only within one in-memory pass. Identity only:
+      -- no packet body, no prompt, no provider output.
+      CREATE TABLE IF NOT EXISTS management_authority_ledger (
+        authority_key TEXT PRIMARY KEY,
+        authority_fingerprint TEXT NOT NULL,
+        project_id TEXT NOT NULL,
+        repo TEXT NOT NULL,
+        issue_number INTEGER NOT NULL,
+        branch TEXT NOT NULL,
+        base_sha TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('issued', 'consumed', 'settled', 'revoked')),
+        recorded_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS management_authority_ledger_project_idx
+        ON management_authority_ledger(project_id, issue_number, authority_key);
+  `,
 });
 
 /**
@@ -247,7 +292,14 @@ const MIGRATIONS = Object.freeze({
  * do, and relies on WAL plus an explicit busy timeout to serialise with them.
  */
 export class ManagementControlStore {
-  constructor(dbPath, { now = () => new Date().toISOString(), busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS } = {}) {
+  /**
+   * `db` attaches this store to an already-open connection -- in practice the
+   * `ManagementEventStore`'s. Sharing one connection is what lets a producer
+   * enqueue a durable event and advance its semantic fingerprint inside a
+   * single SQLite transaction, which no pair of separate connections could do.
+   * The borrowed connection is never closed by this store.
+   */
+  constructor(dbPath, { now = () => new Date().toISOString(), busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS, db = null } = {}) {
     if (!nonEmptyString(dbPath)) throw new Error('management control store db path is required');
     this.dbPath = dbPath;
     this.now = now;
@@ -255,8 +307,13 @@ export class ManagementControlStore {
       ? busyTimeoutMs
       : DEFAULT_BUSY_TIMEOUT_MS;
     this.transactionActive = false;
-    if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
-    this.db = new DatabaseSync(dbPath);
+    this.ownsConnection = db === null;
+    if (this.ownsConnection) {
+      if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
+      this.db = new DatabaseSync(dbPath);
+    } else {
+      this.db = db;
+    }
     this.migrate();
   }
 
@@ -669,7 +726,164 @@ export class ManagementControlStore {
       })));
   }
 
-  close() {
-    this.db.close();
+  // ---------------------------------------------------------------- producer dedupe
+
+  /**
+   * The deterministic dedupe scope for one material transition.
+   *
+   * It is derived from the producer kind and the object identity only. The
+   * caller's correlation id is deliberately **not** part of it, so a caller
+   * cannot defeat semantic suppression by correlating the same observation
+   * differently.
+   */
+  static producerScopeKey({ producerKind, projectId, repository, issueNumber = null, pullRequestNumber = null }) {
+    const scope = {
+      producerKind: requiredToken(producerKind, 'management producer kind'),
+      projectId: requiredId(projectId, 'management producer projectId'),
+      repository: requiredRepository(repository).toLowerCase(),
+      issueNumber: optionalPositiveInteger(issueNumber, 'management producer issueNumber'),
+      pullRequestNumber: optionalPositiveInteger(pullRequestNumber, 'management producer pullRequestNumber'),
+    };
+    return `mps-${sha256(stableJson(scope))}`;
   }
+
+  getProducerState(scopeKey) {
+    const key = requiredId(scopeKey, 'management producer scope key');
+    const row = this.db.prepare('SELECT * FROM management_producer_state WHERE scope_key = ?').get(key);
+    if (!row) return null;
+    return Object.freeze({
+      scopeKey: row.scope_key,
+      producerKind: row.producer_kind,
+      projectId: row.project_id,
+      repository: row.repo,
+      issueNumber: row.issue_number,
+      pullRequestNumber: row.pull_request_number,
+      evidenceFingerprint: row.evidence_fingerprint,
+      eventId: row.event_id,
+      observedCount: Number(row.observed_count),
+      firstObservedAt: row.first_observed_at,
+      updatedAt: row.updated_at,
+    });
+  }
+
+  /**
+   * Advance one producer scope to a newly accepted semantic fingerprint.
+   *
+   * This deliberately opens no transaction of its own: it is called from
+   * inside the producer's single shared transaction, immediately after the
+   * event it describes has been durably enqueued in that same transaction. If
+   * the enqueue fails, the whole transaction unwinds and the stored
+   * fingerprint does not move -- so a failed enqueue can never permanently
+   * suppress required work.
+   */
+  advanceProducerStateInTransaction({
+    scopeKey, producerKind, projectId, repository, issueNumber = null,
+    pullRequestNumber = null, evidenceFingerprint, eventId, now,
+  }) {
+    const key = requiredId(scopeKey, 'management producer scope key');
+    const kind = requiredToken(producerKind, 'management producer kind');
+    const project = requiredId(projectId, 'management producer projectId');
+    const repo = requiredRepository(repository);
+    const fingerprint = requiredId(evidenceFingerprint, 'management producer evidenceFingerprint');
+    const event = requiredId(eventId, 'management producer eventId');
+    const timestamp = iso(now, 'management producer timestamp');
+    this.db.prepare(`
+      INSERT INTO management_producer_state(
+        scope_key, producer_kind, project_id, repo, issue_number, pull_request_number,
+        evidence_fingerprint, event_id, observed_count, first_observed_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+      ON CONFLICT(scope_key) DO UPDATE SET
+        evidence_fingerprint = excluded.evidence_fingerprint,
+        event_id = excluded.event_id,
+        observed_count = management_producer_state.observed_count + 1,
+        updated_at = excluded.updated_at
+    `).run(
+      key, kind, project, repo,
+      optionalPositiveInteger(issueNumber, 'management producer issueNumber'),
+      optionalPositiveInteger(pullRequestNumber, 'management producer pullRequestNumber'),
+      fingerprint, event, timestamp, timestamp,
+    );
+    return this.getProducerState(key);
+  }
+
+  listProducerState({ projectId = null, limit = 100 } = {}) {
+    const bounded = Number.isInteger(limit) && limit >= 1 && limit <= 500 ? limit : 100;
+    const rows = projectId
+      ? this.db.prepare('SELECT scope_key FROM management_producer_state WHERE project_id = ? ORDER BY scope_key ASC LIMIT ?')
+        .all(requiredId(projectId, 'management producer projectId'), bounded)
+      : this.db.prepare('SELECT scope_key FROM management_producer_state ORDER BY scope_key ASC LIMIT ?').all(bounded);
+    return Object.freeze(rows.map((row) => this.getProducerState(row.scope_key)));
+  }
+
+  // ---------------------------------------------------------------- authority ledger
+
+  /**
+   * Persist one issued #267 authority as ledger identity. This is what makes
+   * duplicate-authority reconciliation survive a restart: the next programme
+   * reconciliation reads these rows back as the `ledger.issued` input, so an
+   * identical authority is an idempotent no-op rather than a second grant.
+   */
+  recordIssuedAuthority({ authorityKey, authorityFingerprint, projectId, repository, issueNumber, branch, baseSha, state = 'issued', now = this.now() } = {}) {
+    const key = requiredId(authorityKey, 'management authority key');
+    const fingerprint = requiredFingerprint(authorityFingerprint, 'management authority fingerprint');
+    const project = requiredId(projectId, 'management authority projectId');
+    const repo = requiredRepository(repository);
+    const issue = optionalPositiveInteger(issueNumber, 'management authority issueNumber');
+    if (issue === null) throw new Error('management authority issueNumber is required');
+    if (!nonEmptyString(branch) || branch.length > 200) throw new Error('management authority branch is invalid');
+    const base = optionalSha(baseSha, 'management authority baseSha');
+    if (base === null) throw new Error('management authority baseSha is required');
+    if (!['issued', 'consumed', 'settled', 'revoked'].includes(state)) throw new Error(`unknown management authority state: ${state}`);
+    const timestamp = iso(now, 'management authority timestamp');
+    const result = this.db.prepare(`
+      INSERT INTO management_authority_ledger(
+        authority_key, authority_fingerprint, project_id, repo, issue_number,
+        branch, base_sha, state, recorded_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(authority_key) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at
+    `).run(key, fingerprint, project, repo, issue, branch, base, state, timestamp, timestamp);
+    return Object.freeze({ recorded: Number(result.changes) >= 1, authorityKey: key });
+  }
+
+  /** The bounded `ledger.issued` input the accepted #267 issuance transition expects. */
+  listIssuedAuthorities({ projectId, limit = 200 } = {}) {
+    const bounded = Number.isInteger(limit) && limit >= 1 && limit <= 200 ? limit : 200;
+    return Object.freeze(this.db.prepare(`
+      SELECT * FROM management_authority_ledger WHERE project_id = ?
+      ORDER BY recorded_at ASC, authority_key ASC LIMIT ?
+    `).all(requiredId(projectId, 'management authority projectId'), bounded).map((row) => Object.freeze({
+      authorityKey: row.authority_key,
+      authorityFingerprint: row.authority_fingerprint,
+      issueNumber: Number(row.issue_number),
+      branch: row.branch,
+      baseSha: row.base_sha,
+      state: row.state,
+    })));
+  }
+
+  close() {
+    // A borrowed connection belongs to whoever opened it.
+    if (this.ownsConnection) this.db.close();
+  }
+}
+
+/**
+ * Open the management event ledger and the control-plane store on **one**
+ * shared SQLite connection.
+ *
+ * Production and the focused tests both use this, because the durable producer
+ * dedupe depends on enqueueing an event and advancing its semantic fingerprint
+ * inside a single transaction -- which is only possible on one connection.
+ */
+export function openManagementStores(dbPath, { registry, now = () => new Date().toISOString(), maxAttempts, busyTimeoutMs } = {}) {
+  const eventStore = new ManagementEventStore(dbPath, { registry, now, maxAttempts, busyTimeoutMs });
+  const controlStore = new ManagementControlStore(dbPath, { now, db: eventStore.db });
+  return Object.freeze({
+    eventStore,
+    controlStore,
+    close() {
+      controlStore.close();
+      eventStore.close();
+    },
+  });
 }

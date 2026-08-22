@@ -14,13 +14,15 @@
  *     is no field in which a producer could say what to do -- the handler that
  *     claims the event re-reads authoritative evidence and decides for itself.
  *
- *  2. **Unchanged evidence produces nothing, structurally.** A transition is
- *     accepted only with an `evidenceFingerprint`. If it equals the previous
- *     fingerprint for that transition, no event is produced at all. Cosmetic
- *     GitHub updates, repeated polls, unchanged queue evidence and repeated
- *     status reads therefore cannot generate events -- not because a caller
- *     remembered to pass a flag, but because their semantic fingerprint did not
- *     move.
+ *  2. **Unchanged evidence produces nothing, and the suppression is durable and
+ *     producer-owned.** Every transition carries an `evidenceFingerprint`. The
+ *     last fingerprint that was successfully turned into a durable event is
+ *     persisted per bounded producer scope in the existing controller database,
+ *     so suppression does not depend on a caller remembering what it last saw,
+ *     does not lapse when the previous event settles, and cannot be defeated by
+ *     correlating the same observation differently. Cosmetic GitHub updates,
+ *     repeated polls, unchanged queue evidence and repeated status reads
+ *     therefore cannot generate events.
  *
  *  3. **Production is deterministic, deduplicated, bounded and idempotent.** The
  *     #289 ledger fingerprints and coalesces on the way in, so replaying the
@@ -34,9 +36,10 @@
 
 import {
   ManagementEventStore,
-  enqueueManagementEventAndWake,
+  normalizeManagementEvent,
   recoverDueManagementEvents,
 } from './agent-runner-management-events.mjs';
+import { ManagementControlStore } from './agent-runner-management-control-store.mjs';
 import { isPlainObject, nonEmptyString } from './agent-runner-manager-planner-safety.mjs';
 
 export const MANAGEMENT_PRODUCER_SCHEMA_VERSION = 'agent-runner-management-producers/v1';
@@ -91,7 +94,7 @@ export const PRODUCER_SUPPRESSION_REASONS = Object.freeze([
 
 const TRANSITION_FIELDS = new Set([
   'kind', 'projectId', 'repository', 'issueNumber', 'pullRequestNumber', 'sha',
-  'correlationId', 'evidenceFingerprint', 'previousEvidenceFingerprint', 'notBefore', 'deadlineAt',
+  'correlationId', 'evidenceFingerprint', 'notBefore', 'deadlineAt',
 ]);
 
 const FINGERPRINT_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,199}$/;
@@ -128,63 +131,121 @@ function validateTransition(transition, index) {
   if (!nonEmptyString(transition.evidenceFingerprint) || !FINGERPRINT_PATTERN.test(transition.evidenceFingerprint)) {
     fail(`transitions[${index}].evidenceFingerprint must be a bounded semantic evidence fingerprint`);
   }
-  if (transition.previousEvidenceFingerprint != null
-    && (!nonEmptyString(transition.previousEvidenceFingerprint) || !FINGERPRINT_PATTERN.test(transition.previousEvidenceFingerprint))) {
-    fail(`transitions[${index}].previousEvidenceFingerprint must be a bounded semantic evidence fingerprint when present`);
-  }
   return eventType;
+}
+
+function callWake(wake, payload) {
+  if (typeof wake !== 'function') return Object.freeze({ attempted: false, ok: true });
+  try {
+    wake(Object.freeze(payload));
+    return Object.freeze({ attempted: true, ok: true });
+  } catch {
+    // Best effort by definition: the event is already durable, so a failed wake
+    // degrades to recovery latency rather than lost work.
+    return Object.freeze({ attempted: true, ok: false });
+  }
 }
 
 /**
  * Turn a bounded set of material transitions into durable management events.
  *
- * Durability always completes before the best-effort wake, and every enqueue
- * goes through the #289 ledger so deduplication, coalescing and delayed
- * eligibility are the ledger's, not reimplemented here.
+ * Each transition is processed under the ledger's own single transaction, in
+ * which the event is enqueued **and** the producer's semantic fingerprint is
+ * advanced. That ordering is the whole point:
+ *
+ *  - the fingerprint is never marked accepted before its event is durably
+ *    stored, because both writes commit together or not at all;
+ *  - a failed enqueue rolls the fingerprint back, so a transient failure can
+ *    never permanently suppress required work;
+ *  - a crash between the two is impossible rather than merely unlikely.
+ *
+ * Durability always completes before the best-effort wake.
  */
-export function produceManagementEvents({ store, transitions = [], wake = null, now = null } = {}) {
-  if (!(store instanceof ManagementEventStore)) fail('a ManagementEventStore is required');
+export function produceManagementEvents({
+  eventStore, controlStore, transitions = [], wake = null, now = null,
+} = {}) {
+  if (!(eventStore instanceof ManagementEventStore)) fail('a ManagementEventStore is required');
+  if (!(controlStore instanceof ManagementControlStore)) fail('a ManagementControlStore is required');
+  // The shared connection is what makes the two writes one transaction. Without
+  // it the fingerprint and the event could diverge, so this fails closed rather
+  // than silently degrading to a weaker guarantee.
+  if (controlStore.db !== eventStore.db) {
+    fail('the management event store and control store must share one connection for durable producer dedupe (use openManagementStores)');
+  }
   if (!Array.isArray(transitions)) fail('transitions must be an array');
   if (transitions.length > MAX_TRANSITIONS) fail(`transitions exceed the bounded limit of ${MAX_TRANSITIONS}`);
 
+  const timestamp = now ?? eventStore.now();
   const produced = [];
   const suppressed = [];
+  const due = [];
+
   transitions.forEach((transition, index) => {
     const eventType = validateTransition(transition, index);
+    const scopeKey = ManagementControlStore.producerScopeKey({
+      producerKind: transition.kind,
+      projectId: transition.projectId,
+      repository: transition.repository,
+      issueNumber: transition.issueNumber ?? null,
+      pullRequestNumber: transition.pullRequestNumber ?? null,
+    });
 
-    // The structural no-event rule. Identical semantic evidence cannot wake the
-    // manager, however many times it is observed.
-    if (transition.previousEvidenceFingerprint != null
-      && transition.previousEvidenceFingerprint === transition.evidenceFingerprint) {
-      suppressed.push(Object.freeze({ kind: transition.kind, reason: 'unchanged-evidence' }));
+    // The durable no-event rule. Identical semantic evidence for this scope has
+    // already produced its event, whatever that event's current state and
+    // however the caller chose to correlate this observation.
+    const persisted = controlStore.getProducerState(scopeKey);
+    if (persisted && persisted.evidenceFingerprint === transition.evidenceFingerprint) {
+      suppressed.push(Object.freeze({ kind: transition.kind, reason: 'unchanged-evidence', scopeKey }));
       return;
     }
 
-    const result = enqueueManagementEventAndWake({
-      store,
-      wake,
-      now,
-      event: {
-        eventType,
+    const event = normalizeManagementEvent({
+      eventType,
+      projectId: transition.projectId,
+      repository: transition.repository,
+      issueNumber: transition.issueNumber ?? undefined,
+      pullRequestNumber: transition.pullRequestNumber ?? undefined,
+      sha: transition.sha ?? undefined,
+      correlationId: transition.correlationId ?? derivedCorrelationId(transition),
+      notBefore: transition.notBefore ?? undefined,
+      deadlineAt: transition.deadlineAt ?? undefined,
+    }, { registry: eventStore.registry, now: timestamp });
+
+    const result = eventStore.runInTransaction(() => {
+      const enqueued = eventStore.enqueueInTransaction(event, { now: timestamp });
+      // Only reached when the enqueue above succeeded; a throw unwinds both.
+      controlStore.advanceProducerStateInTransaction({
+        scopeKey,
+        producerKind: transition.kind,
         projectId: transition.projectId,
         repository: transition.repository,
-        issueNumber: transition.issueNumber ?? undefined,
-        pullRequestNumber: transition.pullRequestNumber ?? undefined,
-        sha: transition.sha ?? undefined,
-        correlationId: transition.correlationId ?? derivedCorrelationId(transition),
-        notBefore: transition.notBefore ?? undefined,
-        deadlineAt: transition.deadlineAt ?? undefined,
-      },
+        issueNumber: transition.issueNumber ?? null,
+        pullRequestNumber: transition.pullRequestNumber ?? null,
+        evidenceFingerprint: transition.evidenceFingerprint,
+        eventId: enqueued.event.eventId,
+        now: timestamp,
+      });
+      return enqueued;
     });
+
     produced.push(Object.freeze({
       kind: transition.kind,
       eventType,
       eventId: result.event.eventId,
+      scopeKey,
       inserted: result.inserted,
       duplicate: result.duplicate,
       coalesced: result.coalesced,
     }));
+    if (result.event.state === 'pending' && Date.parse(result.event.notBefore) <= Date.parse(timestamp)) {
+      due.push(result.event.eventId);
+    }
   });
+
+  // One wake for the whole batch, after every event is durable.
+  const wakeResult = due.length > 0
+    ? callWake(wake, { schemaVersion: 1, reason: 'management-event-due', dueCount: due.length })
+    : Object.freeze({ attempted: false, ok: true });
 
   return Object.freeze({
     schemaVersion: MANAGEMENT_PRODUCER_SCHEMA_VERSION,
@@ -194,6 +255,8 @@ export function produceManagementEvents({ store, transitions = [], wake = null, 
     coalescedCount: produced.filter((entry) => entry.coalesced).length,
     duplicateCount: produced.filter((entry) => entry.duplicate).length,
     suppressedCount: suppressed.length,
+    dueCount: due.length,
+    wake: wakeResult,
   });
 }
 

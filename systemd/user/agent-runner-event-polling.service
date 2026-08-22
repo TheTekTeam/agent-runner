@@ -9,6 +9,12 @@ Type=oneshot
 EnvironmentFile=%h/.config/agent-runner/event-polling.env
 EnvironmentFile=-%h/.config/agent-runner/queue-triage-authority.env
 ExecStart=/usr/bin/env node ${AGENT_RUNNER_HOME}/scripts/ops/agent-runner-queue-triage-local-authority.mjs --bootstrap-lookback-ms 86400000 --batch-limit 25 --all-enabled --execute
+# #268: drain the durable management event graph from this same generic cycle.
+# This adds no timer and no service: it reuses the one generic polling unit that
+# already exists, so there is no project- or role-specific manager schedule. The
+# command exits immediately when the control mode is disabled or nothing is due,
+# and the "-" prefix keeps a management refusal from failing the polling cycle.
+ExecStart=-/usr/bin/env node ${AGENT_RUNNER_HOME}/scripts/ops/agent-runner-management-cycle-command.mjs --max-events 10
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

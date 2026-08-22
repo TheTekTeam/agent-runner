@@ -243,12 +243,24 @@ present-and-refusing. `merge`, `closeIssue`, `deploy`, `activateSource`,
 | `review-actionable` | execution |
 | `implementation-slot-occupied` | execution |
 
-**Unchanged evidence produces nothing, structurally.** A transition is accepted
-only with an `evidenceFingerprint`. If it equals the previous fingerprint, no
-event is produced — not because a caller remembered a flag, but because the
-semantic fingerprint did not move. Cosmetic GitHub updates, repeated polls,
-unchanged queue evidence and repeated status reads therefore cannot generate
-events.
+**Unchanged evidence produces nothing, and the suppression is durable and
+producer-owned.** Every transition carries an `evidenceFingerprint`. The last
+fingerprint that was successfully turned into a durable event is persisted in
+`management_producer_state`, keyed by a scope derived from the producer kind and
+the object identity — never from the caller's correlation id. So:
+
+- suppression does not depend on a caller remembering what it last observed;
+- it does not lapse once the previous event settles;
+- it cannot be defeated by correlating the same observation differently;
+- it survives a restart, because it is persisted rather than in memory.
+
+The event and its fingerprint are written in **one shared SQLite transaction**
+(which is why the event ledger and the control store are opened on one
+connection by `openManagementStores()`). A fingerprint is therefore never marked
+accepted before its event is durably stored, and a failed enqueue rolls the
+fingerprint back — so a transient failure can never permanently suppress
+required work. Genuinely new evidence still produces a wake; the ledger's own
+coalescing then decides whether that wake merges into one already pending.
 
 A producer may wake the manager. It may never author a decision.
 
@@ -317,32 +329,126 @@ store, no second authority format, no second queue curator, no second scheduler:
 `management_control_mode_state`, `management_control_mode_audit`,
 `management_control_locks`, `management_control_decisions`,
 `management_control_findings`, `management_control_projections`,
-`management_control_observations`.
+`management_control_observations`, `management_producer_state` (durable semantic
+dedupe) and `management_authority_ledger` (the persisted `#267` ledger, which is
+what makes duplicate-authority reconciliation survive a restart).
 
 Event identity, claims, leases, delays, dedupe and successors remain `#289`'s.
 
-## Wiring the evidence collectors
+`openManagementStores()` opens both stores on one shared connection, which is
+what lets a producer commit an event and its semantic fingerprint atomically.
 
-The control plane is complete and injectable. Cutover wires one `resolvePorts`
-factory that returns, per role:
+## Running it: the production path
 
-**programme** — `collectEvidence` returns
-`{ sourceSha, queueEvidence, quotaAdmission, implementationSlot, authorityLedger, execution, producer, candidateRequests }`,
-where `queueEvidence` must be a snapshot produced by the accepted
-`validateManagerQueueEvidence()`; plus `applyQueueMutation` (returns a `#266`
-client port) and `publishWorkerAuthority`.
+The control plane is wired end to end and shipped. One command runs it:
 
-**execution** — `collectEvidence` returns
-`{ authority, settlementEvidence, previousSettlement, ownership, continuationRequest, producer, projectionContext }`,
-where `authority` and `settlementEvidence` must carry provenance from
-`issueManagerWorkerAuthority()` and `validateManagerSettlementEvidence()`; plus
-`publishContinuationAuthority`.
+```
+npm run management:run -- --project-registry <path>
+# or, with AGENT_RUNNER_PROJECT_REGISTRY already exported:
+node scripts/ops/agent-runner-management-cycle-command.mjs
+```
 
-**assurance** — `collectEvidence` returns the bounded plain-data observation
-described in the assurance module. Read-only: no other port may be supplied.
+`agent-runner-management-cycle-command.mjs` performs, in order:
 
-Each contract is validated at the role boundary, so a mis-wired collector fails
-closed rather than reconciling on partial evidence.
+1. load the canonical project registry and the registered manager profiles;
+2. open the controller SQLite database on one shared connection;
+3. resolve the persisted control mode, failing closed on anything unknown;
+4. **observe** material transitions from live evidence and durably enqueue those
+   whose semantic fingerprint moved;
+5. run **generic recovery** — expired leases, lost wakes, delayed eligibility;
+6. **drain** due events through `runManagementControlCycle()` with the real
+   production collectors;
+7. print a bounded summary and exit.
+
+It has no timer, no loop and no sleep. It processes what is due now and returns,
+exiting cleanly when there is nothing to do.
+
+### Where it runs
+
+From the **existing generic** `agent-runner-event-polling.service`, which gained
+one additional `ExecStart=-` line. That adds no unit, no timer and no
+project- or role-specific manager schedule: the management cycle simply drains
+due events from the one generic polling cycle Dell already runs, and the `-`
+prefix keeps a management refusal from failing that cycle.
+
+### The wake
+
+`agent-runner-management-wake.mjs` best-effort nudges that same generic unit
+(`systemctl --user start --no-block`) once an event is durable, so the controller
+starts draining within seconds instead of at the next polling pass. It is off
+unless `AGENT_RUNNER_MANAGEMENT_WAKE_UNIT` names an allowlisted generic unit, it
+can only ever *start* one, and every failure path returns quietly — the event is
+already durable, so a failed wake costs latency, never work.
+
+### The evidence collectors
+
+`agent-runner-management-collectors.mjs` builds every role's input from live
+evidence and passes all of it through the accepted validators:
+
+**programme** — the exact source SHA, the #261 evidence → brief → proposal chain
+(from the registered plan document plus live instruction-document digests and
+open issue/pull-request state), validated #266 queue evidence parsed back out of
+the curated issue bodies, quota headroom, the global implementation slot, the
+persisted authority ledger, the approved execution selection, the manager
+producer identity, and one candidate request per bound plan item.
+
+**execution** — the exact authority, reconstructed deterministically and then
+**checked against the persisted ledger**, so only an authority this control
+plane actually issued can be rebuilt and a moved base fails closed; plus
+publication, pull-request identity and exact head, exact-head checks, review
+state, the previous lifecycle settlement and the projection context. No live
+authority for an identity is a legitimate `no-op`, not a failure.
+
+**assurance** — its own independent read-only observation, gathered separately
+so the auditor never reads the derived state it is auditing.
+
+`agent-runner-management-dell-adapters.mjs` supplies the real Dell reads (git,
+`gh`, the accepted quota-only admission gate, the implementation lock, host
+identity). Every adapter is injected, so the focused tests drive this same
+production code with bounded fakes rather than a parallel path.
+
+### The management plan document
+
+`#261` validates a plan but deliberately produces none, so the authored parts —
+objective, milestones, proposed work, approved execution parameters — come from
+a checked-in, explicitly registered document per project:
+`config/manager-plans/<projectId>.json`, loaded by
+`agent-runner-management-plan-registry.mjs` exactly as `#259` loads profiles. No
+directory scan, no provider call, no network. Everything revision-dependent (the
+source SHA, evidence timestamps, live queue state) is injected at read time, so a
+checked-in document can never pin a stale base. A project with no registered plan
+is simply not planned yet, and nothing is reconciled for it.
+
+## Supervised shadow acceptance, after merge
+
+No further code is required. In order:
+
+```bash
+# 1. Activate the accepted source (existing separately accepted contract).
+
+# 2. Put the control plane into shadow. Explicit and audited.
+npm run management:mode -- --set shadow \
+  --actor <operator> --reason "begin shadow acceptance" \
+  --project-registry <path>
+
+# 3. Run the production cycle. Observes live evidence, enqueues what moved,
+#    recovers due work and drains it. Safe to run repeatedly.
+npm run management:run -- --project-registry <path> \
+  --expected-source-sha <accepted-sha>
+
+# 4. Read the bounded decisions, projections, findings and observations.
+npm run management:status -- --project-registry <path>
+
+# 5. Evaluate the twenty acceptance probes.
+npm run management:field-acceptance -- --project-registry <path>
+```
+
+Optionally export `AGENT_RUNNER_MANAGEMENT_WAKE_UNIT=agent-runner-event-polling.service`
+to enable the immediate wake, and re-run the event-polling installer so the
+generic unit also drains the graph on its existing cycle.
+
+Throughout shadow, the three external scheduled managers remain authoritative
+and enabled, and nothing the control plane computes is applied.
 
 ## Field acceptance
 
@@ -415,7 +521,13 @@ assurance independently reports a contradiction.
 | `agent-runner-management-execution-role.mjs` | Role 2 — lifecycle follow-through |
 | `agent-runner-management-assurance-role.mjs` | Role 3 — read-only auditor |
 | `agent-runner-management-controller.mjs` | The generic event controller |
-| `agent-runner-management-producers.mjs` | Material transitions → durable events; the recovery seam |
+| `agent-runner-management-producers.mjs` | Material transitions → durable events, with durable semantic dedupe; the recovery seam |
+| `agent-runner-management-observer.mjs` | The closed-allowlist observer that computes those transitions from live evidence |
+| `agent-runner-management-collectors.mjs` | The production `resolvePorts` factory and the three role collectors |
+| `agent-runner-management-dell-adapters.mjs` | Real Dell reads: git, `gh`, quota, implementation lock, host identity |
+| `agent-runner-management-plan-registry.mjs` | The registered per-project management plan document |
+| `agent-runner-management-wake.mjs` | Best-effort wake of the existing generic Dell unit |
+| `agent-runner-management-cycle-command.mjs` | **The production entrypoint** (`npm run management:run`) |
 | `agent-runner-management-field-acceptance.mjs` | Twenty bounded read-only probes |
 | `agent-runner-management-cutover.mjs` | Cutover gates and the ordered rollback plan |
 | `agent-runner-management-control-command.mjs` | Bounded operator CLI |
@@ -424,8 +536,17 @@ assurance independently reports a contradiction.
 
 Focused suites: `agent-runner-management-*.test.mjs` — control modes and
 capabilities, control store, status projection, all three roles, the event
-controller, producers, structural boundaries, and field acceptance / cutover /
-CLI.
+controller, producers and durable semantic dedupe, structural boundaries, field
+acceptance / cutover / CLI, and production wiring.
+
+`agent-runner-management-production-wiring.test.mjs` drives the **shipped**
+entrypoint and collector factory with bounded fake adapters — not a parallel
+test-only path — and proves the whole chain: live evidence → observation →
+durable event → wake → controller → real collectors → deterministic role →
+atomic settlement → successor. It also proves shadow mutates nothing, active
+grants exactly one authority and never a second, an unchanged second cycle
+enqueues nothing, a suppressed wake still recovers through the generic scan, and
+a collector failure isolates to its own project.
 
 The boundary suite is the structural guard: it reads the shipped source to prove
 the assurance role imports no mutation module, no management module contains a

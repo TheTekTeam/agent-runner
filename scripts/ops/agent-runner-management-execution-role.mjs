@@ -99,6 +99,15 @@ const EVIDENCE_FIELDS = new Set([
   'continuationRequest', 'producer', 'projectionContext',
 ]);
 
+/**
+ * The bounded shape a collector returns when there is no live authority for
+ * this identity to follow through. That is a legitimate state rather than a
+ * failure: a shadow run grants nothing, and a revoked or superseded grant
+ * leaves stale execution events behind. Both must settle as a harmless no-op.
+ */
+const NO_ATTEMPT_FIELDS = new Set(['noAuthorisedAttempt', 'reason']);
+const NO_ATTEMPT_REASONS = new Set(['no-issued-authority', 'no-attempt-evidence']);
+
 function fail(message) {
   throw new Error(`Refusing agent runner execution reconciliation: ${message}`);
 }
@@ -110,6 +119,12 @@ function boundedDelay(value) {
 
 function validateCollectedEvidence(collected) {
   if (!isPlainObject(collected)) fail('collectEvidence must return an object');
+  if (collected.noAuthorisedAttempt === true) {
+    const unexpected = Object.keys(collected).filter((key) => !NO_ATTEMPT_FIELDS.has(key));
+    if (unexpected.length > 0) fail(`a no-authorised-attempt result carries unsupported field(s): ${unexpected.sort().join(', ')}`);
+    if (!NO_ATTEMPT_REASONS.has(collected.reason)) fail(`unknown no-authorised-attempt reason: ${String(collected.reason ?? '')}`);
+    return collected;
+  }
   const unknown = Object.keys(collected).filter((key) => !EVIDENCE_FIELDS.has(key));
   if (unknown.length > 0) fail(`collected evidence contains unsupported field(s): ${unknown.sort().join(', ')}`);
   // Provenance checks: both must have been produced by the accepted #267
@@ -179,6 +194,23 @@ export function runExecutionReconciliation({
   // The authoritative re-read. The event says "this attempt's evidence
   // changed"; it never says what the evidence is or what to do about it.
   const collected = validateCollectedEvidence(capabilities.ports.collectEvidence({ event }));
+
+  // Nothing is authorised for this identity right now. The event is a stale or
+  // shadow-mode wake: settle it as an explicit no-op with no successor rather
+  // than treating an ordinary state as a failure.
+  if (collected.noAuthorisedAttempt === true) {
+    return buildManagementRoleResult({
+      role: 'execution',
+      outcome: 'no-op',
+      reason: collected.reason,
+      settlementState: 'settled',
+      mutationSuppressed: capabilities.mutationSuppressed,
+      identity: { projectId: event.projectId, repository: String(event.repository) },
+      successors: [],
+      projection: null,
+    });
+  }
+
   const { authority, settlementEvidence } = collected;
   assertIdentityBinding(event, authority);
 
