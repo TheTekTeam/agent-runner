@@ -147,7 +147,7 @@ export function programmeEvidence(overrides = {}) {
     sourceSha: SOURCE_SHA,
     queueEvidence: curation.queueEvidence,
     quotaAdmission: { state: 'available', profileName: 'complex' },
-    implementationSlot: { occupied: false },
+    implementationSlot: { state: 'free', occupied: false },
     authorityLedger: { issued: [] },
     execution: executionInput(),
     producer: producer(),

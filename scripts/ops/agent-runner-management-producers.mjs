@@ -190,15 +190,6 @@ export function produceManagementEvents({
       pullRequestNumber: transition.pullRequestNumber ?? null,
     });
 
-    // The durable no-event rule. Identical semantic evidence for this scope has
-    // already produced its event, whatever that event's current state and
-    // however the caller chose to correlate this observation.
-    const persisted = controlStore.getProducerState(scopeKey);
-    if (persisted && persisted.evidenceFingerprint === transition.evidenceFingerprint) {
-      suppressed.push(Object.freeze({ kind: transition.kind, reason: 'unchanged-evidence', scopeKey }));
-      return;
-    }
-
     const event = normalizeManagementEvent({
       eventType,
       projectId: transition.projectId,
@@ -211,7 +202,19 @@ export function produceManagementEvents({
       deadlineAt: transition.deadlineAt ?? undefined,
     }, { registry: eventStore.registry, now: timestamp });
 
+    // The durable no-event rule, evaluated **inside** the write transaction.
+    //
+    // `BEGIN IMMEDIATE` takes the write lock first, so the comparison, the
+    // enqueue and the fingerprint advance are one serialized unit. Reading the
+    // persisted fingerprint before the transaction would leave a
+    // time-of-check/time-of-use window in which two overlapping production
+    // processes both saw the old value and both enqueued -- so the read
+    // deliberately happens here and nowhere else.
     const result = eventStore.runInTransaction(() => {
+      const persisted = controlStore.getProducerState(scopeKey);
+      if (persisted && persisted.evidenceFingerprint === transition.evidenceFingerprint) {
+        return null;
+      }
       const enqueued = eventStore.enqueueInTransaction(event, { now: timestamp });
       // Only reached when the enqueue above succeeded; a throw unwinds both.
       controlStore.advanceProducerStateInTransaction({
@@ -227,6 +230,11 @@ export function produceManagementEvents({
       });
       return enqueued;
     });
+
+    if (result === null) {
+      suppressed.push(Object.freeze({ kind: transition.kind, reason: 'unchanged-evidence', scopeKey }));
+      return;
+    }
 
     produced.push(Object.freeze({
       kind: transition.kind,

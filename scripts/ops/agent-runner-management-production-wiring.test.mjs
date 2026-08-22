@@ -79,7 +79,7 @@ function fakeAdapters(overrides = {}) {
     }],
     listOpenPullRequests: () => [],
     readQuotaAdmission: ({ profileName }) => ({ state: 'available', profileName }),
-    readImplementationSlot: () => ({ occupied: false }),
+    readImplementationSlot: () => ({ state: 'free', occupied: false }),
     readOwnership: () => ({ activeLeases: [], openPullRequests: [] }),
     readAttempt: () => null,
     readHosts: () => ({ controllerHost: 'dell', schedulerHost: 'dell', nonSchedulerHosts: [] }),
@@ -576,7 +576,7 @@ test('quota ambiguity fails closed into a bounded delayed retry with no credit c
 test('an occupied global implementation slot authorises nothing new', async () => {
   await withProduction(async (context) => {
     context.setMode('active');
-    const { adapters, calls } = activeAdapters({ readImplementationSlot: () => ({ occupied: true }) });
+    const { adapters, calls } = activeAdapters({ readImplementationSlot: () => ({ state: 'occupied', occupied: true }) });
     await run({ ...context, adapters });
     assert.deepEqual(calls.authority, [], 'the one global implementation slot is never widened');
   });

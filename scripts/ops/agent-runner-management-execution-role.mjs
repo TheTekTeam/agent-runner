@@ -106,7 +106,23 @@ const EVIDENCE_FIELDS = new Set([
  * leaves stale execution events behind. Both must settle as a harmless no-op.
  */
 const NO_ATTEMPT_FIELDS = new Set(['noAuthorisedAttempt', 'reason']);
-const NO_ATTEMPT_REASONS = new Set(['no-issued-authority', 'no-attempt-evidence']);
+
+/**
+ * How each no-attempt reason settles.
+ *
+ * "Nothing is authorised for this identity" is an ordinary state and settles as
+ * a no-op. "I could not tell which attempt this event means" is a safety
+ * failure -- it is exactly the condition under which picking an arbitrary
+ * authority would reconcile the wrong work -- so it settles `blocked` and stays
+ * visible rather than disappearing as a benign no-op.
+ */
+const NO_ATTEMPT_SETTLEMENT = Object.freeze({
+  'no-issued-authority': 'settled',
+  'no-attempt-evidence': 'settled',
+  'ambiguous-attempt-identity': 'blocked',
+  'attempt-identity-mismatch': 'blocked',
+});
+const NO_ATTEMPT_REASONS = new Set(Object.keys(NO_ATTEMPT_SETTLEMENT));
 
 function fail(message) {
   throw new Error(`Refusing agent runner execution reconciliation: ${message}`);
@@ -199,11 +215,12 @@ export function runExecutionReconciliation({
   // shadow-mode wake: settle it as an explicit no-op with no successor rather
   // than treating an ordinary state as a failure.
   if (collected.noAuthorisedAttempt === true) {
+    const settlementState = NO_ATTEMPT_SETTLEMENT[collected.reason];
     return buildManagementRoleResult({
       role: 'execution',
-      outcome: 'no-op',
+      outcome: settlementState === 'blocked' ? 'blocked' : 'no-op',
       reason: collected.reason,
-      settlementState: 'settled',
+      settlementState,
       mutationSuppressed: capabilities.mutationSuppressed,
       identity: { projectId: event.projectId, repository: String(event.repository) },
       successors: [],

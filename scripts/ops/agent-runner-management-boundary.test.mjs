@@ -327,8 +327,46 @@ test('the production collectors never publish an authority the ledger did not re
 test('the Dell adapters read only and never mutate a repository or a service', () => {
   const body = code('agent-runner-management-dell-adapters.mjs');
   assert.ok(!/\bsystemctl\b/.test(body), 'an adapter must never touch a unit');
-  assert.ok(!/--method',\s*'(?:POST|PATCH|PUT|DELETE)/.test(body), 'GitHub adapters are read-only');
+  assert.ok(!/--method',\s*'(?:POST|PATCH|PUT|DELETE)/.test(body), 'GitHub REST adapters are read-only');
   assert.ok(!/\bgit',\s*\['(?:push|commit|merge|checkout|reset|clean)/.test(body), 'git adapters are read-only');
+  // The one GraphQL call is transported over POST, as every GraphQL request is.
+  // What matters is that the document itself is a read: a `mutation` operation
+  // must never appear.
+  const graphql = /const query = '([^']*)'/.exec(body);
+  assert.ok(graphql, 'the GraphQL document must be a single inspectable literal');
+  assert.match(graphql[1], /^query\(/, 'the GraphQL document must be a query');
+  assert.ok(!/\bmutation\s*[({]/.test(body), 'no GraphQL mutation may be issued');
+});
+
+test('the exact-head review contract cannot be satisfied by a stale or absent review', () => {
+  const body = code('agent-runner-management-dell-adapters.mjs');
+  // Reviews are filtered to the exact head before any state is derived, and the
+  // unreliable pull-request review-decision field is not consulted at all.
+  assert.match(body, /commit_id[\s\S]{0,80}toLowerCase\(\) === headSha/);
+  assert.ok(!/review_decision/.test(body), 'the unreliable review-decision field must not be used');
+  assert.ok(!/reviewDecision/.test(body), 'the unreliable review-decision field must not be used');
+});
+
+test('the implementation slot is a tri-state that never fails open', () => {
+  const adapters = code('agent-runner-management-dell-adapters.mjs');
+  // Only a genuinely absent lock is free; every other read failure is ambiguous.
+  assert.match(adapters, /error\.code === 'ENOENT'/);
+  assert.match(adapters, /state: 'ambiguous'[\s\S]{0,120}lock-unreadable/);
+  assert.match(adapters, /state: 'ambiguous'[\s\S]{0,120}lock-malformed/);
+  // And ambiguity blocks a new authority rather than admitting one.
+  const programme = code('agent-runner-management-programme-role.mjs');
+  assert.match(programme, /slotState === 'ambiguous'/);
+  assert.match(programme, /implementation-slot-ambiguous/);
+});
+
+test('an execution wake can never be resolved to an arbitrary ledger authority', () => {
+  const body = code('agent-runner-management-collectors.mjs');
+  // Exact issue identity is required, a duplicate live grant is refused, and
+  // the authority is rebuilt from its pinned issuance inputs rather than guessed.
+  assert.match(body, /ambiguous-attempt-identity/);
+  assert.match(body, /live\.length > 1/);
+  assert.match(body, /rebuildAuthorityFromSnapshot/);
+  assert.match(body, /attempt-identity-mismatch/);
 });
 
 test('no management module persists a machine-local path or a claim token', () => {

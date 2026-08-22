@@ -21,12 +21,41 @@
 
 import { spawnSync as defaultSpawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { readFileSync, readdirSync } from 'node:fs';
 import { hostname } from 'node:os';
+import { resolve } from 'node:path';
 
 import { evaluateProfileQuotaAdmission } from './claude-runner-quota.mjs';
+import { detectUnresolvedReviewFollowUp } from './claude-runner-review-followup.mjs';
 import { parseCronLock, processIsAlive } from './agent-runner-cron-lock.mjs';
 import { resolveGlobalLockPath } from './agent-runner-implementation-recurrence.mjs';
+import { resolveSourceActivationEvidenceDir } from './agent-runner-source-activation.mjs';
 import { isPlainObject, nonEmptyString } from './agent-runner-manager-planner-safety.mjs';
+
+/**
+ * Unresolved review threads are only available through GraphQL. It is optional
+ * evidence: when it cannot be read, the submitted reviews alone decide, which
+ * can only ever be more conservative (an unresolved thread would have made the
+ * head `changes-requested`).
+ */
+function readReviewThreads(spawn, env, slug, number) {
+  const [owner, name] = slug.split('/');
+  const query = 'query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:50){nodes{isResolved}}}}}';
+  try {
+    const stdout = runCommand(spawn, 'gh', [
+      'api', 'graphql',
+      '-f', `query=${query}`,
+      '-F', `owner=${owner}`,
+      '-F', `name=${name}`,
+      '-F', `number=${number}`,
+    ], { env });
+    const payload = JSON.parse(stdout || 'null');
+    const nodes = payload?.data?.repository?.pullRequest?.reviewThreads?.nodes;
+    return Array.isArray(nodes) ? nodes : [];
+  } catch {
+    return [];
+  }
+}
 
 export const MANAGEMENT_DELL_ADAPTERS_SCHEMA_VERSION = 'agent-runner-management-dell-adapters/v1';
 
@@ -114,11 +143,73 @@ function checkState(run) {
   }
 }
 
-/** Map a GitHub review decision onto the bounded #267 review states. */
-function reviewState(decision) {
-  if (decision === 'CHANGES_REQUESTED') return 'changes-requested';
-  if (decision === 'APPROVED') return 'no-blockers';
-  return 'pending';
+/**
+ * Bounded #267 review evidence for one exact head.
+ *
+ * `GET /pulls/{n}` exposes no dependable review-decision field, so this reads
+ * the actual review submissions and unresolved threads and reduces them with
+ * the accepted review-follow-up semantics.
+ *
+ * The exact-head binding is the important part: a review submitted against an
+ * earlier commit says nothing about the current head, so a stale approval can
+ * never approve current code. Stale reviews are dropped before the reduction,
+ * which leaves the head `pending` rather than green.
+ *
+ * No review prose is ever returned -- only bounded finding identity.
+ */
+function buildReviewEvidence({ pullRequestNumber, headSha, reviews, reviewThreads }) {
+  const submitted = (Array.isArray(reviews) ? reviews : [])
+    .filter(isPlainObject)
+    // Only reviews of this exact head are evidence about this head.
+    .filter((review) => String(review.commit_id ?? review.commitId ?? '').toLowerCase() === headSha)
+    .map((review) => ({
+      author: String(review.user?.login ?? review.author?.login ?? review.author ?? 'unknown'),
+      state: String(review.state ?? '').toUpperCase(),
+      submittedAt: review.submitted_at ?? review.submittedAt ?? null,
+      // Deliberately empty: the accepted reducer accepts a body, and we refuse
+      // to carry one so no review prose can reach management state.
+      body: '',
+    }))
+    .filter((review) => review.state !== 'PENDING');
+
+  const threads = (Array.isArray(reviewThreads) ? reviewThreads : [])
+    .filter(isPlainObject)
+    .map((thread) => ({ isResolved: thread.isResolved === true, comments: [] }));
+
+  const followUp = detectUnresolvedReviewFollowUp({ reviews: submitted, reviewThreads: threads, comments: [] });
+
+  const findings = [];
+  if (followUp.hasUnresolvedFollowUp) {
+    const changesRequested = followUp.reasons.some((reason) => reason.startsWith('changes-requested'));
+    const unresolvedThreads = followUp.reasons.some((reason) => reason.startsWith('unresolved-review-threads'));
+    if (changesRequested) {
+      findings.push({
+        id: 'review-changes-requested',
+        severity: 'blocking',
+        category: 'review',
+        summary: 'A reviewer requested changes at the exact current head.',
+        actionable: true,
+      });
+    }
+    if (unresolvedThreads) {
+      findings.push({
+        id: 'review-thread-unresolved',
+        severity: 'blocking',
+        category: 'review',
+        summary: 'An unresolved review thread remains at the exact current head.',
+        actionable: true,
+      });
+    }
+  }
+
+  let state;
+  if (findings.length > 0) state = 'changes-requested';
+  else if (submitted.some((review) => review.state === 'APPROVED')) state = 'no-blockers';
+  // No review of this head yet -- including the case where every review is
+  // stale -- is pending, never green.
+  else state = 'pending';
+
+  return { pullRequestNumber, headSha, state, findings };
 }
 
 /**
@@ -219,34 +310,55 @@ export function createDellManagementAdapters({
       return { state: 'unavailable', profileName };
     },
 
-    /** The one global implementation slot, read from the existing lock. */
+    /**
+     * The one global implementation slot, read from the existing lock, as a
+     * **tri-state**.
+     *
+     * The global-slot invariant is fail-closed, so "I could not read the lock"
+     * must never look like "the slot is free". Only a genuinely absent lock, or
+     * a well-formed lock whose holder is gone (which the accepted
+     * `acquireRecoverableCronLock` contract treats as recoverable), is free.
+     * An unreadable or malformed lock is ambiguous, and ambiguity blocks new
+     * authority.
+     */
     readImplementationSlot() {
       const lockPath = resolveGlobalLockPath(env);
       let contents = null;
       try {
-        // eslint-disable-next-line global-require -- read lazily so a missing lock is simply "free"
-        contents = runCommand(spawn, 'cat', [lockPath]);
-      } catch {
-        return { occupied: false, issueNumber: null };
+        contents = readFileSync(lockPath, 'utf8');
+      } catch (error) {
+        // Absent is the one unambiguous "free": nothing holds the slot.
+        if (error && error.code === 'ENOENT') {
+          return { state: 'free', occupied: false, issueNumber: null, recoverable: false };
+        }
+        // A permission error, an I/O error or anything else is unprovable.
+        return { state: 'ambiguous', occupied: false, issueNumber: null, reason: 'lock-unreadable' };
       }
       const lock = parseCronLock(contents);
-      if (!lock) return { occupied: false, issueNumber: null };
-      return { occupied: processIsAlive(lock.pid), issueNumber: null };
+      if (!lock) {
+        return { state: 'ambiguous', occupied: false, issueNumber: null, reason: 'lock-malformed' };
+      }
+      if (processIsAlive(lock.pid)) {
+        return { state: 'occupied', occupied: true, issueNumber: null, recoverable: false };
+      }
+      // A dead holder is recoverable under the accepted lock contract, so the
+      // slot is takeable -- reported explicitly rather than silently.
+      return { state: 'free', occupied: false, issueNumber: null, recoverable: true };
     },
 
+    /**
+     * Bounded ownership evidence.
+     *
+     * Open pull requests come from GitHub. An implementation lease, however,
+     * exists from the moment an authority is granted -- before any pull request
+     * is published -- so lease evidence is derived by the collector from the
+     * durable authority ledger rather than guessed at here. This adapter
+     * reports only what GitHub can prove.
+     */
     readOwnership({ project, profile }) {
       const pulls = this.listOpenPullRequests({ project, profile });
-      const slot = this.readImplementationSlot({ project, profile });
-      const activeLeases = [];
-      // Only a lease bound to a known issue is reportable ownership; an
-      // unattributable lock is reported through the slot instead.
-      for (const pull of pulls) {
-        if (slot.occupied && pull.issueNumber != null && slot.issueNumber === pull.issueNumber) {
-          activeLeases.push({ issueNumber: pull.issueNumber, kind: 'implementation', holder: 'implementation-lock' });
-        }
-      }
       return {
-        activeLeases,
+        activeLeases: [],
         openPullRequests: pulls
           .filter((pull) => pull.issueNumber != null && SHA_PATTERN.test(pull.headSha))
           .map((pull) => ({ number: pull.number, issueNumber: pull.issueNumber, headSha: pull.headSha })),
@@ -318,14 +430,72 @@ export function createDellManagementAdapters({
           changedPaths: [],
         },
         ci: { headSha, checks },
-        review: {
+        // Real submitted reviews and unresolved threads, bound to this exact
+        // head -- never the unreliable pull-request review-decision field.
+        review: buildReviewEvidence({
           pullRequestNumber: number,
           headSha,
-          state: reviewState(pull.review_decision ?? pull.reviewDecision ?? null),
-          findings: [],
-        },
+          reviews: ghJson(spawn, env, `/repos/${slug}/pulls/${number}/reviews`, { per_page: '50' }),
+          reviewThreads: readReviewThreads(spawn, env, slug, number),
+        }),
         ownership: { activeLeases: [], openPullRequests: [], workspace: null },
       };
+    },
+
+    /**
+     * Recently closed pull requests, so an authorised pull request that has
+     * merged remains observable after it leaves the open list.
+     *
+     * A merge is only ever read from an explicit `merged_at`; a pull request
+     * that merely disappeared is never inferred to have merged.
+     */
+    listRecentlyClosedPullRequests({ profile }) {
+      const payload = ghJson(spawn, env, `/repos/${repositorySlug(profile)}/pulls`, {
+        state: 'closed', sort: 'updated', direction: 'desc', per_page: '25',
+      });
+      if (!Array.isArray(payload)) return [];
+      return payload.filter(isPlainObject).map((pull) => ({
+        number: pull.number,
+        headSha: String(pull.head?.sha ?? '').toLowerCase(),
+        branch: String(pull.head?.ref ?? ''),
+        issueNumber: issueNumberFromBranch(pull.head?.ref),
+        merged: pull.merged_at != null,
+        mergeCommitSha: nonEmptyString(pull.merge_commit_sha) ? String(pull.merge_commit_sha).toLowerCase() : null,
+      }));
+    },
+
+    /**
+     * The newest accepted source-activation evidence record.
+     *
+     * The activation controller already writes a bounded durable record per
+     * attempt, so the observer reads that rather than requiring an operator to
+     * pass an expected SHA on every recurring cycle. Identity and outcome only:
+     * no instruction, and nothing that could authorise an activation.
+     */
+    readSourceActivationEvidence() {
+      const evidenceDir = resolveSourceActivationEvidenceDir(env);
+      let names = [];
+      try {
+        names = readdirSync(evidenceDir).filter((name) => /^activation-.*\.json$/.test(name)).sort();
+      } catch {
+        // No activation has ever been recorded on this host.
+        return null;
+      }
+      for (const name of names.reverse()) {
+        try {
+          const record = JSON.parse(readFileSync(resolve(evidenceDir, name), 'utf8'));
+          if (!isPlainObject(record) || !nonEmptyString(record.result)) continue;
+          return {
+            result: record.result,
+            requestedTarget: nonEmptyString(record.requestedTarget) ? String(record.requestedTarget).toLowerCase() : null,
+            finalHead: nonEmptyString(record.finalHead) ? String(record.finalHead).toLowerCase() : null,
+            recordedAt: nonEmptyString(record.recordedAt) ? record.recordedAt : null,
+          };
+        } catch {
+          // A malformed record is skipped in favour of an older readable one.
+        }
+      }
+      return null;
     },
 
     /**

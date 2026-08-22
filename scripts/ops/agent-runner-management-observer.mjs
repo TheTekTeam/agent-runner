@@ -100,32 +100,102 @@ function observeDependencyReadiness({ profile, issues }) {
   return transition('dependency-readiness-changed', { profile, material });
 }
 
-/** The global implementation slot, reported as whichever edge it is currently on. */
+/**
+ * The global implementation slot, reported as whichever edge it is currently on.
+ *
+ * A freed slot wakes programme reconciliation and needs no issue identity -- it
+ * says "capacity exists", not "reconcile this attempt". An occupied slot wakes
+ * *execution* reconciliation, which does need identity, so it is only emitted
+ * when the occupancy can be attributed to an issue. An ambiguous slot is not a
+ * transition at all: nothing has been proven to change.
+ */
 function observeImplementationSlot({ profile, slot }) {
-  const occupied = slot.occupied === true;
-  return transition(occupied ? 'implementation-slot-occupied' : 'implementation-slot-freed', {
+  const state = nonEmptyString(slot.state) ? slot.state : (slot.occupied === true ? 'occupied' : 'free');
+  if (state === 'ambiguous') return null;
+  if (state === 'free') {
+    return transition('implementation-slot-freed', { profile, material: { state: 'free' } });
+  }
+  if (!Number.isInteger(slot.issueNumber) || slot.issueNumber <= 0) return null;
+  return transition('implementation-slot-occupied', {
     profile,
-    issueNumber: Number.isInteger(slot.issueNumber) && slot.issueNumber > 0 ? slot.issueNumber : null,
-    material: { occupied, issueNumber: slot.issueNumber ?? null },
+    issueNumber: slot.issueNumber,
+    material: { state: 'occupied', issueNumber: slot.issueNumber },
   });
 }
 
-/** Worker ownership: the active lease set only. */
+/**
+ * Worker ownership, one transition **per lease**.
+ *
+ * An aggregate lease-set event could represent several attempts at once and
+ * could not be reconciled against any one of them, so each lease wakes
+ * execution reconciliation for its own issue.
+ */
 function observeWorkerOwnership({ profile, ownership }) {
-  const leases = [...(ownership.activeLeases ?? [])]
-    .map((lease) => ({ issueNumber: lease.issueNumber, kind: lease.kind }))
-    .sort((left, right) => left.issueNumber - right.issueNumber || left.kind.localeCompare(right.kind));
-  if (leases.length === 0) return null;
-  return transition('worker-ownership-changed', { profile, material: leases });
+  const results = [];
+  for (const lease of ownership.activeLeases ?? []) {
+    if (!Number.isInteger(lease.issueNumber) || lease.issueNumber <= 0) continue;
+    results.push(transition('worker-ownership-changed', {
+      profile,
+      issueNumber: lease.issueNumber,
+      material: { issueNumber: lease.issueNumber, kind: lease.kind },
+    }));
+  }
+  return results;
 }
 
-/** The open pull-request set, by identity only. */
-function observePullRequestPublication({ profile, ownership }) {
-  const pulls = [...(ownership.openPullRequests ?? [])]
-    .map((pull) => ({ number: pull.number, issueNumber: pull.issueNumber ?? null }))
-    .sort((left, right) => left.number - right.number);
-  if (pulls.length === 0) return null;
-  return transition('pull-request-published', { profile, material: pulls });
+/**
+ * One publication transition **per pull request**, never one for the set.
+ *
+ * An execution wake must name exactly the attempt it belongs to: an aggregate
+ * event cannot be reconciled against a specific authority, and resolving it
+ * would mean picking an arbitrary one. A pull request that carries no issue
+ * identity therefore produces no event at all rather than an unresolvable one.
+ */
+function observePullRequestPublications({ profile, ownership }) {
+  const results = [];
+  for (const pull of ownership.openPullRequests ?? []) {
+    if (pull.issueNumber == null) continue;
+    results.push(transition('pull-request-published', {
+      profile,
+      issueNumber: pull.issueNumber,
+      pullRequestNumber: pull.number,
+      sha: nonEmptyString(pull.headSha) && SHA_PATTERN.test(String(pull.headSha).toLowerCase())
+        ? String(pull.headSha).toLowerCase()
+        : null,
+      material: { pullRequestNumber: pull.number, issueNumber: pull.issueNumber },
+    }));
+  }
+  return results;
+}
+
+/**
+ * Accepted merge evidence for an authorised pull request that has already left
+ * the open list.
+ *
+ * A merge is read only from explicit merged evidence. A pull request that
+ * merely disappeared from the open set is never inferred to have merged.
+ */
+function observeMergedPullRequests({ profile, closedPulls }) {
+  const results = [];
+  for (const pull of closedPulls ?? []) {
+    if (pull.merged !== true) continue;
+    if (pull.issueNumber == null) continue;
+    results.push(transition('merge-evidence-accepted', {
+      profile,
+      issueNumber: pull.issueNumber,
+      pullRequestNumber: pull.number,
+      sha: nonEmptyString(pull.mergeCommitSha) && SHA_PATTERN.test(String(pull.mergeCommitSha).toLowerCase())
+        ? String(pull.mergeCommitSha).toLowerCase()
+        : null,
+      material: {
+        pullRequestNumber: pull.number,
+        issueNumber: pull.issueNumber,
+        merged: true,
+        mergeCommitSha: pull.mergeCommitSha ?? null,
+      },
+    }));
+  }
+  return results;
 }
 
 /** One transition per authorised pull request whose exact head moved. */
@@ -133,9 +203,12 @@ function observePullRequestHeads({ profile, ownership }) {
   const results = [];
   for (const pull of ownership.openPullRequests ?? []) {
     if (!nonEmptyString(pull.headSha) || !SHA_PATTERN.test(String(pull.headSha).toLowerCase())) continue;
+    // An execution wake must name its attempt; an unattributable pull request
+    // produces no event rather than an unresolvable one.
+    if (pull.issueNumber == null) continue;
     results.push(transition('pull-request-head-changed', {
       profile,
-      issueNumber: pull.issueNumber ?? null,
+      issueNumber: pull.issueNumber,
       pullRequestNumber: pull.number,
       sha: String(pull.headSha).toLowerCase(),
       material: { pullRequestNumber: pull.number, headSha: String(pull.headSha).toLowerCase() },
@@ -153,12 +226,15 @@ function observePullRequestHeads({ profile, ownership }) {
 function observeAttempt({ profile, pull, attempt }) {
   const results = [];
   if (!isPlainObject(attempt)) return results;
+  // Every transition below wakes execution reconciliation, which resolves an
+  // exact authority by issue. Without that identity, emit nothing.
+  if (pull.issueNumber == null) return results;
 
   const publication = attempt.publication ?? null;
   if (isPlainObject(publication)) {
     results.push(transition('implementation-published', {
       profile,
-      issueNumber: pull.issueNumber ?? null,
+      issueNumber: pull.issueNumber,
       pullRequestNumber: pull.number,
       sha: nonEmptyString(publication.headSha) ? String(publication.headSha).toLowerCase() : null,
       material: { attemptId: publication.attemptId, headSha: publication.headSha, completionState: publication.completionState },
@@ -197,7 +273,7 @@ function observeAttempt({ profile, pull, attempt }) {
   if (isPlainObject(review) && ACTIONABLE_REVIEW_STATES.has(review.state)) {
     results.push(transition('review-actionable', {
       profile,
-      issueNumber: pull.issueNumber ?? null,
+      issueNumber: pull.issueNumber,
       pullRequestNumber: pull.number,
       sha: nonEmptyString(review.headSha) ? String(review.headSha).toLowerCase() : null,
       material: {
@@ -215,7 +291,7 @@ function observeAttempt({ profile, pull, attempt }) {
   if (isPlainObject(pullRequest) && pullRequest.state === 'merged') {
     results.push(transition('merge-evidence-accepted', {
       profile,
-      issueNumber: pull.issueNumber ?? null,
+      issueNumber: pull.issueNumber,
       pullRequestNumber: pull.number,
       sha: nonEmptyString(pullRequest.headSha) ? String(pullRequest.headSha).toLowerCase() : null,
       material: { pullRequestNumber: pull.number, state: pullRequest.state, headSha: pullRequest.headSha },
@@ -224,8 +300,30 @@ function observeAttempt({ profile, pull, attempt }) {
   return results;
 }
 
-/** Accepted source-activation evidence: the active revision, read only. */
-function observeSourceActivation({ profile, sourceSha, expectedSourceSha }) {
+/**
+ * Accepted source-activation evidence.
+ *
+ * Read from the durable record the activation controller already writes, so a
+ * recurring production cycle needs no operator-supplied expected SHA. The
+ * transition distinguishes applied from refused and names the exact target; it
+ * carries no instruction and can never authorise an activation.
+ */
+function observeSourceActivation({ profile, sourceSha, activation, expectedSourceSha }) {
+  if (isPlainObject(activation) && nonEmptyString(activation.result)) {
+    const applied = activation.result === 'activated' || activation.result === 'already-active';
+    return transition('source-activation-settled', {
+      profile,
+      sha: nonEmptyString(activation.finalHead) && SHA_PATTERN.test(activation.finalHead) ? activation.finalHead : sourceSha,
+      material: {
+        result: activation.result,
+        applied,
+        requestedTarget: activation.requestedTarget ?? null,
+        finalHead: activation.finalHead ?? null,
+      },
+    });
+  }
+  // Fall back to an explicitly supplied expectation when no durable record
+  // exists yet; with neither, nothing about activation has been observed.
   if (!nonEmptyString(expectedSourceSha)) return null;
   return transition('source-activation-settled', {
     profile,
@@ -278,14 +376,24 @@ export function observeMaterialTransitions({
   const ownership = adapters.readOwnership({ project, profile }) ?? { activeLeases: [], openPullRequests: [] };
   const slot = adapters.readImplementationSlot({ project, profile }) ?? {};
 
+  // Accepted merge evidence outlives the open-pull-request list, so a merged
+  // pull request stays observable after it closes.
+  const closedPulls = typeof adapters.listRecentlyClosedPullRequests === 'function'
+    ? (adapters.listRecentlyClosedPullRequests({ project, profile }) ?? []).slice(0, 50)
+    : [];
+  const activation = typeof adapters.readSourceActivationEvidence === 'function'
+    ? adapters.readSourceActivationEvidence({ project, profile })
+    : null;
+
   const transitions = [
     observeQueueEvidence({ profile, issues }),
     observeDependencyReadiness({ profile, issues }),
     observeImplementationSlot({ profile, slot }),
-    observeWorkerOwnership({ profile, ownership }),
-    observePullRequestPublication({ profile, ownership }),
+    ...observeWorkerOwnership({ profile, ownership }),
+    ...observePullRequestPublications({ profile, ownership }),
     ...observePullRequestHeads({ profile, ownership }),
-    observeSourceActivation({ profile, sourceSha, expectedSourceSha }),
+    ...observeMergedPullRequests({ profile, closedPulls }),
+    observeSourceActivation({ profile, sourceSha, activation, expectedSourceSha }),
   ];
 
   for (const pull of ownership.openPullRequests ?? []) {

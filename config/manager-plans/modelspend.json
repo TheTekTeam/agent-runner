@@ -17,7 +17,7 @@
       "Subscription quota headroom is the only provider admission signal"
     ],
     "nonGoals": [
-      "Autonomous merge, deployment, issue closure or source activation",
+      "Autonomous integration, release, issue closure or checkout activation without a separately accepted contract",
       "Any ModelSpend-specific management timer or separately metered paid fallback"
     ],
     "architectureSummary": "ModelSpend is managed through the shared Agent Runner project registry, manager profile, durable management event ledger and bounded queue, authority and settlement transitions.",

@@ -67,8 +67,27 @@ const EVIDENCE_FIELDS = new Set([
 
 const SHA_PATTERN = /^[0-9a-f]{40}$/;
 
+/**
+ * The bounded states the one global implementation slot may be proven to be in.
+ * `ambiguous` exists so an unreadable or malformed lock can never be mistaken
+ * for a free slot.
+ */
+export const IMPLEMENTATION_SLOT_STATES = Object.freeze(['free', 'occupied', 'ambiguous']);
+
 function fail(message) {
   throw new Error(`Refusing agent runner programme reconciliation: ${message}`);
+}
+
+/**
+ * Resolve the proven slot state. A collector that reports only the older
+ * boolean is honoured for `occupied`, but a bare `false` is *not* accepted as
+ * proof of a free slot -- it must say so explicitly.
+ */
+function resolveSlotState(collected) {
+  const slot = collected.implementationSlot;
+  if (!isPlainObject(slot)) return null;
+  if (nonEmptyString(slot.state)) return slot.state;
+  return slot.occupied === true ? 'occupied' : null;
 }
 
 function boundedDelay(value) {
@@ -123,8 +142,14 @@ function validateCollectedEvidence(collected) {
   if (!nonEmptyString(collected.sourceSha) || !SHA_PATTERN.test(collected.sourceSha)) {
     fail('collected evidence sourceSha must be an exact 40-character lowercase commit SHA');
   }
-  if (!isPlainObject(collected.implementationSlot) || typeof collected.implementationSlot.occupied !== 'boolean') {
-    fail('collected evidence implementationSlot.occupied must be a boolean');
+  // The global slot is a tri-state. "Unprovable" must never read as "free":
+  // an unreadable or malformed lock is ambiguous, and ambiguity blocks a new
+  // authority just as firmly as an occupied slot does.
+  if (!isPlainObject(collected.implementationSlot)) {
+    fail('collected evidence implementationSlot must be an object');
+  }
+  if (!IMPLEMENTATION_SLOT_STATES.includes(resolveSlotState(collected))) {
+    fail(`collected evidence implementationSlot.state must be one of: ${IMPLEMENTATION_SLOT_STATES.join(', ')}`);
   }
   if (!isPlainObject(collected.quotaAdmission)) fail('collected evidence quotaAdmission must be an object');
   return collected;
@@ -255,6 +280,7 @@ export function runProgrammeReconciliation({
   // for anything except identity.
   const collected = validateCollectedEvidence(capabilities.ports.collectEvidence({ event }));
   const { queueEvidence } = collected;
+  const slotState = resolveSlotState(collected);
   assertIdentityBinding(event, queueEvidence);
 
   const curation = curateManagerQueue(queueEvidence);
@@ -299,13 +325,20 @@ export function runProgrammeReconciliation({
     outcome = 'delayed-retry';
     reason = 'mutation-incomplete';
     successors.push({ eventType: 'programme-reconcile-required', notBefore: delayedFrom(now, delayMs) });
-  } else if (collected.implementationSlot.occupied) {
+  } else if (slotState === 'occupied') {
     // Work is already in flight globally. Follow it through rather than
     // selecting anything new: the one-global-implementation-slot invariant is
     // never widened here.
     outcome = 'execution-required';
     reason = 'implementation-slot-occupied';
     successors.push({ eventType: 'execution-reconcile-required' });
+  } else if (slotState === 'ambiguous') {
+    // The slot could not be proven free. Issuing an authority here could put a
+    // second implementation into a slot that is already held, so this fails
+    // closed into a bounded delayed retry instead.
+    outcome = 'delayed-retry';
+    reason = 'implementation-slot-ambiguous';
+    successors.push({ eventType: 'programme-reconcile-required', notBefore: delayedFrom(now, delayMs) });
   } else if (deferred) {
     outcome = 'delayed-retry';
     reason = 'active-ownership-collision';

@@ -43,7 +43,7 @@ import {
   stableJson,
 } from './agent-runner-manager-planner-safety.mjs';
 
-export const MANAGEMENT_CONTROL_STORE_SCHEMA_VERSION = 2;
+export const MANAGEMENT_CONTROL_STORE_SCHEMA_VERSION = 3;
 
 /** The bounded signals the control plane records for operators and the dashboard. */
 export const MANAGEMENT_OBSERVATION_SIGNALS = Object.freeze([
@@ -283,6 +283,27 @@ const MIGRATIONS = Object.freeze({
 
       CREATE INDEX IF NOT EXISTS management_authority_ledger_project_idx
         ON management_authority_ledger(project_id, issue_number, authority_key);
+  `,
+  3: `
+      -- The exact inputs one authority was issued from.
+      --
+      -- An issued authority can only be rebuilt by re-running the accepted #267
+      -- issuance transition, and its key depends on the curation fingerprint --
+      -- which moves as soon as anything in the queue changes. Reproducing an
+      -- authority from *current* evidence is therefore impossible in practice.
+      -- Pinning the issuance inputs makes reproduction exact and permanent:
+      -- issuance is a pure function, so the same inputs always yield the same
+      -- authority however far the live queue has since moved.
+      CREATE TABLE IF NOT EXISTS management_authority_issuance (
+        authority_key TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        issue_number INTEGER NOT NULL,
+        snapshot TEXT NOT NULL,
+        recorded_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS management_authority_issuance_project_idx
+        ON management_authority_issuance(project_id, issue_number, authority_key);
   `,
 });
 
@@ -843,6 +864,40 @@ export class ManagementControlStore {
       ON CONFLICT(authority_key) DO UPDATE SET state = excluded.state, updated_at = excluded.updated_at
     `).run(key, fingerprint, project, repo, issue, branch, base, state, timestamp, timestamp);
     return Object.freeze({ recorded: Number(result.changes) >= 1, authorityKey: key });
+  }
+
+  /**
+   * Pin the exact inputs an authority was issued from, so it can be reproduced
+   * later regardless of how the live queue has moved.
+   */
+  recordAuthorityIssuance({ authorityKey, projectId, issueNumber, snapshot, now = this.now() } = {}) {
+    const key = requiredId(authorityKey, 'management authority key');
+    const project = requiredId(projectId, 'management authority projectId');
+    const issue = optionalPositiveInteger(issueNumber, 'management authority issueNumber');
+    if (issue === null) throw new Error('management authority issueNumber is required');
+    if (!isPlainObject(snapshot)) throw new Error('management authority issuance snapshot must be an object');
+    const serialized = stableJson(snapshot);
+    if (serialized.length > 512_000) throw new Error('management authority issuance snapshot exceeds the bounded size');
+    const timestamp = iso(now, 'management authority issuance timestamp');
+    this.db.prepare(`
+      INSERT INTO management_authority_issuance(authority_key, project_id, issue_number, snapshot, recorded_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(authority_key) DO NOTHING
+    `).run(key, project, issue, serialized, timestamp);
+    return Object.freeze({ recorded: true, authorityKey: key });
+  }
+
+  getAuthorityIssuance(authorityKey) {
+    const key = requiredId(authorityKey, 'management authority key');
+    const row = this.db.prepare('SELECT * FROM management_authority_issuance WHERE authority_key = ?').get(key);
+    if (!row) return null;
+    return Object.freeze({
+      authorityKey: row.authority_key,
+      projectId: row.project_id,
+      issueNumber: Number(row.issue_number),
+      snapshot: JSON.parse(row.snapshot),
+      recordedAt: row.recorded_at,
+    });
   }
 
   /** The bounded `ledger.issued` input the accepted #267 issuance transition expects. */

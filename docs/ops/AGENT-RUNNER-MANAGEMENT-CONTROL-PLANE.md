@@ -254,11 +254,15 @@ the object identity — never from the caller's correlation id. So:
 - it cannot be defeated by correlating the same observation differently;
 - it survives a restart, because it is persisted rather than in memory.
 
-The event and its fingerprint are written in **one shared SQLite transaction**
-(which is why the event ledger and the control store are opened on one
-connection by `openManagementStores()`). A fingerprint is therefore never marked
-accepted before its event is durably stored, and a failed enqueue rolls the
-fingerprint back — so a transient failure can never permanently suppress
+The comparison, the enqueue and the fingerprint advance all happen **inside one
+`BEGIN IMMEDIATE` transaction** (which is why the event ledger and the control
+store are opened on one connection by `openManagementStores()`). Reading the
+fingerprint before the transaction would leave a time-of-check window in which
+two overlapping production processes both saw the old value and both enqueued;
+taking the write lock first serialises them, so the second re-reads, sees the
+first's committed fingerprint and suppresses. A fingerprint is therefore never
+marked accepted before its event is durably stored, and a failed enqueue rolls
+the fingerprint back — so a transient failure can never permanently suppress
 required work. Genuinely new evidence still produces a wake; the ledger's own
 coalescing then decides whether that wake merges into one already pending.
 
@@ -392,12 +396,36 @@ the curated issue bodies, quota headroom, the global implementation slot, the
 persisted authority ledger, the approved execution selection, the manager
 producer identity, and one candidate request per bound plan item.
 
-**execution** — the exact authority, reconstructed deterministically and then
-**checked against the persisted ledger**, so only an authority this control
-plane actually issued can be rebuilt and a moved base fails closed; plus
-publication, pull-request identity and exact head, exact-head checks, review
-state, the previous lifecycle settlement and the projection context. No live
-authority for an identity is a legitimate `no-op`, not a failure.
+**execution** — the exact authority, rebuilt from its **pinned issuance
+snapshot** and then proven against the persisted ledger; plus publication,
+pull-request identity and exact head, exact-head checks, real review state, the
+previous lifecycle settlement and the projection context.
+
+Two identity rules govern this collector:
+
+- *Exact attempt or nothing.* An execution wake must name its issue. An event
+  with no issue identity, or an issue carrying more than one live grant, is
+  refused as `ambiguous-attempt-identity` and settles **blocked** — it is never
+  resolved by taking the first authority from the ledger.
+- *Exact pull request and head.* `event.pullRequestNumber` is passed into the
+  attempt read, and whatever comes back must reproduce the pull request, issue
+  and head the event named. A substituted pull request or a read taken at
+  another head is `attempt-identity-mismatch` and settles blocked, never a
+  silent substitution.
+
+No live authority for an identity remains a legitimate `no-op`.
+
+### Why issuance is pinned
+
+An authority's key depends on the curation fingerprint, which moves whenever
+anything in the queue changes. Re-deriving an authority from *current* evidence
+would therefore stop working the moment the queue moved — including when the
+attempt's own grant took a lease on its issue. So at publication the exact
+inputs the #267 transition consumed are persisted in
+`management_authority_issuance`, and execution replays them through the same
+validators. Issuance is a pure function, so the replay reproduces the identical
+authority however far the live queue has since moved, and the rebuilt key is
+checked against the ledger before it is used.
 
 **assurance** — its own independent read-only observation, gathered separately
 so the auditor never reads the derived state it is auditing.
@@ -406,6 +434,34 @@ so the auditor never reads the derived state it is auditing.
 `gh`, the accepted quota-only admission gate, the implementation lock, host
 identity). Every adapter is injected, so the focused tests drive this same
 production code with bounded fakes rather than a parallel path.
+
+**The implementation slot is a tri-state.** "I could not read the lock" must
+never look like "the slot is free", so only a genuinely absent lock — or a
+well-formed lock whose holder is gone, which the accepted lock contract treats
+as recoverable — reports `free`. An unreadable or malformed lock reports
+`ambiguous`, and programme reconciliation refuses to issue any authority while
+the slot is ambiguous, taking a bounded delayed retry instead.
+
+**Ownership includes pre-publication work.** An authority holds its issue from
+the moment it is granted, before any pull request exists. GitHub cannot see
+that, so the implementation lease is derived from the durable authority ledger
+and merged with the ownership GitHub can prove — otherwise an active worker
+would be invisible and the curator could hand its issue to a second attempt.
+
+**Review evidence is real.** The pull-request review-decision field is not
+consulted. Submitted reviews and unresolved review threads are read and reduced
+with the accepted review-follow-up semantics, and reviews are filtered to the
+**exact current head** first — so an approval of an earlier commit can never
+approve current code; it simply leaves the head `pending`. Only bounded finding
+identity is produced; no review prose ever reaches management state.
+
+**Merge and activation are read from durable evidence.** A merged pull request
+leaves the open list, so recently-closed pull requests are read too and a merge
+is recognised only from explicit merged evidence — a pull request that merely
+disappeared is never inferred to have merged. Source activation is read from the
+bounded record the activation controller already writes, so a recurring
+production cycle needs no operator-supplied expected SHA and can distinguish
+applied from refused.
 
 ### The management plan document
 
@@ -418,6 +474,11 @@ directory scan, no provider call, no network. Everything revision-dependent (the
 source SHA, evidence timestamps, live queue state) is injected at read time, so a
 checked-in document can never pin a stale base. A project with no registered plan
 is simply not planned yet, and nothing is reconciled for it.
+
+Two projects are registered: `agent-runner` and `modelspend`. That is what lets
+the second-project shadow acceptance gate run without a further repository
+change, and a focused test validates every registered plan against its
+registered profile.
 
 ## Supervised shadow acceptance, after merge
 
