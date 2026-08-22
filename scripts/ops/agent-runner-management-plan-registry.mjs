@@ -46,6 +46,7 @@ export const MANAGEMENT_PLAN_SCHEMA_VERSION = 'agent-runner-management-plan/v1';
  */
 export const MANAGEMENT_PLAN_REGISTRY = Object.freeze([
   Object.freeze({ projectId: 'agent-runner', configPath: '../../config/manager-plans/agent-runner.json' }),
+  Object.freeze({ projectId: 'modelspend', configPath: '../../config/manager-plans/modelspend.json' }),
 ]);
 
 const TOP_LEVEL_FIELDS = new Set([
