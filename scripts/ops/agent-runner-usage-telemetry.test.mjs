@@ -49,7 +49,7 @@ test('#194: malformed negative or unbounded numeric values normalize to unknown'
   assert.equal(result.telemetryAvailability, 'unavailable');
 });
 
-test('#194: Claude aggregate and TTL cache evidence normalizes without session/raw fields', () => {
+test('#194: Claude aggregate and current Anthropic TTL cache evidence normalizes without session/raw fields', () => {
   const result = normalizeClaudeUsageEfficiency({
     model: 'sonnet',
     promptCacheMetadata: { cacheStrategy: 'provider-managed', stablePrefixFingerprint: FP },
@@ -59,8 +59,8 @@ test('#194: Claude aggregate and TTL cache evidence normalizes without session/r
       cache_read_input_tokens: 600,
       cache_creation_input_tokens: 300,
       cache_creation: {
-        cache_creation_5m_input_tokens: 200,
-        cache_creation_1h_input_tokens: 100,
+        ephemeral_5m_input_tokens: 200,
+        ephemeral_1h_input_tokens: 100,
       },
       session_id: 'restricted-session',
       prompt: 'secret prompt',
