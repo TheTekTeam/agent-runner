@@ -1,0 +1,82 @@
+{
+  "schemaVersion": "agent-runner-management-plan/v1",
+  "projectId": "modelspend",
+  "tooling": {
+    "languages": ["typescript", "javascript"],
+    "packageManagers": ["pnpm"],
+    "buildTools": ["turbo", "node"],
+    "workflows": ["github-actions"]
+  },
+  "acceptanceCommands": ["npm run validate:thorough"],
+  "brief": {
+    "objective": "Keep the ModelSpend backlog truthful and dependency-correct while the event-driven Build Manager is proven in supervised shadow mode.",
+    "outcome": "ModelSpend can participate in the same durable programme, execution and assurance reconciliation graph as Agent Runner without a project-specific scheduler.",
+    "constraints": [
+      "Dell is the sole scheduler and controller",
+      "One global implementation slot is shared across registered projects",
+      "Subscription quota headroom is the only provider admission signal"
+    ],
+    "nonGoals": [
+      "Autonomous integration, release, issue closure or checkout activation without a separately accepted contract",
+      "Any ModelSpend-specific management timer or separately metered paid fallback"
+    ],
+    "architectureSummary": "ModelSpend is managed through the shared Agent Runner project registry, manager profile, durable management event ledger and bounded queue, authority and settlement transitions.",
+    "risks": [
+      "The live backlog may contain historical labels or dependencies that shadow reconciliation must surface before active mutation",
+      "A collector outage or ambiguous quota state must fail closed rather than infer readiness"
+    ],
+    "assumptions": [
+      "The ModelSpend checkout and GitHub repository identity match the registered project configuration",
+      "The registered ModelSpend manager profile remains current"
+    ],
+    "blockers": [],
+    "escalationQuestions": [
+      "Which backlog changes would materially alter the ModelSpend product boundary rather than merely reconcile engineering state?"
+    ],
+    "definitionOfDone": [
+      "Shadow reconciliation produces bounded deterministic status for ModelSpend",
+      "No ModelSpend mutation occurs while the management control plane is in shadow mode",
+      "Repository validation and exact-head checks are green before any later active cutover"
+    ]
+  },
+  "milestones": [
+    {
+      "id": "management-shadow-acceptance",
+      "title": "ModelSpend management shadow acceptance",
+      "description": "Prove the shared event-driven management graph against live bounded ModelSpend evidence without competing mutation authority.",
+      "dependsOn": []
+    }
+  ],
+  "proposedIssues": [
+    {
+      "id": "shadow-equivalence-evidence",
+      "milestoneId": "management-shadow-acceptance",
+      "title": "Record bounded ModelSpend shadow equivalence evidence",
+      "scope": "Collect and record bounded comparison evidence showing how the event-driven management graph classifies the current ModelSpend queue while the existing external management tasks remain authoritative.",
+      "acceptanceCriteria": [
+        "A deterministic ModelSpend status projection is recorded from live bounded evidence",
+        "Shadow decisions perform no queue mutation or worker-authority publication",
+        "Repeated unchanged evidence is durably deduplicated"
+      ],
+      "decisionType": "implementation"
+    }
+  ],
+  "planBlockers": [],
+  "escalations": [],
+  "execution": {
+    "adapter": "claude-code-cli",
+    "capabilityProfile": "complex",
+    "model": "claude-opus-5",
+    "effort": "high"
+  },
+  "request": {
+    "branchPrefix": "claude/",
+    "scope": [
+      "Implement only the selected bounded ModelSpend issue on the authorised branch and existing pull-request lineage."
+    ],
+    "stopConditions": [
+      "Stop and report if the accepted base commit changes.",
+      "Stop and report if required validation fails or authoritative evidence is ambiguous."
+    ]
+  }
+}

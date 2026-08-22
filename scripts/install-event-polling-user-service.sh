@@ -11,6 +11,8 @@ Usage:
     [--enable]
 
 Installs the read-only GitHub polling/CI-settlement user service and timer.
+The same generic service may also drain due management events; its event-driven
+wake is configured to nudge this existing oneshot unit after a durable enqueue.
 No token or webhook secret is written by this script.
 USAGE
 }
@@ -19,6 +21,7 @@ AGENT_RUNNER_HOME=""
 PROJECT_REGISTRY=""
 CONTROLLER_DB="${HOME}/.local/state/agent-runner/controller/controller.sqlite"
 ENABLE=0
+MANAGEMENT_WAKE_UNIT="agent-runner-event-polling.service"
 
 while (($#)); do
   case "$1" in
@@ -66,6 +69,7 @@ AGENT_RUNNER_HOME="$(realpath "$AGENT_RUNNER_HOME")"
 PROJECT_REGISTRY="$(realpath "$PROJECT_REGISTRY")"
 [[ -d "$AGENT_RUNNER_HOME/.git" ]] || fail 'agent runner home is not a git checkout'
 [[ -f "$AGENT_RUNNER_HOME/scripts/ops/agent-runner-polling-controller-cycle.mjs" ]] || fail 'polling controller command is missing'
+[[ -f "$AGENT_RUNNER_HOME/scripts/ops/agent-runner-management-cycle-command.mjs" ]] || fail 'management controller command is missing'
 [[ -f "$PROJECT_REGISTRY" ]] || fail 'project registry file is missing'
 command -v node >/dev/null 2>&1 || fail 'node is not installed'
 command -v gh >/dev/null 2>&1 || fail 'gh is not installed'
@@ -92,11 +96,13 @@ cat >"$ENV_FILE" <<EOF
 AGENT_RUNNER_HOME=$AGENT_RUNNER_HOME
 AGENT_RUNNER_PROJECT_REGISTRY=$PROJECT_REGISTRY
 AGENT_RUNNER_CONTROLLER_DB=$CONTROLLER_DB
+AGENT_RUNNER_MANAGEMENT_WAKE_UNIT=$MANAGEMENT_WAKE_UNIT
 EOF
 chmod 600 "$ENV_FILE"
 
 node "$AGENT_RUNNER_HOME/scripts/ops/agent-runner-event-controller-cycle.mjs" --help >/dev/null
 node "$AGENT_RUNNER_HOME/scripts/ops/agent-runner-polling-controller-cycle.mjs" --help >/dev/null
+node "$AGENT_RUNNER_HOME/scripts/ops/agent-runner-management-cycle-command.mjs" --help >/dev/null
 systemctl --user daemon-reload
 
 if [[ "$ENABLE" -eq 1 ]]; then
@@ -107,6 +113,7 @@ fi
 printf 'agent_runner_home=%s\n' "$AGENT_RUNNER_HOME"
 printf 'project_registry=%s\n' "$PROJECT_REGISTRY"
 printf 'controller_db=%s\n' "$CONTROLLER_DB"
+printf 'management_wake_unit=%s\n' "$MANAGEMENT_WAKE_UNIT"
 printf 'timer_enabled=%s\n' "$(systemctl --user is-enabled agent-runner-event-polling.timer 2>/dev/null || true)"
 printf 'timer_active=%s\n' "$(systemctl --user is-active agent-runner-event-polling.timer 2>/dev/null || true)"
 printf 'service_result=%s\n' "$(systemctl --user show agent-runner-event-polling.service --property=Result --value 2>/dev/null || true)"

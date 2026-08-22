@@ -25,6 +25,13 @@
     "merge:execute": "node scripts/ops/agent-runner-merge-transaction-command.mjs",
     "reconcile:issue": "node scripts/ops/agent-runner-issue-reconciliation-command.mjs",
     "reconcile:attention": "node scripts/ops/agent-runner-attention-reconcile-command.mjs",
-    "scheduler:reentry": "node scripts/ops/agent-runner-scheduler-reentry-command.mjs"
+    "scheduler:reentry": "node scripts/ops/agent-runner-scheduler-reentry-command.mjs",
+    "management:run": "node scripts/ops/agent-runner-management-cycle-command.mjs",
+    "management:status": "node scripts/ops/agent-runner-management-control-command.mjs status",
+    "management:mode": "node scripts/ops/agent-runner-management-control-command.mjs mode",
+    "management:fence": "node scripts/ops/agent-runner-management-control-command.mjs fence",
+    "management:recover": "node scripts/ops/agent-runner-management-control-command.mjs recover",
+    "management:field-acceptance": "node scripts/ops/agent-runner-management-control-command.mjs field-acceptance",
+    "management:cutover": "node scripts/ops/agent-runner-management-control-command.mjs cutover"
   }
 }

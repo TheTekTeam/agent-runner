@@ -1,0 +1,81 @@
+{
+  "schemaVersion": "agent-runner-management-plan/v1",
+  "projectId": "agent-runner",
+  "tooling": {
+    "languages": ["javascript"],
+    "packageManagers": ["npm"],
+    "buildTools": ["node"],
+    "workflows": ["github-actions"]
+  },
+  "acceptanceCommands": ["npm test", "npm run validate"],
+  "brief": {
+    "objective": "Keep the Agent Runner harness advancing through bounded, event-driven management reconciliation for explicitly registered projects.",
+    "outcome": "Each accepted slice of Agent Runner work is planned, curated, authorised and settled through durable management events rather than a periodic management task.",
+    "constraints": [
+      "One explicitly registered project per management profile",
+      "One global implementation slot",
+      "Subscription quota headroom is the only admission signal"
+    ],
+    "nonGoals": [
+      "Concurrency expansion beyond the single implementation slot",
+      "Any separately metered paid execution path"
+    ],
+    "architectureSummary": "Node.js modules under scripts/ops validated with node:test, a bounded SQLite control plane under XDG state, and durable management events that wake deterministic role handlers.",
+    "risks": [
+      "Queue evidence can go stale between reconciliations if the accepted base revision moves",
+      "A collector outage leaves reconciliation on bounded delayed retry"
+    ],
+    "assumptions": [
+      "Evidence is collected at the exact accepted source revision",
+      "The registered manager profile is current"
+    ],
+    "blockers": [],
+    "escalationQuestions": [
+      "Which proposed work is a product decision rather than an implementation decision?"
+    ],
+    "definitionOfDone": [
+      "Focused tests pass",
+      "Repository validation passes",
+      "Exact-head checks are green"
+    ]
+  },
+  "milestones": [
+    {
+      "id": "control-plane-acceptance",
+      "title": "Event-driven control plane acceptance",
+      "description": "Prove the durable management graph against live bounded evidence under supervised shadow observation.",
+      "dependsOn": []
+    }
+  ],
+  "proposedIssues": [
+    {
+      "id": "shadow-equivalence-evidence",
+      "milestoneId": "control-plane-acceptance",
+      "title": "Record bounded shadow equivalence evidence for the management control plane",
+      "scope": "Collect and record bounded comparison evidence between the shadow management decisions and the current external management behaviour for each registered project.",
+      "acceptanceCriteria": [
+        "Bounded shadow decisions are recorded for every registered project",
+        "Comparison evidence is reproducible from persisted control-plane state"
+      ],
+      "decisionType": "implementation"
+    }
+  ],
+  "planBlockers": [],
+  "escalations": [],
+  "execution": {
+    "adapter": "claude-code-cli",
+    "capabilityProfile": "complex",
+    "model": "claude-opus-5",
+    "effort": "high"
+  },
+  "request": {
+    "branchPrefix": "claude/",
+    "scope": [
+      "Implement the proposed slice with focused deterministic tests."
+    ],
+    "stopConditions": [
+      "Stop and report if the accepted base commit changes.",
+      "Stop and report if required validation fails or evidence is ambiguous."
+    ]
+  }
+}

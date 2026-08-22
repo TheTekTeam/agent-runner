@@ -12,6 +12,7 @@ This private repository is the canonical home of the reusable Agent Runner imple
 
 - For manager preflight packets, packet revision/fingerprint, body digest, authority keys, or repository/branch dispatch, read [`docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-CODE-MAP.md`](docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-CODE-MAP.md) before searching source.
 - The runner and implementation workers never create, refresh or revoke manager authority: they validate manager-authored packets and compute the full comment-body digest. The only in-repository producer is the deterministic Build Manager authority transition (`#267`, `scripts/ops/agent-runner-manager-worker-authority.mjs`), which runs in the manager domain and can never consume the authority it issues — see [`docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-REVIEW.md`](docs/ops/AGENT-RUNNER-MANAGER-AUTHORITY-REVIEW.md).
+- For the event-driven management control plane (management events, programme/execution/assurance roles, control modes, shadow/fencing, status projection, field acceptance or cutover/rollback), read [`docs/ops/AGENT-RUNNER-MANAGEMENT-CONTROL-PLANE.md`](docs/ops/AGENT-RUNNER-MANAGEMENT-CONTROL-PLANE.md) before searching source. Management progression is event-driven: there is no manager cron and no per-role or per-project management timer.
 - For a known issue, fetch that issue and its comments directly. Do not scan the full queue or preload unrelated runner history.
 
 ## Assignment policy
