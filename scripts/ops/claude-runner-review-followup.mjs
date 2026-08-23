@@ -13,6 +13,29 @@
 // the linkage text.
 const LINKED_ISSUE_PATTERN = /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?|implement(?:s|ed|ing)?)\s*:?\s*#(\d+)/gi;
 
+/**
+ * #242: which review authors may supply *executable* correction input.
+ *
+ * Detection/reporting (the accepted #188 semantics) stays deliberately wide:
+ * any unresolved thread still blocks new issue work, because a conservative
+ * block is always safe. Execution is the opposite -- a write-capable provider
+ * run under someone else's manager authority must not be triggerable by an
+ * arbitrary GitHub account that can comment on a public PR. GitHub's own
+ * author association is the existing, already-authoritative signal for "this
+ * person has write standing on this repository", so it is reused here rather
+ * than inventing a parallel allowlist.
+ */
+export const TRUSTED_REVIEW_AUTHOR_ASSOCIATIONS = Object.freeze(['OWNER', 'MEMBER', 'COLLABORATOR']);
+
+export function reviewAuthorAssociation(record) {
+  const raw = record?.authorAssociation ?? record?.author_association ?? null;
+  return raw === null || raw === undefined ? null : String(raw).toUpperCase();
+}
+
+export function isTrustedReviewAuthor(record) {
+  return TRUSTED_REVIEW_AUTHOR_ASSOCIATIONS.includes(reviewAuthorAssociation(record) || '');
+}
+
 function latestReviewStatePerAuthor(reviews = []) {
   const latestByAuthor = new Map();
   for (const review of reviews) {
@@ -20,7 +43,13 @@ function latestReviewStatePerAuthor(reviews = []) {
     const submittedAt = review?.submitted_at || review?.submittedAt || review?.createdAt || null;
     const existing = latestByAuthor.get(author);
     if (!existing || new Date(submittedAt || 0) >= new Date(existing.submittedAt || 0)) {
-      latestByAuthor.set(author, { author, state: review?.state || null, body: review?.body || '', submittedAt });
+      latestByAuthor.set(author, {
+        author,
+        state: review?.state || null,
+        body: review?.body || '',
+        submittedAt,
+        authorAssociation: reviewAuthorAssociation(review),
+      });
     }
   }
   return [...latestByAuthor.values()];
@@ -52,6 +81,7 @@ export function detectUnresolvedReviewFollowUp({ reviews = [], reviewThreads = [
       author: comment?.user?.login || comment?.author?.login || comment?.author || 'unknown',
       body: comment?.body || '',
       createdAt: comment?.created_at || comment?.createdAt || null,
+      authorAssociation: reviewAuthorAssociation(comment),
     }))),
   ];
 
@@ -62,6 +92,7 @@ export function detectUnresolvedReviewFollowUp({ reviews = [], reviewThreads = [
       author: comment?.user?.login || comment?.author?.login || comment?.author || 'unknown',
       body: comment?.body || '',
       createdAt: comment?.created_at || comment?.createdAt || null,
+      authorAssociation: reviewAuthorAssociation(comment),
     }));
 
   return {
@@ -69,6 +100,110 @@ export function detectUnresolvedReviewFollowUp({ reviews = [], reviewThreads = [
     reasons,
     unresolvedComments: [...unresolvedComments, ...recentManagerComments],
   };
+}
+
+// A single continuation prompt must stay bounded regardless of how much
+// review conversation a PR accumulated. These caps are applied on top of the
+// per-comment truncation the GraphQL reader already performs.
+export const MAX_EXECUTABLE_REVIEW_INSTRUCTIONS = 20;
+export const MAX_EXECUTABLE_REVIEW_INSTRUCTION_CHARS = 2000;
+
+export const REVIEW_FEEDBACK_NONE = 'pr-continuation-no-unresolved-review-instruction';
+export const REVIEW_FEEDBACK_UNTRUSTED = 'pr-continuation-review-authors-untrusted';
+
+function boundInstructionBody(body) {
+  const text = String(body || '').trim();
+  if (text.length <= MAX_EXECUTABLE_REVIEW_INSTRUCTION_CHARS) return text;
+  const marker = '… [truncated]';
+  return `${text.slice(0, Math.max(0, MAX_EXECUTABLE_REVIEW_INSTRUCTION_CHARS - marker.length))}${marker}`;
+}
+
+/**
+ * #242: select the review feedback a write-capable continuation is allowed to
+ * act on.
+ *
+ * Only two GitHub-authoritative signals qualify: an unresolved review thread,
+ * or a reviewer whose latest review state is CHANGES_REQUESTED. Both must come
+ * from an author with write standing (see TRUSTED_REVIEW_AUTHOR_ASSOCIATIONS).
+ * Issue-comment chatter is never executable input -- it is reporting context
+ * only -- so it is deliberately excluded here even though
+ * `detectUnresolvedReviewFollowUp` still surfaces it.
+ *
+ * Fails closed with a distinct reason when unresolved feedback exists but no
+ * part of it is trusted, so the refusal is truthful about *why* rather than
+ * looking like "nothing to do".
+ */
+export function selectExecutableReviewFeedback({ reviews = [], reviewThreads = [] } = {}) {
+  const unresolvedThreads = (reviewThreads || []).filter((thread) => thread && thread.isResolved === false);
+  const changesRequested = latestReviewStatePerAuthor(reviews).filter((review) => review.state === 'CHANGES_REQUESTED');
+
+  const candidates = [
+    ...changesRequested.map((review) => ({
+      source: 'review',
+      threadId: null,
+      author: review.author,
+      authorAssociation: review.authorAssociation,
+      body: review.body,
+      createdAt: review.submittedAt,
+    })),
+    ...unresolvedThreads.flatMap((thread) => (thread.comments || []).map((comment) => ({
+      source: 'review-thread',
+      threadId: thread.id || null,
+      author: comment?.user?.login || comment?.author?.login || comment?.author || 'unknown',
+      authorAssociation: reviewAuthorAssociation(comment),
+      body: comment?.body || '',
+      createdAt: comment?.created_at || comment?.createdAt || null,
+    }))),
+  ].filter((candidate) => String(candidate.body || '').trim().length > 0);
+
+  if (candidates.length === 0) {
+    return Object.freeze({
+      executable: false,
+      failureReason: REVIEW_FEEDBACK_NONE,
+      instructions: Object.freeze([]),
+      rejectedAuthorCount: 0,
+      unresolvedThreadIds: Object.freeze(unresolvedThreads.map((thread) => thread.id || null).filter(Boolean)),
+    });
+  }
+
+  const trusted = candidates.filter((candidate) => isTrustedReviewAuthor(candidate));
+  if (trusted.length === 0) {
+    return Object.freeze({
+      executable: false,
+      failureReason: REVIEW_FEEDBACK_UNTRUSTED,
+      instructions: Object.freeze([]),
+      rejectedAuthorCount: candidates.length,
+      unresolvedThreadIds: Object.freeze(unresolvedThreads.map((thread) => thread.id || null).filter(Boolean)),
+    });
+  }
+
+  const instructions = trusted
+    .slice(0, MAX_EXECUTABLE_REVIEW_INSTRUCTIONS)
+    .map((candidate) => Object.freeze({ ...candidate, body: boundInstructionBody(candidate.body) }));
+
+  return Object.freeze({
+    executable: true,
+    failureReason: null,
+    instructions: Object.freeze(instructions),
+    rejectedAuthorCount: candidates.length - trusted.length,
+    truncatedInstructionCount: Math.max(0, trusted.length - instructions.length),
+    unresolvedThreadIds: Object.freeze(unresolvedThreads.map((thread) => thread.id || null).filter(Boolean)),
+  });
+}
+
+/**
+ * Render selected feedback as the continuation prompt's mutable evidence.
+ * Deterministic and side-effect free so the dynamic-suffix fingerprint is
+ * reproducible for identical feedback (#193/#248).
+ */
+export function renderExecutableReviewInstructions(instructions = []) {
+  if (!instructions.length) return '(no executable review feedback captured)';
+  return instructions
+    .map((instruction, index) => [
+      `${index + 1}. [${instruction.source}] ${instruction.author} (${instruction.authorAssociation || 'unknown association'}, ${instruction.createdAt || 'unknown time'}):`,
+      `   ${String(instruction.body || '').replace(/\n/g, '\n   ')}`,
+    ].join('\n'))
+    .join('\n\n');
 }
 
 /**

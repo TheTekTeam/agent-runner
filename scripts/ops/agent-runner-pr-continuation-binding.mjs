@@ -51,6 +51,7 @@ export function resolvePrContinuationBinding({
   resolveDispatchIdentity,
   prepareWorkspace,
   captureEvidence,
+  verifyRecoveryCheckpoint = null,
 } = {}) {
   if (!pullRequest || !issue) {
     return fail('pr-continuation-input-missing');
@@ -179,10 +180,45 @@ export function resolvePrContinuationBinding({
       observedHeadSha: worktreeEvidence.head || null,
     });
   }
+  // #242 defect 4: a *failed* continuation (for example a worker that edited
+  // but never committed) leaves this worktree dirty, which the clean-start
+  // rule above would then refuse forever -- permanently dead-ending the PR
+  // and pushing the operator toward resetting/discarding real work.
+  //
+  // The safe recovery model is neither "reset it" nor "trust any dirt": the
+  // dirt is admissible only when it is provably the *exact* preserved
+  // checkpoint the previous failed continuation recorded for this same
+  // repository, PR, branch and published head, byte-identical by status
+  // fingerprint. Any unrelated modification changes that fingerprint and
+  // fails closed here, and work is never destroyed either way.
+  let recoveredCheckpoint = null;
   if (worktreeEvidence.dirtyEntryCount !== 0) {
-    return fail('pr-continuation-worktree-dirty', {
+    const recovery = typeof verifyRecoveryCheckpoint === 'function'
+      ? verifyRecoveryCheckpoint({
+        repository: authorisedRepository,
+        prNumber: pullRequest.number,
+        branch: authorisedBranch,
+        headSha: head.sha,
+        worktreeIdentity: dispatchIdentity.worktreeIdentity,
+        rootPath: workspace.rootPath || null,
+        worktreePath: workspace.worktreePath || null,
+        statusFingerprint: worktreeEvidence.statusFingerprint || null,
+        dirtyEntryCount: worktreeEvidence.dirtyEntryCount,
+      })
+      : null;
+    if (recovery?.recoverable !== true) {
+      return fail('pr-continuation-worktree-dirty', {
+        dirtyEntryCount: worktreeEvidence.dirtyEntryCount,
+        statusFingerprint: worktreeEvidence.statusFingerprint || null,
+        recoveryFailureReason: recovery?.failureReason || 'pr-continuation-no-preserved-checkpoint',
+      });
+    }
+    recoveredCheckpoint = Object.freeze({
+      recovered: true,
+      checkpointHead: head.sha,
+      checkpointStatusFingerprint: worktreeEvidence.statusFingerprint || null,
       dirtyEntryCount: worktreeEvidence.dirtyEntryCount,
-      statusFingerprint: worktreeEvidence.statusFingerprint || null,
+      handleDigest: recovery.handleDigest || null,
     });
   }
 
@@ -214,5 +250,6 @@ export function resolvePrContinuationBinding({
       dirtyEntryCount: worktreeEvidence.dirtyEntryCount,
       statusFingerprint: worktreeEvidence.statusFingerprint || null,
     }),
+    recoveredCheckpoint,
   });
 }

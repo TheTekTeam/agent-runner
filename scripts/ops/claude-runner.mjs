@@ -23,8 +23,12 @@ import {
   findLinkedOpenPullRequests,
   linkedIssueNumberFromPr,
   linkedIssueNumbersFromPr,
+  renderExecutableReviewInstructions,
+  selectExecutableReviewFeedback,
 } from './claude-runner-review-followup.mjs';
 import { resolvePrContinuationBinding } from './agent-runner-pr-continuation-binding.mjs';
+import { resolveManagerContinuationAuthority } from './agent-runner-manager-continuation-authority.mjs';
+import { acquireImplementationSlot } from './agent-runner-implementation-slot.mjs';
 import {
   agentRunMetadata,
   buildAgentCommandArgs,
@@ -55,7 +59,11 @@ import {
   inspectClaudeCliHelp,
   inspectClaudeCliVersion,
 } from './claude-runner-execution-policy.mjs';
-import { restrictedHandleBindingDigest, writeRestrictedRecoveryHandle } from './claude-runner-recovery-adapter.mjs';
+import {
+  readRestrictedRecoveryHandle,
+  restrictedHandleBindingDigest,
+  writeRestrictedRecoveryHandle,
+} from './claude-runner-recovery-adapter.mjs';
 import {
   commentRevision,
   normalizeCommentIdentity,
@@ -66,6 +74,7 @@ import {
   buildEvidenceSchemaSection,
   buildExecutionPhaseInvariantsSection,
   buildFinalRequestSection,
+  buildPrContinuationScopeSection,
   buildPromptCacheMetadata,
   buildRepositoryInstructionContractSection,
   buildSafetyAuthorityInvariantsSection,
@@ -493,6 +502,75 @@ export function claudePromptCacheMetadata({
     adapterId: 'claude-code-cli',
     model: profile?.model,
     profile: profile?.profile,
+    cacheStrategy: 'provider-managed',
+  });
+}
+
+/**
+ * #242 defect 1: compile an authorised PR review continuation through the
+ * *same* canonical stable-prefix compiler every other implementation run
+ * uses, instead of the separate review-only prompt builder.
+ *
+ * The failed field acceptance is exactly what that divergence costs: the
+ * review-only prompt never carried the implementation-phase invariant that
+ * tells the worker to "finish with a clean commit on that exact branch using
+ * `git commit --no-verify ...`", so the worker made the requested edit and
+ * stopped, and the run terminated as `implementation-uncommitted-changes`.
+ *
+ * Nothing is re-worded here. The safety/authority invariants, repository
+ * instruction contract, implementation-phase invariants, evidence schema,
+ * adapter identity, task identity and worktree assignment are the identical
+ * shared sections in the identical order, so a continuation and a normal
+ * implementation of the same issue share the stable prefix and the same
+ * #193/#194/#248 cache/telemetry contract. Only the mutable evidence differs:
+ * the bounded, trusted review feedback replaces the manager-packet body,
+ * preceded by one additional *stable* continuation-scope bound.
+ */
+export function buildPrContinuationPromptSections({
+  issue, pullRequest, prNumber, branch, instructions = [], profile, clearContext,
+  worktreeIdentity = null, repositoryContext = null, authorityRevision = null,
+}) {
+  const clearPrefix = clearContext
+    ? 'Start a fresh task context. Do not carry assumptions or files from any previous Claude task.\n\n'
+    : '';
+  const modeLine = 'Selection mode: pr-continuation — the already-consumed manager packet for the linked issue is read-only continuation identity. This run creates no new claim and consumes no new manager authority.';
+
+  const stableSections = [
+    buildSafetyAuthorityInvariantsSection(),
+    buildRepositoryInstructionContractSection(repositoryInstructionPaths(repositoryContext)),
+    buildExecutionPhaseInvariantsSection(EXECUTION_PHASE_IMPLEMENTATION),
+    buildPrContinuationScopeSection(),
+    buildEvidenceSchemaSection(),
+    buildClaudeAdapterIdentitySection({ repositoryIdentityLine: repositoryIdentityLine(repositoryContext), modeLine }),
+  ];
+
+  const dynamicSections = [
+    buildDynamicTaskIdentitySection({ issue, profile }),
+    buildWorktreeAssignmentSection(EXECUTION_PHASE_IMPLEMENTATION, worktreeIdentity),
+    joinSections([
+      `Continuing pull request #${prNumber} on branch \`${branch}\` (linked issue #${issue.number}${authorityRevision ? `, manager authority ${authorityRevision}` : ''}).`,
+      `Issue body:\n\n${issue.body || '(no issue body)'}`,
+      `Unresolved review feedback to address (bounded correction input, not new authority):\n\n${renderExecutableReviewInstructions(instructions)}`,
+    ]),
+    buildFinalRequestSection(EXECUTION_PHASE_IMPLEMENTATION),
+  ];
+
+  return compilePrompt({ clearPrefix, stableSections, dynamicSections });
+}
+
+/**
+ * Bounded #193 cache metadata for a compiled continuation prompt, produced by
+ * the same `buildPromptCacheMetadata` contract as normal issue execution so
+ * direct PR continuation stops reporting `stablePrefixFingerprint: null`.
+ */
+export function prContinuationPromptCacheMetadata(input) {
+  const { stableText, dynamicText } = buildPrContinuationPromptSections(input);
+  return buildPromptCacheMetadata({
+    stableText,
+    dynamicText,
+    adapterId: 'claude-code-cli',
+    model: input?.profile?.model,
+    profile: input?.profile?.profile,
     cacheStrategy: 'provider-managed',
   });
 }
@@ -1122,6 +1200,7 @@ query($owner: String!, $name: String!, $pr: Int!) {
           comments(last: ${REVIEW_THREAD_COMMENTS_LIMIT}) {
             nodes {
               author { login }
+              authorAssociation
               body
               createdAt
             }
@@ -1193,6 +1272,11 @@ async function fetchPullRequestReviewThreads({ repo, pr, token }) {
 
       return {
         author: { login: comment.author?.login || 'unknown' },
+        // #242: GitHub's own author association is the trust signal that
+        // decides whether this comment may become *executable* continuation
+        // input. A missing/unknown association stays null and is therefore
+        // never trusted (see selectExecutableReviewFeedback).
+        authorAssociation: typeof comment.authorAssociation === 'string' ? comment.authorAssociation : null,
         body: boundCommentBody(comment.body),
         createdAt: comment.createdAt,
       };
@@ -1552,8 +1636,24 @@ export function classifyClaudeRunFailure({
 /**
  * Run Claude (dry-run or --execute) with a prebuilt prompt/profile and
  * persist a redacted run log. Shared by issue mode and PR follow-up mode.
+ *
+ * This outer function owns the one machine-global implementation slot for the
+ * whole write-capable run (#242), so the slot is always released -- including
+ * on an early policy refusal or a thrown error.
  */
-export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs, processRunner = spawnSync }) {
+export async function runOrPlanClaude(input) {
+  const slot = { release: () => {} };
+  try {
+    return await executeOrPlanClaudeRun(input, slot);
+  } finally {
+    slot.release();
+  }
+}
+
+async function executeOrPlanClaudeRun({
+  args, env, label, runPlan, prompt, claudeArgs, processRunner = spawnSync,
+  prePublicationCheck = null, acquireSlot = acquireImplementationSlot,
+}, slot = { release: () => {} }) {
   let planWithPrompt = { ...runPlan, prompt: redactSensitiveText(prompt) };
 
   if (!args.execute) {
@@ -1615,6 +1715,32 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
         'native_resume was requested without a --resume-session value. No paid process was started.',
       );
     }
+
+    // #242 defect 6: every write-capable implementation launch takes the one
+    // machine-global implementation slot, not just the systemd recurrence
+    // tick. Direct `--pr <n> --execute` continuation previously took no lock
+    // at all, so it could run a second worker alongside a running recurrence.
+    // When this process is already a descendant of the slot owner (the
+    // recurrence -> run-project.sh -> pinned cron -> runner chain) the slot is
+    // inherited rather than re-taken, so the normal recurrence path cannot
+    // deadlock against itself.
+    const implementationSlot = acquireSlot({ env });
+    if (!implementationSlot.held) {
+      return policyBlock(
+        implementationSlot.failureReason,
+        'Another implementation already holds the one global implementation slot on this machine (or slot ownership could not be proven). No Claude process was started.',
+        { implementationSlot: { lockPath: implementationSlot.lockPath, inherited: false, detail: implementationSlot.detail || null } },
+      );
+    }
+    slot.release = implementationSlot.release;
+    planWithPrompt = {
+      ...planWithPrompt,
+      implementationSlot: {
+        lockPath: implementationSlot.lockPath,
+        inherited: implementationSlot.inherited,
+        held: true,
+      },
+    };
 
     // native_resume, same_agent_continuation, and PR review-followup
     // continuation (#242) all reconnect to the exact worktree/branch an
@@ -1710,7 +1836,31 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
     ? collectImplementationEvidence({ workspace: implementationWorkspace, worktreeIdentity: runPlan.worktreeIdentity })
     : null;
   let implementationPublication = null;
+  let prePublicationRevalidation = null;
   if (runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION
+    && result.status === 0
+    && !resultEnvelope.isError
+    && !executionCheck.noop
+    && !planCheck.planProduced
+    && implementationEvidence?.valid) {
+    // Re-verify live authority once more before any push. A refusal here is
+    // a truthful publication failure that preserves the committed local work
+    // — never a force-push, a replacement PR, or a silent success.
+    if (typeof prePublicationCheck === 'function') {
+      try {
+        prePublicationRevalidation = await prePublicationCheck();
+      } catch {
+        prePublicationRevalidation = { allowed: false, failureReason: 'pr-continuation-revalidation-unavailable' };
+      }
+    }
+  }
+  if (prePublicationRevalidation && prePublicationRevalidation.allowed !== true) {
+    implementationEvidence = {
+      ...implementationEvidence,
+      valid: false,
+      failureReason: prePublicationRevalidation.failureReason || 'pr-continuation-revalidation-refused',
+    };
+  } else if (runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION
     && result.status === 0
     && !resultEnvelope.isError
     && !executionCheck.noop
@@ -1759,18 +1909,36 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
   // booleans do.
   let restrictedRecoveryHandleDigest = null;
   let restrictedHandleBindingDigestValue = null;
-  if (args.attemptId && runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION && runPlan.worktreeIdentity && implementationWorkspace?.allowed) {
+  // #242 defect 4: a direct PR continuation has no operator-supplied
+  // --attempt-id, so a failed run used to leave the worktree dirty with no
+  // recorded checkpoint at all — permanently dead-ending the PR. Derive a
+  // deterministic per-PR attempt id instead, so the run that fails and the
+  // next run that must recover address the same restricted handle.
+  const continuationRepository = isPrContinuation
+    ? (runPlan.repositoryContext?.implementationRepository || runPlan.repo || null)
+    : null;
+  const restrictedAttemptId = args.attemptId
+    || (isPrContinuation && continuationRepository && Number.isInteger(runPlan.prNumber)
+      ? prContinuationAttemptId({ repo: continuationRepository, prNumber: runPlan.prNumber })
+      : null);
+  if (restrictedAttemptId && runPlan.executionPhase === EXECUTION_PHASE_IMPLEMENTATION && runPlan.worktreeIdentity && implementationWorkspace?.allowed) {
     try {
       const handleAgent = runPlan.agent?.agentId || 'claude-code-cli';
       const handleModel = runPlan.agent?.model || runPlan.profile?.model || null;
       const handleHarness = runPlan.agent?.agentType || 'claude';
       const checkpointHead = implementationEvidence?.worktree?.head || null;
       const checkpointStatusFingerprint = implementationEvidence?.worktree?.statusFingerprint || null;
-      const written = writeRestrictedRecoveryHandle(args.outputDir, args.attemptId, {
-        attemptId: args.attemptId,
+      const written = writeRestrictedRecoveryHandle(args.outputDir, restrictedAttemptId, {
+        attemptId: restrictedAttemptId,
         sessionId: extractRestrictedSessionId(result.stdout || ''),
         worktreeName: runPlan.worktreeIdentity.name,
         expectedBranch: runPlan.worktreeIdentity.expectedBranch,
+        // Continuation lineage identity. Present only for PR continuation, and
+        // required to match exactly before a dirty worktree may be reused
+        // (verifyPrContinuationRecoveryCheckpoint).
+        continuationKind: isPrContinuation ? PR_CONTINUATION_RECOVERY_HANDLE_KIND : null,
+        continuationRepository: isPrContinuation ? continuationRepository : null,
+        continuationPrNumber: isPrContinuation ? runPlan.prNumber : null,
         // The exact checkpoint this attempt can resume from — not merely
         // "some commit exists". verifyPreservedWorktree() requires HEAD to
         // still equal checkpointHead exactly, and (when captured) the
@@ -1790,7 +1958,7 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
       // above, and independently recomputed/verified at revalidation time
       // (#698 finding 8).
       restrictedHandleBindingDigestValue = restrictedHandleBindingDigest({
-        attemptId: args.attemptId, agent: handleAgent, model: handleModel, harness: handleHarness,
+        attemptId: restrictedAttemptId, agent: handleAgent, model: handleModel, harness: handleHarness,
         checkpointHead, checkpointStatusFingerprint,
       });
     } catch { /* restricted capture is best-effort; recovery simply stays unavailable */ }
@@ -1820,6 +1988,7 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
     awaitingPlanApproval: runPlan.executionPhase === EXECUTION_PHASE_PLAN && planCheck.planProduced,
     implementationEvidence,
     implementationPublication,
+    prePublicationRevalidation,
     checkpointAvailable,
     sessionAvailable,
     recoveryEvidence,
@@ -1837,6 +2006,74 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
 }
 
 /**
+ * The deterministic restricted-recovery attempt id for one PR's continuation
+ * lineage. Deliberately independent of head SHA and of any per-process value,
+ * so the run that *fails* and the next run that must recover address the same
+ * handle. The head/status identity that actually authorises recovery lives
+ * inside the handle, not in its name.
+ */
+export function prContinuationAttemptId({ repo, prNumber }) {
+  return `pr-continuation:${String(repo || '').replace(/\//g, '_')}:${prNumber}`;
+}
+
+export const PR_CONTINUATION_RECOVERY_HANDLE_KIND = 'pr-continuation';
+
+/**
+ * #242 defect 4: decide whether a dirty continuation worktree is the exact
+ * preserved checkpoint of this PR's previous failed continuation.
+ *
+ * Reuses the existing restricted recovery handle store rather than adding a
+ * second checkpoint mechanism. Every field must match: the handle must be
+ * permission-safe and available, addressed to this repository/PR/branch, and
+ * record a checkpoint head equal to the published PR head *and* a status
+ * fingerprint byte-identical to what the worktree contains right now. Any
+ * unrelated edit changes the fingerprint and fails closed, and nothing here
+ * ever resets, cleans, stashes or commits the preserved work.
+ */
+export function verifyPrContinuationRecoveryCheckpoint({
+  outputDir,
+  repository,
+  prNumber,
+  branch,
+  headSha,
+  worktreeIdentity,
+  statusFingerprint,
+  readHandle = readRestrictedRecoveryHandle,
+} = {}) {
+  const refuse = (failureReason) => Object.freeze({ recoverable: false, failureReason, handleDigest: null });
+  if (!outputDir || !repository || !branch || !headSha || !statusFingerprint) {
+    return refuse('pr-continuation-recovery-input-missing');
+  }
+
+  let read;
+  try {
+    read = readHandle(outputDir, prContinuationAttemptId({ repo: repository, prNumber }));
+  } catch {
+    return refuse('pr-continuation-recovery-handle-unreadable');
+  }
+  if (read?.permissionSafe !== true) return refuse('pr-continuation-recovery-handle-permission-unsafe');
+  if (read?.available !== true || !read.handle) return refuse('pr-continuation-no-preserved-checkpoint');
+
+  const handle = read.handle;
+  if (handle.continuationKind !== PR_CONTINUATION_RECOVERY_HANDLE_KIND) return refuse('pr-continuation-recovery-handle-kind-mismatch');
+  if (handle.continuationRepository !== repository) return refuse('pr-continuation-recovery-repository-mismatch');
+  if (handle.continuationPrNumber !== prNumber) return refuse('pr-continuation-recovery-pr-mismatch');
+  if (handle.expectedBranch !== branch) return refuse('pr-continuation-recovery-branch-mismatch');
+  if (worktreeIdentity?.name && handle.worktreeName !== worktreeIdentity.name) {
+    return refuse('pr-continuation-recovery-worktree-mismatch');
+  }
+  // The preserved work must sit on exactly the published PR head: a
+  // checkpoint taken against a different commit is not this PR's state.
+  if (handle.checkpointHead !== headSha) return refuse('pr-continuation-recovery-head-mismatch');
+  if (!handle.checkpointStatusFingerprint) return refuse('pr-continuation-recovery-status-unrecorded');
+  if (handle.checkpointStatusFingerprint !== statusFingerprint) {
+    return refuse('pr-continuation-recovery-worktree-modified');
+  }
+
+  return Object.freeze({ recoverable: true, failureReason: null, handleDigest: read.digest || null });
+}
+
+/**
  * Resolve the #241 continuation binding for a direct `--pr --execute`
  * follow-up (#242): the linked issue must be unique and explicit before any
  * GitHub read of it is attempted, and every other refusal path is delegated
@@ -1844,14 +2081,14 @@ export function runOrPlanClaude({ args, env, label, runPlan, prompt, claudeArgs,
  * its identity/authority/workspace logic.
  */
 export async function resolvePrExecutionBinding({
-  pullRequest, repo, config, env, token,
+  pullRequest, repo, config, env, token, outputDir = null,
 }) {
   const linkedIssueNumbers = linkedIssueNumbersFromPr({ title: pullRequest.title || '', body: pullRequest.body || '' });
   const { issue: linkedIssueRecord, comments: linkedIssueComments } = linkedIssueNumbers.length === 1
     ? await fetchIssueAndComments({ repo, issue: linkedIssueNumbers[0], token })
     : { issue: {}, comments: [] };
 
-  return resolvePrContinuationBinding({
+  const binding = resolvePrContinuationBinding({
     pullRequest,
     issue: linkedIssueRecord,
     issueComments: linkedIssueComments,
@@ -1861,7 +2098,17 @@ export async function resolvePrExecutionBinding({
     resolveDispatchIdentity: resolveImplementationDispatchIdentity,
     prepareWorkspace: prepareContinuationWorkspace,
     captureEvidence: captureGitRepositoryEvidence,
+    verifyRecoveryCheckpoint: outputDir
+      ? (input) => verifyPrContinuationRecoveryCheckpoint({ ...input, outputDir })
+      : null,
   });
+
+  // The already-fetched linked issue travels with the binding so the
+  // canonical continuation prompt can carry the real issue identity/body
+  // without a second GitHub read. Refusals carry no issue evidence.
+  return binding.allowed === true
+    ? Object.freeze({ ...binding, linkedIssue: linkedIssueRecord })
+    : binding;
 }
 
 export async function runPrFollowUp(args, env, token, config = {}, {
@@ -1886,14 +2133,31 @@ export async function runPrFollowUp(args, env, token, config = {}, {
     return 0;
   }
 
-  const prompt = buildReviewFollowUpPrompt({
-    pr: { number: args.pr, title: pullRequest.title, url: pullRequest.html_url },
-    issueNumber: linkedIssue,
-    branch,
-    unresolved,
-    repo: args.repo,
-  });
   const clearContext = shouldUseClear({ noClear: args.noClear, resumeSession: args.resumeSession });
+
+  // #242 defect 3: only GitHub-authoritative feedback from an author with
+  // write standing may become executable input. This is evaluated before the
+  // continuation binding so an untrusted trigger never causes a linked-issue
+  // read, a worktree inspection, or a provider launch.
+  const executableFeedback = args.execute
+    ? selectExecutableReviewFeedback({ reviews, reviewThreads })
+    : null;
+  if (args.execute && executableFeedback.executable !== true) {
+    const payload = {
+      mode: PR_REVIEW_FOLLOWUP_MODE,
+      pr: args.pr,
+      repo: args.repo,
+      dryRun: false,
+      blocked: true,
+      reason: executableFeedback.failureReason,
+      failureReason: executableFeedback.failureReason,
+      rejectedAuthorCount: executableFeedback.rejectedAuthorCount,
+      message: `No executable review instruction from an author with write standing on ${args.repo} was found for PR #${args.pr} (${executableFeedback.failureReason}). No Claude process was started.`,
+    };
+    const logPath = writeRunLog({ outputDir: args.outputDir, label: `pr-${args.pr}`, payload });
+    console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+    return EXECUTION_POLICY_EXIT_CODE;
+  }
 
   // A write-capable direct --pr --execute run must bind to the exact
   // existing authorised PR continuation (#241) before it can ever be
@@ -1903,7 +2167,7 @@ export async function runPrFollowUp(args, env, token, config = {}, {
   let continuationBinding = null;
   if (args.execute) {
     continuationBinding = await resolveBinding({
-      pullRequest, repo: args.repo, config, env, token,
+      pullRequest, repo: args.repo, config, env, token, outputDir: args.outputDir,
     });
     if (!continuationBinding.allowed) {
       const payload = {
@@ -1914,6 +2178,10 @@ export async function runPrFollowUp(args, env, token, config = {}, {
         blocked: true,
         reason: continuationBinding.failureReason,
         failureReason: continuationBinding.failureReason,
+        // A dirty-worktree refusal now also reports *why* recovery was not
+        // possible, so a preserved failed continuation is diagnosable
+        // without anyone inspecting (or clearing) the worktree by hand.
+        recoveryFailureReason: continuationBinding.recoveryFailureReason || null,
         message: `Safe PR continuation binding refused this follow-up (${continuationBinding.failureReason}). No Claude process was started.`,
       };
       const logPath = writeRunLog({ outputDir: args.outputDir, label: `pr-${args.pr}`, payload });
@@ -1952,6 +2220,39 @@ export async function runPrFollowUp(args, env, token, config = {}, {
       { model: args.model, effort: args.effort },
       env,
     );
+  // #242 defects 1 and 2. A bound, write-capable continuation compiles
+  // through the canonical implementation compiler -- so it inherits the
+  // clean-commit invariant whose absence caused the field failure, and
+  // produces real #193 stable-prefix cache metadata instead of null. The
+  // unauthenticated dry-run preview has no binding, profile, worktree or
+  // repository context to compile against and stays on the preview-only
+  // builder; `promptContract` records which artifact a log is showing so the
+  // two can never be mistaken for one another.
+  const continuationPromptInput = continuationBinding
+    ? {
+      issue: continuationBinding.linkedIssue?.number
+        ? continuationBinding.linkedIssue
+        : { number: continuationBinding.issueNumber, title: pullRequest.title || '', body: '' },
+      pullRequest,
+      prNumber: continuationBinding.prNumber,
+      branch: continuationBinding.dispatchAuthority?.branch || branch,
+      instructions: executableFeedback?.instructions || [],
+      profile,
+      clearContext,
+      worktreeIdentity: continuationBinding.worktreeIdentity,
+      repositoryContext: continuationBinding.repositoryContext,
+      authorityRevision: continuationBinding.authority?.revision || null,
+    }
+    : null;
+  const prompt = continuationPromptInput
+    ? buildPrContinuationPromptSections(continuationPromptInput).prompt
+    : buildReviewFollowUpPrompt({
+      pr: { number: args.pr, title: pullRequest.title, url: pullRequest.html_url },
+      issueNumber: linkedIssue,
+      branch,
+      unresolved,
+      repo: args.repo,
+    });
   const claudeArgs = buildClaudeArgs({ prompt, profile, resumeSession: args.resumeSession });
 
   const runPlan = {
@@ -1975,6 +2276,19 @@ export async function runPrFollowUp(args, env, token, config = {}, {
       disableSlashCommands: implementationToolPolicy.disableSlashCommands,
     } : null,
     preRunHeadSha: continuationBinding?.preRunHeadSha || null,
+    recoveredCheckpoint: continuationBinding?.recoveredCheckpoint || null,
+    promptContract: continuationPromptInput ? 'canonical-implementation' : 'review-followup-preview',
+    promptCacheMetadata: continuationPromptInput
+      ? prContinuationPromptCacheMetadata(continuationPromptInput)
+      : null,
+    executableReviewFeedback: executableFeedback
+      ? {
+        instructionCount: executableFeedback.instructions.length,
+        rejectedAuthorCount: executableFeedback.rejectedAuthorCount,
+        truncatedInstructionCount: executableFeedback.truncatedInstructionCount || 0,
+        unresolvedThreadIds: executableFeedback.unresolvedThreadIds,
+      }
+      : null,
     profile,
     costAdmission: evaluateClaudeCostAdmission(profile, env),
     agent: agentRunMetadata(resolveAgentById('claude-code-cli'), profile),
@@ -1985,7 +2299,72 @@ export async function runPrFollowUp(args, env, token, config = {}, {
     claudeArgsPreview: redactExecutableArgs(claudeArgs, { redactFinalAsPrompt: true }),
   };
 
-  return run({ args, env, label: `pr-${args.pr}`, runPlan, prompt, claudeArgs });
+  return run({
+    args,
+    env,
+    label: `pr-${args.pr}`,
+    runPlan,
+    prompt,
+    claudeArgs,
+    // #242 defect 5: authority is bound *before* the model starts, but the
+    // model then runs for minutes. Re-read the authoritative state once more
+    // immediately before publication, so a PR that was closed, a branch that
+    // was repointed, a remote head that advanced under us, revoked manager
+    // authority, or feedback that stopped being executable can never be
+    // published onto. This never force-pushes and never opens a replacement
+    // PR: it only decides whether the deterministic same-PR publication is
+    // still legitimate.
+    prePublicationCheck: continuationBinding
+      ? () => revalidatePrContinuationAuthority({
+        repo: args.repo, binding: continuationBinding, token,
+      })
+      : null,
+  });
+}
+
+/**
+ * Re-verify, immediately before publication, that the exact authority this
+ * continuation was bound to is still the live authority. Read-only: it makes
+ * no GitHub mutation and no local repository change.
+ */
+export async function revalidatePrContinuationAuthority({
+  repo, binding, token, fetchReviewContext = fetchPullRequestReviewContext, fetchIssue = fetchIssueAndComments,
+}) {
+  const refuse = (failureReason) => ({ allowed: false, failureReason });
+  let context;
+  try {
+    context = await fetchReviewContext({ repo, pr: binding.prNumber, token });
+  } catch {
+    return refuse('pr-continuation-revalidation-unavailable');
+  }
+  const pullRequest = context?.pullRequest;
+  if (!pullRequest || pullRequest.number !== binding.prNumber) return refuse('pr-continuation-revalidation-pr-number-changed');
+  if (pullRequest.state !== 'open') return refuse('pr-continuation-revalidation-pr-not-open');
+  if (pullRequest.head?.ref !== binding.branch) return refuse('pr-continuation-revalidation-branch-changed');
+  if (pullRequest.head?.repo?.full_name !== binding.repository) return refuse('pr-continuation-revalidation-repository-changed');
+  // The published head must still be exactly the head this continuation was
+  // bound to. If the remote advanced while the model was running, the local
+  // commit is no longer a continuation of the reviewed state.
+  if (pullRequest.head?.sha !== binding.preRunHeadSha) return refuse('pr-continuation-revalidation-remote-head-advanced');
+
+  const feedback = selectExecutableReviewFeedback({
+    reviews: context.reviews, reviewThreads: context.reviewThreads,
+  });
+  if (feedback.executable !== true) return refuse('pr-continuation-revalidation-feedback-withdrawn');
+
+  let issueComments;
+  try {
+    ({ comments: issueComments } = await fetchIssue({ repo, issue: binding.issueNumber, token }));
+  } catch {
+    return refuse('pr-continuation-revalidation-unavailable');
+  }
+  const authority = resolveManagerContinuationAuthority(issueComments);
+  if (!authority.allowed || !authority.authority) return refuse('pr-continuation-revalidation-authority-revoked');
+  if (binding.authority?.authorityKey && authority.authority.authorityKey !== binding.authority.authorityKey) {
+    return refuse('pr-continuation-revalidation-authority-changed');
+  }
+
+  return { allowed: true, failureReason: null };
 }
 
 export function assertConfiguredRepositoryIdentity({ configPath, config, repo }) {

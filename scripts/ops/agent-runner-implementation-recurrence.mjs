@@ -18,6 +18,11 @@ import { fileURLToPath } from 'node:url';
 
 import { acquireRecoverableCronLock } from './agent-runner-cron-lock.mjs';
 import { PROJECT_SCOPED_ENV_FIELDS } from './agent-runner-config.mjs';
+import {
+  GLOBAL_LOCK_ENV,
+  markInheritedImplementationSlot,
+  resolveGlobalLockPath,
+} from './agent-runner-implementation-slot.mjs';
 import { computeManagerProfileShadow } from './agent-runner-manager-profile-shadow.mjs';
 import {
   readProjectRegistryEntries,
@@ -29,13 +34,14 @@ const CANDIDATE_PROBE_SCRIPT = resolve(HERE, 'claude-runner-candidate-probe.mjs'
 const RUN_PROJECT_WRAPPER = resolve(HERE, '../../bin/run-project.sh');
 
 export const NO_RUNNABLE_CANDIDATE_EXIT_CODE = 3;
-export const GLOBAL_LOCK_ENV = 'AGENT_RUNNER_IMPLEMENTATION_LOCK';
 export const EVIDENCE_DIR_ENV = 'AGENT_RUNNER_IMPLEMENTATION_EVIDENCE_DIR';
 
-export function resolveGlobalLockPath(env = process.env) {
-  return env[GLOBAL_LOCK_ENV]
-    || resolve(String(env.HOME || homedir()), '.local/state/agent-runner/implementation-recurrence.lock');
-}
+// The global implementation slot's lock identity now has exactly one
+// definition (#242), in agent-runner-implementation-slot.mjs, so the direct
+// runner path and this recurrence can never disagree about which lock file
+// *is* the one global slot. Re-exported here because the accepted #210
+// recurrence contract and its tests address these names on this module.
+export { GLOBAL_LOCK_ENV, resolveGlobalLockPath };
 
 export function resolveEvidenceDir(env = process.env) {
   return env[EVIDENCE_DIR_ENV]
@@ -80,7 +86,13 @@ export function buildProjectScopedInvocationEnv(env, configPath) {
   }
   scrubbed.AGENT_RUNNER_CONFIG = configPath;
   scrubbed.CLAUDE_RUNNER_CONFIG = configPath;
-  return scrubbed;
+  // This recurrence already owns the one global implementation slot for the
+  // whole tick (see runImplementationRecurrence below). Every descendant it
+  // spawns therefore runs *inside* that slot and must not try to take the
+  // same lock again -- the direct-path guard added for #242 would otherwise
+  // deadlock the normal systemd recurrence against itself. Marking the child
+  // env is not a grant: the child still verifies this pid is alive.
+  return markInheritedImplementationSlot(scrubbed);
 }
 
 function defaultProbeProject({ config, configPath }, { argv = [], env = process.env, nodeBin = process.execPath } = {}) {

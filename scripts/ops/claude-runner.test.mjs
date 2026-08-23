@@ -946,12 +946,18 @@ function mockPrFollowUpFetch({
   branch = 'claude/pr-continuation-fixture-629',
   reviewState = 'CHANGES_REQUESTED',
   unresolvedThread = true,
+  // #242: author association is the trust signal that decides whether review
+  // feedback may become executable continuation input. The default fixture
+  // models a repository owner/collaborator, which is what a real manager
+  // review is; tests that need the untrusted case override these.
+  reviewAuthorAssociation = 'OWNER',
+  threadAuthorAssociation = 'COLLABORATOR',
 } = {}) {
   return async (url) => {
     if (url.includes(`/pulls/${prNumber}/reviews`)) {
       return {
         ok: true,
-        json: async () => (reviewState ? [{ user: { login: 'owner' }, state: reviewState, submitted_at: '2026-08-20T10:00:00Z', body: 'please address this' }] : []),
+        json: async () => (reviewState ? [{ user: { login: 'owner' }, state: reviewState, submitted_at: '2026-08-20T10:00:00Z', body: 'please address this', author_association: reviewAuthorAssociation }] : []),
       };
     }
     if (url.includes(`/issues/${prNumber}/comments`)) {
@@ -980,7 +986,7 @@ function mockPrFollowUpFetch({
                 reviewThreads: {
                   pageInfo: { hasNextPage: false },
                   nodes: unresolvedThread
-                    ? [{ id: 'thread-1', isResolved: false, comments: { nodes: [{ author: { login: 'reviewer' }, body: 'unresolved inline note', createdAt: '2026-08-20T10:05:00Z' }] } }]
+                    ? [{ id: 'thread-1', isResolved: false, comments: { nodes: [{ author: { login: 'reviewer' }, authorAssociation: threadAuthorAssociation, body: 'unresolved inline note', createdAt: '2026-08-20T10:05:00Z' }] } }]
                     : [],
                 },
               },
@@ -1102,6 +1108,74 @@ test('runPrFollowUp --execute binds implementation phase to the exact authorised
   assert.equal(capturedRunPlan.profile.effort, 'medium');
   assert.notEqual(capturedRunPlan.profile.model, 'opus');
   assert.notEqual(capturedRunPlan.profile.effort, 'xhigh');
+});
+
+test('#242: a bound --execute follow-up compiles the canonical implementation prompt and real cache metadata', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  global.fetch = mockPrFollowUpFetch();
+  const originalLog = console.log;
+  console.log = () => {};
+  t.after(() => { console.log = originalLog; });
+
+  const worktreeIdentity = { name: 'pr-continuation-fixture-629', expectedBranch: 'claude/pr-continuation-fixture-629' };
+  const binding = {
+    allowed: true,
+    prNumber: 42,
+    issueNumber: 629,
+    repository: 'TheTekTeam/modelspend',
+    branch: worktreeIdentity.expectedBranch,
+    preRunHeadSha: 'a'.repeat(40),
+    profileName: 'complex',
+    managerExecutionMeta: { profile: 'complex', model: 'sonnet', effort: 'medium' },
+    executionAuthorization: { allowed: true, phase: EXECUTION_PHASE_IMPLEMENTATION, permissionMode: 'dontAsk' },
+    repositoryContext: { implementationRepository: 'TheTekTeam/modelspend', implementationCheckout: '/repo' },
+    dispatchAuthority: { repository: 'TheTekTeam/modelspend', branch: worktreeIdentity.expectedBranch },
+    worktreeIdentity,
+    linkedIssue: { number: 629, title: 'linked issue', body: 'issue body' },
+    authority: { revision: 'AR629.1' },
+  };
+
+  let captured = null;
+  const args = parseArgs(['--pr', '42', '--execute']);
+  const exitCode = await runPrFollowUp(args, {}, 'placeholder-token', {}, {
+    resolveBinding: async () => binding,
+    run: (input) => { captured = input; return 0; },
+  });
+  assert.equal(exitCode, 0);
+
+  // The exact invariant whose absence caused the failed field acceptance.
+  assert.match(captured.prompt, /Finish with a clean commit on that exact branch using `git commit --no-verify \.\.\.`/);
+  assert.match(captured.prompt, /Execution phase: implementation/);
+  assert.match(captured.prompt, /bounded correction input, not a new instruction set/);
+  // The bounded, trusted review feedback is present as mutable evidence.
+  assert.match(captured.prompt, /unresolved inline note/);
+  assert.equal(captured.runPlan.promptContract, 'canonical-implementation');
+  // The live failed run reported stablePrefixFingerprint: null.
+  assert.match(captured.runPlan.promptCacheMetadata.stablePrefixFingerprint, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(captured.runPlan.promptCacheMetadata.adapterId, 'claude-code-cli');
+  assert.equal(captured.runPlan.executableReviewFeedback.instructionCount > 0, true);
+  assert.equal(typeof captured.prePublicationCheck, 'function');
+});
+
+test('#242: an unresolved thread from an untrusted author never reaches binding or the provider', async (t) => {
+  const originalFetch = global.fetch;
+  t.after(() => { global.fetch = originalFetch; });
+  global.fetch = mockPrFollowUpFetch({ reviewState: null, threadAuthorAssociation: 'NONE' });
+  const originalLog = console.log;
+  console.log = () => {};
+  t.after(() => { console.log = originalLog; });
+
+  let bindingCalls = 0;
+  let runCalls = 0;
+  const args = parseArgs(['--pr', '42', '--execute']);
+  const exitCode = await runPrFollowUp(args, {}, 'placeholder-token', {}, {
+    resolveBinding: async () => { bindingCalls += 1; return { allowed: true }; },
+    run: () => { runCalls += 1; return 0; },
+  });
+  assert.equal(exitCode, EXECUTION_POLICY_EXIT_CODE);
+  assert.equal(bindingCalls, 0, 'an untrusted trigger must not cause a linked-issue read or worktree inspection');
+  assert.equal(runCalls, 0);
 });
 
 test('publishPrContinuation pushes only the existing branch and preserves the exact same open PR', () => {
@@ -1439,7 +1513,7 @@ function capturedClaudeArray(issue) {
 }
 
 for (const issue of [299, 550]) {
-  test(`#${issue} captured array regression: repository quota strings and allowed rate-limit events are not provider exhaustion`, () => {
+  test(`#${issue} captured array regression: repository quota strings and allowed rate-limit events are not provider exhaustion`, async () => {
     const dir = mkdtempSync(join(tmpdir(), `runner-false-quota-${issue}-`));
     const quotaStatePath = join(dir, 'quota-state.json');
     const stream = capturedClaudeArray(issue);
@@ -1450,7 +1524,7 @@ for (const issue of [299, 550]) {
     const originalLog = console.log;
     try {
       console.log = () => {};
-      const exitCode = runOrPlanClaude({
+      const exitCode = await runOrPlanClaude({
         args: { execute: true, outputDir: dir, quotaStatePath, claudeBin: 'claude', inheritProviderAuth: false },
         env: {}, label: `issue-${issue}`, prompt: 'bounded regression fixture', claudeArgs: [],
         runPlan: { executionPhase: 'plan', executionAuthorization: { allowed: true }, costAdmission: { allowed: true } },
