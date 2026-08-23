@@ -107,6 +107,14 @@ fingerprint and refuses with
 `recoveryFailureReason`, so the situation is diagnosable without touching the
 worktree.
 
+A worktree left dirty by a continuation that ran *before* this fix has no
+recorded checkpoint at all, because the checkpoint is written by the failing
+run. Such a worktree refuses with `recoveryFailureReason:
+pr-continuation-no-preserved-checkpoint`. That refusal is the designed
+fail-closed behaviour protecting uncommitted work — it is **not** a
+regression, and it is not evidence that the continuation fix failed. It
+applies to the preserved `#303` / PR `#304` field canary worktree.
+
 If a preserved worktree cannot safely be reused, preserve it as evidence and
 create a new explicitly disposable canary — do not delete it.
 
