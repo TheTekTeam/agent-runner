@@ -35,28 +35,16 @@ jobs:
         with:
           node-version: 22.23.0
 
-      - name: Diagnose PR continuation tests
+      - name: Diagnose PR continuation binding input
         shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          tests=(scripts/ops/agent-runner-pr-conti*.test.mjs)
-          ((${#tests[@]} == 0)) || node --test "${tests[@]}"
+        run: node --test scripts/ops/agent-runner-pr-continuation-binding-input.test.mjs
 
-      - name: Diagnose PR contract controller tests
+      - name: Diagnose PR continuation binding
         if: always()
         shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          tests=(scripts/ops/agent-runner-pr-contr*.test.mjs)
-          ((${#tests[@]} == 0)) || node --test "${tests[@]}"
+        run: node --test scripts/ops/agent-runner-pr-continuation-binding.test.mjs
 
-      - name: Diagnose remaining PR A-F tests
+      - name: Diagnose PR continuation stability
         if: always()
         shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          tests=(scripts/ops/agent-runner-pr-[a-bd-f]*.test.mjs)
-          ((${#tests[@]} == 0)) || node --test "${tests[@]}"
+        run: node --test scripts/ops/agent-runner-pr-continuation-stability.test.mjs
