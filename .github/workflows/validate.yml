@@ -35,5 +35,11 @@ jobs:
         with:
           node-version: 22.23.0
 
+      - name: Diagnose compact prompt compiler tests
+        run: node --test scripts/ops/claude-runner-prompt-compiler.test.mjs
+
+      - name: Diagnose runner prompt compatibility tests
+        run: node --test scripts/ops/claude-runner.test.mjs
+
       - name: Run canonical repository validation
         run: npm run validate
