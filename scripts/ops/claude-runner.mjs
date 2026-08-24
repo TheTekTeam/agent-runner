@@ -1057,9 +1057,13 @@ function defaultReconcileWait(ms) {
  * then re-reads the exact same open PR number/branch and requires the
  * published head to equal the committed worktree HEAD before declaring
  * success. Any identity drift (PR closed, reopened as a different number,
- * head branch changed) fails closed immediately. A stale `headRefOid` alone
- * (bounded GitHub PR-head propagation lag after the push already landed) is
- * retried a small bounded number of times before failing closed (#310).
+ * head branch changed) fails closed immediately. Retry is limited to the
+ * one shape that is actual GitHub PR-head propagation lag: the observed
+ * `headRefOid` still equals the exact known pre-run head
+ * (`workspace.baseHead`) and the remote branch ref still positively equals
+ * `committedHead`. Any other observed head (a third/unexpected SHA), or a
+ * remote ref that has advanced away from `committedHead` during the retry
+ * window, fails closed immediately instead of waiting (#310).
  */
 export function publishPrContinuation({
   workspace,
@@ -1153,7 +1157,29 @@ export function publishPrContinuation({
     if (observedHead === committedHead) {
       break;
     }
+    // Retry is limited to the exact known pre-run head -- that is the only
+    // shape bounded GitHub PR-head propagation lag can take. Any other
+    // observed head is a real mismatch, not lag, so it fails closed below
+    // with a single PR read and zero wait.
+    if (observedHead !== workspace.baseHead) {
+      break;
+    }
     if (attempt < maxAttempts) {
+      // A remote ref that has advanced away from the committed HEAD during
+      // the retry window is a concurrent later branch advance, not
+      // propagation lag -- fail closed immediately instead of continuing to
+      // wait/retry.
+      const midRemoteHead = readRemoteBranchHead();
+      if (midRemoteHead !== committedHead) {
+        return {
+          published: false,
+          failureReason: 'pr-continuation-publication-remote-ref-mismatch',
+          stage: 'remote-ref-retry',
+          prNumber: pullRequest.number,
+          expectedHeadSha: committedHead,
+          observedHeadSha: midRemoteHead,
+        };
+      }
       wait(retryDelayMs);
     }
   }
