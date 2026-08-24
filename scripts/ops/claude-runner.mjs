@@ -1846,6 +1846,31 @@ async function executeOrPlanClaudeRun({
     implementationWorkspace = (args.recoveryMode || isPrContinuation)
       ? prepareContinuationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env })
       : prepareImplementationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env });
+    // #316 committed-ahead recovery: the binding already proved the exact
+    // preserved one-commit-ahead checkpoint against the published PR head
+    // before this launch was ever authorised. The clean-commit invariant
+    // below must still measure "changed" against that unchanged PR head,
+    // not against the checkpoint commit itself -- otherwise a resume that
+    // only removes the preserved checkpoint's untracked residue (making no
+    // further commit) would be wrongly reported as "no repository change".
+    // A worktree that has moved off the exact checkpoint since the binding
+    // check ran is never silently accepted here.
+    if (implementationWorkspace.allowed && isPrContinuation && runPlan.recoveredCheckpoint?.committedAhead) {
+      if (implementationWorkspace.baseHead !== runPlan.recoveredCheckpoint.checkpointHead) {
+        implementationWorkspace = {
+          allowed: false,
+          failureReason: 'pr-continuation-committed-ahead-checkpoint-changed',
+          baseRef: implementationWorkspace.baseRef || null,
+          rootPath: implementationWorkspace.rootPath || null,
+          worktreePath: implementationWorkspace.worktreePath || null,
+        };
+      } else {
+        implementationWorkspace = {
+          ...implementationWorkspace,
+          baseHead: runPlan.recoveredCheckpoint.preRunHeadSha,
+        };
+      }
+    }
     planWithPrompt = {
       ...planWithPrompt,
       workspacePreparation: {
@@ -2039,6 +2064,13 @@ async function executeOrPlanClaudeRun({
         // the checkpoint as current (#698 finding 2 re-review).
         checkpointHead,
         checkpointStatusFingerprint,
+        // The PR head this attempt started from, before any commit it made.
+        // Ordinary dirty-checkpoint recovery never needs this (its
+        // checkpointHead already equals the published PR head), but
+        // committed-ahead recovery (#316) does: it must positively prove the
+        // preserved local commit's sole parent is the exact PR head this
+        // handle was captured against, not merely "some earlier head".
+        preRunHeadSha: implementationWorkspace?.baseHead || null,
         agent: handleAgent,
         model: handleModel,
         harness: handleHarness,
@@ -2167,6 +2199,92 @@ export function verifyPrContinuationRecoveryCheckpoint({
 }
 
 /**
+ * #316: decide whether an unpublished, already-*committed* continuation
+ * checkpoint (as opposed to the merely-dirty checkpoint above) is the exact
+ * preserved one-commit-ahead state of this PR's previous authorised
+ * continuation attempt.
+ *
+ * This is a distinct, narrower recovery shape from
+ * `verifyPrContinuationRecoveryCheckpoint` -- it is only ever consulted when
+ * the worktree's committed HEAD is *not* the published PR head at all, which
+ * that function already refuses unconditionally. Every proposition in #316's
+ * admissible shape must be positively proven: the restricted handle must be
+ * permission-safe and addressed to this exact repository/PR/branch/worktree,
+ * must record this exact local commit as its checkpoint, must record this
+ * exact (unchanged) PR head as the head it was captured against, and the
+ * checkpoint commit's git history must show exactly one unpublished commit
+ * -- a sole parent equal to that same PR head. Nothing here ever resets,
+ * cleans, stashes, amends, or pushes; it only proves a fact about existing
+ * git history and a previously captured restricted handle.
+ */
+export function verifyPrContinuationCommittedAheadCheckpoint({
+  outputDir,
+  repository,
+  prNumber,
+  branch,
+  prHeadSha,
+  checkpointHeadSha,
+  worktreeIdentity,
+  rootPath,
+  runner = spawnSync,
+  readHandle = readRestrictedRecoveryHandle,
+} = {}) {
+  const refuse = (failureReason) => Object.freeze({
+    recoverable: false, failureReason, handleDigest: null, expectedStatusFingerprint: null,
+  });
+  if (!outputDir || !repository || !branch || !prHeadSha || !checkpointHeadSha || !rootPath) {
+    return refuse('pr-continuation-committed-ahead-input-missing');
+  }
+  if (checkpointHeadSha === prHeadSha) return refuse('pr-continuation-committed-ahead-not-ahead');
+
+  let read;
+  try {
+    read = readHandle(outputDir, prContinuationAttemptId({ repo: repository, prNumber }));
+  } catch {
+    return refuse('pr-continuation-committed-ahead-handle-unreadable');
+  }
+  if (read?.permissionSafe !== true) return refuse('pr-continuation-committed-ahead-handle-permission-unsafe');
+  if (read?.available !== true || !read.handle) return refuse('pr-continuation-no-preserved-committed-ahead-checkpoint');
+
+  const handle = read.handle;
+  if (handle.continuationKind !== PR_CONTINUATION_RECOVERY_HANDLE_KIND) return refuse('pr-continuation-committed-ahead-handle-kind-mismatch');
+  if (handle.continuationRepository !== repository) return refuse('pr-continuation-committed-ahead-repository-mismatch');
+  if (handle.continuationPrNumber !== prNumber) return refuse('pr-continuation-committed-ahead-pr-mismatch');
+  if (handle.expectedBranch !== branch) return refuse('pr-continuation-committed-ahead-branch-mismatch');
+  if (worktreeIdentity?.name && handle.worktreeName !== worktreeIdentity.name) {
+    return refuse('pr-continuation-committed-ahead-worktree-mismatch');
+  }
+  // The handle must record both the exact preserved local commit and the
+  // exact PR head it was captured against -- a checkpoint recorded against a
+  // different local commit, or against a different (older/newer) PR head,
+  // is not this exact preserved state.
+  if (handle.checkpointHead !== checkpointHeadSha) return refuse('pr-continuation-committed-ahead-head-mismatch');
+  if (!handle.preRunHeadSha || handle.preRunHeadSha !== prHeadSha) {
+    return refuse('pr-continuation-committed-ahead-pre-run-head-mismatch');
+  }
+  if (!handle.checkpointStatusFingerprint) return refuse('pr-continuation-committed-ahead-status-unrecorded');
+
+  // Exactly one unpublished commit ahead for this v1 seam: the checkpoint's
+  // sole parent must equal the unchanged PR head. Zero parents (root
+  // commit), two or more parents (a merge commit), or a sole parent that is
+  // not the PR head (more than one commit ahead, or a different lineage)
+  // all fail closed rather than being generalised to an arbitrary range.
+  const parentsResult = runGit(['rev-list', '--parents', '-n', '1', checkpointHeadSha], { cwd: rootPath, runner });
+  if (parentsResult?.status !== 0) return refuse('pr-continuation-committed-ahead-history-unavailable');
+  const parents = String(parentsResult.stdout || '').trim().split(/\s+/).slice(1);
+  if (parents.length !== 1 || parents[0] !== prHeadSha) {
+    return refuse('pr-continuation-committed-ahead-not-single-parent');
+  }
+
+  return Object.freeze({
+    recoverable: true,
+    failureReason: null,
+    handleDigest: read.digest || null,
+    expectedStatusFingerprint: handle.checkpointStatusFingerprint,
+  });
+}
+
+/**
  * Resolve the #241 continuation binding for a direct `--pr --execute`
  * follow-up (#242): the linked issue must be unique and explicit before any
  * GitHub read of it is attempted, and every other refusal path is delegated
@@ -2193,6 +2311,9 @@ export async function resolvePrExecutionBinding({
     captureEvidence: captureGitRepositoryEvidence,
     verifyRecoveryCheckpoint: outputDir
       ? (input) => verifyPrContinuationRecoveryCheckpoint({ ...input, outputDir })
+      : null,
+    verifyCommittedAheadCheckpoint: outputDir
+      ? (input) => verifyPrContinuationCommittedAheadCheckpoint({ ...input, outputDir })
       : null,
   });
 

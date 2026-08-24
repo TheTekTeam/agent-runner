@@ -27,6 +27,7 @@ import {
   PR_REVIEW_FOLLOWUP_MODE,
   publishPrContinuation,
   runOrPlanClaude,
+  verifyPrContinuationCommittedAheadCheckpoint,
   verifyPrContinuationRecoveryCheckpoint,
 } from './claude-runner.mjs';
 import { resolvePrContinuationBinding } from './agent-runner-pr-continuation-binding.mjs';
@@ -169,6 +170,14 @@ function fakeWorker(fixture, behaviour) {
       git(fixture.worktreePath, 'add', 'canary.md');
       git(fixture.worktreePath, 'commit', '--no-verify', '-m', 'address review feedback');
       writeFileSync(join(fixture.worktreePath, 'stray.md'), 'uncommitted residue\n');
+    } else if (behaviour === 'remove-residue') {
+      // #316: exactly what an authorised resume of a preserved committed-ahead
+      // checkpoint does -- finish/remove its own leftover untracked residue,
+      // without touching the already-preserved commit at all.
+      rmSync(join(fixture.worktreePath, 'stray.md'), { force: true });
+    } else if (behaviour === 'remove-residue-and-stay-dirty') {
+      rmSync(join(fixture.worktreePath, 'stray.md'), { force: true });
+      writeFileSync(join(fixture.worktreePath, 'still-dirty.md'), 'another leftover\n');
     }
     return { status: 0, signal: null, stdout: successEnvelope(), stderr: '', error: null };
   };
@@ -685,6 +694,300 @@ test('#242 regression: a clean published-head worktree still binds without any r
   assert.equal(binding.allowed, true);
   assert.equal(binding.recoveredCheckpoint, null);
   assert.equal(binding.preRunHeadSha, fixture.publishedHead);
+});
+
+// ---------------------------------------------------------------------------
+// #316: recovery of an owned, already-*committed* (not merely dirty)
+// continuation checkpoint exactly one commit ahead of the published PR head
+// -- the exact #314/#315 field shape (a committed correction plus one
+// leftover untracked diagnostic file, publication never attempted).
+// ---------------------------------------------------------------------------
+
+// Reuses 'commit-then-dirty': it produces exactly the #314/#315 shape (one
+// new local commit whose sole parent is the published head, plus one
+// untracked residue file), and the first run already refuses to publish it
+// (asserted separately above), so the checkpoint this helper returns is
+// genuinely preserved/unpublished, not fabricated.
+async function committedAheadCheckpointFixture(t) {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  await runContinuation(fixture, 'commit-then-dirty');
+  const checkpointHead = git(fixture.worktreePath, 'rev-parse', 'HEAD');
+  return { fixture, checkpointHead };
+}
+
+test('#316: the exact preserved one-commit-ahead checkpoint is recoverable, and nothing is reset or discarded', async (t) => {
+  const { fixture, checkpointHead } = await committedAheadCheckpointFixture(t);
+  assert.notEqual(checkpointHead, fixture.publishedHead);
+  const before = readFileSync(join(fixture.worktreePath, 'canary.md'), 'utf8');
+
+  const verdict = verifyPrContinuationCommittedAheadCheckpoint({
+    outputDir: fixture.outputDir,
+    repository: REPO,
+    prNumber: PR_NUMBER,
+    branch: BRANCH,
+    prHeadSha: fixture.publishedHead,
+    checkpointHeadSha: checkpointHead,
+    worktreeIdentity,
+    rootPath: fixture.repoPath,
+  });
+  assert.equal(verdict.recoverable, true);
+  assert.ok(verdict.expectedStatusFingerprint);
+
+  // Verification is read-only: nothing was reset, cleaned, stashed or committed.
+  assert.equal(readFileSync(join(fixture.worktreePath, 'canary.md'), 'utf8'), before);
+  assert.equal(existsSync(join(fixture.worktreePath, 'stray.md')), true);
+  assert.equal(fixture.originHead(), fixture.publishedHead);
+});
+
+test('#316: exactly-one-commit-ahead is required -- zero, multiple or wrong-lineage parents fail closed', async (t) => {
+  const { fixture, checkpointHead } = await committedAheadCheckpointFixture(t);
+  const base = {
+    outputDir: fixture.outputDir,
+    repository: REPO,
+    prNumber: PR_NUMBER,
+    branch: BRANCH,
+    worktreeIdentity,
+    rootPath: fixture.repoPath,
+  };
+
+  // The published head itself has zero parents relative to this branch's
+  // first commit here in effect -- more importantly, it is not ahead at all.
+  assert.equal(
+    verifyPrContinuationCommittedAheadCheckpoint({
+      ...base, prHeadSha: fixture.publishedHead, checkpointHeadSha: fixture.publishedHead,
+    }).failureReason,
+    'pr-continuation-committed-ahead-not-ahead',
+  );
+
+  // A checkpoint whose sole parent is not the current PR head (more than one
+  // commit ahead, or a different lineage) is refused, not generalised.
+  git(fixture.worktreePath, 'checkout', BRANCH);
+  writeFileSync(join(fixture.worktreePath, 'canary.md'), 'canary\nreview correction applied\nsecond commit\n');
+  git(fixture.worktreePath, 'add', 'canary.md');
+  git(fixture.worktreePath, 'commit', '--no-verify', '-m', 'second unpublished commit');
+  const twoAhead = git(fixture.worktreePath, 'rev-parse', 'HEAD');
+  assert.equal(
+    verifyPrContinuationCommittedAheadCheckpoint({
+      ...base, prHeadSha: fixture.publishedHead, checkpointHeadSha: twoAhead,
+    }).failureReason,
+    // The restricted handle itself still points at the first (one-ahead)
+    // commit, so this also fails on the recorded-checkpoint identity check
+    // before even reaching history -- either way it must refuse.
+    'pr-continuation-committed-ahead-head-mismatch',
+  );
+
+  // A merge commit (two parents) is never treated as a single-commit checkpoint.
+  git(fixture.repoPath, 'checkout', 'main');
+  writeFileSync(join(fixture.repoPath, 'other.md'), 'unrelated\n');
+  git(fixture.repoPath, 'add', 'other.md');
+  git(fixture.repoPath, 'commit', '-m', 'unrelated main commit');
+  git(fixture.worktreePath, 'merge', '--no-ff', '-m', 'merge unrelated', 'main');
+  const merged = git(fixture.worktreePath, 'rev-parse', 'HEAD');
+  assert.equal(
+    verifyPrContinuationCommittedAheadCheckpoint({
+      ...base, prHeadSha: fixture.publishedHead, checkpointHeadSha: merged,
+    }).failureReason,
+    'pr-continuation-committed-ahead-head-mismatch',
+  );
+});
+
+test('#316: a checkpoint recorded against a different PR head is never accepted', async (t) => {
+  const { fixture, checkpointHead } = await committedAheadCheckpointFixture(t);
+  const verdict = verifyPrContinuationCommittedAheadCheckpoint({
+    outputDir: fixture.outputDir,
+    repository: REPO,
+    prNumber: PR_NUMBER,
+    branch: BRANCH,
+    // The PR head has since moved (a concurrent advance) -- this handle was
+    // captured against the old head, so it can never authorise recovery
+    // against a different current head.
+    prHeadSha: 'f'.repeat(40),
+    checkpointHeadSha: checkpointHead,
+    worktreeIdentity,
+    rootPath: fixture.repoPath,
+  });
+  assert.equal(verdict.recoverable, false);
+  assert.equal(verdict.failureReason, 'pr-continuation-committed-ahead-pre-run-head-mismatch');
+});
+
+test('#316: no preserved committed-ahead handle at all fails before any provider launch', async (t) => {
+  const fixture = makeFixture();
+  t.after(fixture.cleanup);
+  // Simulate a locally-committed-ahead worktree with no restricted handle
+  // ever written for it (e.g. tampered with, or never captured).
+  writeFileSync(join(fixture.worktreePath, 'canary.md'), 'canary\nunauthorised local commit\n');
+  git(fixture.worktreePath, 'add', 'canary.md');
+  git(fixture.worktreePath, 'commit', '--no-verify', '-m', 'unauthorised local commit');
+  const localHead = git(fixture.worktreePath, 'rev-parse', 'HEAD');
+
+  const verdict = verifyPrContinuationCommittedAheadCheckpoint({
+    outputDir: fixture.outputDir,
+    repository: REPO,
+    prNumber: PR_NUMBER,
+    branch: BRANCH,
+    prHeadSha: fixture.publishedHead,
+    checkpointHeadSha: localHead,
+    worktreeIdentity,
+    rootPath: fixture.repoPath,
+  });
+  assert.equal(verdict.recoverable, false);
+  assert.equal(verdict.failureReason, 'pr-continuation-no-preserved-committed-ahead-checkpoint');
+});
+
+test('#316: binding recognises the exact preserved committed-ahead checkpoint and resumes without recovery for any other head drift', async (t) => {
+  const { fixture, checkpointHead } = await committedAheadCheckpointFixture(t);
+
+  const accepted = resolvePrContinuationBinding({
+    ...bindingDeps(fixture),
+    prepareWorkspace: () => ({
+      allowed: true, baseHead: checkpointHead, rootPath: fixture.repoPath, worktreePath: fixture.worktreePath,
+    }),
+    captureEvidence: () => ({
+      head: checkpointHead, branch: BRANCH, dirtyEntryCount: 1,
+      statusFingerprint: readRestrictedRecoveryHandle(
+        fixture.outputDir, prContinuationAttemptId({ repo: REPO, prNumber: PR_NUMBER }),
+      ).handle.checkpointStatusFingerprint,
+    }),
+    verifyCommittedAheadCheckpoint: (input) => verifyPrContinuationCommittedAheadCheckpoint({ ...input, outputDir: fixture.outputDir }),
+  });
+  assert.equal(accepted.allowed, true);
+  assert.equal(accepted.recoveredCheckpoint.recovered, true);
+  assert.equal(accepted.recoveredCheckpoint.committedAhead, true);
+  assert.equal(accepted.recoveredCheckpoint.checkpointHead, checkpointHead);
+  assert.equal(accepted.recoveredCheckpoint.preRunHeadSha, fixture.publishedHead);
+  assert.equal(accepted.preRunHeadSha, fixture.publishedHead);
+
+  // An arbitrary third head (neither the PR head nor the exact preserved
+  // checkpoint) is never accepted, with or without a verifier.
+  const arbitraryMismatch = resolvePrContinuationBinding({
+    ...bindingDeps(fixture),
+    prepareWorkspace: () => ({
+      allowed: true, baseHead: 'f'.repeat(40), rootPath: fixture.repoPath, worktreePath: fixture.worktreePath,
+    }),
+    captureEvidence: () => { throw new Error('evidence must not be captured for an ineligible head mismatch'); },
+    verifyCommittedAheadCheckpoint: () => ({ recoverable: false, failureReason: 'pr-continuation-committed-ahead-head-mismatch' }),
+  });
+  assert.equal(arbitraryMismatch.allowed, false);
+  assert.equal(arbitraryMismatch.failureReason, 'pr-continuation-pr-head-worktree-mismatch');
+});
+
+test('#316: a worktree modified since the committed-ahead checkpoint was captured fails closed', async (t) => {
+  const { fixture, checkpointHead } = await committedAheadCheckpointFixture(t);
+
+  const refused = resolvePrContinuationBinding({
+    ...bindingDeps(fixture),
+    prepareWorkspace: () => ({
+      allowed: true, baseHead: checkpointHead, rootPath: fixture.repoPath, worktreePath: fixture.worktreePath,
+    }),
+    captureEvidence: () => ({
+      head: checkpointHead, branch: BRANCH, dirtyEntryCount: 2, statusFingerprint: 'sha256:not-the-recorded-one',
+    }),
+    verifyCommittedAheadCheckpoint: (input) => verifyPrContinuationCommittedAheadCheckpoint({ ...input, outputDir: fixture.outputDir }),
+  });
+  assert.equal(refused.allowed, false);
+  assert.equal(refused.failureReason, 'pr-continuation-committed-ahead-worktree-modified');
+});
+
+test('#316: the local worktree HEAD must still equal the exact recovered checkpoint, not merely any commit ahead of the PR head', async (t) => {
+  const { fixture, checkpointHead } = await committedAheadCheckpointFixture(t);
+
+  // The worktree has since moved past the preserved checkpoint (a further,
+  // unauthorised local commit) -- the binding must require the *exact*
+  // preserved checkpoint, not merely "some commit ahead".
+  git(fixture.worktreePath, 'commit', '--allow-empty', '--no-verify', '-m', 'unexpected further commit');
+  const movedOn = git(fixture.worktreePath, 'rev-parse', 'HEAD');
+
+  const refused = resolvePrContinuationBinding({
+    ...bindingDeps(fixture),
+    prepareWorkspace: () => ({
+      allowed: true, baseHead: checkpointHead, rootPath: fixture.repoPath, worktreePath: fixture.worktreePath,
+    }),
+    captureEvidence: () => ({ head: movedOn, branch: BRANCH, dirtyEntryCount: 1, statusFingerprint: 'irrelevant' }),
+    verifyCommittedAheadCheckpoint: (input) => verifyPrContinuationCommittedAheadCheckpoint({ ...input, outputDir: fixture.outputDir }),
+  });
+  assert.equal(refused.allowed, false);
+  assert.equal(refused.failureReason, 'pr-continuation-pr-head-worktree-mismatch');
+});
+
+test('#316: resume finishes the preserved checkpoint\'s cleanup and publishes the exact preserved commit', async (t) => {
+  const { fixture, checkpointHead } = await committedAheadCheckpointFixture(t);
+  assert.equal(fixture.originHead(), fixture.publishedHead, 'the preserved checkpoint must never have been published');
+
+  const resumeExit = await runContinuation(fixture, 'remove-residue', {
+    runPlan: {
+      recoveredCheckpoint: {
+        recovered: true,
+        committedAhead: true,
+        checkpointHead,
+        preRunHeadSha: fixture.publishedHead,
+      },
+    },
+  });
+  assert.equal(resumeExit, 0);
+
+  const log = latestRunLog(fixture);
+  assert.equal(log.failureReason, null);
+  assert.equal(log.implementationEvidence.valid, true);
+  assert.equal(log.implementationEvidence.committed, true);
+  assert.equal(log.implementationEvidence.clean, true);
+  assert.equal(log.implementationPublication.published, true);
+  // Publication is exactly the already-preserved commit -- resume never
+  // needed (and never made) a second commit.
+  assert.equal(git(fixture.worktreePath, 'rev-parse', 'HEAD'), checkpointHead);
+  assert.equal(log.implementationPublication.headSha, checkpointHead);
+  assert.equal(fixture.originHead(), checkpointHead);
+});
+
+test('#316: a resume that leaves the worktree dirty again stays unpublished and preserves a new truthful checkpoint', async (t) => {
+  const { fixture, checkpointHead } = await committedAheadCheckpointFixture(t);
+
+  const resumeExit = await runContinuation(fixture, 'remove-residue-and-stay-dirty', {
+    runPlan: {
+      recoveredCheckpoint: {
+        recovered: true,
+        committedAhead: true,
+        checkpointHead,
+        preRunHeadSha: fixture.publishedHead,
+      },
+    },
+  });
+  assert.notEqual(resumeExit, 0);
+
+  const log = latestRunLog(fixture);
+  assert.equal(log.failureReason, 'implementation-worktree-dirty');
+  assert.equal(log.implementationPublication, null);
+  assert.equal(fixture.originHead(), fixture.publishedHead, 'a still-dirty resume must never publish');
+
+  const read = readRestrictedRecoveryHandle(fixture.outputDir, prContinuationAttemptId({ repo: REPO, prNumber: PR_NUMBER }));
+  assert.equal(read.available, true);
+  assert.equal(read.handle.checkpointHead, checkpointHead);
+  assert.ok(read.handle.checkpointStatusFingerprint);
+});
+
+test('#316: a worktree that has drifted from the exact bound checkpoint since binding refuses launch without mutating the worktree', async (t) => {
+  const { fixture, checkpointHead } = await committedAheadCheckpointFixture(t);
+  const before = readFileSync(join(fixture.worktreePath, 'canary.md'), 'utf8');
+
+  const resumeExit = await runContinuation(fixture, 'remove-residue', {
+    runPlan: {
+      recoveredCheckpoint: {
+        recovered: true,
+        committedAhead: true,
+        // A stale/incorrect binding recording a different checkpoint than
+        // what is actually preserved in the worktree right now.
+        checkpointHead: 'e'.repeat(40),
+        preRunHeadSha: fixture.publishedHead,
+      },
+    },
+  });
+  assert.notEqual(resumeExit, 0);
+
+  const log = latestRunLog(fixture);
+  assert.equal(log.reason, 'pr-continuation-committed-ahead-checkpoint-changed');
+  assert.equal(readFileSync(join(fixture.worktreePath, 'canary.md'), 'utf8'), before);
+  assert.equal(existsSync(join(fixture.worktreePath, 'stray.md')), true, 'a refused launch must never run the worker or mutate the worktree');
+  assert.equal(fixture.originHead(), fixture.publishedHead);
 });
 
 // ---------------------------------------------------------------------------
