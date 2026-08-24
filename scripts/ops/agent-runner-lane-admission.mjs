@@ -102,8 +102,15 @@ export function laneCapacityReasons(candidateInput, activeInputs = [], capsInput
   if (active.length >= caps.global) reasons.push('global-cap-full');
   const repoCap = caps.perRepository[candidate.repository] ?? caps.defaultPerRepository;
   if (countBy(active, (lane) => lane.repository, candidate.repository) >= repoCap) reasons.push('repository-cap-full');
-  const agentCap = caps.perAgent[candidate.agentInstanceId] ?? caps.perAgent[candidate.adapterId] ?? caps.defaultPerAgent;
-  if (countBy(active, (lane) => lane.agentInstanceId, candidate.agentInstanceId) >= agentCap) reasons.push('agent-cap-full');
+  const instanceCap = caps.perAgent[candidate.agentInstanceId];
+  const adapterCap = caps.perAgent[candidate.adapterId];
+  if (instanceCap !== undefined) {
+    if (countBy(active, (lane) => lane.agentInstanceId, candidate.agentInstanceId) >= instanceCap) reasons.push('agent-cap-full');
+  } else if (adapterCap !== undefined) {
+    if (countBy(active, (lane) => lane.adapterId, candidate.adapterId) >= adapterCap) reasons.push('agent-cap-full');
+  } else if (countBy(active, (lane) => lane.agentInstanceId, candidate.agentInstanceId) >= caps.defaultPerAgent) {
+    reasons.push('agent-cap-full');
+  }
   const nodeCap = caps.perNode[candidate.nodeId] ?? caps.defaultPerNode;
   if (countBy(active, (lane) => lane.nodeId, candidate.nodeId) >= nodeCap) reasons.push('node-cap-full');
   return reasons.sort();
