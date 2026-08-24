@@ -1,16 +1,12 @@
 #!/usr/bin/env node
 
-// #210: the one generic serial implementation recurrence. It removes GP from
-// the manual per-issue Agent Runner start loop by probing every *enabled*
-// managed-registry project (#100/#177) each tick, selecting at most one
-// runnable project/candidate, and invoking the existing project-bound
-// bin/run-project.sh wrapper for that project's exact config -- the same
-// production execution seam the accepted ModelSpend-only timer already uses.
-// This module never reimplements candidate selection, claim or execution: it
-// only orders existing project-bound probes and delegates to the existing
-// wrapper.
+// #51: Dell remains the one scheduler/controller, but scheduling and worker
+// execution are no longer the same global critical section. One short
+// scheduler mutex protects registry probing/selection; selected independent
+// issue lanes then execute concurrently and acquire their own recoverable lane
+// locks inside the project runner.
 
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
@@ -20,7 +16,8 @@ import { acquireRecoverableCronLock } from './agent-runner-cron-lock.mjs';
 import { PROJECT_SCOPED_ENV_FIELDS } from './agent-runner-config.mjs';
 import {
   GLOBAL_LOCK_ENV,
-  markInheritedImplementationSlot,
+  IMPLEMENTATION_LANE_ENV,
+  SLOT_INHERITED_ENV,
   resolveGlobalLockPath,
 } from './agent-runner-implementation-slot.mjs';
 import { computeManagerProfileShadow } from './agent-runner-manager-profile-shadow.mjs';
@@ -35,12 +32,8 @@ const RUN_PROJECT_WRAPPER = resolve(HERE, '../../bin/run-project.sh');
 
 export const NO_RUNNABLE_CANDIDATE_EXIT_CODE = 3;
 export const EVIDENCE_DIR_ENV = 'AGENT_RUNNER_IMPLEMENTATION_EVIDENCE_DIR';
+export const MAX_PARALLEL_ENV = 'AGENT_RUNNER_MAX_PARALLEL';
 
-// The global implementation slot's lock identity now has exactly one
-// definition (#242), in agent-runner-implementation-slot.mjs, so the direct
-// runner path and this recurrence can never disagree about which lock file
-// *is* the one global slot. Re-exported here because the accepted #210
-// recurrence contract and its tests address these names on this module.
 export { GLOBAL_LOCK_ENV, resolveGlobalLockPath };
 
 export function resolveEvidenceDir(env = process.env) {
@@ -48,13 +41,17 @@ export function resolveEvidenceDir(env = process.env) {
     || resolve(String(env.HOME || homedir()), '.local/state/agent-runner/implementation-recurrence');
 }
 
-/**
- * Load enabled registry entries with each project's *exact* config and the
- * config file path it was loaded from, so probing/invocation can bind
- * AGENT_RUNNER_CONFIG to that project's config -- the same identity contract
- * bin/run-project.sh itself binds to -- rather than reimplementing registry
- * admission rules.
- */
+export function resolveMaxParallel(env = process.env, runnableCount = 0) {
+  const raw = String(env[MAX_PARALLEL_ENV] || '').trim();
+  if (!raw) return Math.max(1, runnableCount || 1);
+  if (!/^\d+$/.test(raw)) throw new Error(`${MAX_PARALLEL_ENV} must be a positive integer`);
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || value > 64) {
+    throw new Error(`${MAX_PARALLEL_ENV} must be between 1 and 64`);
+  }
+  return value;
+}
+
 export function loadEnabledProjectsWithConfigPaths({ argv = [], env = process.env, registryPath } = {}) {
   const { registryPath: resolvedPath, manifest, entries } = readProjectRegistryEntries({ argv, env, registryPath });
   const selection = resolveProjectRegistrySelection({ manifest, entries });
@@ -69,30 +66,20 @@ export function loadEnabledProjectsWithConfigPaths({ argv = [], env = process.en
 }
 
 /**
- * Env vars that steer a *previously selected* project's repo/output/state/lock
- * identity (see PROJECT_SCOPED_ENV_FIELDS / assertProjectScopedEnv in
- * agent-runner-config.mjs) must never be forwarded into a probe or invocation
- * bound to a *different* project's config. The recurrence process's own
- * environment can carry these left over from an unrelated machine-level
- * export (e.g. a ModelSpend-scoped GITHUB_REPOSITORY set for manual runner
- * use); scrub them before rebinding to the selected project's exact config so
- * a different project can never inherit another project's identity and trip
- * the wrapper's own project-scoped-env-mismatch refusal (#210 requirement 1).
+ * Scrub any previous project identity. Scheduler probes are read-only and need
+ * no implementation lane. Worker invocations receive one exact issue lane;
+ * inherited-slot markers are always removed at the scheduler boundary so a
+ * worker must independently acquire its own lane.
  */
-export function buildProjectScopedInvocationEnv(env, configPath) {
+export function buildProjectScopedInvocationEnv(env, configPath, { laneId = null } = {}) {
   const scrubbed = { ...env };
-  for (const { envVarName } of PROJECT_SCOPED_ENV_FIELDS) {
-    delete scrubbed[envVarName];
-  }
+  for (const { envVarName } of PROJECT_SCOPED_ENV_FIELDS) delete scrubbed[envVarName];
+  delete scrubbed[SLOT_INHERITED_ENV];
+  delete scrubbed[IMPLEMENTATION_LANE_ENV];
   scrubbed.AGENT_RUNNER_CONFIG = configPath;
   scrubbed.CLAUDE_RUNNER_CONFIG = configPath;
-  // This recurrence already owns the one global implementation slot for the
-  // whole tick (see runImplementationRecurrence below). Every descendant it
-  // spawns therefore runs *inside* that slot and must not try to take the
-  // same lock again -- the direct-path guard added for #242 would otherwise
-  // deadlock the normal systemd recurrence against itself. Marking the child
-  // env is not a grant: the child still verifies this pid is alive.
-  return markInheritedImplementationSlot(scrubbed);
+  if (laneId) scrubbed[IMPLEMENTATION_LANE_ENV] = laneId;
+  return scrubbed;
 }
 
 function defaultProbeProject({ config, configPath }, { argv = [], env = process.env, nodeBin = process.execPath } = {}) {
@@ -105,25 +92,22 @@ function defaultProbeProject({ config, configPath }, { argv = [], env = process.
   try {
     const lastLine = String(result.stdout || '').trim().split('\n').pop();
     payload = lastLine ? JSON.parse(lastLine) : null;
-  } catch { /* best-effort evidence only; classification relies on exit status */ }
+  } catch { /* bounded evidence only */ }
   return { status: result.status, payload, stderr: result.stderr };
 }
 
-function defaultInvokeProject({ configPath }, { argv = [], env = process.env } = {}) {
-  const result = spawnSync(RUN_PROJECT_WRAPPER, argv, {
-    env: buildProjectScopedInvocationEnv(env, configPath),
-    stdio: 'inherit',
+function defaultInvokeProject({ config, configPath }, { argv = [], env = process.env, laneId } = {}) {
+  return new Promise((resolveResult) => {
+    const child = spawn(RUN_PROJECT_WRAPPER, argv, {
+      cwd: config.localRepoPath,
+      env: buildProjectScopedInvocationEnv(env, configPath, { laneId }),
+      stdio: 'inherit',
+    });
+    child.once('error', (error) => resolveResult({ status: 1, error: String(error?.message || error) }));
+    child.once('close', (code, signal) => resolveResult({ status: code, signal: signal || null }));
   });
-  return { status: result.status };
 }
 
-/**
- * Classify one project-bound probe result into runnable / no-candidate /
- * blocked. Exit code 0 and 3 are the existing claude-runner-candidate-probe
- * contract (candidate found / no runnable candidate). Any other status is a
- * project-local blocker, not "no work" -- it is recorded and skipped so it
- * cannot permanently stop inspection of another enabled project.
- */
 export function classifyProbeOutcome({ status, payload }) {
   if (status === 0) {
     return { runnable: true, blocked: false, reason: 'runnable-candidate', selectedIssue: payload?.selectedIssue ?? null };
@@ -134,21 +118,42 @@ export function classifyProbeOutcome({ status, payload }) {
   return { runnable: false, blocked: true, reason: `probe-failed-exit-${status}`, selectedIssue: null };
 }
 
-/**
- * Serial fall-through selection (#210 requirement 8): probe every enabled
- * project in registry order and select the first with a runnable candidate.
- * Never probes more than one project's worth of claim/model/worktree work --
- * probing is read-only discovery; only the single selected project is later
- * invoked through the production wrapper.
- */
+/** Historical single-result helper retained for callers/tests. */
 export function selectRunnableProject(projects, { probeProject, ...probeOptions }) {
+  const { selected, probed } = selectRunnableProjects(projects, { probeProject, ...probeOptions, maxParallel: 1 });
+  return { selected: selected[0]?.entry || null, probed };
+}
+
+/**
+ * Probe all enabled projects under the Dell scheduler mutex and return up to
+ * maxParallel independent runnable project candidates. One candidate per
+ * project is deliberate: same-repository/same-issue partition concurrency
+ * requires a separately explicit disjoint-scope authority contract.
+ */
+export function selectRunnableProjects(projects, {
+  probeProject,
+  maxParallel = Math.max(1, projects.length),
+  ...probeOptions
+}) {
+  const selected = [];
   const probed = [];
   for (const entry of projects) {
     const outcome = classifyProbeOutcome(probeProject(entry, probeOptions));
-    probed.push({ projectId: entry.config.projectId, githubRepo: entry.config.githubRepo, ...outcome });
-    if (outcome.runnable) return { selected: entry, probed };
+    const evidence = { projectId: entry.config.projectId, githubRepo: entry.config.githubRepo, ...outcome };
+    probed.push(evidence);
+    if (outcome.runnable && selected.length < maxParallel) {
+      selected.push({ entry, outcome });
+    }
   }
-  return { selected: null, probed };
+  return { selected, probed };
+}
+
+export function implementationLaneForSelection(entry, outcome) {
+  const issue = outcome?.selectedIssue;
+  if (!Number.isSafeInteger(Number(issue)) || Number(issue) <= 0) {
+    throw new Error(`Runnable project ${entry.config.projectId} did not provide a valid selected issue`);
+  }
+  return `${entry.config.projectId}:issue:${Number(issue)}`;
 }
 
 function writeEvidence(evidenceDir, payload) {
@@ -160,13 +165,9 @@ function writeEvidence(evidenceDir, payload) {
 }
 
 /**
- * The one generic serial implementation recurrence (#210). Registry
- * load/validation happens before the global lock is even requested, so an
- * invalid/partial registry fails before any lock, claim, GitHub or model
- * activity. The global lock is then held for the full probe+invoke pass, so
- * timer/manual/re-entry collisions cannot launch a second worker while this
- * one is selecting or running. A healthy empty queue (no enabled project has
- * a runnable candidate) performs no invocation and is zero-model/no-mutation.
+ * One Dell scheduler recurrence with concurrent independent execution lanes.
+ * The scheduler lock is held only while probing/selecting; provider and repo
+ * mutation happen after release, inside exact issue-scoped lane locks.
  */
 export async function runImplementationRecurrence({
   argv = [],
@@ -180,58 +181,76 @@ export async function runImplementationRecurrence({
   computeProfileShadow = computeManagerProfileShadow,
 } = {}) {
   const { registryPath: resolvedRegistryPath, projects } = loadEnabledProjectsWithConfigPaths({ argv, env, registryPath });
-
+  const maxParallel = resolveMaxParallel(env, projects.length);
   const lockPath = resolveGlobalLockPath(env);
+
+  let selected;
+  let probed;
+  let profileShadow;
   const release = acquireLock(lockPath);
   try {
-    const { selected, probed } = selectRunnableProject(projects, { probeProject, argv, env });
-
-    // #259: a read-only comparison of the profile-resolved manager context
-    // against each enabled project's canonical registry identity. It is
-    // pure evidence -- computed after selection so it can never influence
-    // which project is probed or invoked -- and any failure inside it is
-    // already captured as a bounded `available: false` result rather than
-    // thrown, so it can never block or alter this recurrence.
-    const profileShadow = computeProfileShadow(projects);
-
-    const base = {
-      schemaVersion: 1,
-      recordedAt: now(),
-      registryPath: resolvedRegistryPath,
-      lockPath,
-      probed,
-      profileShadow,
-    };
-
-    if (!selected) {
-      const payload = {
-        ...base,
-        selectedProjectId: null,
-        selectedRepository: null,
-        selectedIssue: null,
-        invoked: false,
-        reason: 'no-runnable-project',
-      };
-      payload.evidencePath = writeEvidenceFile(resolveEvidenceDir(env), payload);
-      return payload;
-    }
-
-    const selectedProbe = probed.find((entry) => entry.projectId === selected.config.projectId);
-    const invokeResult = await invokeProject(selected, { argv, env });
-    const payload = {
-      ...base,
-      selectedProjectId: selected.config.projectId,
-      selectedRepository: selected.config.githubRepo,
-      selectedIssue: selectedProbe?.selectedIssue ?? null,
-      invoked: true,
-      invokeExitCode: invokeResult.status ?? null,
-      reason: 'candidate-selected',
-    };
-    payload.evidencePath = writeEvidenceFile(resolveEvidenceDir(env), payload);
-    return payload;
+    ({ selected, probed } = selectRunnableProjects(projects, { probeProject, argv, env, maxParallel }));
+    profileShadow = computeProfileShadow(projects);
   } finally {
     release();
   }
+
+  const base = {
+    schemaVersion: 2,
+    recordedAt: now(),
+    registryPath: resolvedRegistryPath,
+    schedulerLockPath: lockPath,
+    maxParallel,
+    probed,
+    profileShadow,
+  };
+
+  if (selected.length === 0) {
+    const payload = {
+      ...base,
+      selectedProjectId: null,
+      selectedRepository: null,
+      selectedIssue: null,
+      selectedProjects: [],
+      invoked: false,
+      reason: 'no-runnable-project',
+    };
+    payload.evidencePath = writeEvidenceFile(resolveEvidenceDir(env), payload);
+    return payload;
+  }
+
+  const jobs = selected.map(({ entry, outcome }) => {
+    const laneId = implementationLaneForSelection(entry, outcome);
+    return { entry, outcome, laneId };
+  });
+
+  const results = await Promise.all(jobs.map(async ({ entry, outcome, laneId }) => {
+    const invokeResult = await Promise.resolve(invokeProject(entry, { argv, env, laneId }));
+    return {
+      projectId: entry.config.projectId,
+      repository: entry.config.githubRepo,
+      selectedIssue: outcome.selectedIssue,
+      laneId,
+      invokeExitCode: invokeResult?.status ?? null,
+      signal: invokeResult?.signal ?? null,
+      error: invokeResult?.error ?? null,
+    };
+  }));
+
+  const first = results[0];
+  const payload = {
+    ...base,
+    // Compatibility summary fields identify the first selected lane only.
+    selectedProjectId: first.projectId,
+    selectedRepository: first.repository,
+    selectedIssue: first.selectedIssue,
+    selectedProjects: results,
+    invoked: true,
+    invokeExitCode: results.length === 1 ? first.invokeExitCode : null,
+    reason: results.length === 1 ? 'candidate-selected' : 'candidates-selected-concurrently',
+  };
+  payload.evidencePath = writeEvidenceFile(resolveEvidenceDir(env), payload);
+  return payload;
 }
 
 const invokedAsScript = process.argv[1]
@@ -242,7 +261,8 @@ if (invokedAsScript) {
   try {
     const result = await runImplementationRecurrence({ argv: process.argv.slice(2) });
     console.log(JSON.stringify(result));
-    process.exitCode = result.invoked ? (result.invokeExitCode || 0) : 0;
+    const failures = result.selectedProjects?.filter((entry) => Number(entry.invokeExitCode) !== 0) || [];
+    process.exitCode = failures.length ? 1 : 0;
   } catch (error) {
     console.error(error?.stack || error?.message || String(error));
     process.exitCode = 1;
