@@ -11,6 +11,8 @@
     "validate:import": "node scripts/import-modelspend-runner.mjs --verify-only",
     "validate": "bash scripts/validate.sh",
     "test": "bash scripts/test-imported-runner.sh",
+    "observability:exporter": "node scripts/ops/agent-runner-observability-exporter.mjs",
+    "observability:exporter:test": "node --test scripts/ops/agent-runner-observability-exporter.test.mjs",
     "queue:triage": "node scripts/ops/agent-runner-queue-triage-command.mjs",
     "queue:triage:prompt": "node scripts/ops/agent-runner-queue-triage-command.mjs --format openai",
     "queue:triage:shadow": "node scripts/ops/agent-runner-queue-triage-shadow-command.mjs",

@@ -7,6 +7,12 @@ node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"))' "$
 node -e 'JSON.parse(require("node:fs").readFileSync(process.argv[1],"utf8"))' "$ROOT/config/modelspend.example.json"
 node --check "$ROOT/scripts/import-modelspend-runner.mjs"
 node --check "$ROOT/scripts/verify-imported-tree.mjs"
+node --check "$ROOT/scripts/ops/agent-runner-observability-exporter.mjs"
+node --check "$ROOT/scripts/ops/agent-runner-observability-common.mjs"
+node --check "$ROOT/scripts/ops/agent-runner-observability-projection.mjs"
+node --check "$ROOT/scripts/ops/agent-runner-observability-metrics.mjs"
+node --check "$ROOT/scripts/ops/agent-runner-observability-events.mjs"
+node --check "$ROOT/scripts/ops/agent-runner-observability-http.mjs"
 
 while IFS= read -r -d '' file; do
   bash -n "$file"
@@ -36,6 +42,11 @@ state = (root / 'scripts/migrate-state.sh').read_text()
 runner = (root / 'bin/run-project.sh').read_text()
 publisher = (root / 'bin/publish-dashboard.sh').read_text()
 config = (root / 'config/modelspend.example.json').read_text()
+exporter = (root / 'scripts/ops/agent-runner-observability-exporter.mjs').read_text()
+exporter_common = (root / 'scripts/ops/agent-runner-observability-common.mjs').read_text()
+exporter_projection = (root / 'scripts/ops/agent-runner-observability-projection.mjs').read_text()
+exporter_http = (root / 'scripts/ops/agent-runner-observability-http.mjs').read_text()
+exporter_installer = (root / 'scripts/install-observability-exporter.sh').read_text()
 
 expect('dependencyClosure' in importer and 'MIGRATION-MANIFEST.json' in importer, 'deterministic import closure/provenance missing')
 expect("status', '--porcelain" in importer, 'dirty source checkout refusal missing')
@@ -62,6 +73,28 @@ expect('ProtectHome=read-only' not in runner_unit, 'runner execution service mus
 expect('NoNewPrivileges=true' in runner_unit and 'PrivateTmp=true' in runner_unit, 'runner execution service hardening regressed')
 expect('ProtectSystem=strict' in dashboard_unit and 'ProtectHome=read-only' in dashboard_unit, 'read-only dashboard service sandbox regressed')
 
+expect("const LOOPBACK_HOST = '127.0.0.1'" in exporter_common, 'observability exporter loopback constant missing')
+expect('args.host !== LOOPBACK_HOST' in exporter, 'observability exporter does not reject non-loopback binding')
+expect("path === '/metrics'" in exporter_http and "path === '/healthz'" in exporter_http and "path === '/events.ndjson'" in exporter_http,
+       'observability exporter endpoint contract missing')
+expect("!['GET','HEAD'].includes(request.method)" in exporter_http, 'observability exporter does not reject write methods')
+expect('MAX_EVENTS = 100' in exporter_common and 'MAX_EVENT_BYTES = 256 * 1024' in exporter_common,
+       'observability event feed is not bounded')
+expect("new DatabaseSync(dbPath, { readOnly: true })" in exporter_projection,
+       'observability projection does not open SQLite read-only')
+expect('PRAGMA query_only = ON' in exporter_projection and 'PRAGMA trusted_schema = OFF' in exporter_projection,
+       'observability projection SQLite safety pragmas missing')
+expect('payload_json' not in exporter_projection and 'log_path' not in exporter_projection,
+       'observability projection contains prohibited raw columns')
+expect('buildRunnerDashboard' not in exporter and 'openRunnerStateStore' not in exporter_projection,
+       'observability exporter must not invoke the mutable runner state store')
+expect('ProtectSystem=strict' in exporter_installer and 'ProtectHome=read-only' in exporter_installer,
+       'observability exporter systemd sandbox missing')
+expect('NoNewPrivileges=true' in exporter_installer and 'MemoryMax=128M' in exporter_installer,
+       'observability exporter resource/security hardening missing')
+expect('ExecStart=/usr/bin/node' in exporter_installer and '--host $HOST' in exporter_installer,
+       'observability exporter service entrypoint missing')
+
 all_text = '\n'.join(
     p.read_text(errors='replace')
     for p in root.rglob('*')
@@ -80,7 +113,7 @@ if errors:
     for error in errors:
         print(f'ERROR: {error}', file=sys.stderr)
     raise SystemExit(1)
-print('PASS: standalone migration safety invariants')
+print('PASS: standalone migration and observability safety invariants')
 PY
 
 node "$ROOT/scripts/verify-imported-tree.mjs"
