@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { EXECUTION_PHASE_IMPLEMENTATION } from './claude-runner-execution-policy.mjs';
 import { buildEvidenceSchemaSection } from './claude-runner-prompt-compiler.mjs';
 import {
   buildPreflightDirectPrompt,
   buildPrContinuationPromptSections,
-  EXECUTION_PHASE_IMPLEMENTATION,
 } from './claude-runner.mjs';
 
 const PROFILE = {
