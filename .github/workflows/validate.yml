@@ -35,29 +35,5 @@ jobs:
         with:
           node-version: 22.23.0
 
-      - name: Diagnose compact prompt compiler tests
-        run: node --test scripts/ops/claude-runner-prompt-compiler.test.mjs
-
-      - name: Diagnose runner prompt compatibility tests
-        run: node --test scripts/ops/claude-runner.test.mjs
-
-      - name: Diagnose import provenance
-        run: node scripts/verify-imported-tree.mjs
-
-      - name: Diagnose remaining Claude runner tests
-        shell: bash
-        run: |
-          mapfile -t tests < <(find scripts/ops -maxdepth 2 -type f -name 'claude-runner*.test.mjs' | sort)
-          node --test "${tests[@]}"
-
-      - name: Diagnose Agent Runner tests individually
-        shell: bash
-        run: |
-          mapfile -t tests < <(find scripts/ops -maxdepth 2 -type f -name 'agent-runner*.test.mjs' | sort)
-          for test_file in "${tests[@]}"; do
-            printf '\n=== %s ===\n' "$test_file"
-            node --test "$test_file"
-          done
-
       - name: Run canonical repository validation
         run: npm run validate
