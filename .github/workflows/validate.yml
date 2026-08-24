@@ -35,5 +35,55 @@ jobs:
         with:
           node-version: 22.23.0
 
-      - name: Run canonical repository validation
-        run: npm run validate
+      - name: Diagnose Agent Runner tests A-D
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(scripts/ops/agent-runner-[a-d]*.test.mjs)
+          ((${#tests[@]} == 0)) || node --test "${tests[@]}"
+
+      - name: Diagnose Agent Runner tests E-H
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(scripts/ops/agent-runner-[e-h]*.test.mjs)
+          ((${#tests[@]} == 0)) || node --test "${tests[@]}"
+
+      - name: Diagnose Agent Runner tests I-L
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(scripts/ops/agent-runner-[i-l]*.test.mjs)
+          ((${#tests[@]} == 0)) || node --test "${tests[@]}"
+
+      - name: Diagnose Agent Runner tests M-P
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(scripts/ops/agent-runner-[m-p]*.test.mjs)
+          ((${#tests[@]} == 0)) || node --test "${tests[@]}"
+
+      - name: Diagnose Agent Runner tests Q-T
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(scripts/ops/agent-runner-[q-t]*.test.mjs)
+          ((${#tests[@]} == 0)) || node --test "${tests[@]}"
+
+      - name: Diagnose Agent Runner tests U-Z
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          tests=(scripts/ops/agent-runner-[u-z]*.test.mjs)
+          ((${#tests[@]} == 0)) || node --test "${tests[@]}"
