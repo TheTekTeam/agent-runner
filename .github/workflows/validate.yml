@@ -35,39 +35,39 @@ jobs:
         with:
           node-version: 22.23.0
 
-      - name: Diagnose Agent Runner tests A-D
+      - name: Diagnose Agent Runner tests M
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tests=(scripts/ops/agent-runner-[a-d]*.test.mjs)
+          tests=(scripts/ops/agent-runner-m*.test.mjs)
           ((${#tests[@]} == 0)) || node --test "${tests[@]}"
 
-      - name: Diagnose Agent Runner tests E-H
+      - name: Diagnose Agent Runner tests N
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tests=(scripts/ops/agent-runner-[e-h]*.test.mjs)
+          tests=(scripts/ops/agent-runner-n*.test.mjs)
           ((${#tests[@]} == 0)) || node --test "${tests[@]}"
 
-      - name: Diagnose Agent Runner tests I-L
+      - name: Diagnose Agent Runner tests O
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tests=(scripts/ops/agent-runner-[i-l]*.test.mjs)
+          tests=(scripts/ops/agent-runner-o*.test.mjs)
           ((${#tests[@]} == 0)) || node --test "${tests[@]}"
 
-      - name: Diagnose Agent Runner tests M-P
+      - name: Diagnose Agent Runner tests P
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tests=(scripts/ops/agent-runner-[m-p]*.test.mjs)
+          tests=(scripts/ops/agent-runner-p*.test.mjs)
           ((${#tests[@]} == 0)) || node --test "${tests[@]}"
 
       - name: Diagnose Agent Runner tests Q-T
