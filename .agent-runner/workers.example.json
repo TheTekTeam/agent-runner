@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "controllerNodeId": "dell",
+  "workers": [
+    {
+      "nodeId": "dell",
+      "hostname": "dev-cluster-dell",
+      "state": "enabled",
+      "transport": {
+        "type": "local"
+      },
+      "concurrencyCap": 2,
+      "placementWeight": 0,
+      "qualifications": {
+        "claude-code-cli": {
+          "state": "unqualified"
+        },
+        "codex-cli": {
+          "state": "unqualified"
+        },
+        "grok-cli": {
+          "state": "unqualified"
+        },
+        "gemini-cli": {
+          "state": "unqualified"
+        },
+        "ollama-agent": {
+          "state": "unqualified"
+        }
+      }
+    },
+    {
+      "nodeId": "z790",
+      "hostname": "dev-cluster-z790",
+      "state": "enabled",
+      "transport": {
+        "type": "restricted-ssh",
+        "host": "dev-cluster-z790",
+        "entrypoint": "/usr/local/lib/agent-runner/worker-entrypoint"
+      },
+      "concurrencyCap": 2,
+      "placementWeight": 0,
+      "qualifications": {
+        "claude-code-cli": {
+          "state": "unqualified"
+        },
+        "codex-cli": {
+          "state": "unqualified"
+        },
+        "grok-cli": {
+          "state": "unqualified"
+        },
+        "gemini-cli": {
+          "state": "unqualified"
+        },
+        "ollama-agent": {
+          "state": "unqualified"
+        }
+      }
+    }
+  ]
+}
