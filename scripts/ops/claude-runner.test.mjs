@@ -1178,21 +1178,33 @@ test('#242: an unresolved thread from an untrusted author never reaches binding 
   assert.equal(runCalls, 0);
 });
 
+const PR_CONTINUATION_FIXTURE_HEAD = 'c'.repeat(40);
+const PR_CONTINUATION_STALE_HEAD = 'd'.repeat(40);
+
+function pullRequestViewResult({ number = 42, state = 'OPEN', branch, headRefOid = PR_CONTINUATION_FIXTURE_HEAD, url }) {
+  return {
+    status: 0,
+    stdout: JSON.stringify({
+      number, state, headRefName: branch, headRefOid, url: url || `https://github.com/TheTekTeam/modelspend/pull/${number}`,
+    }),
+  };
+}
+
+function remoteRefResult(branch, sha) {
+  return { status: 0, stdout: `${sha}\trefs/heads/${branch}\n` };
+}
+
 test('publishPrContinuation pushes only the existing branch and preserves the exact same open PR', () => {
   const branch = 'claude/pr-continuation-fixture-629';
   const calls = [];
   const runner = (command, args) => {
     calls.push([command, ...args]);
     if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
-    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${'c'.repeat(40)}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${PR_CONTINUATION_FIXTURE_HEAD}\n` };
+    if (command === 'git' && args[0] === 'ls-remote') return remoteRefResult(branch, PR_CONTINUATION_FIXTURE_HEAD);
     if (command === 'git') return { status: 0, stdout: '' };
     if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
-      return {
-        status: 0,
-        stdout: JSON.stringify({
-          number: 42, state: 'OPEN', headRefName: branch, headRefOid: 'c'.repeat(40), url: 'https://github.com/TheTekTeam/modelspend/pull/42',
-        }),
-      };
+      return pullRequestViewResult({ branch, headRefOid: PR_CONTINUATION_FIXTURE_HEAD });
     }
     return { status: 1, stdout: '', stderr: 'unexpected command' };
   };
@@ -1206,24 +1218,107 @@ test('publishPrContinuation pushes only the existing branch and preserves the ex
   });
   assert.equal(result.published, true);
   assert.equal(result.prNumber, 42);
-  assert.equal(result.headSha, 'c'.repeat(40));
+  assert.equal(result.headSha, PR_CONTINUATION_FIXTURE_HEAD);
   assert.ok(calls.some((call) => call.join(' ') === `git push origin ${branch}`));
   assert.equal(calls.some((call) => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'create'), false);
+  assert.equal(calls.filter((call) => call[0] === 'gh' && call[1] === 'pr' && call[2] === 'view').length, 1, 'an immediate exact head must not perform unnecessary retries');
+});
+
+test('publishPrContinuation reconciles a stale headRefOid on the same PR within the bounded retry window', () => {
+  const branch = 'claude/pr-continuation-fixture-629';
+  let viewCalls = 0;
+  const waits = [];
+  const runner = (command, args) => {
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${PR_CONTINUATION_FIXTURE_HEAD}\n` };
+    if (command === 'git' && args[0] === 'ls-remote') return remoteRefResult(branch, PR_CONTINUATION_FIXTURE_HEAD);
+    if (command === 'git') return { status: 0, stdout: '' };
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      viewCalls += 1;
+      const headRefOid = viewCalls === 1 ? PR_CONTINUATION_STALE_HEAD : PR_CONTINUATION_FIXTURE_HEAD;
+      return pullRequestViewResult({ branch, headRefOid });
+    }
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  const result = publishPrContinuation({
+    workspace: { worktreePath: '/tmp/worktree' },
+    worktreeIdentity: { expectedBranch: branch },
+    repo: 'TheTekTeam/modelspend',
+    prNumber: 42,
+    runner,
+    wait: (ms) => { waits.push(ms); },
+    env: {},
+  });
+  assert.equal(result.published, true);
+  assert.equal(result.headSha, PR_CONTINUATION_FIXTURE_HEAD);
+  assert.equal(viewCalls, 2, 'must retry the same PR number after a stale head');
+  assert.equal(waits.length, 1);
+});
+
+test('publishPrContinuation fails closed when the pushed branch ref is not yet reflected remotely', () => {
+  const branch = 'claude/pr-continuation-fixture-629';
+  const runner = (command, args) => {
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${PR_CONTINUATION_FIXTURE_HEAD}\n` };
+    if (command === 'git' && args[0] === 'ls-remote') return remoteRefResult(branch, PR_CONTINUATION_STALE_HEAD);
+    if (command === 'git') return { status: 0, stdout: '' };
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  const result = publishPrContinuation({
+    workspace: { worktreePath: '/tmp/worktree' },
+    worktreeIdentity: { expectedBranch: branch },
+    repo: 'TheTekTeam/modelspend',
+    prNumber: 42,
+    runner,
+    env: {},
+  });
+  assert.equal(result.published, false);
+  assert.equal(result.failureReason, 'pr-continuation-publication-remote-ref-mismatch');
+});
+
+test('publishPrContinuation fails closed with a truthful head-mismatch after the retry bound is exhausted', () => {
+  const branch = 'claude/pr-continuation-fixture-629';
+  let viewCalls = 0;
+  const waits = [];
+  const runner = (command, args) => {
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${PR_CONTINUATION_FIXTURE_HEAD}\n` };
+    if (command === 'git' && args[0] === 'ls-remote') return remoteRefResult(branch, PR_CONTINUATION_FIXTURE_HEAD);
+    if (command === 'git') return { status: 0, stdout: '' };
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      viewCalls += 1;
+      return pullRequestViewResult({ branch, headRefOid: PR_CONTINUATION_STALE_HEAD });
+    }
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  const result = publishPrContinuation({
+    workspace: { worktreePath: '/tmp/worktree' },
+    worktreeIdentity: { expectedBranch: branch },
+    repo: 'TheTekTeam/modelspend',
+    prNumber: 42,
+    runner,
+    wait: (ms) => { waits.push(ms); },
+    env: {},
+  });
+  assert.equal(result.published, false);
+  assert.equal(result.failureReason, 'pr-continuation-publication-head-mismatch');
+  assert.equal(result.expectedHeadSha, PR_CONTINUATION_FIXTURE_HEAD);
+  assert.equal(result.observedHeadSha, PR_CONTINUATION_STALE_HEAD);
+  assert.ok(viewCalls >= 2 && viewCalls <= 5, 'retries must be bounded, not indefinite');
+  assert.equal(waits.length, viewCalls - 1);
 });
 
 test('publishPrContinuation fails closed instead of creating a replacement PR when the PR number changed', () => {
   const branch = 'claude/pr-continuation-fixture-629';
+  let viewCalls = 0;
   const runner = (command, args) => {
     if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
-    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${'c'.repeat(40)}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${PR_CONTINUATION_FIXTURE_HEAD}\n` };
+    if (command === 'git' && args[0] === 'ls-remote') return remoteRefResult(branch, PR_CONTINUATION_FIXTURE_HEAD);
     if (command === 'git') return { status: 0, stdout: '' };
     if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
-      return {
-        status: 0,
-        stdout: JSON.stringify({
-          number: 99, state: 'OPEN', headRefName: branch, headRefOid: 'c'.repeat(40), url: 'https://github.com/TheTekTeam/modelspend/pull/99',
-        }),
-      };
+      viewCalls += 1;
+      return pullRequestViewResult({ number: 99, branch, headRefOid: PR_CONTINUATION_FIXTURE_HEAD });
     }
     return { status: 1, stdout: '', stderr: 'unexpected command' };
   };
@@ -1237,21 +1332,18 @@ test('publishPrContinuation fails closed instead of creating a replacement PR wh
   });
   assert.equal(result.published, false);
   assert.equal(result.failureReason, 'pr-continuation-publication-pr-number-changed');
+  assert.equal(viewCalls, 1, 'an identity change must fail immediately, not be retried as propagation lag');
 });
 
 test('publishPrContinuation fails closed when the published head does not equal the committed worktree HEAD', () => {
   const branch = 'claude/pr-continuation-fixture-629';
   const runner = (command, args) => {
     if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
-    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${'c'.repeat(40)}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${PR_CONTINUATION_FIXTURE_HEAD}\n` };
+    if (command === 'git' && args[0] === 'ls-remote') return remoteRefResult(branch, PR_CONTINUATION_FIXTURE_HEAD);
     if (command === 'git') return { status: 0, stdout: '' };
     if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
-      return {
-        status: 0,
-        stdout: JSON.stringify({
-          number: 42, state: 'OPEN', headRefName: branch, headRefOid: 'd'.repeat(40), url: 'https://github.com/TheTekTeam/modelspend/pull/42',
-        }),
-      };
+      return pullRequestViewResult({ branch, headRefOid: PR_CONTINUATION_STALE_HEAD });
     }
     return { status: 1, stdout: '', stderr: 'unexpected command' };
   };
@@ -1261,6 +1353,7 @@ test('publishPrContinuation fails closed when the published head does not equal 
     repo: 'TheTekTeam/modelspend',
     prNumber: 42,
     runner,
+    maxAttempts: 1,
     env: {},
   });
   assert.equal(result.published, false);
@@ -1269,17 +1362,15 @@ test('publishPrContinuation fails closed when the published head does not equal 
 
 test('publishPrContinuation fails closed when the PR is no longer open, without creating a replacement', () => {
   const branch = 'claude/pr-continuation-fixture-629';
+  let viewCalls = 0;
   const runner = (command, args) => {
     if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
-    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${'c'.repeat(40)}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${PR_CONTINUATION_FIXTURE_HEAD}\n` };
+    if (command === 'git' && args[0] === 'ls-remote') return remoteRefResult(branch, PR_CONTINUATION_FIXTURE_HEAD);
     if (command === 'git') return { status: 0, stdout: '' };
     if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
-      return {
-        status: 0,
-        stdout: JSON.stringify({
-          number: 42, state: 'CLOSED', headRefName: branch, headRefOid: 'c'.repeat(40), url: 'https://github.com/TheTekTeam/modelspend/pull/42',
-        }),
-      };
+      viewCalls += 1;
+      return pullRequestViewResult({ state: 'CLOSED', branch, headRefOid: PR_CONTINUATION_FIXTURE_HEAD });
     }
     return { status: 1, stdout: '', stderr: 'unexpected command' };
   };
@@ -1293,6 +1384,65 @@ test('publishPrContinuation fails closed when the PR is no longer open, without 
   });
   assert.equal(result.published, false);
   assert.equal(result.failureReason, 'pr-continuation-publication-pr-not-open');
+  assert.equal(viewCalls, 1, 'a closed PR must fail immediately, not be retried as propagation lag');
+});
+
+test('publishPrContinuation fails closed when a final remote-ref check differs after a transient matching PR view', () => {
+  const branch = 'claude/pr-continuation-fixture-629';
+  let lsRemoteCalls = 0;
+  const runner = (command, args) => {
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${PR_CONTINUATION_FIXTURE_HEAD}\n` };
+    if (command === 'git' && args[0] === 'ls-remote') {
+      lsRemoteCalls += 1;
+      const sha = lsRemoteCalls === 1 ? PR_CONTINUATION_FIXTURE_HEAD : PR_CONTINUATION_STALE_HEAD;
+      return remoteRefResult(branch, sha);
+    }
+    if (command === 'git') return { status: 0, stdout: '' };
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') {
+      return pullRequestViewResult({ branch, headRefOid: PR_CONTINUATION_FIXTURE_HEAD });
+    }
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  const result = publishPrContinuation({
+    workspace: { worktreePath: '/tmp/worktree' },
+    worktreeIdentity: { expectedBranch: branch },
+    repo: 'TheTekTeam/modelspend',
+    prNumber: 42,
+    runner,
+    env: {},
+  });
+  assert.equal(result.published, false);
+  assert.equal(result.failureReason, 'pr-continuation-publication-head-mismatch');
+  assert.equal(result.stage, 'remote-ref-final');
+  assert.equal(lsRemoteCalls, 2, 'must re-check the remote ref both before reconciliation and immediately before success');
+});
+
+test('publishPrContinuation push failure remains a push failure without any PR reconciliation', () => {
+  const branch = 'claude/pr-continuation-fixture-629';
+  let viewCalls = 0;
+  let lsRemoteCalls = 0;
+  const runner = (command, args) => {
+    if (command === 'git' && args.join(' ') === 'branch --show-current') return { status: 0, stdout: `${branch}\n` };
+    if (command === 'git' && args.join(' ') === 'rev-parse HEAD') return { status: 0, stdout: `${PR_CONTINUATION_FIXTURE_HEAD}\n` };
+    if (command === 'git' && args[0] === 'push') return { status: 1, stdout: '', stderr: 'push rejected' };
+    if (command === 'git' && args[0] === 'ls-remote') { lsRemoteCalls += 1; return remoteRefResult(branch, PR_CONTINUATION_FIXTURE_HEAD); }
+    if (command === 'git') return { status: 0, stdout: '' };
+    if (command === 'gh' && args[0] === 'pr' && args[1] === 'view') { viewCalls += 1; return pullRequestViewResult({ branch, headRefOid: PR_CONTINUATION_FIXTURE_HEAD }); }
+    return { status: 1, stdout: '', stderr: 'unexpected command' };
+  };
+  const result = publishPrContinuation({
+    workspace: { worktreePath: '/tmp/worktree' },
+    worktreeIdentity: { expectedBranch: branch },
+    repo: 'TheTekTeam/modelspend',
+    prNumber: 42,
+    runner,
+    env: {},
+  });
+  assert.equal(result.published, false);
+  assert.equal(result.failureReason, 'pr-continuation-branch-push-failed');
+  assert.equal(lsRemoteCalls, 0, 'a push failure must never trigger PR reconciliation reads');
+  assert.equal(viewCalls, 0, 'a push failure must never trigger PR reconciliation reads');
 });
 
 

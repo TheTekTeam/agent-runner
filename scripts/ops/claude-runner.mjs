@@ -1033,6 +1033,23 @@ function parseSinglePullRequest(stdout = '') {
   }
 }
 
+function parseRemoteBranchHead(stdout = '') {
+  const line = String(stdout || '').trim().split('\n')[0] || '';
+  const sha = line.split(/\s+/)[0] || '';
+  return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+}
+
+const PR_CONTINUATION_RECONCILE_MAX_ATTEMPTS = 3;
+const PR_CONTINUATION_RECONCILE_DELAY_MS = 500;
+
+// A synchronous, bounded sleep -- `publishPrContinuation` stays a plain
+// (non-async) function so its existing call sites and fixtures are
+// untouched; `Atomics.wait` blocks the thread without a scheduler/timer API
+// change.
+function defaultReconcileWait(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /**
  * Strict same-PR publication for a bounded PR review-followup continuation
  * (#242). Unlike `publishImplementationDraft`, this never creates a
@@ -1040,8 +1057,9 @@ function parseSinglePullRequest(stdout = '') {
  * then re-reads the exact same open PR number/branch and requires the
  * published head to equal the committed worktree HEAD before declaring
  * success. Any identity drift (PR closed, reopened as a different number,
- * head branch changed, or a head that does not match the local commit)
- * fails closed instead of publishing a new PR.
+ * head branch changed) fails closed immediately. A stale `headRefOid` alone
+ * (bounded GitHub PR-head propagation lag after the push already landed) is
+ * retried a small bounded number of times before failing closed (#310).
  */
 export function publishPrContinuation({
   workspace,
@@ -1050,6 +1068,9 @@ export function publishPrContinuation({
   prNumber,
   env = process.env,
   runner = spawnSync,
+  wait = defaultReconcileWait,
+  maxAttempts = PR_CONTINUATION_RECONCILE_MAX_ATTEMPTS,
+  retryDelayMs = PR_CONTINUATION_RECONCILE_DELAY_MS,
 } = {}) {
   const branch = String(worktreeIdentity?.expectedBranch || '');
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(String(repo || ''))
@@ -1083,37 +1104,83 @@ export function publishPrContinuation({
     return { published: false, failureReason: 'pr-continuation-branch-push-failed', stage: 'push', exitCode: push?.status ?? null };
   }
 
-  const view = runner('gh', [
-    'pr', 'view', String(prNumber),
-    '--repo', repo,
-    '--json', 'number,state,headRefName,headRefOid,url',
-  ], processOptions);
-  if (view?.status !== 0) {
-    return { published: false, failureReason: 'pr-continuation-publication-pr-query-failed', stage: 'pr-query', exitCode: view?.status ?? null };
+  const readRemoteBranchHead = () => {
+    const remoteRef = runner('git', ['ls-remote', 'origin', `refs/heads/${branch}`], processOptions);
+    return remoteRef?.status === 0 ? parseRemoteBranchHead(remoteRef.stdout) : null;
+  };
+
+  // A non-force push already succeeded above; the remote ref must positively
+  // reflect the committed HEAD before any PR reconciliation is attempted.
+  const postPushRemoteHead = readRemoteBranchHead();
+  if (postPushRemoteHead !== committedHead) {
+    return {
+      published: false,
+      failureReason: 'pr-continuation-publication-remote-ref-mismatch',
+      stage: 'remote-ref',
+      expectedHeadSha: committedHead,
+      observedHeadSha: postPushRemoteHead,
+    };
   }
-  const pullRequest = parseSinglePullRequest(view.stdout);
-  if (!pullRequest?.number || !pullRequest?.url) {
-    return { published: false, failureReason: 'pr-continuation-publication-pr-evidence-missing', stage: 'pr-evidence' };
+
+  let pullRequest = null;
+  let observedHead = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const view = runner('gh', [
+      'pr', 'view', String(prNumber),
+      '--repo', repo,
+      '--json', 'number,state,headRefName,headRefOid,url',
+    ], processOptions);
+    if (view?.status !== 0) {
+      return { published: false, failureReason: 'pr-continuation-publication-pr-query-failed', stage: 'pr-query', exitCode: view?.status ?? null };
+    }
+    pullRequest = parseSinglePullRequest(view.stdout);
+    if (!pullRequest?.number || !pullRequest?.url) {
+      return { published: false, failureReason: 'pr-continuation-publication-pr-evidence-missing', stage: 'pr-evidence' };
+    }
+    // Identity must be exactly preserved -- a closed/reopened/renumbered PR
+    // is never rebound to a freshly created replacement, and is never
+    // retried since it is a real identity change, not propagation lag.
+    if (pullRequest.number !== prNumber) {
+      return { published: false, failureReason: 'pr-continuation-publication-pr-number-changed', stage: 'pr-evidence', prNumber: pullRequest.number };
+    }
+    if (pullRequest.state !== 'OPEN') {
+      return { published: false, failureReason: 'pr-continuation-publication-pr-not-open', stage: 'pr-evidence', prNumber: pullRequest.number };
+    }
+    if (pullRequest.headRefName !== branch) {
+      return { published: false, failureReason: 'pr-continuation-publication-branch-changed', stage: 'pr-evidence', prNumber: pullRequest.number };
+    }
+    observedHead = pullRequest.headRefOid || null;
+    if (observedHead === committedHead) {
+      break;
+    }
+    if (attempt < maxAttempts) {
+      wait(retryDelayMs);
+    }
   }
-  // Identity must be exactly preserved -- a closed/reopened/renumbered PR is
-  // never rebound to a freshly created replacement.
-  if (pullRequest.number !== prNumber) {
-    return { published: false, failureReason: 'pr-continuation-publication-pr-number-changed', stage: 'pr-evidence', prNumber: pullRequest.number };
-  }
-  if (pullRequest.state !== 'OPEN') {
-    return { published: false, failureReason: 'pr-continuation-publication-pr-not-open', stage: 'pr-evidence', prNumber: pullRequest.number };
-  }
-  if (pullRequest.headRefName !== branch) {
-    return { published: false, failureReason: 'pr-continuation-publication-branch-changed', stage: 'pr-evidence', prNumber: pullRequest.number };
-  }
-  if (pullRequest.headRefOid !== committedHead) {
+
+  if (observedHead !== committedHead) {
     return {
       published: false,
       failureReason: 'pr-continuation-publication-head-mismatch',
       stage: 'pr-evidence',
       prNumber: pullRequest.number,
       expectedHeadSha: committedHead,
-      observedHeadSha: pullRequest.headRefOid || null,
+      observedHeadSha: observedHead,
+    };
+  }
+
+  // Guard against a concurrent later branch advance being hidden by a
+  // transiently matching PR view: the remote ref must still equal the
+  // committed HEAD right before success is declared.
+  const finalRemoteHead = readRemoteBranchHead();
+  if (finalRemoteHead !== committedHead) {
+    return {
+      published: false,
+      failureReason: 'pr-continuation-publication-head-mismatch',
+      stage: 'remote-ref-final',
+      prNumber: pullRequest.number,
+      expectedHeadSha: committedHead,
+      observedHeadSha: finalRemoteHead,
     };
   }
 
