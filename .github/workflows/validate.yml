@@ -35,37 +35,28 @@ jobs:
         with:
           node-version: 22.23.0
 
-      - name: Diagnose PR tests A-F
+      - name: Diagnose PR continuation tests
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tests=(scripts/ops/agent-runner-pr-[a-f]*.test.mjs)
+          tests=(scripts/ops/agent-runner-pr-conti*.test.mjs)
           ((${#tests[@]} == 0)) || node --test "${tests[@]}"
 
-      - name: Diagnose PR tests G-O
+      - name: Diagnose PR contract controller tests
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tests=(scripts/ops/agent-runner-pr-[g-o]*.test.mjs)
+          tests=(scripts/ops/agent-runner-pr-contr*.test.mjs)
           ((${#tests[@]} == 0)) || node --test "${tests[@]}"
 
-      - name: Diagnose PR tests P-S
+      - name: Diagnose remaining PR A-F tests
         if: always()
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          tests=(scripts/ops/agent-runner-pr-[p-s]*.test.mjs)
-          ((${#tests[@]} == 0)) || node --test "${tests[@]}"
-
-      - name: Diagnose PR tests T-Z
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          tests=(scripts/ops/agent-runner-pr-[t-z]*.test.mjs)
+          tests=(scripts/ops/agent-runner-pr-[a-bd-f]*.test.mjs)
           ((${#tests[@]} == 0)) || node --test "${tests[@]}"
