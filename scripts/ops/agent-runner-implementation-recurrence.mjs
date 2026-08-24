@@ -150,18 +150,21 @@ function defaultInvokeProject({ config, configPath }, { argv = [], env = process
 
 export function classifyProbeOutcome({ status, payload }) {
   if (status === 0) {
-    return {
+    const outcome = {
       runnable: true,
       blocked: false,
       reason: 'runnable-candidate',
       selectedIssue: payload?.selectedIssue ?? null,
-      selectedAgentId: payload?.selectedAgentId ?? null,
     };
+    if (payload && Object.prototype.hasOwnProperty.call(payload, 'selectedAgentId')) {
+      outcome.selectedAgentId = payload.selectedAgentId ?? null;
+    }
+    return outcome;
   }
   if (status === NO_RUNNABLE_CANDIDATE_EXIT_CODE) {
-    return { runnable: false, blocked: false, reason: 'no-runnable-candidate', selectedIssue: null, selectedAgentId: null };
+    return { runnable: false, blocked: false, reason: 'no-runnable-candidate', selectedIssue: null };
   }
-  return { runnable: false, blocked: true, reason: `probe-failed-exit-${status}`, selectedIssue: null, selectedAgentId: null };
+  return { runnable: false, blocked: true, reason: `probe-failed-exit-${status}`, selectedIssue: null };
 }
 
 /** Historical single-result helper retained for callers/tests. */
@@ -283,7 +286,7 @@ export async function runImplementationRecurrence({
   }
 
   const base = {
-    schemaVersion: 3,
+    schemaVersion: 2,
     recordedAt: now(),
     registryPath: resolvedRegistryPath,
     schedulerLockPath: lockPath,
@@ -318,7 +321,6 @@ export async function runImplementationRecurrence({
       projectId: entry.config.projectId,
       repository: entry.config.githubRepo,
       selectedIssue: outcome.selectedIssue,
-      selectedAgentId: outcome.selectedAgentId || 'claude-code-cli',
       laneId,
       invokeExitCode: invokeResult?.status ?? null,
       signal: invokeResult?.signal ?? null,
