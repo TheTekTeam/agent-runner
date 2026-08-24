@@ -72,9 +72,17 @@ test('repository instruction contract section renders one Follow line per config
   assert.equal(buildRepositoryInstructionContractSection([]), '');
 });
 
-test('evidence schema section states the bounded final report fields exactly once', () => {
+test('evidence schema section requires the compact seven-field final capsule', () => {
   const section = buildEvidenceSchemaSection();
-  assert.match(section, /branch, commit SHA if committed, draft PR URL if created, files changed, tests\/validation run, blocker if any, and safe to merge: yes\/no/);
+  assert.match(section, /return ONLY these seven newline-delimited fields and nothing else/i);
+  assert.match(section, /branch=<branch>/);
+  assert.match(section, /commit=<sha\|none>/);
+  assert.match(section, /pr=<draft PR URL\|none>/);
+  assert.match(section, /files=<comma-separated changed paths\|none>/);
+  assert.match(section, /validation=<compact command\/result summary; no logs>/);
+  assert.match(section, /blocker=<none\|one concise blocker>/);
+  assert.match(section, /safe_to_merge=<yes\|no>/);
+  assert.match(section, /no headings, narrative, issue restatement, implementation explanation, repeated safety prose, or raw test\/build logs/i);
 });
 
 test('buildPromptCacheMetadata never contains prompt text, only bounded content-addressed fingerprints and estimates', () => {
@@ -198,7 +206,7 @@ test('semantic equivalence: the compiled preflight-direct prompt still carries e
     /Do not invoke Agent\/Task subagents/,
     /Do not hardcode secrets/,
     /Manager preflight packet\nBounded scope\./,
-    /branch, commit SHA if committed, draft PR URL if created, files changed, tests\/validation run, blocker if any, and safe to merge: yes\/no/,
+    /safe_to_merge=<yes\|no>/,
   ];
   for (const pattern of requiredInvariants) {
     assert.match(prompt, pattern);
