@@ -92,7 +92,8 @@ export function buildPrContinuationScopeSection() {
 
 export function buildEvidenceSchemaSection() {
   return [
-    'Final report: return ONLY these seven newline-delimited fields and nothing else; no headings, narrative, issue restatement, implementation explanation, repeated safety prose, or raw test/build logs.',
+    'Final report: be machine-oriented and concise; no headings, narrative, issue restatement, implementation explanation, repeated safety prose, or raw test/build logs.',
+    'If execution phase is implementation, return ONLY these seven newline-delimited fields:',
     'branch=<branch>',
     'commit=<sha|none>',
     'pr=<draft PR URL|none>',
@@ -100,6 +101,9 @@ export function buildEvidenceSchemaSection() {
     'validation=<compact command/result summary; no logs>',
     'blocker=<none|one concise blocker>',
     'safe_to_merge=<yes|no>',
+    'If execution phase is plan, return ONLY these two newline-delimited fields:',
+    'plan=<concise bounded implementation plan>',
+    'blocker=<none|one concise blocker>',
   ].join('\n');
 }
 
@@ -128,7 +132,7 @@ export function buildWorktreeAssignmentSection(executionPhase, worktreeIdentity)
 export function buildFinalRequestSection(executionPhase) {
   return executionPhase === EXECUTION_PHASE_IMPLEMENTATION
     ? 'Implement the issue now using the material above; follow the final report schema stated above.'
-    : 'Produce the plan now using the material above.';
+    : 'Produce the plan now using the material above; follow the final report schema stated above.';
 }
 
 // ---- Cache-aware bounded metadata contract ----
