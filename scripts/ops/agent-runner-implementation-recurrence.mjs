@@ -2,9 +2,9 @@
 
 // #51: Dell remains the one scheduler/controller, but scheduling and worker
 // execution are no longer the same global critical section. One short
-// scheduler mutex protects registry probing/selection; selected independent
-// issue lanes then execute concurrently and acquire their own recoverable lane
-// locks inside the project runner.
+// scheduler mutex protects registry probing/selection/admission; selected
+// independent issue lanes then execute concurrently and acquire their own
+// recoverable lane locks inside the project runner.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -20,6 +20,7 @@ import {
   SLOT_INHERITED_ENV,
   resolveGlobalLockPath,
 } from './agent-runner-implementation-slot.mjs';
+import { admitLaneBatch, normalizeLaneCaps } from './agent-runner-lane-admission.mjs';
 import { computeManagerProfileShadow } from './agent-runner-manager-profile-shadow.mjs';
 import {
   readProjectRegistryEntries,
@@ -33,6 +34,9 @@ const RUN_PROJECT_WRAPPER = resolve(HERE, '../../bin/run-project.sh');
 export const NO_RUNNABLE_CANDIDATE_EXIT_CODE = 3;
 export const EVIDENCE_DIR_ENV = 'AGENT_RUNNER_IMPLEMENTATION_EVIDENCE_DIR';
 export const MAX_PARALLEL_ENV = 'AGENT_RUNNER_MAX_PARALLEL';
+export const LANE_CAPS_ENV = 'AGENT_RUNNER_LANE_CAPS_JSON';
+export const LOCAL_WORKER_NODE_ID_ENV = 'AGENT_RUNNER_LOCAL_WORKER_NODE_ID';
+export const DEFAULT_LOCAL_WORKER_NODE_ID = 'dev-cluster-dell';
 
 export { GLOBAL_LOCK_ENV, resolveGlobalLockPath };
 
@@ -48,6 +52,42 @@ export function resolveMaxParallel(env = process.env, runnableCount = 0) {
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < 1 || value > 64) {
     throw new Error(`${MAX_PARALLEL_ENV} must be between 1 and 64`);
+  }
+  return value;
+}
+
+export function resolveRecurrenceLaneCaps(env = process.env, maxParallel = 1) {
+  const raw = String(env[LANE_CAPS_ENV] || '').trim();
+  if (Buffer.byteLength(raw, 'utf8') > 8192) throw new Error(`${LANE_CAPS_ENV} exceeds 8192 bytes`);
+  let configured = {};
+  if (raw) {
+    try {
+      configured = JSON.parse(raw);
+    } catch {
+      throw new Error(`${LANE_CAPS_ENV} must contain valid JSON`);
+    }
+    if (!configured || typeof configured !== 'object' || Array.isArray(configured)) {
+      throw new Error(`${LANE_CAPS_ENV} must contain a JSON object`);
+    }
+  }
+  // Safety defaults: global capacity follows the established recurrence cap,
+  // one unknown-scope lane per repository, while agent/node capacity may use
+  // the full recurrence capacity unless explicitly narrowed. Same-repository
+  // parallelism requires explicit partition-aware scheduling rather than an
+  // unsafe assumption that candidate file ownership is disjoint.
+  return normalizeLaneCaps({
+    global: maxParallel,
+    defaultPerRepository: 1,
+    defaultPerAgent: maxParallel,
+    defaultPerNode: maxParallel,
+    ...configured,
+  });
+}
+
+export function resolveLocalWorkerNodeId(env = process.env) {
+  const value = String(env[LOCAL_WORKER_NODE_ID_ENV] || DEFAULT_LOCAL_WORKER_NODE_ID).trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(value)) {
+    throw new Error(`${LOCAL_WORKER_NODE_ID_ENV} is invalid`);
   }
   return value;
 }
@@ -110,12 +150,18 @@ function defaultInvokeProject({ config, configPath }, { argv = [], env = process
 
 export function classifyProbeOutcome({ status, payload }) {
   if (status === 0) {
-    return { runnable: true, blocked: false, reason: 'runnable-candidate', selectedIssue: payload?.selectedIssue ?? null };
+    return {
+      runnable: true,
+      blocked: false,
+      reason: 'runnable-candidate',
+      selectedIssue: payload?.selectedIssue ?? null,
+      selectedAgentId: payload?.selectedAgentId ?? null,
+    };
   }
   if (status === NO_RUNNABLE_CANDIDATE_EXIT_CODE) {
-    return { runnable: false, blocked: false, reason: 'no-runnable-candidate', selectedIssue: null };
+    return { runnable: false, blocked: false, reason: 'no-runnable-candidate', selectedIssue: null, selectedAgentId: null };
   }
-  return { runnable: false, blocked: true, reason: `probe-failed-exit-${status}`, selectedIssue: null };
+  return { runnable: false, blocked: true, reason: `probe-failed-exit-${status}`, selectedIssue: null, selectedAgentId: null };
 }
 
 /** Historical single-result helper retained for callers/tests. */
@@ -156,6 +202,38 @@ export function implementationLaneForSelection(entry, outcome) {
   return `${entry.config.projectId}:issue:${Number(issue)}`;
 }
 
+export function laneAdmissionCandidateForSelection(entry, outcome, { nodeId = DEFAULT_LOCAL_WORKER_NODE_ID } = {}) {
+  const issueNumber = Number(outcome?.selectedIssue);
+  const laneId = implementationLaneForSelection(entry, outcome);
+  // Existing production execution is Claude-only; old/custom probes that do
+  // not yet expose selectedAgentId therefore preserve that exact compatibility
+  // identity. A positively returned different adapter is retained verbatim.
+  const adapterId = String(outcome?.selectedAgentId || 'claude-code-cli');
+  return {
+    laneId,
+    projectId: entry.config.projectId,
+    repository: entry.config.githubRepo,
+    issueNumber,
+    agentInstanceId: `${adapterId}@${nodeId}`,
+    adapterId,
+    nodeId,
+    branch: `${entry.config.projectId}/issue/${issueNumber}`,
+    worktree: `${entry.config.projectId}/issue/${issueNumber}`,
+    files: [],
+    resources: [],
+  };
+}
+
+export function admitRecurrenceSelections(selected, { env = process.env, maxParallel } = {}) {
+  const caps = resolveRecurrenceLaneCaps(env, maxParallel);
+  const nodeId = resolveLocalWorkerNodeId(env);
+  const candidates = selected.map(({ entry, outcome }) => laneAdmissionCandidateForSelection(entry, outcome, { nodeId }));
+  const admission = admitLaneBatch(candidates, { active: [], caps });
+  const admittedIds = new Set(admission.admitted.map((candidate) => candidate.laneId));
+  const admittedSelections = selected.filter(({ entry, outcome }) => admittedIds.has(implementationLaneForSelection(entry, outcome)));
+  return { caps, nodeId, admission, admittedSelections };
+}
+
 function writeEvidence(evidenceDir, payload) {
   mkdirSync(evidenceDir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -166,8 +244,8 @@ function writeEvidence(evidenceDir, payload) {
 
 /**
  * One Dell scheduler recurrence with concurrent independent execution lanes.
- * The scheduler lock is held only while probing/selecting; provider and repo
- * mutation happen after release, inside exact issue-scoped lane locks.
+ * The scheduler lock is held only while probing/selecting/admitting; provider
+ * and repo mutation happen after release, inside exact issue-scoped lane locks.
  */
 export async function runImplementationRecurrence({
   argv = [],
@@ -187,22 +265,32 @@ export async function runImplementationRecurrence({
   let selected;
   let probed;
   let profileShadow;
+  let laneAdmission;
   const release = acquireLock(lockPath);
   try {
     ({ selected, probed } = selectRunnableProjects(projects, { probeProject, argv, env, maxParallel }));
     profileShadow = computeProfileShadow(projects);
+    const admitted = admitRecurrenceSelections(selected, { env, maxParallel });
+    selected = admitted.admittedSelections;
+    laneAdmission = {
+      nodeId: admitted.nodeId,
+      caps: admitted.caps,
+      admitted: admitted.admission.admitted.map((candidate) => candidate.laneId),
+      rejected: admitted.admission.rejected,
+    };
   } finally {
     release();
   }
 
   const base = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     recordedAt: now(),
     registryPath: resolvedRegistryPath,
     schedulerLockPath: lockPath,
     maxParallel,
     probed,
     profileShadow,
+    laneAdmission,
   };
 
   if (selected.length === 0) {
@@ -213,7 +301,7 @@ export async function runImplementationRecurrence({
       selectedIssue: null,
       selectedProjects: [],
       invoked: false,
-      reason: 'no-runnable-project',
+      reason: laneAdmission?.rejected?.length ? 'candidates-rejected-by-lane-admission' : 'no-runnable-project',
     };
     payload.evidencePath = writeEvidenceFile(resolveEvidenceDir(env), payload);
     return payload;
@@ -230,6 +318,7 @@ export async function runImplementationRecurrence({
       projectId: entry.config.projectId,
       repository: entry.config.githubRepo,
       selectedIssue: outcome.selectedIssue,
+      selectedAgentId: outcome.selectedAgentId || 'claude-code-cli',
       laneId,
       invokeExitCode: invokeResult?.status ?? null,
       signal: invokeResult?.signal ?? null,
