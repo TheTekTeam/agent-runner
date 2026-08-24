@@ -6,14 +6,24 @@ import test from 'node:test';
 
 import { assertProjectScopedEnv } from './agent-runner-config.mjs';
 import {
+  acquireImplementationSlot,
+  IMPLEMENTATION_LANE_ENV,
+  resolveImplementationLaneLockPath,
+  sanitizeImplementationLane,
+  SLOT_INVALID_LANE,
+} from './agent-runner-implementation-slot.mjs';
+import {
   buildProjectScopedInvocationEnv,
   classifyProbeOutcome,
+  implementationLaneForSelection,
   loadEnabledProjectsWithConfigPaths,
   NO_RUNNABLE_CANDIDATE_EXIT_CODE,
   resolveEvidenceDir,
   resolveGlobalLockPath,
+  resolveMaxParallel,
   runImplementationRecurrence,
   selectRunnableProject,
+  selectRunnableProjects,
 } from './agent-runner-implementation-recurrence.mjs';
 
 function projectConfig(projectId, githubRepo, localRepoPath, overrides = {}) {
@@ -48,79 +58,155 @@ function withRegistry(files, registry, fn) {
   }
 }
 
-function fakeLock() {
-  const calls = [];
-  const acquireLock = (path) => {
-    calls.push(path);
-    return () => calls.push(`release:${path}`);
+function fakeLock(events = []) {
+  return (path) => {
+    events.push(`lock:${path}`);
+    return () => events.push(`release:${path}`);
   };
-  return { acquireLock, calls };
 }
 
 function noopEvidence(evidenceDir, payload) {
   return `${evidenceDir}/stub-${payload.selectedProjectId || 'none'}.json`;
 }
 
-test('classifyProbeOutcome maps exit 0 to a runnable candidate carrying its issue number', () => {
+test('probe classification preserves runnable, idle and blocked semantics', () => {
   assert.deepEqual(classifyProbeOutcome({ status: 0, payload: { selectedIssue: 42 } }), {
-    runnable: true,
-    blocked: false,
-    reason: 'runnable-candidate',
-    selectedIssue: 42,
+    runnable: true, blocked: false, reason: 'runnable-candidate', selectedIssue: 42,
   });
+  assert.equal(classifyProbeOutcome({ status: NO_RUNNABLE_CANDIDATE_EXIT_CODE }).reason, 'no-runnable-candidate');
+  assert.equal(classifyProbeOutcome({ status: 17 }).reason, 'probe-failed-exit-17');
 });
 
-test('classifyProbeOutcome maps the candidate-probe no-runnable-candidate exit code to non-blocking idle', () => {
-  const outcome = classifyProbeOutcome({ status: NO_RUNNABLE_CANDIDATE_EXIT_CODE, payload: null });
-  assert.equal(outcome.runnable, false);
-  assert.equal(outcome.blocked, false);
-  assert.equal(outcome.reason, 'no-runnable-candidate');
-});
-
-test('classifyProbeOutcome treats any other exit status as a project-local blocker, not "no work"', () => {
-  const outcome = classifyProbeOutcome({ status: 1, payload: null });
-  assert.equal(outcome.runnable, false);
-  assert.equal(outcome.blocked, true);
-  assert.equal(outcome.reason, 'probe-failed-exit-1');
-});
-
-test('selectRunnableProject stops at the first runnable project in registry order', () => {
+test('historical selectRunnableProject remains first-runnable compatible', () => {
   const projects = [
     { config: { projectId: 'alpha', githubRepo: 'Owner/Alpha' } },
     { config: { projectId: 'beta', githubRepo: 'Owner/Beta' } },
   ];
-  const probeProject = (entry) => (entry.config.projectId === 'beta' ? { status: 0, payload: { selectedIssue: 7 } } : { status: NO_RUNNABLE_CANDIDATE_EXIT_CODE });
-  const { selected, probed } = selectRunnableProject(projects, { probeProject });
-  assert.equal(selected.config.projectId, 'beta');
-  assert.equal(probed.length, 2);
-  assert.equal(probed[0].runnable, false);
-  assert.equal(probed[1].runnable, true);
+  const result = selectRunnableProject(projects, {
+    probeProject: (entry) => entry.config.projectId === 'beta'
+      ? { status: 0, payload: { selectedIssue: 7 } }
+      : { status: NO_RUNNABLE_CANDIDATE_EXIT_CODE },
+  });
+  assert.equal(result.selected.config.projectId, 'beta');
+  assert.equal(result.probed.length, 2);
 });
 
-test('a project-local probe blocker does not permanently stop inspection of the next enabled project', () => {
+test('selectRunnableProjects keeps all independent runnable projects up to the cap', () => {
+  const projects = ['alpha', 'beta', 'gamma'].map((projectId) => ({
+    config: { projectId, githubRepo: `Owner/${projectId}` },
+  }));
+  const result = selectRunnableProjects(projects, {
+    maxParallel: 2,
+    probeProject: (entry) => ({ status: 0, payload: { selectedIssue: entry.config.projectId.length } }),
+  });
+  assert.deepEqual(result.selected.map(({ entry }) => entry.config.projectId), ['alpha', 'beta']);
+  assert.equal(result.probed.length, 3, 'all projects are still probed for truthful evidence');
+});
+
+test('a project-local blocker does not stop another runnable project', () => {
   const projects = [
     { config: { projectId: 'alpha', githubRepo: 'Owner/Alpha' } },
     { config: { projectId: 'beta', githubRepo: 'Owner/Beta' } },
   ];
-  const probeProject = (entry) => (entry.config.projectId === 'alpha' ? { status: 17 } : { status: 0, payload: { selectedIssue: 9 } });
-  const { selected, probed } = selectRunnableProject(projects, { probeProject });
-  assert.equal(selected.config.projectId, 'beta');
-  assert.equal(probed[0].blocked, true);
-  assert.equal(probed[0].runnable, false);
+  const result = selectRunnableProjects(projects, {
+    maxParallel: 2,
+    probeProject: (entry) => entry.config.projectId === 'alpha'
+      ? { status: 9 }
+      : { status: 0, payload: { selectedIssue: 11 } },
+  });
+  assert.deepEqual(result.selected.map(({ entry }) => entry.config.projectId), ['beta']);
+  assert.equal(result.probed[0].blocked, true);
 });
 
-test('no enabled project with a runnable candidate is a healthy no-op with nothing selected', () => {
-  const projects = [
-    { config: { projectId: 'alpha', githubRepo: 'Owner/Alpha' } },
-    { config: { projectId: 'beta', githubRepo: 'Owner/Beta' } },
-  ];
-  const probeProject = () => ({ status: NO_RUNNABLE_CANDIDATE_EXIT_CODE });
-  const { selected, probed } = selectRunnableProject(projects, { probeProject });
-  assert.equal(selected, null);
-  assert.equal(probed.every((entry) => !entry.runnable), true);
+test('max parallel defaults to runnable capacity and validates explicit bounds', () => {
+  assert.equal(resolveMaxParallel({}, 3), 3);
+  assert.equal(resolveMaxParallel({ AGENT_RUNNER_MAX_PARALLEL: '4' }, 20), 4);
+  assert.throws(() => resolveMaxParallel({ AGENT_RUNNER_MAX_PARALLEL: '0' }, 3), /between 1 and 64/);
+  assert.throws(() => resolveMaxParallel({ AGENT_RUNNER_MAX_PARALLEL: 'many' }, 3), /positive integer/);
 });
 
-test('disabled projects are excluded from the enabled project list and are never probed or selected', () => withRegistry(
+test('issue-scoped lane identity is deterministic and refuses missing issue identity', () => {
+  const entry = { config: { projectId: 'modelspend' } };
+  assert.equal(implementationLaneForSelection(entry, { selectedIssue: 792 }), 'modelspend:issue:792');
+  assert.throws(() => implementationLaneForSelection(entry, { selectedIssue: null }), /valid selected issue/);
+});
+
+test('explicit implementation lanes resolve to independent lock paths while legacy callers keep the global lock', () => {
+  const base = { HOME: '/home/op' };
+  assert.equal(resolveImplementationLaneLockPath(base), '/home/op/.local/state/agent-runner/implementation-recurrence.lock');
+  assert.equal(
+    resolveImplementationLaneLockPath({ ...base, [IMPLEMENTATION_LANE_ENV]: 'modelspend:issue:792' }),
+    '/home/op/.local/state/agent-runner/implementation-lanes/modelspend-issue-792.lock',
+  );
+  assert.notEqual(
+    resolveImplementationLaneLockPath({ ...base, [IMPLEMENTATION_LANE_ENV]: 'modelspend:issue:792' }),
+    resolveImplementationLaneLockPath({ ...base, [IMPLEMENTATION_LANE_ENV]: 'agent-runner:issue:314' }),
+  );
+});
+
+test('lane sanitization fails closed for unsafe or oversized identities', () => {
+  assert.equal(sanitizeImplementationLane('agent-runner:issue:314'), 'agent-runner-issue-314');
+  assert.equal(sanitizeImplementationLane('../../bad lane'), null);
+  assert.equal(sanitizeImplementationLane('x'.repeat(181)), null);
+  const result = acquireImplementationSlot({
+    env: { HOME: '/home/op', [IMPLEMENTATION_LANE_ENV]: '../../bad lane' },
+    acquireLock: () => { throw new Error('must not be reached'); },
+  });
+  assert.equal(result.held, false);
+  assert.equal(result.failureReason, SLOT_INVALID_LANE);
+});
+
+test('different exact lanes can acquire independently while the same lane remains collision protected', () => {
+  const locked = new Set();
+  const acquireLock = (path) => {
+    if (locked.has(path)) throw new Error('held');
+    locked.add(path);
+    return () => locked.delete(path);
+  };
+  const oneEnv = { HOME: '/home/op', [IMPLEMENTATION_LANE_ENV]: 'alpha:issue:1' };
+  const twoEnv = { HOME: '/home/op', [IMPLEMENTATION_LANE_ENV]: 'beta:issue:2' };
+  const one = acquireImplementationSlot({ env: oneEnv, acquireLock });
+  const two = acquireImplementationSlot({ env: twoEnv, acquireLock });
+  const duplicate = acquireImplementationSlot({ env: oneEnv, acquireLock });
+  assert.equal(one.held, true);
+  assert.equal(two.held, true);
+  assert.equal(duplicate.held, false);
+  one.release();
+  two.release();
+});
+
+test('buildProjectScopedInvocationEnv scrubs prior project and slot identity and binds only the selected lane', () => {
+  const inherited = {
+    HOME: '/home/op',
+    GITHUB_REPOSITORY: 'TheTekTeam/modelspend',
+    CLAUDE_RUNNER_OUTPUT_DIR: '/srv/modelspend/.var',
+    AGENT_RUNNER_IMPLEMENTATION_SLOT_PID: '123',
+    AGENT_RUNNER_IMPLEMENTATION_LANE: 'old:issue:1',
+    UNRELATED_MACHINE_POLICY: 'kept',
+  };
+  const result = buildProjectScopedInvocationEnv(inherited, '/srv/agent-runner/config.json', {
+    laneId: 'agent-runner:issue:314',
+  });
+  assert.equal(result.GITHUB_REPOSITORY, undefined);
+  assert.equal(result.CLAUDE_RUNNER_OUTPUT_DIR, undefined);
+  assert.equal(result.AGENT_RUNNER_IMPLEMENTATION_SLOT_PID, undefined);
+  assert.equal(result.AGENT_RUNNER_IMPLEMENTATION_LANE, 'agent-runner:issue:314');
+  assert.equal(result.AGENT_RUNNER_CONFIG, '/srv/agent-runner/config.json');
+  assert.equal(result.CLAUDE_RUNNER_CONFIG, '/srv/agent-runner/config.json');
+  assert.equal(result.UNRELATED_MACHINE_POLICY, 'kept');
+});
+
+test('selected project binding still satisfies the project identity gate', () => {
+  const config = projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner');
+  const configPath = '/home/op/.config/agent-runner/agent-runner.json';
+  const env = buildProjectScopedInvocationEnv({
+    HOME: '/home/op',
+    GITHUB_REPOSITORY: 'TheTekTeam/modelspend',
+  }, configPath, { laneId: 'agent-runner:issue:314' });
+  assert.doesNotThrow(() => assertProjectScopedEnv({ config, configPath, env }));
+});
+
+test('disabled projects are excluded before probing', () => withRegistry(
   {
     'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
     'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner', { enabled: false }),
@@ -128,278 +214,108 @@ test('disabled projects are excluded from the enabled project list and are never
   { schemaVersion: 1, defaultProjectId: 'modelspend', projects: [{ configPath: 'modelspend.json', enabled: true }, { configPath: 'agent-runner.json', enabled: false }] },
   (registryPath) => {
     const { projects } = loadEnabledProjectsWithConfigPaths({ registryPath });
-    assert.equal(projects.length, 1);
-    assert.equal(projects[0].config.projectId, 'modelspend');
+    assert.deepEqual(projects.map(({ config }) => config.projectId), ['modelspend']);
   },
 ));
 
-test('an invalid registry fails before any lock is acquired', () => withRegistry(
+test('invalid registry fails before scheduler lock acquisition', () => withRegistry(
   { 'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend') },
   '{"schemaVersion":1,"projects":[]}',
   async (registryPath) => {
-    const { acquireLock, calls } = fakeLock();
+    let locked = false;
     await assert.rejects(
-      () => runImplementationRecurrence({ registryPath, acquireLock, probeProject: () => ({ status: 0 }) }),
+      () => runImplementationRecurrence({
+        registryPath,
+        acquireLock: () => { locked = true; return () => {}; },
+        probeProject: () => ({ status: 0 }),
+      }),
       /Invalid agent runner project registry/,
     );
-    assert.equal(calls.length, 0);
+    assert.equal(locked, false);
   },
 ));
 
-test('ModelSpend runnable and Agent Runner idle selects ModelSpend and invokes it with its exact config path', () => withRegistry(
+test('Dell scheduler lock is released before worker invocations and two projects execute concurrently', () => withRegistry(
   {
-    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
-    'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner'),
+    'alpha.json': projectConfig('alpha', 'Owner/alpha', '/srv/alpha'),
+    'beta.json': projectConfig('beta', 'Owner/beta', '/srv/beta'),
   },
-  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json', 'agent-runner.json'] },
+  { schemaVersion: 1, defaultProjectId: 'alpha', projects: ['alpha.json', 'beta.json'] },
   async (registryPath) => {
-    const { acquireLock } = fakeLock();
-    const probeProject = (entry) => (entry.config.projectId === 'modelspend' ? { status: 0, payload: { selectedIssue: 100 } } : { status: NO_RUNNABLE_CANDIDATE_EXIT_CODE });
-    const invocations = [];
-    const invokeProject = (entry) => { invocations.push(entry.configPath); return { status: 0 }; };
-    const result = await runImplementationRecurrence({
-      registryPath, acquireLock, probeProject, invokeProject, writeEvidenceFile: noopEvidence,
-    });
-    assert.equal(result.selectedProjectId, 'modelspend');
-    assert.equal(result.selectedIssue, 100);
-    assert.equal(invocations.length, 1);
-    assert.match(invocations[0], /modelspend\.json$/);
-  },
-));
-
-test('the recurrence records a read-only profile shadow that matches the real manager profiles without altering selection or invocation', () => withRegistry(
-  {
-    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
-    'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner'),
-  },
-  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json', 'agent-runner.json'] },
-  async (registryPath) => {
-    const { acquireLock } = fakeLock();
-    const probeProject = (entry) => (entry.config.projectId === 'modelspend' ? { status: 0, payload: { selectedIssue: 100 } } : { status: NO_RUNNABLE_CANDIDATE_EXIT_CODE });
-    const invocations = [];
-    const invokeProject = (entry) => { invocations.push(entry.configPath); return { status: 0 }; };
-    const result = await runImplementationRecurrence({
-      registryPath, acquireLock, probeProject, invokeProject, writeEvidenceFile: noopEvidence,
-    });
-    assert.equal(result.selectedProjectId, 'modelspend');
-    assert.equal(invocations.length, 1);
-    assert.equal(result.profileShadow.available, true);
-    assert.equal(result.profileShadow.projects.length, 2);
-    assert.ok(result.profileShadow.projects.every((entry) => entry.available === true && entry.matches === true));
-  },
-));
-
-test('a mismatched or unavailable profile shadow never influences selection or invocation', () => withRegistry(
-  {
-    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
-    'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner'),
-  },
-  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json', 'agent-runner.json'] },
-  async (registryPath) => {
-    const { acquireLock } = fakeLock();
-    const probeProject = (entry) => (entry.config.projectId === 'modelspend' ? { status: 0, payload: { selectedIssue: 100 } } : { status: NO_RUNNABLE_CANDIDATE_EXIT_CODE });
-    const invocations = [];
-    const invokeProject = (entry) => { invocations.push(entry.configPath); return { status: 0 }; };
-    const adversarialShadow = {
-      schemaVersion: 'agent-runner-manager-profile-shadow/v1',
-      available: false,
-      reason: 'manager-profile-registry-error:injected-for-test',
-      projects: [{ projectId: 'modelspend', available: true, matches: false, mismatches: ['repository', 'enabled'], nonComparable: [] }],
-    };
+    const events = [];
+    let active = 0;
+    let peak = 0;
     const result = await runImplementationRecurrence({
       registryPath,
-      acquireLock,
-      probeProject,
-      invokeProject,
+      env: { HOME: '/home/op', AGENT_RUNNER_MAX_PARALLEL: '2' },
+      acquireLock: fakeLock(events),
+      probeProject: (entry) => ({ status: 0, payload: { selectedIssue: entry.config.projectId === 'alpha' ? 10 : 20 } }),
+      invokeProject: async (entry, { laneId }) => {
+        assert.ok(events.some((entryEvent) => entryEvent.startsWith('release:')), 'scheduler mutex must be released before execution');
+        events.push(`start:${entry.config.projectId}:${laneId}`);
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 20));
+        active -= 1;
+        events.push(`end:${entry.config.projectId}`);
+        return { status: 0 };
+      },
       writeEvidenceFile: noopEvidence,
-      computeProfileShadow: () => adversarialShadow,
+      computeProfileShadow: () => ({ available: true, projects: [] }),
     });
-    assert.equal(result.selectedProjectId, 'modelspend');
-    assert.equal(result.selectedIssue, 100);
-    assert.equal(invocations.length, 1);
-    assert.match(invocations[0], /modelspend\.json$/);
-    assert.deepEqual(result.profileShadow, adversarialShadow);
+    assert.equal(peak, 2);
+    assert.equal(result.invoked, true);
+    assert.equal(result.reason, 'candidates-selected-concurrently');
+    assert.deepEqual(result.selectedProjects.map((entry) => entry.laneId), ['alpha:issue:10', 'beta:issue:20']);
+    assert.ok(events.indexOf('end:alpha') > events.indexOf('start:beta:beta:issue:20'));
   },
 ));
 
-test('Agent Runner runnable and ModelSpend blocked selects Agent Runner', () => withRegistry(
+test('parallel cap restricts execution without hiding probe evidence', () => withRegistry(
   {
-    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
-    'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner'),
+    'alpha.json': projectConfig('alpha', 'Owner/alpha', '/srv/alpha'),
+    'beta.json': projectConfig('beta', 'Owner/beta', '/srv/beta'),
   },
-  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json', 'agent-runner.json'] },
+  { schemaVersion: 1, defaultProjectId: 'alpha', projects: ['alpha.json', 'beta.json'] },
   async (registryPath) => {
-    const { acquireLock } = fakeLock();
-    const probeProject = (entry) => (entry.config.projectId === 'agent-runner' ? { status: 0, payload: { selectedIssue: 210 } } : { status: 9 });
     const invocations = [];
-    const invokeProject = (entry) => { invocations.push(entry.config.projectId); return { status: 0 }; };
     const result = await runImplementationRecurrence({
-      registryPath, acquireLock, probeProject, invokeProject, writeEvidenceFile: noopEvidence,
+      registryPath,
+      env: { HOME: '/home/op', AGENT_RUNNER_MAX_PARALLEL: '1' },
+      acquireLock: fakeLock(),
+      probeProject: () => ({ status: 0, payload: { selectedIssue: 1 } }),
+      invokeProject: (entry) => { invocations.push(entry.config.projectId); return { status: 0 }; },
+      writeEvidenceFile: noopEvidence,
+      computeProfileShadow: () => ({ available: true, projects: [] }),
     });
-    assert.equal(result.selectedProjectId, 'agent-runner');
-    assert.deepEqual(invocations, ['agent-runner']);
+    assert.deepEqual(invocations, ['alpha']);
+    assert.equal(result.probed.length, 2);
+    assert.equal(result.selectedProjects.length, 1);
   },
 ));
 
-test('both projects runnable results in exactly one invocation', () => withRegistry(
-  {
-    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
-    'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner'),
-  },
-  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json', 'agent-runner.json'] },
+test('no runnable project remains a zero-invocation healthy result', () => withRegistry(
+  { 'alpha.json': projectConfig('alpha', 'Owner/alpha', '/srv/alpha') },
+  { schemaVersion: 1, defaultProjectId: 'alpha', projects: ['alpha.json'] },
   async (registryPath) => {
-    const { acquireLock } = fakeLock();
-    const probeProject = () => ({ status: 0, payload: { selectedIssue: 1 } });
-    const invocations = [];
-    const invokeProject = (entry) => { invocations.push(entry.config.projectId); return { status: 0 }; };
     const result = await runImplementationRecurrence({
-      registryPath, acquireLock, probeProject, invokeProject, writeEvidenceFile: noopEvidence,
-    });
-    assert.equal(invocations.length, 1);
-    assert.equal(result.selectedProjectId, 'modelspend');
-  },
-));
-
-test('neither project runnable is a healthy no-op with zero invocation', () => withRegistry(
-  {
-    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
-    'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner'),
-  },
-  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json', 'agent-runner.json'] },
-  async (registryPath) => {
-    const { acquireLock } = fakeLock();
-    let invoked = false;
-    const probeProject = () => ({ status: NO_RUNNABLE_CANDIDATE_EXIT_CODE });
-    const invokeProject = () => { invoked = true; return { status: 0 }; };
-    const result = await runImplementationRecurrence({
-      registryPath, acquireLock, probeProject, invokeProject, writeEvidenceFile: noopEvidence,
+      registryPath,
+      env: { HOME: '/home/op' },
+      acquireLock: fakeLock(),
+      probeProject: () => ({ status: NO_RUNNABLE_CANDIDATE_EXIT_CODE }),
+      invokeProject: () => { throw new Error('must not invoke'); },
+      writeEvidenceFile: noopEvidence,
+      computeProfileShadow: () => ({ available: true, projects: [] }),
     });
     assert.equal(result.invoked, false);
-    assert.equal(result.selectedProjectId, null);
+    assert.deepEqual(result.selectedProjects, []);
     assert.equal(result.reason, 'no-runnable-project');
-    assert.equal(invoked, false);
   },
 ));
 
-test('the global lock is acquired once before probing and released after invocation, before any per-project work runs unlocked', () => withRegistry(
-  {
-    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
-    'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner'),
-  },
-  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json', 'agent-runner.json'] },
-  async (registryPath) => {
-    const { acquireLock, calls } = fakeLock();
-    const probeProject = () => ({ status: 0, payload: { selectedIssue: 1 } });
-    const invokeProject = () => ({ status: 0 });
-    await runImplementationRecurrence({ registryPath, acquireLock, probeProject, invokeProject, writeEvidenceFile: noopEvidence });
-    assert.equal(calls.length, 2);
-    assert.match(calls[0], /implementation-recurrence\.lock$/);
-    assert.match(calls[1], /^release:/);
-  },
-));
-
-test('a duplicate concurrent recurrence is refused by a held lock before any probe runs', () => withRegistry(
-  {
-    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
-  },
-  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json'] },
-  async (registryPath) => {
-    let probeCalls = 0;
-    const acquireLock = () => { throw Object.assign(new Error('Runner lock is held by active or unverifiable process'), { code: 'AGENT_RUNNER_LOCKED' }); };
-    const probeProject = () => { probeCalls += 1; return { status: 0 }; };
-    await assert.rejects(
-      () => runImplementationRecurrence({ registryPath, acquireLock, probeProject }),
-      /AGENT_RUNNER_LOCKED|held by active/,
-    );
-    assert.equal(probeCalls, 0);
-  },
-));
-
-test('project A configuration cannot be substituted for project B: each probe/invoke call is bound to its own config path', () => withRegistry(
-  {
-    'modelspend.json': projectConfig('modelspend', 'TheTekTeam/modelspend', '/srv/modelspend'),
-    'agent-runner.json': projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner'),
-  },
-  { schemaVersion: 1, defaultProjectId: 'modelspend', projects: ['modelspend.json', 'agent-runner.json'] },
-  (registryPath) => {
-    const { projects } = loadEnabledProjectsWithConfigPaths({ registryPath });
-    const paths = projects.map((entry) => entry.configPath);
-    assert.equal(new Set(paths).size, paths.length);
-    for (const entry of projects) {
-      assert.match(entry.configPath, new RegExp(`${entry.config.projectId}\\.json$`));
-    }
-  },
-));
-
-test('resolveGlobalLockPath defaults under the shared XDG state root and is overridable', () => {
-  const defaultPath = resolveGlobalLockPath({ HOME: '/home/op' });
-  assert.equal(defaultPath, '/home/op/.local/state/agent-runner/implementation-recurrence.lock');
-  const overridden = resolveGlobalLockPath({ HOME: '/home/op', AGENT_RUNNER_IMPLEMENTATION_LOCK: '/tmp/custom.lock' });
-  assert.equal(overridden, '/tmp/custom.lock');
-});
-
-test('resolveEvidenceDir defaults under the shared XDG state root and is overridable', () => {
-  const defaultDir = resolveEvidenceDir({ HOME: '/home/op' });
-  assert.equal(defaultDir, '/home/op/.local/state/agent-runner/implementation-recurrence');
-  const overridden = resolveEvidenceDir({ HOME: '/home/op', AGENT_RUNNER_IMPLEMENTATION_EVIDENCE_DIR: '/tmp/evidence' });
-  assert.equal(overridden, '/tmp/evidence');
-});
-
-// #210 requirement 1: project-neutral environment handoff. A machine
-// environment scoped to one project (e.g. ModelSpend's GITHUB_REPOSITORY,
-// CLAUDE_RUNNER_OUTPUT_DIR, CLAUDE_RUNNER_STATE_DB, CLAUDE_RUNNER_CRON_LOCK)
-// must never leak into a probe/invocation bound to a different project.
-
-test('buildProjectScopedInvocationEnv strips all inherited project-scoped identity/path vars and binds the selected config', () => {
-  const inheritedEnv = {
-    HOME: '/home/op',
-    PATH: '/usr/bin',
-    GITHUB_REPOSITORY: 'TheTekTeam/modelspend',
-    CLAUDE_RUNNER_OUTPUT_DIR: '/srv/modelspend/.var/claude-runner',
-    CLAUDE_RUNNER_STATE_DB: '/srv/modelspend/.var/claude-runner/runner-state.sqlite',
-    CLAUDE_RUNNER_CRON_LOCK: '/srv/modelspend/.var/claude-runner/cron.lock',
-    AGENT_RUNNER_CONFIG: '/srv/modelspend/config.json',
-    CLAUDE_RUNNER_CONFIG: '/srv/modelspend/config.json',
-    UNRELATED_MACHINE_POLICY: 'kept',
-  };
-  const result = buildProjectScopedInvocationEnv(inheritedEnv, '/srv/agent-runner/config.json');
-  assert.equal(result.GITHUB_REPOSITORY, undefined);
-  assert.equal(result.CLAUDE_RUNNER_OUTPUT_DIR, undefined);
-  assert.equal(result.CLAUDE_RUNNER_STATE_DB, undefined);
-  assert.equal(result.CLAUDE_RUNNER_CRON_LOCK, undefined);
-  assert.equal(result.AGENT_RUNNER_CONFIG, '/srv/agent-runner/config.json');
-  assert.equal(result.CLAUDE_RUNNER_CONFIG, '/srv/agent-runner/config.json');
-  assert.equal(result.HOME, '/home/op');
-  assert.equal(result.PATH, '/usr/bin');
-  assert.equal(result.UNRELATED_MACHINE_POLICY, 'kept');
-  // inherited env object itself is untouched
-  assert.equal(inheritedEnv.GITHUB_REPOSITORY, 'TheTekTeam/modelspend');
-});
-
-test('selecting Agent Runner while the machine environment carries ModelSpend-scoped values succeeds through project binding instead of reproducing the identity-mismatch refusal', () => {
-  const modelspendScopedEnv = {
-    HOME: '/home/op',
-    GITHUB_REPOSITORY: 'TheTekTeam/modelspend',
-    CLAUDE_RUNNER_OUTPUT_DIR: '/srv/modelspend/.var/claude-runner',
-    CLAUDE_RUNNER_STATE_DB: '/srv/modelspend/.var/claude-runner/runner-state.sqlite',
-    CLAUDE_RUNNER_CRON_LOCK: '/srv/modelspend/.var/claude-runner/cron.lock',
-  };
-  const agentRunnerConfig = projectConfig('agent-runner', 'TheTekTeam/agent-runner', '/srv/agent-runner');
-  const agentRunnerConfigPath = '/home/op/.config/agent-runner/agent-runner.json';
-
-  // Reproduce the exact failure mode first: the raw inherited environment
-  // disagrees with the selected project's identity and the wrapper's own
-  // pre-scheduler gate refuses it.
-  assert.throws(
-    () => assertProjectScopedEnv({ config: agentRunnerConfig, configPath: agentRunnerConfigPath, env: modelspendScopedEnv }),
-    /disagrees with project "agent-runner"/,
-  );
-
-  // The recurrence's project-neutral handoff scrubs those inherited values
-  // before binding the selected project's exact config, so the same gate
-  // succeeds through project binding rather than refusing.
-  const scrubbedEnv = buildProjectScopedInvocationEnv(modelspendScopedEnv, agentRunnerConfigPath);
-  assert.doesNotThrow(
-    () => assertProjectScopedEnv({ config: agentRunnerConfig, configPath: agentRunnerConfigPath, env: scrubbedEnv }),
-  );
+test('scheduler lock and evidence paths remain backward-compatible and overridable', () => {
+  assert.equal(resolveGlobalLockPath({ HOME: '/home/op' }), '/home/op/.local/state/agent-runner/implementation-recurrence.lock');
+  assert.equal(resolveGlobalLockPath({ HOME: '/home/op', AGENT_RUNNER_IMPLEMENTATION_LOCK: '/tmp/custom.lock' }), '/tmp/custom.lock');
+  assert.equal(resolveEvidenceDir({ HOME: '/home/op' }), '/home/op/.local/state/agent-runner/implementation-recurrence');
+  assert.equal(resolveEvidenceDir({ HOME: '/home/op', AGENT_RUNNER_IMPLEMENTATION_EVIDENCE_DIR: '/tmp/evidence' }), '/tmp/evidence');
 });

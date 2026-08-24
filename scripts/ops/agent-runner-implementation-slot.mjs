@@ -1,24 +1,12 @@
 #!/usr/bin/env node
 
-// #242: one machine-global implementation slot for every write-capable
-// implementation launch, not only for the systemd recurrence tick.
+// #51: write-capable implementation execution is protected by an exact lane
+// lease rather than one machine-global execution mutex. Dell remains the sole
+// scheduler/controller; this module protects worker execution from collisions.
 //
-// `agent-runner-implementation-recurrence.mjs` already takes this exact lock
-// before it selects and invokes a project. A *direct* operator invocation of
-// `claude-runner.mjs` -- including the `--pr <n> --execute` continuation
-// wired by this issue -- previously took no lock at all, so the "one global
-// implementation slot" rule depended entirely on an operator remembering to
-// hold the recurrence lock by hand. That is a practical bypass: a direct
-// continuation could run a second write-capable worker while the
-// timer-driven recurrence was already running one.
-//
-// This module closes the gap without adding a second scheduler or a second
-// lock system. It reuses the same canonical lock path and the same
-// `acquireRecoverableCronLock` primitive, and it additionally understands
-// *inheritance*, so the existing
-//   recurrence -> bin/run-project.sh -> pinned cron -> claude-runner.mjs
-// chain (whose ancestor already owns the slot) can never deadlock against
-// itself. The lock is still taken in exactly one place per process tree.
+// Compatibility is deliberately fail-closed: callers that do not provide an
+// explicit lane continue to use the historical global implementation lock.
+// Only the generic scheduler is allowed to assign independent lane identities.
 
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -31,28 +19,52 @@ import {
 } from './agent-runner-cron-lock.mjs';
 
 export const GLOBAL_LOCK_ENV = 'AGENT_RUNNER_IMPLEMENTATION_LOCK';
+export const IMPLEMENTATION_LANE_ENV = 'AGENT_RUNNER_IMPLEMENTATION_LANE';
+export const IMPLEMENTATION_LANE_ROOT_ENV = 'AGENT_RUNNER_IMPLEMENTATION_LANE_ROOT';
 
 /**
- * Set by a process that already owns the global implementation slot, to the
- * pid owning it, immediately before spawning a descendant that will perform
- * the implementation. This marker is only a claim: descendants independently
- * verify that the canonical lock names the same owner and that their process
- * ancestry actually descends from that owner before inheritance is accepted.
+ * Set by a process that already owns an implementation lane, to the pid owning
+ * that exact lane. Descendants independently verify lock ownership and process
+ * ancestry before inheritance is accepted.
  */
 export const SLOT_INHERITED_ENV = 'AGENT_RUNNER_IMPLEMENTATION_SLOT_PID';
 
 export const SLOT_UNAVAILABLE = 'implementation-slot-unavailable';
 export const SLOT_INHERITANCE_STALE = 'implementation-slot-inheritance-stale';
+export const SLOT_INVALID_LANE = 'implementation-slot-invalid-lane';
 
 export function resolveGlobalLockPath(env = process.env) {
   return env[GLOBAL_LOCK_ENV]
     || resolve(String(env.HOME || homedir()), '.local/state/agent-runner/implementation-recurrence.lock');
 }
 
+export function sanitizeImplementationLane(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  if (raw.length > 180) return null;
+  if (!/^[A-Za-z0-9._:#@/-]+$/.test(raw)) return null;
+  return raw.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || null;
+}
+
+/**
+ * Resolve the lock for one write-capable execution lane.
+ *
+ * No lane => historical global mutex (safe compatibility for direct/manual
+ * callers). Explicit scheduler-assigned lane => independent recoverable lock.
+ */
+export function resolveImplementationLaneLockPath(env = process.env) {
+  const declared = String(env[IMPLEMENTATION_LANE_ENV] || '').trim();
+  if (!declared) return resolveGlobalLockPath(env);
+  const lane = sanitizeImplementationLane(declared);
+  if (!lane) return null;
+  const root = env[IMPLEMENTATION_LANE_ROOT_ENV]
+    || resolve(String(env.HOME || homedir()), '.local/state/agent-runner/implementation-lanes');
+  return resolve(root, `${lane}.lock`);
+}
+
 /**
  * Stamp an about-to-be-spawned child's environment as running inside this
- * process's already-held slot. Never grants a slot on its own: the descendant
- * must prove this pid owns the canonical lock and is in its ancestor chain.
+ * process's already-held exact lane. Never grants a lane on its own.
  */
 export function markInheritedImplementationSlot(env = {}, pid = process.pid) {
   return { ...env, [SLOT_INHERITED_ENV]: String(pid) };
@@ -66,11 +78,6 @@ function defaultReadLockOwner(lockPath) {
   return parsed?.pid || null;
 }
 
-/**
- * Linux production ancestry reader. `/proc/<pid>/stat` has the command name
- * in parentheses (which may itself contain spaces), followed by state and
- * parent pid. Parsing from the final `) ` boundary avoids splitting comm.
- */
 function defaultReadParentPid(pid) {
   const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
   const boundary = stat.lastIndexOf(') ');
@@ -106,16 +113,10 @@ export function processDescendsFromOwner({
 }
 
 /**
- * Acquire (or inherit) the one machine-global implementation slot.
+ * Acquire (or inherit) one exact implementation lane.
  *
- * Fails closed in every ambiguous case. A declared inherited pid is accepted
- * only when all three facts agree at this instant:
- *   1. the declared owner is live;
- *   2. the canonical lock file names that exact pid as its owner; and
- *   3. the current process is that owner or one of its descendants.
- *
- * This prevents an operator/caller from exporting an arbitrary live pid to
- * bypass the global lock while preserving deadlock-free recurrence children.
+ * Explicit independent lanes may coexist. The same lane cannot. Direct callers
+ * without a scheduler-assigned lane retain the historical global mutex.
  */
 export function acquireImplementationSlot({
   env = process.env,
@@ -125,16 +126,27 @@ export function acquireImplementationSlot({
   currentPid = process.pid,
   readParentPid = defaultReadParentPid,
 } = {}) {
-  const lockPath = resolveGlobalLockPath(env);
+  const lockPath = resolveImplementationLaneLockPath(env);
+  if (!lockPath) {
+    return Object.freeze({
+      held: false,
+      inherited: false,
+      lockPath: null,
+      lane: String(env[IMPLEMENTATION_LANE_ENV] || ''),
+      failureReason: SLOT_INVALID_LANE,
+      detail: 'implementation lane identity is invalid',
+      release: NOOP_RELEASE,
+    });
+  }
+
+  const lane = String(env[IMPLEMENTATION_LANE_ENV] || '').trim() || 'legacy-global';
   const declared = String(env[SLOT_INHERITED_ENV] || '').trim();
 
   if (declared) {
     const pid = Number(declared);
     if (!/^\d+$/.test(declared) || !Number.isSafeInteger(pid) || pid <= 0 || !isAlive(pid)) {
       return Object.freeze({
-        held: false,
-        inherited: false,
-        lockPath,
+        held: false, inherited: false, lockPath, lane,
         failureReason: SLOT_INHERITANCE_STALE,
         detail: `declared implementation-slot owner ${declared} is not a live process`,
         release: NOOP_RELEASE,
@@ -149,20 +161,16 @@ export function acquireImplementationSlot({
     }
     if (observedOwner !== pid) {
       return Object.freeze({
-        held: false,
-        inherited: false,
-        lockPath,
+        held: false, inherited: false, lockPath, lane,
         failureReason: SLOT_INHERITANCE_STALE,
-        detail: `declared implementation-slot owner ${declared} does not own the canonical lock`,
+        detail: `declared implementation-slot owner ${declared} does not own the exact lane lock`,
         release: NOOP_RELEASE,
       });
     }
 
     if (!processDescendsFromOwner({ ownerPid: pid, currentPid, readParentPid })) {
       return Object.freeze({
-        held: false,
-        inherited: false,
-        lockPath,
+        held: false, inherited: false, lockPath, lane,
         failureReason: SLOT_INHERITANCE_STALE,
         detail: `current process ${currentPid} is not a descendant of implementation-slot owner ${declared}`,
         release: NOOP_RELEASE,
@@ -170,20 +178,20 @@ export function acquireImplementationSlot({
     }
 
     return Object.freeze({
-      held: true, inherited: true, lockPath, failureReason: null, detail: null, release: NOOP_RELEASE,
+      held: true, inherited: true, lockPath, lane,
+      failureReason: null, detail: null, release: NOOP_RELEASE,
     });
   }
 
   try {
     const release = acquireLock(lockPath);
     return Object.freeze({
-      held: true, inherited: false, lockPath, failureReason: null, detail: null, release,
+      held: true, inherited: false, lockPath, lane,
+      failureReason: null, detail: null, release,
     });
   } catch (error) {
     return Object.freeze({
-      held: false,
-      inherited: false,
-      lockPath,
+      held: false, inherited: false, lockPath, lane,
       failureReason: SLOT_UNAVAILABLE,
       detail: String(error?.message || error),
       release: NOOP_RELEASE,

@@ -25,11 +25,23 @@ import {
 
 export const STATUS_READY = 'status:ready';
 export const STATUS_IN_PROGRESS = 'status:in-progress';
+export const OWNER_CHATGPT_DIRECT = 'owner:chatgpt-direct';
+export const OWNER_CHATGPT_DIRECT_REASON = 'owner-chatgpt-direct';
 export const RUNNER_STARTED_HEADING = '## Claude runner started';
 export const CLAUDE_COMMAND_HEADINGS = {
   proceed: '## Claude proceed command',
   continue: '## Claude continue command',
 };
+
+function issueLabelNames(issue) {
+  return (issue?.labels || [])
+    .map((label) => (typeof label === 'string' ? label : label?.name))
+    .filter(Boolean);
+}
+
+export function hasDirectChatgptOwner(issue) {
+  return issueLabelNames(issue).includes(OWNER_CHATGPT_DIRECT);
+}
 
 export function commentTime(comment) {
   return comment?.created_at || comment?.createdAt || '1970-01-01T00:00:00Z';
@@ -147,6 +159,10 @@ export function preflightAlreadyClaimed(comments = [], preflight) {
  * helper as an authority source.
  */
 export function runnableCommandForIssue(issue, comments = [], { requireManagerPreflight = true } = {}) {
+  if (hasDirectChatgptOwner(issue)) {
+    return { command: null, reason: OWNER_CHATGPT_DIRECT_REASON };
+  }
+
   if (issue.statusLabel === STATUS_READY) {
     const command = findLatestClaudeCommand(comments, ['proceed']);
     if (!command) return { command: null, reason: 'missing proceed command' };
@@ -183,6 +199,9 @@ export function runnableCommandForIssue(issue, comments = [], { requireManagerPr
  * or outrank a new claim.
  */
 export function resolveIssueSelection(issue, comments = [], { requireManagerPreflight = true } = {}) {
+  if (hasDirectChatgptOwner(issue)) {
+    return { mode: null, command: null, preflight: null, managerAuthority: null, reason: OWNER_CHATGPT_DIRECT_REASON };
+  }
   if (![STATUS_READY, STATUS_IN_PROGRESS].includes(issue?.statusLabel)) {
     return { mode: null, command: null, preflight: null, managerAuthority: null, reason: `unsupported status label ${issue?.statusLabel || 'unknown'}` };
   }

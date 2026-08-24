@@ -1,5 +1,5 @@
 [Unit]
-Description=Agent Runner generic serial implementation recurrence selector (#210)
+Description=Agent Runner concurrent implementation recurrence scheduler (#51)
 Documentation=https://github.com/TheTekTeam/agent-runner/blob/main/docs/ops/AGENT-RUNNER-IMPLEMENTATION-RECURRENCE-MIGRATION.md
 
 [Service]

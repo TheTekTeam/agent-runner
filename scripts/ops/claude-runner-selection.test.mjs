@@ -6,6 +6,8 @@ import {
 } from './agent-runner-manager-authority.mjs';
 import {
   MANAGER_PREFLIGHT_REQUIRED,
+  OWNER_CHATGPT_DIRECT,
+  OWNER_CHATGPT_DIRECT_REASON,
   resolveIssueSelection,
   STATUS_IN_PROGRESS,
   STATUS_READY,
@@ -42,6 +44,22 @@ test('resolveIssueSelection works identically for a status:in-progress issue wit
   const result = resolveIssueSelection({ statusLabel: STATUS_IN_PROGRESS }, [comment]);
   assert.equal(result.mode, 'preflight-direct');
   assert.equal(result.managerAuthority.approvedAgent, 'claude-code-cli');
+});
+
+test('resolveIssueSelection excludes a Ready issue reserved for direct ChatGPT before manager authority is consumed', () => {
+  const comment = preflightComment({ approvedAgent: 'claude-code-cli' });
+  const result = resolveIssueSelection({ statusLabel: STATUS_READY, labels: [OWNER_CHATGPT_DIRECT] }, [comment]);
+  assert.equal(result.mode, null);
+  assert.equal(result.reason, OWNER_CHATGPT_DIRECT_REASON);
+  assert.equal(result.managerAuthority, null);
+});
+
+test('resolveIssueSelection excludes an In Progress issue reserved for direct ChatGPT with object-form GitHub labels', () => {
+  const comment = preflightComment({ approvedAgent: 'claude-code-cli' });
+  const result = resolveIssueSelection({ statusLabel: STATUS_IN_PROGRESS, labels: [{ name: OWNER_CHATGPT_DIRECT }] }, [comment]);
+  assert.equal(result.mode, null);
+  assert.equal(result.reason, OWNER_CHATGPT_DIRECT_REASON);
+  assert.equal(result.managerAuthority, null);
 });
 
 test('resolveIssueSelection reports an unsupported status label rather than guessing a mode', () => {
