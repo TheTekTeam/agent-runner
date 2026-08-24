@@ -7,12 +7,16 @@
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 
+import { resolveAgentForLabels } from './agent-runner-agents.mjs';
+
 export const NO_RUNNABLE_CANDIDATE_EXIT_CODE = 3;
 
 export function candidateFromSelection(selected = {}) {
+  const agent = selected.issue ? resolveAgentForLabels(selected.issue.labels || []) : null;
   return {
     candidate: Boolean(selected.issue),
     selectedIssue: selected.issue?.number || null,
+    selectedAgentId: agent?.agentId || null,
     selectionMode: selected.selection?.mode || null,
     skipCount: (selected.skipped || []).length,
   };
