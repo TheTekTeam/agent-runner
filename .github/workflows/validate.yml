@@ -50,11 +50,14 @@ jobs:
           mapfile -t tests < <(find scripts/ops -maxdepth 2 -type f -name 'claude-runner*.test.mjs' | sort)
           node --test "${tests[@]}"
 
-      - name: Diagnose Agent Runner tests
+      - name: Diagnose Agent Runner tests individually
         shell: bash
         run: |
           mapfile -t tests < <(find scripts/ops -maxdepth 2 -type f -name 'agent-runner*.test.mjs' | sort)
-          node --test "${tests[@]}"
+          for test_file in "${tests[@]}"; do
+            printf '\n=== %s ===\n' "$test_file"
+            node --test "$test_file"
+          done
 
       - name: Run canonical repository validation
         run: npm run validate
