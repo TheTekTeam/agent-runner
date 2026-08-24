@@ -92,7 +92,7 @@ export function buildPrContinuationScopeSection() {
 
 export function buildEvidenceSchemaSection() {
   return [
-    'Final report: be machine-oriented and concise; no headings, narrative, issue restatement, implementation explanation, repeated safety prose, or raw test/build logs.',
+    'Final report schema: be machine-oriented and concise; no headings, narrative, issue restatement, implementation explanation, repeated safety prose, or raw test/build logs.',
     'If execution phase is implementation, return ONLY these seven newline-delimited fields:',
     'branch=<branch>',
     'commit=<sha|none>',
