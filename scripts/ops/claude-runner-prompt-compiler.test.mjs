@@ -72,9 +72,32 @@ test('repository instruction contract section renders one Follow line per config
   assert.equal(buildRepositoryInstructionContractSection([]), '');
 });
 
-test('evidence schema section states the bounded final report fields exactly once', () => {
+test('evidence schema section provides compact phase-aware implementation and plan capsules', () => {
   const section = buildEvidenceSchemaSection();
-  assert.match(section, /branch, commit SHA if committed, draft PR URL if created, files changed, tests\/validation run, blocker if any, and safe to merge: yes\/no/);
+  assert.match(section, /If execution phase is implementation, return ONLY these seven newline-delimited fields/i);
+  assert.match(section, /branch=<branch>/);
+  assert.match(section, /commit=<sha\|none>/);
+  assert.match(section, /pr=<draft PR URL\|none>/);
+  assert.match(section, /files=<comma-separated changed paths\|none>/);
+  assert.match(section, /validation=<compact command\/result summary; no logs>/);
+  assert.match(section, /blocker=<none\|one concise blocker>/);
+  assert.match(section, /safe_to_merge=<yes\|no>/);
+  assert.match(section, /If execution phase is plan, return ONLY these two newline-delimited fields/i);
+  assert.match(section, /plan=<concise bounded implementation plan>/);
+  assert.match(section, /no headings, narrative, issue restatement, implementation explanation, repeated safety prose, or raw test\/build logs/i);
+});
+
+test('plan-mode prompt retains a plan output while staying compact', () => {
+  const prompt = buildPreflightDirectPrompt({
+    issue: { number: 323, title: 'Compact worker output', body: 'Reduce final provider output.' },
+    preflight: { id: 1, sourceCommentId: 1, body: '## Manager preflight packet\nBounded planning.' },
+    profile: { profile: 'complex', model: 'sonnet', effort: 'medium' },
+    clearContext: true,
+    executionPhase: EXECUTION_PHASE_PLAN,
+  });
+  assert.match(prompt, /Execution phase: plan/);
+  assert.match(prompt, /plan=<concise bounded implementation plan>/);
+  assert.match(prompt, /Produce the plan now using the material above; follow the final report schema stated above\./);
 });
 
 test('buildPromptCacheMetadata never contains prompt text, only bounded content-addressed fingerprints and estimates', () => {
@@ -198,7 +221,7 @@ test('semantic equivalence: the compiled preflight-direct prompt still carries e
     /Do not invoke Agent\/Task subagents/,
     /Do not hardcode secrets/,
     /Manager preflight packet\nBounded scope\./,
-    /branch, commit SHA if committed, draft PR URL if created, files changed, tests\/validation run, blocker if any, and safe to merge: yes\/no/,
+    /safe_to_merge=<yes\|no>/,
   ];
   for (const pattern of requiredInvariants) {
     assert.match(prompt, pattern);

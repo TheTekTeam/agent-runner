@@ -91,7 +91,20 @@ export function buildPrContinuationScopeSection() {
 // ---- Section 4: stable output/evidence schema ----
 
 export function buildEvidenceSchemaSection() {
-  return 'Final report schema: branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.';
+  return [
+    'Final report schema: be machine-oriented and concise; no headings, narrative, issue restatement, implementation explanation, repeated safety prose, or raw test/build logs.',
+    'If execution phase is implementation, return ONLY these seven newline-delimited fields:',
+    'branch=<branch>',
+    'commit=<sha|none>',
+    'pr=<draft PR URL|none>',
+    'files=<comma-separated changed paths|none>',
+    'validation=<compact command/result summary; no logs>',
+    'blocker=<none|one concise blocker>',
+    'safe_to_merge=<yes|no>',
+    'If execution phase is plan, return ONLY these two newline-delimited fields:',
+    'plan=<concise bounded implementation plan>',
+    'blocker=<none|one concise blocker>',
+  ].join('\n');
 }
 
 // ---- Section 5: provider/adapter-specific stable instructions ----
@@ -119,7 +132,7 @@ export function buildWorktreeAssignmentSection(executionPhase, worktreeIdentity)
 export function buildFinalRequestSection(executionPhase) {
   return executionPhase === EXECUTION_PHASE_IMPLEMENTATION
     ? 'Implement the issue now using the material above; follow the final report schema stated above.'
-    : 'Produce the plan now using the material above.';
+    : 'Produce the plan now using the material above; follow the final report schema stated above.';
 }
 
 // ---- Cache-aware bounded metadata contract ----
