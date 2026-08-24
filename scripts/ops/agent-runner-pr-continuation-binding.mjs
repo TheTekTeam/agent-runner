@@ -52,6 +52,12 @@ export function resolvePrContinuationBinding({
   prepareWorkspace,
   captureEvidence,
   verifyRecoveryCheckpoint = null,
+  // #316: distinct, narrower recovery seam for an owned *committed* (not
+  // merely dirty) continuation checkpoint exactly one commit ahead of the
+  // published PR head. Only ever consulted when the worktree's head has
+  // already failed the ordinary exact-head check below; never weakens that
+  // check itself.
+  verifyCommittedAheadCheckpoint = null,
 } = {}) {
   if (!pullRequest || !issue) {
     return fail('pr-continuation-input-missing');
@@ -149,11 +155,33 @@ export function resolvePrContinuationBinding({
   if (workspace?.allowed !== true) {
     return fail(workspace?.failureReason || 'pr-continuation-workspace-refused');
   }
+  // #316: a worktree whose committed HEAD is not the published PR head is
+  // ordinarily an unconditional mismatch. The one narrow exception is an
+  // owned, already-committed continuation checkpoint exactly one commit
+  // ahead of that same head -- proven only by the injected committed-ahead
+  // verifier below, never assumed. Any other head difference (including no
+  // verifier being available at all) fails exactly as before.
+  let committedAheadCandidate = null;
   if (workspace.baseHead !== head.sha) {
-    return fail('pr-continuation-pr-head-worktree-mismatch', {
-      expectedHeadSha: head.sha,
-      observedHeadSha: workspace.baseHead || null,
-    });
+    const committedAheadAttempt = typeof verifyCommittedAheadCheckpoint === 'function'
+      ? verifyCommittedAheadCheckpoint({
+        repository: authorisedRepository,
+        prNumber: pullRequest.number,
+        branch: authorisedBranch,
+        prHeadSha: head.sha,
+        checkpointHeadSha: workspace.baseHead,
+        worktreeIdentity: dispatchIdentity.worktreeIdentity,
+        rootPath: workspace.rootPath || null,
+      })
+      : null;
+    if (committedAheadAttempt?.recoverable !== true) {
+      return fail('pr-continuation-pr-head-worktree-mismatch', {
+        expectedHeadSha: head.sha,
+        observedHeadSha: workspace.baseHead || null,
+        committedAheadRecoveryFailureReason: committedAheadAttempt?.failureReason || null,
+      });
+    }
+    committedAheadCandidate = committedAheadAttempt;
   }
 
   // prepareContinuationWorkspace deliberately supports dirty recovery
@@ -174,25 +202,53 @@ export function resolvePrContinuationBinding({
       observedBranch: worktreeEvidence.branch || null,
     });
   }
-  if (worktreeEvidence.head !== head.sha) {
+  // Committed-ahead recovery expects the worktree HEAD to still equal the
+  // exact preserved checkpoint commit (workspace.baseHead), not the PR head
+  // itself -- that is the whole point of this recovery shape.
+  const expectedWorktreeHead = committedAheadCandidate ? workspace.baseHead : head.sha;
+  if (worktreeEvidence.head !== expectedWorktreeHead) {
     return fail('pr-continuation-pr-head-worktree-mismatch', {
-      expectedHeadSha: head.sha,
+      expectedHeadSha: expectedWorktreeHead,
       observedHeadSha: worktreeEvidence.head || null,
     });
   }
-  // #242 defect 4: a *failed* continuation (for example a worker that edited
-  // but never committed) leaves this worktree dirty, which the clean-start
-  // rule above would then refuse forever -- permanently dead-ending the PR
-  // and pushing the operator toward resetting/discarding real work.
-  //
-  // The safe recovery model is neither "reset it" nor "trust any dirt": the
-  // dirt is admissible only when it is provably the *exact* preserved
-  // checkpoint the previous failed continuation recorded for this same
-  // repository, PR, branch and published head, byte-identical by status
-  // fingerprint. Any unrelated modification changes that fingerprint and
-  // fails closed here, and work is never destroyed either way.
+
   let recoveredCheckpoint = null;
-  if (worktreeEvidence.dirtyEntryCount !== 0) {
+  if (committedAheadCandidate) {
+    // The committed-ahead verifier already proved handle/history identity
+    // before evidence capture; the one thing it could not check yet is the
+    // live working-tree status fingerprint. A checkpoint is exactly the
+    // preserved state only when that fingerprint is still byte-identical --
+    // any other dirt (new, unrelated, or missing) fails closed here without
+    // touching the worktree.
+    if (worktreeEvidence.statusFingerprint !== committedAheadCandidate.expectedStatusFingerprint) {
+      return fail('pr-continuation-committed-ahead-worktree-modified', {
+        dirtyEntryCount: worktreeEvidence.dirtyEntryCount,
+        statusFingerprint: worktreeEvidence.statusFingerprint || null,
+      });
+    }
+    recoveredCheckpoint = Object.freeze({
+      recovered: true,
+      committedAhead: true,
+      checkpointHead: workspace.baseHead,
+      preRunHeadSha: head.sha,
+      checkpointStatusFingerprint: worktreeEvidence.statusFingerprint || null,
+      dirtyEntryCount: worktreeEvidence.dirtyEntryCount,
+      handleDigest: committedAheadCandidate.handleDigest || null,
+    });
+  } else if (worktreeEvidence.dirtyEntryCount !== 0) {
+    // #242 defect 4: a *failed* continuation (for example a worker that
+    // edited but never committed) leaves this worktree dirty, which the
+    // clean-start rule above would then refuse forever -- permanently
+    // dead-ending the PR and pushing the operator toward
+    // resetting/discarding real work.
+    //
+    // The safe recovery model is neither "reset it" nor "trust any dirt":
+    // the dirt is admissible only when it is provably the *exact* preserved
+    // checkpoint the previous failed continuation recorded for this same
+    // repository, PR, branch and published head, byte-identical by status
+    // fingerprint. Any unrelated modification changes that fingerprint and
+    // fails closed here, and work is never destroyed either way.
     const recovery = typeof verifyRecoveryCheckpoint === 'function'
       ? verifyRecoveryCheckpoint({
         repository: authorisedRepository,
