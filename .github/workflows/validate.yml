@@ -41,5 +41,20 @@ jobs:
       - name: Diagnose runner prompt compatibility tests
         run: node --test scripts/ops/claude-runner.test.mjs
 
+      - name: Diagnose import provenance
+        run: node scripts/verify-imported-tree.mjs
+
+      - name: Diagnose remaining Claude runner tests
+        shell: bash
+        run: |
+          mapfile -t tests < <(find scripts/ops -maxdepth 2 -type f -name 'claude-runner*.test.mjs' | sort)
+          node --test "${tests[@]}"
+
+      - name: Diagnose Agent Runner tests
+        shell: bash
+        run: |
+          mapfile -t tests < <(find scripts/ops -maxdepth 2 -type f -name 'agent-runner*.test.mjs' | sort)
+          node --test "${tests[@]}"
+
       - name: Run canonical repository validation
         run: npm run validate
