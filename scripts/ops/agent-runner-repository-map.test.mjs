@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
@@ -234,5 +234,26 @@ test('source identity is clean at commit and changes for one uncommitted source 
     assert.match(dirty.dirtyFingerprint, /^sha256:[a-f0-9]{64}$/);
   } finally {
     value.cleanup();
+  }
+});
+
+test('dirty symlink identity hashes the link target string without dereferencing outside repository', () => {
+  const value = fixture();
+  const external = mkdtempSync(join(tmpdir(), 'agent-runner-repository-map-external-'));
+  try {
+    const outside = join(external, 'outside.txt');
+    writeFileSync(outside, 'first outside value\n', 'utf8');
+    symlinkSync(outside, join(value.root, 'outside-link'));
+
+    const before = captureRepositorySourceIdentity({ repositoryRoot: value.root });
+    assert.equal(before.dirty, true);
+    writeFileSync(outside, 'second outside value with different bytes\n', 'utf8');
+    const after = captureRepositorySourceIdentity({ repositoryRoot: value.root });
+
+    assert.equal(after.sourceFingerprint, before.sourceFingerprint);
+    assert.equal(after.dirtyFingerprint, before.dirtyFingerprint);
+  } finally {
+    value.cleanup();
+    rmSync(external, { recursive: true, force: true });
   }
 });
