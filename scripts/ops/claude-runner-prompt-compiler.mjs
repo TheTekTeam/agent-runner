@@ -91,7 +91,16 @@ export function buildPrContinuationScopeSection() {
 // ---- Section 4: stable output/evidence schema ----
 
 export function buildEvidenceSchemaSection() {
-  return 'Final report schema: branch, commit SHA if committed, draft PR URL if created, files changed, tests/validation run, blocker if any, and safe to merge: yes/no.';
+  return [
+    'Final report: return ONLY these seven newline-delimited fields and nothing else; no headings, narrative, issue restatement, implementation explanation, repeated safety prose, or raw test/build logs.',
+    'branch=<branch>',
+    'commit=<sha|none>',
+    'pr=<draft PR URL|none>',
+    'files=<comma-separated changed paths|none>',
+    'validation=<compact command/result summary; no logs>',
+    'blocker=<none|one concise blocker>',
+    'safe_to_merge=<yes|no>',
+  ].join('\n');
 }
 
 // ---- Section 5: provider/adapter-specific stable instructions ----
