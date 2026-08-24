@@ -145,6 +145,10 @@ export function resolvePrContinuationBinding({
     implementationCheckout: dispatchIdentity.repositoryContext?.implementationCheckout,
     env,
     runner,
+    // #314: the exact PR head this binding just verified is the only SHA a
+    // missing local worktree may ever be rehydrated at. When a worktree is
+    // already present, prepareWorkspace ignores this and behaves unchanged.
+    rehydrate: { expectedHeadSha: head.sha },
   });
   if (workspace?.allowed !== true) {
     return fail(workspace?.failureReason || 'pr-continuation-workspace-refused');
@@ -243,6 +247,7 @@ export function resolvePrContinuationBinding({
       rootPath: workspace.rootPath || null,
       worktreePath: workspace.worktreePath || null,
       workspacePreparedByRunner: workspace.workspacePreparedByRunner === true,
+      rehydrated: workspace.rehydrated === true,
     }),
     worktreeEvidence: Object.freeze({
       head: worktreeEvidence.head,
