@@ -1,17 +1,17 @@
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import {
-  existsSync,
   lstatSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  readlinkSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 
 export const REPOSITORY_MAP_SCHEMA_VERSION = 1;
 export const REPOSITORY_MAP_TOOL_VERSION = 'repository-map-v1';
@@ -102,7 +102,13 @@ function nonEmptyString(value) {
 function safeRelativePath(value, name = 'path') {
   if (!nonEmptyString(value)) throw new Error(`${name} is required`);
   const normalized = value.replaceAll('\\', '/').replace(/^\.\//, '');
-  if (isAbsolute(value) || normalized === '..' || normalized.startsWith('../') || normalized.includes('/../') || normalized.includes('\0')) {
+  if (
+    isAbsolute(value)
+    || normalized === '..'
+    || normalized.startsWith('../')
+    || normalized.includes('/../')
+    || normalized.includes('\0')
+  ) {
     throw new Error(`${name} must be repository-relative`);
   }
   return normalized;
@@ -153,20 +159,31 @@ function parseStatusPaths(statusText) {
     const entry = parts[index];
     if (entry.length < 4) continue;
     const status = entry.slice(0, 2);
-    const path = safeRelativePath(entry.slice(3), 'dirty path');
-    paths.push(path);
-    if (/[RC]/.test(status) && parts[index + 1]) index += 1;
+    paths.push(safeRelativePath(entry.slice(3), 'dirty path'));
+    if (/[RC]/.test(status) && parts[index + 1]) {
+      paths.push(safeRelativePath(parts[index + 1], 'dirty rename path'));
+      index += 1;
+    }
   }
   return [...new Set(paths)].sort();
+}
+
+function lstatIfPresent(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw error;
+  }
 }
 
 function gitObjectHash(repositoryRoot, relativePath) {
   const absolute = resolve(repositoryRoot, relativePath);
   const rel = relative(repositoryRoot, absolute);
   if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('dirty path escaped repository root');
-  if (!existsSync(absolute)) return 'deleted';
-  const stat = lstatSync(absolute);
-  if (stat.isSymbolicLink()) return `symlink:${digest(readFileSync(absolute, { encoding: 'utf8', flag: 'r' }))}`;
+  const stat = lstatIfPresent(absolute);
+  if (!stat) return 'deleted';
+  if (stat.isSymbolicLink()) return `symlink:${digest(readlinkSync(absolute, 'utf8'))}`;
   if (!stat.isFile()) return `non-file:${stat.mode}`;
   return runGit(repositoryRoot, ['hash-object', '--no-filters', '--', relativePath], { maxBuffer: 1024 * 1024 });
 }
@@ -183,10 +200,13 @@ export function captureRepositorySourceIdentity({ repositoryRoot }) {
     stdio: ['ignore', 'pipe', 'pipe'],
     maxBuffer: 8 * 1024 * 1024,
   });
-  const dirtyPaths = parseStatusPaths(statusText);
-  const dirtyEntries = dirtyPaths.map((path) => ({ path, objectHash: gitObjectHash(root, path) }));
+  const dirtyEntries = parseStatusPaths(statusText).map((path) => ({ path, objectHash: gitObjectHash(root, path) }));
   const dirtyFingerprint = dirtyEntries.length === 0 ? 'clean' : `sha256:${digest(dirtyEntries)}`;
-  const sourceFingerprint = `sha256:${digest({ headSha: headSha.toLowerCase(), treeSha: treeSha.toLowerCase(), dirtyEntries })}`;
+  const sourceFingerprint = `sha256:${digest({
+    headSha: headSha.toLowerCase(),
+    treeSha: treeSha.toLowerCase(),
+    dirtyEntries,
+  })}`;
   return Object.freeze({
     headSha: headSha.toLowerCase(),
     treeSha: treeSha.toLowerCase(),
@@ -194,6 +214,20 @@ export function captureRepositorySourceIdentity({ repositoryRoot }) {
     dirtyFingerprint,
     sourceFingerprint,
   });
+}
+
+function sameSourceIdentity(actual, expected) {
+  return actual?.sourceFingerprint === expected?.sourceFingerprint
+    && actual?.headSha === expected?.headSha
+    && actual?.treeSha === expected?.treeSha
+    && actual?.dirtyFingerprint === expected?.dirtyFingerprint;
+}
+
+function assertSourceUnchanged(repositoryRoot, expected) {
+  const current = captureRepositorySourceIdentity({ repositoryRoot });
+  if (!sameSourceIdentity(current, expected)) {
+    throw new Error('repository source changed while repository map was being loaded or built');
+  }
 }
 
 function classifyLanguage(path) {
@@ -245,8 +279,8 @@ function readBoundedText(repositoryRoot, path, maxBytes) {
   const absolute = resolve(repositoryRoot, path);
   const rel = relative(repositoryRoot, absolute);
   if (rel.startsWith('..') || isAbsolute(rel)) return null;
-  const stat = lstatSync(absolute);
-  if (!stat.isFile() || stat.size > maxBytes) return null;
+  const stat = lstatIfPresent(absolute);
+  if (!stat || stat.isSymbolicLink() || !stat.isFile() || stat.size > maxBytes) return null;
   const value = readFileSync(absolute);
   if (value.includes(0)) return null;
   return value.toString('utf8');
@@ -274,10 +308,9 @@ function normalizeWorkspacePatterns(value) {
 function collectEntrypoints(manifest) {
   const result = new Set();
   const add = (value) => {
-    if (typeof value === 'string' && value.length <= 500 && !value.includes('://')) {
-      const clean = value.replace(/^\.\//, '');
-      if (clean && !clean.startsWith('/') && !clean.includes('..')) result.add(clean);
-    }
+    if (typeof value !== 'string' || value.length > 500 || value.includes('://')) return;
+    const clean = value.replace(/^\.\//, '');
+    if (clean && !clean.startsWith('/') && !clean.includes('..')) result.add(clean);
   };
   add(manifest.main);
   add(manifest.module);
@@ -312,7 +345,15 @@ function packageBoundaries(repositoryRoot, files, maxBytes) {
         entrypoints: collectEntrypoints(manifest),
       });
     } catch {
-      packages.push({ path, root: dirname(path) === '.' ? '.' : dirname(path).replaceAll('\\', '/'), name: null, packageType: null, workspacePatterns: [], entrypoints: [], invalidManifest: true });
+      packages.push({
+        path,
+        root: dirname(path) === '.' ? '.' : dirname(path).replaceAll('\\', '/'),
+        name: null,
+        packageType: null,
+        workspacePatterns: [],
+        entrypoints: [],
+        invalidManifest: true,
+      });
     }
   }
   return packages;
@@ -414,8 +455,7 @@ export function buildRepositoryMap({ project, repositoryRoot, sourceIdentity = n
     dependencies: dependencyEdges(root, files, effectiveLimits),
   };
   map.mapDigest = finalMapDigest(map);
-  const serialized = JSON.stringify(map);
-  if (Buffer.byteLength(serialized) > effectiveLimits.maxMapBytes) {
+  if (Buffer.byteLength(JSON.stringify(map)) > effectiveLimits.maxMapBytes) {
     throw new Error(`repository map exceeds ${effectiveLimits.maxMapBytes} byte bound`);
   }
   return Object.freeze(map);
@@ -433,12 +473,16 @@ export function defaultRepositoryMapCacheRoot(env = process.env) {
 }
 
 function ensureSafeDirectory(path) {
-  if (existsSync(path)) {
-    const stat = lstatSync(path);
+  const stat = lstatIfPresent(path);
+  if (stat) {
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error(`repository map cache path is unsafe: ${path}`);
     return;
   }
   mkdirSync(path, { recursive: true, mode: 0o700 });
+  const created = lstatIfPresent(path);
+  if (!created || created.isSymbolicLink() || !created.isDirectory()) {
+    throw new Error(`repository map cache path is unsafe: ${path}`);
+  }
 }
 
 function cacheFilePath({ cacheRoot, project, sourceIdentity, configFingerprint: configDigest }) {
@@ -452,7 +496,7 @@ function validateLoadedMap(map, { project, sourceIdentity, configFingerprint: co
   const normalized = normalizeProject(project);
   if (!map || map.schemaVersion !== REPOSITORY_MAP_SCHEMA_VERSION || map.toolVersion !== REPOSITORY_MAP_TOOL_VERSION) return false;
   if (map.project?.projectId !== normalized.projectId || String(map.project?.githubRepo).toLowerCase() !== normalized.githubRepo.toLowerCase()) return false;
-  if (map.source?.sourceFingerprint !== sourceIdentity.sourceFingerprint || map.source?.headSha !== sourceIdentity.headSha || map.source?.treeSha !== sourceIdentity.treeSha) return false;
+  if (!sameSourceIdentity(map.source, sourceIdentity)) return false;
   if (map.configFingerprint !== configDigest) return false;
   if (!/^sha256:[a-f0-9]{64}$/.test(map.mapDigest || '') || map.mapDigest !== finalMapDigest(map)) return false;
   return true;
@@ -470,27 +514,53 @@ export function loadOrBuildRepositoryMap({ project, repositoryRoot, cacheRoot = 
   const effectiveLimits = { ...DEFAULT_REPOSITORY_MAP_LIMITS, ...limits };
   const sourceIdentity = captureRepositorySourceIdentity({ repositoryRoot: root });
   const configDigest = currentConfigFingerprint(root, effectiveLimits);
+  assertSourceUnchanged(root, sourceIdentity);
+
   const rootPath = resolve(cacheRoot);
   ensureSafeDirectory(rootPath);
   const namespacePath = join(rootPath, namespaceForProject(normalizedProject));
   ensureSafeDirectory(namespacePath);
   const path = cacheFilePath({ cacheRoot: rootPath, project: normalizedProject, sourceIdentity, configFingerprint: configDigest });
-  if (existsSync(path)) {
+
+  const cacheStat = lstatIfPresent(path);
+  if (cacheStat) {
+    if (cacheStat.isSymbolicLink() || !cacheStat.isFile()) {
+      throw new Error(`repository map cache entry is unsafe: ${path}`);
+    }
     try {
       const candidate = JSON.parse(readFileSync(path, 'utf8'));
       if (validateLoadedMap(candidate, { project: normalizedProject, sourceIdentity, configFingerprint: configDigest })) {
+        assertSourceUnchanged(root, sourceIdentity);
         return Object.freeze({ map: Object.freeze(candidate), reused: true, cachePath: path });
       }
-    } catch {
-      // Corruption is an efficiency failure only. Rebuild from exact current source.
+    } catch (error) {
+      if (String(error?.message || '').includes('repository source changed')) throw error;
+      // Corrupt or stale cache is an efficiency failure only; rebuild from exact source.
     }
     rmSync(path, { force: true });
   }
-  const map = buildRepositoryMap({ project: normalizedProject, repositoryRoot: root, sourceIdentity, limits: effectiveLimits });
-  if (map.configFingerprint !== configDigest) throw new Error('repository configuration changed while repository map was being built');
+
+  const map = buildRepositoryMap({
+    project: normalizedProject,
+    repositoryRoot: root,
+    sourceIdentity,
+    limits: effectiveLimits,
+  });
+  if (map.configFingerprint !== configDigest) {
+    throw new Error('repository configuration changed while repository map was being built');
+  }
+  assertSourceUnchanged(root, sourceIdentity);
+
   const temporary = `${path}.tmp-${process.pid}-${Date.now()}`;
-  writeFileSync(temporary, `${JSON.stringify(map)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-  renameSync(temporary, path);
+  try {
+    writeFileSync(temporary, `${JSON.stringify(map)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    renameSync(temporary, path);
+    assertSourceUnchanged(root, sourceIdentity);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    if (String(error?.message || '').includes('repository source changed')) rmSync(path, { force: true });
+    throw error;
+  }
   return Object.freeze({ map, reused: false, cachePath: path });
 }
 
@@ -499,7 +569,9 @@ export function assertRepositoryMapIdentity(map, expected) {
   const expectedRepo = nonEmptyString(expected?.githubRepo) ? expected.githubRepo.toLowerCase() : null;
   const expectedFingerprint = expected?.sourceFingerprint;
   if (map?.project?.projectId !== expectedProjectId) throw new Error('repository map project identity mismatch');
-  if (!expectedRepo || String(map?.project?.githubRepo || '').toLowerCase() !== expectedRepo) throw new Error('repository map repository identity mismatch');
+  if (!expectedRepo || String(map?.project?.githubRepo || '').toLowerCase() !== expectedRepo) {
+    throw new Error('repository map repository identity mismatch');
+  }
   if (!/^sha256:[a-f0-9]{64}$/.test(expectedFingerprint || '') || map?.source?.sourceFingerprint !== expectedFingerprint) {
     throw new Error('repository map source fingerprint mismatch');
   }
@@ -545,13 +617,17 @@ function applicableInstructions(map, path) {
 
 function boundResult(value, { maxItems, maxBytes }) {
   const result = { ...value };
+  let truncated = Boolean(result.truncated);
   for (const [key, item] of Object.entries(result)) {
-    if (Array.isArray(item)) result[key] = item.slice(0, maxItems);
+    if (!Array.isArray(item)) continue;
+    if (item.length > maxItems) truncated = true;
+    result[key] = item.slice(0, maxItems);
   }
+  result.truncated = truncated;
   while (Buffer.byteLength(JSON.stringify(result)) > maxBytes) {
     const arrays = Object.keys(result).filter((key) => Array.isArray(result[key]) && result[key].length > 0);
     if (arrays.length === 0) throw new Error('repository map query scalar result exceeds byte bound');
-    arrays.sort((a, b) => result[b].length - result[a].length);
+    arrays.sort((a, b) => result[b].length - result[a].length || a.localeCompare(b));
     result[arrays[0]].pop();
     result.truncated = true;
   }
@@ -591,7 +667,12 @@ export function queryRepositoryMap(map, query = {}, limits = {}) {
   } else {
     throw new Error(`unsupported repository map query kind: ${String(kind || '')}`);
   }
-  return boundResult({ schemaVersion: 1, sourceFingerprint: map?.source?.sourceFingerprint, ...result, truncated: Boolean(map?.truncated) }, { maxItems, maxBytes });
+  return boundResult({
+    schemaVersion: 1,
+    sourceFingerprint: map?.source?.sourceFingerprint,
+    ...result,
+    truncated: Boolean(map?.truncated),
+  }, { maxItems, maxBytes });
 }
 
 export function buildRepositoryNavigationCapsule(map, { paths = [], terms = [] } = {}, limits = {}) {
@@ -599,6 +680,8 @@ export function buildRepositoryNavigationCapsule(map, { paths = [], terms = [] }
   const relevant = new Set();
   const tests = new Set();
   const instructions = new Set();
+  const requestTruncated = paths.length > maxItems || terms.length > maxItems;
+
   for (const rawPath of paths.slice(0, maxItems)) {
     const path = safeRelativePath(rawPath);
     if ((map.files || []).includes(path)) relevant.add(path);
@@ -617,6 +700,7 @@ export function buildRepositoryNavigationCapsule(map, { paths = [], terms = [] }
     for (const instruction of applicableInstructions(map, path)) instructions.add(instruction.path);
     for (const test of likelyTests(map, path)) tests.add(test);
   }
+
   return boundResult({
     schemaVersion: 1,
     sourceFingerprint: map.source.sourceFingerprint,
@@ -626,14 +710,25 @@ export function buildRepositoryNavigationCapsule(map, { paths = [], terms = [] }
     instructions: [...instructions].sort(),
     mapTruncated: Boolean(map.truncated),
     navigationOnly: true,
+    truncated: requestTruncated,
   }, { maxItems, maxBytes: Math.min(Number(limits.maxBytes || 8 * 1024), 16 * 1024) });
 }
 
 export function tryRepositoryNavigationCapsule(options, request, limits = {}) {
   try {
     const loaded = loadOrBuildRepositoryMap(options);
-    return Object.freeze({ available: true, reused: loaded.reused, capsule: buildRepositoryNavigationCapsule(loaded.map, request, limits) });
+    return Object.freeze({
+      available: true,
+      reused: loaded.reused,
+      capsule: buildRepositoryNavigationCapsule(loaded.map, request, limits),
+    });
   } catch (error) {
-    return Object.freeze({ available: false, reused: false, capsule: null, reason: 'repository-map-unavailable', detail: String(error?.message || error).slice(0, 300) });
+    return Object.freeze({
+      available: false,
+      reused: false,
+      capsule: null,
+      reason: 'repository-map-unavailable',
+      detail: String(error?.message || error).slice(0, 300),
+    });
   }
 }
