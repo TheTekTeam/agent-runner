@@ -35,16 +35,5 @@ jobs:
         with:
           node-version: 22.23.0
 
-      - name: Diagnose PR continuation binding input
-        shell: bash
-        run: node --test scripts/ops/agent-runner-pr-continuation-binding-input.test.mjs
-
-      - name: Diagnose PR continuation binding
-        if: always()
-        shell: bash
-        run: node --test scripts/ops/agent-runner-pr-continuation-binding.test.mjs
-
-      - name: Diagnose PR continuation stability
-        if: always()
-        shell: bash
-        run: node --test scripts/ops/agent-runner-pr-continuation-stability.test.mjs
+      - name: Run canonical repository validation
+        run: npm run validate
