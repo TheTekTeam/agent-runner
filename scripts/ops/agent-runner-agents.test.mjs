@@ -28,7 +28,11 @@ test('Claude implementation adapter builds a cache-stable uncapped CLI invocatio
 
 test('agent command construction uses only supported execution controls', () => {
   const agent = resolveAgentById('claude-code-cli');
-  assert.equal(Object.keys(agent.controls).includes(['max', 'Turns'].join('')), false);
+  // #320 exposes the documented turn-cap capability in the Claude adapter,
+  // while live command construction remains fail-closed unless machine
+  // qualification, explicit enablement and native-resume recovery are all on.
+  assert.equal(agent.controls.maxTurns.supported, true);
+  assert.equal(agent.controls.maxTurns.flag, ['--max', 'turns'].join('-'));
   assert.equal(agent.controls.excludeDynamicSystemPromptSections.supported, true);
   assert.equal(agent.controls.excludeDynamicSystemPromptSections.flag, '--exclude-dynamic-system-prompt-sections');
 
