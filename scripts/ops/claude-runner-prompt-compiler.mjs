@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 
+import { liveDeterministicHandoffPromptSection } from './agent-runner-deterministic-live-handoff.mjs';
 import { EXECUTION_PHASE_IMPLEMENTATION } from './claude-runner-execution-policy.mjs';
 
 // #193: one provider-neutral stable-prefix prompt contract. Every adapter
@@ -163,11 +164,12 @@ export const CACHE_STRATEGIES = Object.freeze([
 ]);
 
 /**
- * Bounded cache-aware metadata for a compiled prompt: schema/version,
- * content-addressed stable-prefix/dynamic-suffix fingerprints, locally
- * measurable size estimates, and adapter/model/profile identity. Contains no
- * prompt text, provider output, credentials or unrestricted environment
- * content.
+ * Bounded cache-aware metadata for the effective provider prompt. The stable
+ * compiler prefix is never changed by #319. When the live Claude handoff is
+ * present, the exact same bounded section appended by buildAgentCommandArgs()
+ * is incorporated into the dynamic-suffix fingerprint/size estimates here so
+ * prompt telemetry never under-reports provider input. No handoff text is
+ * persisted in metadata; only one-way fingerprints and sizes are recorded.
  */
 export function buildPromptCacheMetadata({
   stableText = '',
@@ -176,20 +178,32 @@ export function buildPromptCacheMetadata({
   model,
   profile,
   cacheStrategy = 'none/unknown',
+  env = process.env,
 } = {}) {
   if (!CACHE_STRATEGIES.includes(cacheStrategy)) {
     throw new Error(`Unknown cache strategy: ${cacheStrategy}`);
   }
+  const liveHandoffSection = adapterId === 'claude-code-cli'
+    ? liveDeterministicHandoffPromptSection(env, { agentId: adapterId })
+    : '';
+  const effectiveDynamicText = joinSections([dynamicText, liveHandoffSection]);
   const stableBytes = byteEstimate(stableText);
-  const dynamicBytes = byteEstimate(dynamicText);
+  const dynamicBytes = byteEstimate(effectiveDynamicText);
+  const liveHandoffBytes = byteEstimate(liveHandoffSection);
   return {
     schemaVersion: PROMPT_SCHEMA_VERSION,
     stablePrefixFingerprint: `sha256:${sha256Hex(stableText)}`,
     stablePrefixByteEstimate: stableBytes,
     stablePrefixTokenEstimate: tokenEstimate(stableBytes),
-    dynamicSuffixFingerprint: `sha256:${sha256Hex(dynamicText)}`,
+    dynamicSuffixFingerprint: `sha256:${sha256Hex(effectiveDynamicText)}`,
     dynamicSuffixByteEstimate: dynamicBytes,
     dynamicSuffixTokenEstimate: tokenEstimate(dynamicBytes),
+    liveDeterministicHandoff: {
+      included: Boolean(liveHandoffSection),
+      fingerprint: liveHandoffSection ? `sha256:${sha256Hex(liveHandoffSection)}` : null,
+      byteEstimate: liveHandoffBytes,
+      tokenEstimate: tokenEstimate(liveHandoffBytes),
+    },
     adapterId: adapterId || null,
     model: model || null,
     profile: profile || null,
