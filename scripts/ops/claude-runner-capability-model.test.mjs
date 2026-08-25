@@ -95,7 +95,7 @@ test('dependency read capabilities cannot install, update, fix, or widen shell s
   ]);
   const added = addedRules(readOnly);
   assert.ok(added.includes('Bash(pnpm list --depth Infinity --json)'));
-  assert.ok(added.every((rule) => !/pnpm (?:install|update|add)|--fix|npm /i.test(rule)));
+  assert.ok(added.every((rule) => !/pnpm (?:install|update|add)|--fix|Bash\(npm /i.test(rule)));
   assert.ok(added.every((rule) => !/[;|&`$<>]/.test(rule)));
   assert.ok(added.every((rule) => !rule.includes('*')));
 });
