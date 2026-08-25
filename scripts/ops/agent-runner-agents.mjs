@@ -6,6 +6,7 @@ export const SHARED_CODEX_CLAUDE_LABEL = 'agent:codex-claude';
 export const DETERMINISTIC_HANDOFF_ENV = 'AGENT_RUNNER_DETERMINISTIC_HANDOFF_JSON';
 export const CLAUDE_MAX_TURNS_ENABLE_ENV = 'AGENT_RUNNER_CLAUDE_MAX_TURNS_ENABLED';
 export const CLAUDE_MAX_TURNS_QUALIFICATION_ENV = 'AGENT_RUNNER_CLAUDE_MAX_TURNS_QUALIFICATION_REVISION';
+export const CLAUDE_NATIVE_RESUME_ENABLE_ENV = 'CLAUDE_RUNNER_ENABLE_NATIVE_RESUME';
 
 export const AGENT_ASSIGNMENT_DISPLAY_NAMES = Object.freeze({
   [SHARED_CODEX_CLAUDE_LABEL]: 'Codex / Claude',
@@ -98,14 +99,16 @@ function taskClassForProfile(profile = {}) {
 export function claudeMaxTurnsPolicy(profile = {}, env = process.env) {
   const revision = qualificationRevision(env[CLAUDE_MAX_TURNS_QUALIFICATION_ENV]);
   const enabled = truthy(env[CLAUDE_MAX_TURNS_ENABLE_ENV]);
+  const recoveryEnabled = truthy(env[CLAUDE_NATIVE_RESUME_ENABLE_ENV]);
   const taskClass = taskClassForProfile(profile);
+  const adapterCapable = Boolean(revision && enabled && recoveryEnabled);
   const budget = chooseContextBudget({
     taskClass,
     risk: taskClass === 'critical' ? 'critical' : 'normal',
-    adapterCapabilities: { maxTurns: Boolean(revision && enabled) },
+    adapterCapabilities: { maxTurns: adapterCapable },
     requestedReasoningEffort: profile.effort || null,
   });
-  const active = Boolean(revision && enabled && Number.isInteger(budget.providerControls.maxTurns));
+  const active = Boolean(adapterCapable && Number.isInteger(budget.providerControls.maxTurns));
   return Object.freeze({
     active,
     qualificationRevision: revision,
@@ -117,7 +120,9 @@ export function claudeMaxTurnsPolicy(profile = {}, env = process.env) {
         ? 'machine-qualification-missing'
         : !enabled
           ? 'machine-enable-gate-off'
-          : 'turn-budget-unavailable',
+          : !recoveryEnabled
+            ? 'native-resume-recovery-gate-off'
+            : 'turn-budget-unavailable',
   });
 }
 
