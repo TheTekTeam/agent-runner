@@ -124,12 +124,19 @@ function providerFacts(value) {
 
 function continuationDeltaFacts(facts) {
   const changedFiles = facts.find((entry) => entry.capability === 'changed-files') || null;
+  let changedFilesResult = changedFiles?.result ?? null;
+  let changedFilesDetailOmitted = false;
+  if (changedFilesResult !== null && Buffer.byteLength(JSON.stringify(changedFilesResult), 'utf8') > 2 * 1024) {
+    changedFilesResult = null;
+    changedFilesDetailOmitted = true;
+  }
   return {
     changedFiles: changedFiles ? {
       capability: changedFiles.capability,
       status: changedFiles.status,
       reused: changedFiles.reused,
-      result: changedFiles.result,
+      result: changedFilesResult,
+      detailOmitted: changedFilesDetailOmitted,
       digest: changedFiles.digest,
     } : null,
     evidenceDigests: facts.map((entry) => ({
