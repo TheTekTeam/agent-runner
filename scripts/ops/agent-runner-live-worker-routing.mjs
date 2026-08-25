@@ -67,6 +67,7 @@ export function resolveLiveWorkerRoute({
   model = null,
   profile = null,
   requiredCapabilities = [],
+  remoteDispatchAvailable = null,
 } = {}) {
   const local = nodeId(localNodeId, 'localNodeId');
   const adapter = String(adapterId || '').trim();
@@ -85,7 +86,9 @@ export function resolveLiveWorkerRoute({
     });
   }
 
-  const remoteEnabled = remoteWorkerDispatchEnabled(env);
+  const remoteEnabled = remoteDispatchAvailable === null
+    ? remoteWorkerDispatchEnabled(env)
+    : remoteDispatchAvailable === true;
   const configuredPreference = nodePreference(env);
   const preferredNodeIds = remoteEnabled
     ? configuredPreference
