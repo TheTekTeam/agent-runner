@@ -67,11 +67,14 @@ test('admitted candidate receives exact-source bounded deterministic evidence fo
     });
     assert.equal(result.available, true);
     assert.equal(result.issueNumber, 319);
+    assert.equal(result.agentId, 'claude-code-cli');
     assert.match(result.sourceFingerprint, /^sha256:[a-f0-9]{64}$/);
+    assert.match(result.headSha, /^[a-f0-9]{40,64}$/);
     assert.ok(result.results.length >= 4);
-    assert.equal(validateLiveDeterministicHandoff(result, { issueNumber: 319 }).valid, true);
-    const rendered = renderLiveDeterministicHandoffForProvider(result);
-    assert.ok(rendered.includes('exact deterministic evidence'));
+    assert.equal(validateLiveDeterministicHandoff(result, { issueNumber: 319, agentId: 'claude-code-cli' }).valid, true);
+    const rendered = renderLiveDeterministicHandoffForProvider(result, { agentId: 'claude-code-cli' });
+    assert.ok(rendered.includes('Non-authoritative deterministic source evidence only'));
+    assert.ok(rendered.includes(result.headSha));
     assert.ok(Buffer.byteLength(rendered) <= 10 * 1024);
   } finally { value.cleanup(); }
 });
@@ -83,17 +86,19 @@ test('unchanged source reuses evidence and changed source invalidates it', () =>
     const second = buildLiveDeterministicHandoff({ project: value.project, candidateAdmission: value.admission, evidenceRoot: value.evidenceRoot, mapCacheRoot: value.mapCacheRoot });
     assert.ok(second.evidenceReused > first.evidenceReused);
     assert.equal(second.sourceFingerprint, first.sourceFingerprint);
+    assert.equal(second.headSha, first.headSha);
     write(value.root, 'src/index.mjs', 'export const answer = 43;\n');
     const changed = buildLiveDeterministicHandoff({ project: value.project, candidateAdmission: value.admission, evidenceRoot: value.evidenceRoot, mapCacheRoot: value.mapCacheRoot });
     assert.notEqual(changed.sourceFingerprint, first.sourceFingerprint);
   } finally { value.cleanup(); }
 });
 
-test('wrong issue binding and tampered handoff are refused', () => {
+test('wrong issue, wrong agent and tampered handoff are refused', () => {
   const value = fixture();
   try {
     const result = buildLiveDeterministicHandoff({ project: value.project, candidateAdmission: value.admission, evidenceRoot: value.evidenceRoot, mapCacheRoot: value.mapCacheRoot });
     assert.equal(validateLiveDeterministicHandoff(result, { issueNumber: 999 }).reason, 'handoff-issue-mismatch');
+    assert.equal(validateLiveDeterministicHandoff(result, { agentId: 'codex-cli' }).reason, 'handoff-agent-mismatch');
     assert.equal(validateLiveDeterministicHandoff({ ...result, sourceFingerprint: `sha256:${'b'.repeat(64)}` }).reason, 'handoff-digest-mismatch');
   } finally { value.cleanup(); }
 });
