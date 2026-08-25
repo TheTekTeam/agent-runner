@@ -12,6 +12,11 @@ import {
 } from './agent-runner-repository-context.mjs';
 import { redactExecutableArgs, redactSensitiveText } from './lib/redact.mjs';
 import {
+  CONTEXT_BUDGET_POLICY_REVISION,
+  chooseContextBudget,
+  decideSessionLifecycle,
+} from './agent-runner-context-budget.mjs';
+import {
   buildQuotaCheckArgs,
   evaluateQuotaPauseState,
   parseQuotaCheckOutput,
@@ -401,6 +406,111 @@ export function resolveProfile(profileName, overrides = {}, env = process.env) {
 
 export function shouldUseClear({ noClear = false, resumeSession } = {}) {
   return !noClear && !resumeSession;
+}
+
+function contextTaskClassForClaudeProfile(profile = {}) {
+  const name = String(profile?.profile || '').trim().toLowerCase();
+  if (name === 'docs') return 'routine';
+  if (name === 'narrow') return 'narrow';
+  if (name === 'complex') return 'complex';
+  if (name === 'critical') return 'critical';
+  return 'normal';
+}
+
+export function buildClaudeContextPolicyShadow({
+  taskIdentity = {},
+  profile = {},
+  resumeSession = null,
+  recoveryMode = null,
+  clearContext = true,
+} = {}) {
+  const actualResumeRequested = Boolean(resumeSession);
+  const identityComplete = Boolean(
+    taskIdentity?.projectId
+    && taskIdentity?.githubRepo
+    && Number.isInteger(taskIdentity?.issueNumber)
+    && taskIdentity.issueNumber > 0
+  );
+
+  let lifecycle;
+  if (!actualResumeRequested) {
+    lifecycle = decideSessionLifecycle({
+      taskIdentity,
+      session: null,
+    });
+  } else if (!recoveryMode) {
+    lifecycle = Object.freeze({
+      decision: 'provider-context-incompatible',
+      resume: false,
+      compact: false,
+      reason: 'session-binding-unproven',
+    });
+  } else if (!identityComplete) {
+    lifecycle = Object.freeze({
+      decision: 'provider-context-incompatible',
+      resume: false,
+      compact: false,
+      reason: 'task-identity-incomplete',
+    });
+  } else {
+    lifecycle = decideSessionLifecycle({
+      taskIdentity,
+      session: {
+        sessionId: resumeSession,
+        identity: taskIdentity,
+        relevance: 'high',
+      },
+      recovery: {
+        requiresExactSession: true,
+        sessionId: resumeSession,
+      },
+    });
+  }
+
+  const taskClass = contextTaskClassForClaudeProfile(profile);
+  const budget = chooseContextBudget({
+    taskClass,
+    risk: taskClass === 'critical' ? 'critical' : 'normal',
+  });
+
+  const actualClearContext = clearContext === true;
+  const behaviourMatchesPolicy = lifecycle.resume === true
+    ? actualResumeRequested && !actualClearContext
+    : !actualResumeRequested && actualClearContext;
+
+  return Object.freeze({
+    policyRevision: CONTEXT_BUDGET_POLICY_REVISION,
+    taskClass: budget.taskClass,
+    lifecycleDecision: lifecycle.decision,
+    lifecycleReason: lifecycle.reason,
+    policyResume: lifecycle.resume === true,
+    policyCompact: lifecycle.compact === true,
+    actualResumeRequested,
+    actualClearContext,
+    behaviourMatchesPolicy,
+    maxOutputBytes: budget.maxOutputBytes,
+    measurementOnly: true,
+  });
+}
+
+export function buildClaudeOutputBudgetShadow({ profile = {}, output = '' } = {}) {
+  const taskClass = contextTaskClassForClaudeProfile(profile);
+  const budget = chooseContextBudget({
+    taskClass,
+    risk: taskClass === 'critical' ? 'critical' : 'normal',
+  });
+  const measuredOutputBytes = Buffer.byteLength(String(output ?? ''), 'utf8');
+
+  return Object.freeze({
+    policyRevision: CONTEXT_BUDGET_POLICY_REVISION,
+    taskClass: budget.taskClass,
+    maxOutputBytes: budget.maxOutputBytes,
+    measuredOutputBytes,
+    outputWithinTaskBudget: measuredOutputBytes <= budget.maxOutputBytes,
+    overBudgetBytes: Math.max(0, measuredOutputBytes - budget.maxOutputBytes),
+    measurementBasis: 'terminal-result-text-plus-errors',
+    measurementOnly: true,
+  });
 }
 
 function repositoryIdentityLine(repositoryContext) {
@@ -1901,6 +2011,10 @@ async function executeOrPlanClaudeRun({
   const resultText = resultEnvelope.parsed
     ? [resultEnvelope.resultText, ...resultEnvelope.errors].filter(Boolean).join('\n')
     : String(result.stdout || '');
+  const outputBudgetShadow = buildClaudeOutputBudgetShadow({
+    profile: runPlan.profile,
+    output: resultText,
+  });
   const telemetryFinishedAt = new Date().toISOString();
   const usageAccounting = buildClaudeUsageAccounting({
     resultEnvelope,
@@ -1933,6 +2047,7 @@ async function executeOrPlanClaudeRun({
       stdout: redactSensitiveText(resultText),
       stderr: redactSensitiveText(result.stderr || ''),
       usageAccounting,
+      outputBudgetShadow,
       implementationEvidence,
       spawnError: result.error ? String(result.error.message || result.error) : null,
     };
@@ -2104,6 +2219,7 @@ async function executeOrPlanClaudeRun({
     stdout: redactSensitiveText(resultText),
     stderr: redactSensitiveText(result.stderr || ''),
     usageAccounting,
+    outputBudgetShadow,
     spawnError: result.error ? String(result.error.message || result.error) : null,
     executionNoop: executionCheck.noop,
     executionNoopReason: executionCheck.reason,
@@ -2434,6 +2550,21 @@ export async function runPrFollowUp(args, env, token, config = {}, {
       { model: args.model, effort: args.effort },
       env,
     );
+  const contextPolicyShadow = buildClaudeContextPolicyShadow({
+    taskIdentity: {
+      projectId: config.projectId || null,
+      githubRepo: args.repo,
+      issueNumber: continuationBinding?.issueNumber ?? linkedIssue ?? null,
+      prNumber: continuationBinding?.prNumber ?? args.pr,
+      branch: continuationBinding?.dispatchAuthority?.branch || branch,
+      sourceFingerprint: continuationBinding?.authority?.fingerprint || null,
+      authorityRevision: continuationBinding?.authority?.revision || null,
+    },
+    profile,
+    resumeSession: args.resumeSession,
+    recoveryMode: args.recoveryMode,
+    clearContext,
+  });
   // #242 defects 1 and 2. A bound, write-capable continuation compiles
   // through the canonical implementation compiler -- so it inherits the
   // clean-commit invariant whose absence caused the field failure, and
@@ -2495,6 +2626,7 @@ export async function runPrFollowUp(args, env, token, config = {}, {
     promptCacheMetadata: continuationPromptInput
       ? prContinuationPromptCacheMetadata(continuationPromptInput)
       : null,
+    contextPolicyShadow,
     executableReviewFeedback: executableFeedback
       ? {
         instructionCount: executableFeedback.instructions.length,
@@ -2703,6 +2835,20 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   }, env);
 
   const clearContext = shouldUseClear({ noClear: args.noClear, resumeSession: args.resumeSession });
+  const contextPolicyShadow = buildClaudeContextPolicyShadow({
+    taskIdentity: {
+      projectId: config.projectId || null,
+      githubRepo: args.repo,
+      issueNumber: args.issue,
+      branch: dispatchAuthority?.branch || null,
+      sourceFingerprint: managerAuthority.authority.fingerprint || null,
+      authorityRevision: managerAuthority.authority.revision || null,
+    },
+    profile,
+    resumeSession: args.resumeSession,
+    recoveryMode: args.recoveryMode,
+    clearContext,
+  });
   const prompt = command
     ? buildClaudePrompt({
       issue: { number: args.issue, title: issue.title },
@@ -2754,6 +2900,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     repositoryContext,
     selectionMode,
     promptCacheMetadata,
+    contextPolicyShadow,
     commandKind: command?.kind || null,
     commandHeading: command?.heading || null,
     sourceCommentId: command?.sourceCommentId || null,
