@@ -1,10 +1,21 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
-import test from 'node:test';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import test, { after } from 'node:test';
 
 const SCRIPT = new URL('../install-agent-runner-fleet-runtime.sh', import.meta.url);
-const SAFE_TEST_PATH = '/usr/bin:/bin';
+const SAFE_TEST_PATH = mkdtempSync(join(tmpdir(), 'agent-runner-fleet-runtime-test-'));
+const ID_SHIM = join(SAFE_TEST_PATH, 'id');
+
+writeFileSync(
+  ID_SHIM,
+  '#!/bin/sh\nif [ "$1" = "-u" ]; then printf "1000\\n"; exit 0; fi\nexit 1\n',
+);
+chmodSync(ID_SHIM, 0o755);
+after(() => rmSync(SAFE_TEST_PATH, { recursive: true, force: true }));
 
 function run(args) {
   return spawnSync('/usr/bin/bash', [SCRIPT.pathname, ...args], {
