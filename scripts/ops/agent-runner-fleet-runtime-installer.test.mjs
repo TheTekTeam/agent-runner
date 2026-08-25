@@ -9,12 +9,18 @@ import test, { after } from 'node:test';
 const SCRIPT = new URL('../install-agent-runner-fleet-runtime.sh', import.meta.url);
 const SAFE_TEST_PATH = mkdtempSync(join(tmpdir(), 'agent-runner-fleet-runtime-test-'));
 const ID_SHIM = join(SAFE_TEST_PATH, 'id');
+const CAT_SHIM = join(SAFE_TEST_PATH, 'cat');
 
 writeFileSync(
   ID_SHIM,
   '#!/bin/sh\nif [ "$1" = "-u" ]; then printf "1000\\n"; exit 0; fi\nexit 1\n',
 );
 chmodSync(ID_SHIM, 0o755);
+writeFileSync(
+  CAT_SHIM,
+  '#!/bin/sh\nwhile IFS= read -r line || [ -n "$line" ]; do printf "%s\\n" "$line"; done\n',
+);
+chmodSync(CAT_SHIM, 0o755);
 after(() => rmSync(SAFE_TEST_PATH, { recursive: true, force: true }));
 
 function run(args) {
