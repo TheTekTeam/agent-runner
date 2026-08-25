@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 
 import { spawnSync } from 'node:child_process';
-import os from 'node:os';
 
 import {
   assertWorkerOnlyFleetNode,
@@ -131,7 +130,6 @@ export function collectFleetReadiness({ nodeId, workerOnly = false, runner = spa
     controllerAuthorityGranted: false,
     os: String(platform),
     arch: String(arch),
-    hostnameDigestAvailable: Boolean(os.hostname()),
     probes: Object.values(probes),
     provisioningProjection: projection,
     agentInstances,
