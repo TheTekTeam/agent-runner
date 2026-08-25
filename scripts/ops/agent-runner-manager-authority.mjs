@@ -6,6 +6,7 @@ import {
   commentRevision,
   normalizeCommentIdentity,
 } from './claude-runner-comment-identity.mjs';
+import { normalizeRequiredCapabilities } from './claude-runner-capability-model.mjs';
 
 export const MANAGER_PREFLIGHT_MARKER = '<!-- agent-runner:manager-preflight -->';
 export const MANAGER_PREFLIGHT_SCHEMA_VERSION = 'agent-runner-manager-preflight/v1';
@@ -57,8 +58,9 @@ function scalarFromYamlBlock(body, key) {
   return raw === null ? null : raw.replace(/^["']|["']$/g, '');
 }
 
-function yamlListHasValues(body, keys = []) {
+function yamlListValues(body, keys = []) {
   const accepted = new Set(keys);
+  const values = [];
   for (const block of yamlBlocks(body)) {
     const lines = block.split(/\r?\n/);
     let active = false;
@@ -68,10 +70,15 @@ function yamlListHasValues(body, keys = []) {
         active = accepted.has(topLevel[1]);
         continue;
       }
-      if (active && /^\s+-\s+\S/.test(line)) return true;
+      const item = active && line.match(/^\s+-\s+(\S.*?)\s*$/);
+      if (item) values.push(item[1].replace(/^["']|["']$/g, ''));
     }
   }
-  return false;
+  return values;
+}
+
+function yamlListHasValues(body, keys = []) {
+  return yamlListValues(body, keys).length > 0;
 }
 
 export function managerAuthorityKey(revision, fingerprint) {
@@ -251,4 +258,20 @@ export function resolveManagerPreflightExecutionMetadata(commentOrBody) {
     model: scalarFromYamlBlock(body, 'model') || null,
     effort: scalarFromYamlBlock(body, 'effort') || null,
   });
+}
+
+/**
+ * Resolve the structured `required_capabilities` list from a manager
+ * preflight packet (#228). Capabilities are only ever taken from this exact
+ * structured YAML field -- never inferred from free-form issue or packet
+ * prose -- and unknown/ambiguous identifiers fail the whole packet closed
+ * rather than being silently dropped.
+ */
+export function resolveManagerPreflightRequiredCapabilities(commentOrBody) {
+  const comment = typeof commentOrBody === 'string'
+    ? { body: commentOrBody }
+    : (commentOrBody || {});
+  const body = String(comment.body || '');
+  const raw = yamlListValues(body, ['required_capabilities']);
+  return normalizeRequiredCapabilities(raw);
 }

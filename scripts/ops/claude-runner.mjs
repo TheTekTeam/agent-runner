@@ -42,6 +42,7 @@ import {
 import {
   resolveCurrentManagerAuthority,
   resolveManagerPreflightExecutionMetadata,
+  resolveManagerPreflightRequiredCapabilities,
 } from './agent-runner-manager-authority.mjs';
 import { resolveDispatchAuthority } from './agent-runner-dispatch-authority.mjs';
 import {
@@ -2817,8 +2818,26 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     preflight, selectionMode, managerExecutionMeta, dispatchAuthority, repositoryContext, profileName,
     executionAuthorization, sourceCommentIdentity, sourcePreflightCommentIdentity, worktreeIdentity,
   } = dispatchIdentity;
+
+  const requiredCapabilities = resolveManagerPreflightRequiredCapabilities(currentPreflight);
+  if (!requiredCapabilities.valid) {
+    const payload = {
+      blocked: true,
+      reason: 'unknown-required-capability',
+      issue: args.issue,
+      unknownCapabilities: requiredCapabilities.unknown,
+      message: `The current manager preflight for issue #${args.issue} declares unknown required_capabilities (${requiredCapabilities.unknown.join(', ')}). No Claude process was started.`,
+    };
+    console.log(JSON.stringify(payload, null, 2));
+    return EXECUTION_POLICY_EXIT_CODE;
+  }
+
   const implementationToolPolicy = worktreeIdentity
-    ? buildImplementationToolPolicy({ expectedBranch: worktreeIdentity.expectedBranch, approvedBranch: dispatchAuthority?.branch })
+    ? buildImplementationToolPolicy({
+      expectedBranch: worktreeIdentity.expectedBranch,
+      approvedBranch: dispatchAuthority?.branch,
+      requiredCapabilities: requiredCapabilities.capabilities,
+    })
     : null;
   const profile = resolveProfile(profileName, {
     model: args.model || managerExecutionMeta.model,

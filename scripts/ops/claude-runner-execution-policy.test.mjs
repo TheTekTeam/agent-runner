@@ -14,6 +14,7 @@ import {
   inspectClaudeCliVersion,
   resolveRequestedExecutionPhase,
 } from './claude-runner-execution-policy.mjs';
+import { CAPABILITY_DEPENDENCY_AUDIT_READ } from './claude-runner-capability-model.mjs';
 
 const PREFLIGHT = {
   id: 4985264598,
@@ -158,6 +159,29 @@ test('implementation tool policy is explicit, branch-scoped, and never enables b
   assert.ok(policy.disallowedTools.includes('Bash(gh *)'));
   assert.doesNotMatch(`${policy.allowedTools.join(',')}${policy.settings}`, /bypassPermissions[^M]/);
   assert.equal(JSON.parse(policy.settings).permissions.disableBypassPermissionsMode, 'disable');
+});
+
+test('#228: buildImplementationToolPolicy stays baseline-compatible with no declared capabilities and grants only reviewed rules when declared', () => {
+  const baseline = buildImplementationToolPolicy({ expectedBranch: 'worktree-agent-runner-658-4985264598' });
+  assert.deepEqual([...baseline.grantedCapabilities], []);
+
+  const withCapability = buildImplementationToolPolicy({
+    expectedBranch: 'worktree-agent-runner-658-4985264598',
+    requiredCapabilities: [CAPABILITY_DEPENDENCY_AUDIT_READ],
+  });
+  const added = withCapability.allowedTools.filter((rule) => !baseline.allowedTools.includes(rule));
+  assert.deepEqual(added.sort(), ['Bash(npm audit *)', 'Bash(npm audit)', 'Bash(npm outdated *)', 'Bash(npm outdated)'].sort());
+  assert.deepEqual([...withCapability.grantedCapabilities], [CAPABILITY_DEPENDENCY_AUDIT_READ]);
+});
+
+test('#228: buildImplementationToolPolicy fails closed on an unknown capability identifier', () => {
+  assert.throws(
+    () => buildImplementationToolPolicy({
+      expectedBranch: 'worktree-agent-runner-658-4985264598',
+      requiredCapabilities: ['not-a-real-capability'],
+    }),
+    /Unknown implementation capability/,
+  );
 });
 
 test('installed CLI capability check requires every implementation safety flag, cache-stability flag, and dontAsk', () => {
