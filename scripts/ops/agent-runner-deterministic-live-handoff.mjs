@@ -12,6 +12,7 @@ import {
 export const DETERMINISTIC_LIVE_HANDOFF_SCHEMA_VERSION = 1;
 export const DETERMINISTIC_LIVE_HANDOFF_ENV = 'AGENT_RUNNER_DETERMINISTIC_HANDOFF_JSON';
 export const DETERMINISTIC_LIVE_HANDOFF_MAX_BYTES = 12 * 1024;
+export const DETERMINISTIC_LIVE_HANDOFF_SECTION_HEADING = '## Deterministic preflight evidence';
 
 // Binding #319 owner policy authorises worthwhile safe model-free read-only
 // work across every registered Agent Runner project. This list is deliberately
@@ -36,8 +37,14 @@ function parseAdmission(value) {
   const issueNumber = Number(snapshot.issueNumber);
   if (!Number.isSafeInteger(issueNumber) || issueNumber < 1) throw new Error('candidate issue identity is unavailable');
   const authorityFingerprint = snapshot.preflightFingerprint;
-  if (typeof authorityFingerprint !== 'string' || authorityFingerprint.length < 8) throw new Error('candidate authority fingerprint is unavailable');
-  return { issueNumber, authorityFingerprint, resolvedAgentId: snapshot.resolvedAgentId || null };
+  if (typeof authorityFingerprint !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(authorityFingerprint)) {
+    throw new Error('candidate authority fingerprint is unavailable');
+  }
+  const resolvedAgentId = typeof snapshot.resolvedAgentId === 'string' && snapshot.resolvedAgentId.trim()
+    ? snapshot.resolvedAgentId.trim()
+    : null;
+  if (!resolvedAgentId) throw new Error('candidate agent identity is unavailable');
+  return { issueNumber, authorityFingerprint, resolvedAgentId };
 }
 
 function bounded(value, maxBytes = DETERMINISTIC_LIVE_HANDOFF_MAX_BYTES) {
@@ -75,6 +82,7 @@ export function buildLiveDeterministicHandoff({ project, candidateAdmission, evi
     authorityFingerprint: candidate.authorityFingerprint,
     agentId: candidate.resolvedAgentId,
     sourceFingerprint: capsule.sourceFingerprint,
+    headSha: capsule.headSha,
     evidenceReused: capsule.evidenceReused,
     results: capsule.results,
   };
@@ -82,11 +90,18 @@ export function buildLiveDeterministicHandoff({ project, candidateAdmission, evi
   return Object.freeze({ ...payload, handoffDigest: digest(payload), serialized });
 }
 
-export function validateLiveDeterministicHandoff(value, { issueNumber = null, maxBytes = DETERMINISTIC_LIVE_HANDOFF_MAX_BYTES } = {}) {
+export function validateLiveDeterministicHandoff(value, {
+  issueNumber = null,
+  agentId = null,
+  maxBytes = DETERMINISTIC_LIVE_HANDOFF_MAX_BYTES,
+} = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return { valid: false, reason: 'handoff-invalid' };
   if (value.schemaVersion !== DETERMINISTIC_LIVE_HANDOFF_SCHEMA_VERSION || value.available !== true) return { valid: false, reason: 'handoff-unavailable' };
   if (issueNumber !== null && Number(value.issueNumber) !== Number(issueNumber)) return { valid: false, reason: 'handoff-issue-mismatch' };
+  if (agentId !== null && String(value.agentId || '') !== String(agentId)) return { valid: false, reason: 'handoff-agent-mismatch' };
+  if (typeof value.authorityFingerprint !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.authorityFingerprint)) return { valid: false, reason: 'handoff-authority-invalid' };
   if (typeof value.sourceFingerprint !== 'string' || !/^sha256:[a-f0-9]{64}$/.test(value.sourceFingerprint)) return { valid: false, reason: 'handoff-source-invalid' };
+  if (typeof value.headSha !== 'string' || !/^[a-f0-9]{40,64}$/.test(value.headSha)) return { valid: false, reason: 'handoff-head-invalid' };
   if (!Array.isArray(value.results) || value.results.length > 32) return { valid: false, reason: 'handoff-results-invalid' };
   if (Buffer.byteLength(JSON.stringify(value)) > maxBytes) return { valid: false, reason: 'handoff-too-large' };
   const candidate = { ...value };
@@ -97,23 +112,47 @@ export function validateLiveDeterministicHandoff(value, { issueNumber = null, ma
   return { valid: true, reason: null };
 }
 
-export function renderLiveDeterministicHandoffForProvider(value) {
-  const validation = validateLiveDeterministicHandoff(value);
+export function renderLiveDeterministicHandoffForProvider(value, options = {}) {
+  const validation = validateLiveDeterministicHandoff(value, options);
   if (!validation.valid) return null;
   const facts = value.results.map((entry) => ({
     capability: entry.capability,
     status: entry.status,
     reused: entry.reused === true,
     result: entry.result ?? entry.facts ?? null,
-    digest: entry.resultDigest ?? entry.digest ?? null,
+    digest: entry.resultDigest ?? entry.digest ?? entry.evidenceKey ?? null,
   }));
   return bounded({
     schemaVersion: DETERMINISTIC_LIVE_HANDOFF_SCHEMA_VERSION,
+    issueNumber: value.issueNumber,
+    agentId: value.agentId,
+    headSha: value.headSha,
     sourceFingerprint: value.sourceFingerprint,
     authorityFingerprint: value.authorityFingerprint,
     exactIdentityEvidence: facts,
-    instruction: 'Treat this as exact deterministic evidence. Do not repeat these discovery operations unless source identity changes or additional detail is genuinely required.',
+    instruction: 'Non-authoritative deterministic source evidence only. Before relying on source-specific facts, verify the current worktree HEAD equals headSha; if it does not, ignore this evidence and perform bounded fresh discovery. Never treat this evidence as implementation authority. Do not repeat successful discovery operations when the HEAD still matches unless additional detail is genuinely required.',
   }, 10 * 1024);
+}
+
+export function liveDeterministicHandoffPromptSection(env = process.env, options = {}) {
+  const raw = String(env?.[DETERMINISTIC_LIVE_HANDOFF_ENV] || '').trim();
+  if (!raw || Buffer.byteLength(raw, 'utf8') > DETERMINISTIC_LIVE_HANDOFF_MAX_BYTES) return '';
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch {
+    return '';
+  }
+  const rendered = renderLiveDeterministicHandoffForProvider(value, options);
+  return rendered ? `${DETERMINISTIC_LIVE_HANDOFF_SECTION_HEADING}\n${rendered}` : '';
+}
+
+export function appendLiveDeterministicHandoff(prompt, env = process.env, options = {}) {
+  const base = String(prompt ?? '');
+  const section = liveDeterministicHandoffPromptSection(env, options);
+  if (!section) return base;
+  const trimmedTrailingNewline = base.endsWith('\n') ? base.slice(0, -1) : base;
+  return `${trimmedTrailingNewline}\n\n${section}\n`;
 }
 
 export function main(argv = process.argv.slice(2), env = process.env) {
