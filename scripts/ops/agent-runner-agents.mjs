@@ -1,5 +1,5 @@
 import { assertClaudePromptCacheEnabled } from './claude-runner-cache-policy.mjs';
-import { renderLiveDeterministicHandoffForProvider } from './agent-runner-deterministic-live-handoff.mjs';
+import { appendLiveDeterministicHandoff } from './agent-runner-deterministic-live-handoff.mjs';
 
 export const SHARED_CODEX_CLAUDE_LABEL = 'agent:codex-claude';
 export const DETERMINISTIC_HANDOFF_ENV = 'AGENT_RUNNER_DETERMINISTIC_HANDOFF_JSON';
@@ -132,20 +132,8 @@ export function agentRunMetadata(agent, profile = {}) {
   };
 }
 
-export function hydratePromptWithDeterministicHandoff(prompt, env = process.env) {
-  const base = String(prompt ?? '');
-  const raw = String(env?.[DETERMINISTIC_HANDOFF_ENV] || '').trim();
-  if (!raw) return base;
-  if (Buffer.byteLength(raw, 'utf8') > 12 * 1024) return base;
-  let value;
-  try {
-    value = JSON.parse(raw);
-  } catch {
-    return base;
-  }
-  const rendered = renderLiveDeterministicHandoffForProvider(value);
-  if (!rendered) return base;
-  return `${base}\n\n## Deterministic preflight evidence\n${rendered}`;
+export function hydratePromptWithDeterministicHandoff(prompt, env = process.env, { agentId = 'claude-code-cli' } = {}) {
+  return appendLiveDeterministicHandoff(prompt, env, { agentId });
 }
 
 export function buildAgentCommandArgs({
@@ -210,6 +198,6 @@ export function buildAgentCommandArgs({
     args.push(agent.controls.settingSources.flag, profile.settingSources);
   }
   args.push(agent.controls.outputFormat.flag, outputFormat || agent.controls.outputFormat.default);
-  args.push(hydratePromptWithDeterministicHandoff(prompt, env));
+  args.push(hydratePromptWithDeterministicHandoff(prompt, env, { agentId: agent.agentId }));
   return args;
 }
