@@ -15,6 +15,7 @@ RESULT_FILE="${AGENT_RUNNER_RUN_RESULT_FILE:-}"
 unset AGENT_RUNNER_RUN_RESULT_FILE
 NODE_BIN="${AGENT_RUNNER_NODE_BIN:-node}"
 PINNED_CRON="$ROOT/scripts/ops/agent-runner-pinned-atomic-cron.mjs"
+DETERMINISTIC_HANDOFF="$ROOT/scripts/ops/agent-runner-deterministic-live-handoff.mjs"
 
 [ -f "$CONFIG_FILE" ] || { echo "[agent-runner] ERROR: config missing: $CONFIG_FILE" >&2; exit 1; }
 [ -f "$PINNED_CRON" ] || {
@@ -78,6 +79,8 @@ json_value() {
 load_env_file "$ENV_FILE"
 # runner.env is config, not a result channel; re-scrub in case it declared it.
 unset AGENT_RUNNER_RUN_RESULT_FILE
+unset AGENT_RUNNER_CANDIDATE_ADMISSION_JSON
+unset AGENT_RUNNER_DETERMINISTIC_HANDOFF_JSON
 export PATH="/usr/local/bin:/opt/homebrew/bin:/opt/cpanel/ea-nodejs22/bin:$HOME/.local/bin:$HOME/bin:$PATH"
 export AGENT_RUNNER_CONFIG="$CONFIG_FILE"
 export CLAUDE_RUNNER_CONFIG="$CONFIG_FILE"
@@ -190,6 +193,28 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
   case "$CANDIDATE_STATUS" in
     0)
       printf '%s\n' "$CANDIDATE_OUTPUT"
+      # #319 live integration: execute the fixed safe read-only deterministic
+      # baseline after exact candidate authority is atomically admitted and
+      # before the provider scheduler runs. This is an optional accelerator;
+      # failure or unavailability is recorded only by omission and never turns
+      # cheaper automation into a new delivery blocker.
+      if [ -f "$DETERMINISTIC_HANDOFF" ]; then
+        set +e
+        DETERMINISTIC_OUTPUT="$(AGENT_RUNNER_CANDIDATE_ADMISSION_JSON="$CANDIDATE_OUTPUT" \
+          "$NODE_BIN" "$DETERMINISTIC_HANDOFF" "${ARGS[@]}" 2>/dev/null)"
+        DETERMINISTIC_STATUS=$?
+        set -e
+        if [ "$DETERMINISTIC_STATUS" -eq 0 ]; then
+          DETERMINISTIC_AVAILABLE="$("$NODE_BIN" -e '
+            let value = null;
+            try { value = JSON.parse(process.argv[1]); } catch { value = null; }
+            process.stdout.write(value?.available === true ? "true" : "false");
+          ' "$DETERMINISTIC_OUTPUT")"
+          if [ "$DETERMINISTIC_AVAILABLE" = "true" ]; then
+            export AGENT_RUNNER_DETERMINISTIC_HANDOFF_JSON="$DETERMINISTIC_OUTPUT"
+          fi
+        fi
+      fi
       write_run_result canonical_runner_invoked canonical-runner-executed 0
       exec "$NODE_BIN" "$PINNED_CRON" "${ARGS[@]}"
       ;;

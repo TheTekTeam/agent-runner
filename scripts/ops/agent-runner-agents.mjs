@@ -1,6 +1,8 @@
 import { assertClaudePromptCacheEnabled } from './claude-runner-cache-policy.mjs';
+import { appendLiveDeterministicHandoff } from './agent-runner-deterministic-live-handoff.mjs';
 
 export const SHARED_CODEX_CLAUDE_LABEL = 'agent:codex-claude';
+export const DETERMINISTIC_HANDOFF_ENV = 'AGENT_RUNNER_DETERMINISTIC_HANDOFF_JSON';
 
 export const AGENT_ASSIGNMENT_DISPLAY_NAMES = Object.freeze({
   [SHARED_CODEX_CLAUDE_LABEL]: 'Codex / Claude',
@@ -130,6 +132,10 @@ export function agentRunMetadata(agent, profile = {}) {
   };
 }
 
+export function hydratePromptWithDeterministicHandoff(prompt, env = process.env, { agentId = 'claude-code-cli' } = {}) {
+  return appendLiveDeterministicHandoff(prompt, env, { agentId });
+}
+
 export function buildAgentCommandArgs({
   agent = resolveAgentById(),
   prompt,
@@ -192,6 +198,6 @@ export function buildAgentCommandArgs({
     args.push(agent.controls.settingSources.flag, profile.settingSources);
   }
   args.push(agent.controls.outputFormat.flag, outputFormat || agent.controls.outputFormat.default);
-  args.push(prompt);
+  args.push(hydratePromptWithDeterministicHandoff(prompt, env, { agentId: agent.agentId }));
   return args;
 }
