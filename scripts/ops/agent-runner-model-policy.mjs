@@ -1,7 +1,7 @@
 export const MODEL_POLICY_SCHEMA_VERSION = 1;
 export const MODEL_IDENTITY_STATES = Object.freeze([
+  'compatibility-alias',
   'qualified',
-  'candidate',
   'historically-valid',
   'unsupported',
 ]);
@@ -9,51 +9,40 @@ export const MODEL_IDENTITY_STATES = Object.freeze([
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
 const EFFORTS = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
-const CLAUDE_MODEL_IDENTITIES = Object.freeze({
-  'claude-sonnet-5': Object.freeze({
-    adapterId: 'claude-code-cli',
-    modelId: 'claude-sonnet-5',
-    capabilityTier: 'sonnet',
-    historical: false,
-  }),
-  'claude-opus-5': Object.freeze({
-    adapterId: 'claude-code-cli',
-    modelId: 'claude-opus-5',
-    capabilityTier: 'opus',
-    historical: false,
-  }),
+// These are the exact aliases already accepted by the live Claude runner.
+// They remain compatibility identities until an exact model migration is
+// separately qualified. Do not infer an underlying provider model from an
+// alias and do not add guessed future full model names here.
+const CLAUDE_COMPATIBILITY_ALIASES = Object.freeze({
   haiku: Object.freeze({
     adapterId: 'claude-code-cli',
     modelId: 'haiku',
-    capabilityTier: 'legacy-alias',
-    historical: true,
+    capabilityTier: 'compatibility-alias',
   }),
   sonnet: Object.freeze({
     adapterId: 'claude-code-cli',
     modelId: 'sonnet',
-    capabilityTier: 'legacy-alias',
-    historical: true,
+    capabilityTier: 'compatibility-alias',
   }),
   opus: Object.freeze({
     adapterId: 'claude-code-cli',
     modelId: 'opus',
-    capabilityTier: 'legacy-alias',
-    historical: true,
+    capabilityTier: 'compatibility-alias',
   }),
-});
-
-// Candidate policy only. These values do not alter the live Claude defaults;
-// each exact model + effort pair must be positively qualified against the
-// installed CLI before this contract can select it for a new attempt.
-const DEFAULT_PROFILE_CANDIDATES = Object.freeze({
-  docs: Object.freeze({ adapterId: 'claude-code-cli', modelId: 'claude-sonnet-5', effort: 'low' }),
-  narrow: Object.freeze({ adapterId: 'claude-code-cli', modelId: 'claude-sonnet-5', effort: 'low' }),
-  complex: Object.freeze({ adapterId: 'claude-code-cli', modelId: 'claude-sonnet-5', effort: 'medium' }),
-  critical: Object.freeze({ adapterId: 'claude-code-cli', modelId: 'claude-opus-5', effort: 'high' }),
 });
 
 function token(value, name) {
   if (typeof value !== 'string' || !TOKEN.test(value)) throw new Error(`${name} is invalid`);
+  return value;
+}
+
+function optionalToken(value, name) {
+  if (value === undefined || value === null || value === '') return null;
+  return token(value, name);
+}
+
+function boolean(value, name) {
+  if (typeof value !== 'boolean') throw new Error(`${name} is invalid`);
   return value;
 }
 
@@ -66,87 +55,148 @@ function normalizeQualifiedEfforts(values = []) {
 
 function normalizeQualification(value = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('qualification is invalid');
-  const revision = value.revision == null ? null : token(value.revision, 'qualification.revision');
-  const adapterId = value.adapterId == null ? null : token(value.adapterId, 'qualification.adapterId');
-  const modelId = value.modelId == null ? null : token(value.modelId, 'qualification.modelId');
-  const cliVersion = value.cliVersion == null ? null : token(value.cliVersion, 'qualification.cliVersion');
+  const revision = optionalToken(value.revision, 'qualification.revision');
+  const adapterId = optionalToken(value.adapterId, 'qualification.adapterId');
+  const modelId = optionalToken(value.modelId, 'qualification.modelId');
+  const cliVersion = optionalToken(value.cliVersion, 'qualification.cliVersion');
+  const documentationRevision = optionalToken(value.documentationRevision, 'qualification.documentationRevision');
+  const documentationVerified = value.documentationVerified === undefined ? false : boolean(value.documentationVerified, 'qualification.documentationVerified');
   const qualified = value.qualified === true;
   const supportedEfforts = normalizeQualifiedEfforts(value.supportedEfforts || []);
-  return Object.freeze({ revision, adapterId, modelId, cliVersion, qualified, supportedEfforts });
+  const requiresExplicitMachineOptIn = value.requiresExplicitMachineOptIn === undefined
+    ? false
+    : boolean(value.requiresExplicitMachineOptIn, 'qualification.requiresExplicitMachineOptIn');
+  return Object.freeze({
+    revision,
+    adapterId,
+    modelId,
+    cliVersion,
+    documentationRevision,
+    documentationVerified,
+    qualified,
+    supportedEfforts,
+    requiresExplicitMachineOptIn,
+  });
 }
 
-export function registeredClaudeModelIdentities() {
-  return Object.values(CLAUDE_MODEL_IDENTITIES).map((entry) => ({ ...entry }));
+export function registeredClaudeCompatibilityAliases() {
+  return Object.values(CLAUDE_COMPATIBILITY_ALIASES).map((entry) => ({ ...entry }));
 }
 
 export function inspectModelIdentity({ adapterId, modelId, qualification = {} } = {}) {
   const adapter = token(adapterId, 'adapterId');
   const model = token(modelId, 'modelId');
   const evidence = normalizeQualification(qualification);
-  const known = adapter === 'claude-code-cli' ? CLAUDE_MODEL_IDENTITIES[model] : null;
 
-  if (!known || known.adapterId !== adapter) {
+  if (adapter !== 'claude-code-cli') {
     return Object.freeze({
       schemaVersion: MODEL_POLICY_SCHEMA_VERSION,
       adapterId: adapter,
       modelId: model,
       state: 'unsupported',
       selectable: false,
+      exactIdentity: false,
       historical: false,
       qualificationRevision: null,
+      cliVersion: null,
+      documentationRevision: null,
       supportedEfforts: Object.freeze([]),
-      reason: 'model-not-registered-for-adapter',
+      requiresExplicitMachineOptIn: false,
+      reason: 'adapter-model-policy-not-qualified-here',
     });
   }
 
-  if (known.historical) {
+  const alias = CLAUDE_COMPATIBILITY_ALIASES[model];
+  if (alias) {
     return Object.freeze({
       schemaVersion: MODEL_POLICY_SCHEMA_VERSION,
       adapterId: adapter,
       modelId: model,
-      state: 'historically-valid',
-      selectable: false,
+      state: 'compatibility-alias',
+      selectable: true,
+      exactIdentity: false,
       historical: true,
       qualificationRevision: null,
+      cliVersion: null,
+      documentationRevision: null,
       supportedEfforts: Object.freeze([]),
-      reason: 'historical-identity-not-selectable-for-new-attempt',
+      requiresExplicitMachineOptIn: model === 'opus',
+      reason: 'live-compatibility-alias-not-exact-model-identity',
     });
   }
 
-  const exactQualification = Boolean(evidence.qualified
+  const exactQualification = Boolean(
+    evidence.qualified
+    && evidence.documentationVerified
     && evidence.revision
     && evidence.adapterId === adapter
     && evidence.modelId === model
-    && evidence.cliVersion);
+    && evidence.cliVersion
+    && evidence.documentationRevision,
+  );
+
+  if (!exactQualification) {
+    return Object.freeze({
+      schemaVersion: MODEL_POLICY_SCHEMA_VERSION,
+      adapterId: adapter,
+      modelId: model,
+      state: 'unsupported',
+      selectable: false,
+      exactIdentity: true,
+      historical: false,
+      qualificationRevision: null,
+      cliVersion: null,
+      documentationRevision: null,
+      supportedEfforts: Object.freeze([]),
+      requiresExplicitMachineOptIn: false,
+      reason: 'exact-model-documentation-and-cli-qualification-required',
+    });
+  }
+
   return Object.freeze({
     schemaVersion: MODEL_POLICY_SCHEMA_VERSION,
     adapterId: adapter,
     modelId: model,
-    state: exactQualification ? 'qualified' : 'candidate',
-    selectable: exactQualification,
+    state: 'qualified',
+    selectable: true,
+    exactIdentity: true,
     historical: false,
-    qualificationRevision: exactQualification ? evidence.revision : null,
-    cliVersion: exactQualification ? evidence.cliVersion : null,
-    supportedEfforts: Object.freeze(exactQualification ? [...evidence.supportedEfforts] : []),
-    reason: exactQualification ? null : 'exact-installed-cli-qualification-required',
+    qualificationRevision: evidence.revision,
+    cliVersion: evidence.cliVersion,
+    documentationRevision: evidence.documentationRevision,
+    supportedEfforts: Object.freeze([...evidence.supportedEfforts]),
+    requiresExplicitMachineOptIn: evidence.requiresExplicitMachineOptIn,
+    reason: null,
   });
 }
 
-export function resolveProfileModelCandidate(profileName, { qualification = {}, allowOpus = false } = {}) {
+// This helper deliberately takes the exact candidate identity as input. The
+// repository does not choose or guess a future full model name. A caller may
+// migrate a profile only after separate current documentation + installed CLI
+// evidence has qualified that exact adapter/model/effort tuple.
+export function resolveQualifiedProfileCandidate({
+  profileName,
+  adapterId = 'claude-code-cli',
+  modelId,
+  effort,
+  qualification = {},
+  allowExplicitMachineOptIn = false,
+} = {}) {
   const profile = token(profileName, 'profileName');
-  const candidate = DEFAULT_PROFILE_CANDIDATES[profile];
-  if (!candidate) throw new Error('profileName is unsupported');
-  const identity = inspectModelIdentity({ adapterId: candidate.adapterId, modelId: candidate.modelId, qualification });
-  if (!identity.selectable) {
-    return Object.freeze({ selected: false, profileName: profile, candidate, identity, reason: identity.reason });
+  const requestedEffort = token(effort, 'effort');
+  if (!EFFORTS.has(requestedEffort)) throw new Error('effort is unsupported');
+  const identity = inspectModelIdentity({ adapterId, modelId, qualification });
+
+  if (identity.state !== 'qualified' || identity.exactIdentity !== true) {
+    return Object.freeze({ selected: false, profileName: profile, modelId, effort: requestedEffort, identity, reason: 'exact-qualified-model-required' });
   }
-  if (!identity.supportedEfforts.includes(candidate.effort)) {
-    return Object.freeze({ selected: false, profileName: profile, candidate, identity, reason: 'profile-effort-not-qualified' });
+  if (!identity.supportedEfforts.includes(requestedEffort)) {
+    return Object.freeze({ selected: false, profileName: profile, modelId, effort: requestedEffort, identity, reason: 'profile-effort-not-qualified' });
   }
-  if (candidate.modelId === 'claude-opus-5' && allowOpus !== true) {
-    return Object.freeze({ selected: false, profileName: profile, candidate, identity, reason: 'opus-requires-explicit-machine-opt-in' });
+  if (identity.requiresExplicitMachineOptIn && allowExplicitMachineOptIn !== true) {
+    return Object.freeze({ selected: false, profileName: profile, modelId, effort: requestedEffort, identity, reason: 'model-requires-explicit-machine-opt-in' });
   }
-  return Object.freeze({ selected: true, profileName: profile, candidate, identity, reason: null });
+  return Object.freeze({ selected: true, profileName: profile, modelId, effort: requestedEffort, identity, reason: null });
 }
 
 export function assertAttemptModelBinding({ capturedModelId, requestedModelId } = {}) {
@@ -156,13 +206,14 @@ export function assertAttemptModelBinding({ capturedModelId, requestedModelId } 
   return captured;
 }
 
-export function classifyHistoricalModelIdentity({ adapterId, modelId } = {}) {
-  const identity = inspectModelIdentity({ adapterId, modelId });
+export function classifyHistoricalModelIdentity({ adapterId, modelId, qualification = {} } = {}) {
+  const identity = inspectModelIdentity({ adapterId, modelId, qualification });
   return Object.freeze({
     adapterId: identity.adapterId,
     modelId: identity.modelId,
-    historicallyValid: identity.state === 'historically-valid' || identity.state === 'candidate' || identity.state === 'qualified',
+    historicallyValid: identity.state === 'compatibility-alias' || identity.state === 'historically-valid' || identity.state === 'qualified',
     currentlySelectable: identity.selectable,
+    exactIdentity: identity.exactIdentity,
     state: identity.state,
   });
 }
