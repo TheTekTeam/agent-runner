@@ -12,6 +12,7 @@
     "validate": "bash scripts/validate.sh",
     "test": "bash scripts/test-imported-runner.sh",
     "repository:map": "node scripts/ops/agent-runner-repository-map-command.mjs",
+    "fleet:readiness": "node scripts/ops/agent-runner-fleet-readiness-command.mjs",
     "queue:triage": "node scripts/ops/agent-runner-queue-triage-command.mjs",
     "queue:triage:prompt": "node scripts/ops/agent-runner-queue-triage-command.mjs --format openai",
     "queue:triage:shadow": "node scripts/ops/agent-runner-queue-triage-shadow-command.mjs",
