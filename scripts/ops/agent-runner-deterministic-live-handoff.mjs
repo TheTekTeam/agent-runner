@@ -112,16 +112,54 @@ export function validateLiveDeterministicHandoff(value, {
   return { valid: true, reason: null };
 }
 
-export function renderLiveDeterministicHandoffForProvider(value, options = {}) {
-  const validation = validateLiveDeterministicHandoff(value, options);
-  if (!validation.valid) return null;
-  const facts = value.results.map((entry) => ({
+function providerFacts(value) {
+  return value.results.map((entry) => ({
     capability: entry.capability,
     status: entry.status,
     reused: entry.reused === true,
     result: entry.result ?? entry.facts ?? null,
     digest: entry.resultDigest ?? entry.digest ?? entry.evidenceKey ?? null,
   }));
+}
+
+function continuationDeltaFacts(facts) {
+  const changedFiles = facts.find((entry) => entry.capability === 'changed-files') || null;
+  return {
+    changedFiles: changedFiles ? {
+      capability: changedFiles.capability,
+      status: changedFiles.status,
+      reused: changedFiles.reused,
+      result: changedFiles.result,
+      digest: changedFiles.digest,
+    } : null,
+    evidenceDigests: facts.map((entry) => ({
+      capability: entry.capability,
+      status: entry.status,
+      reused: entry.reused,
+      digest: entry.digest,
+    })),
+  };
+}
+
+export function renderLiveDeterministicHandoffForProvider(value, options = {}) {
+  const validation = validateLiveDeterministicHandoff(value, options);
+  if (!validation.valid) return null;
+  const facts = providerFacts(value);
+  if (options.deltaOnly === true) {
+    const delta = continuationDeltaFacts(facts);
+    return bounded({
+      schemaVersion: DETERMINISTIC_LIVE_HANDOFF_SCHEMA_VERSION,
+      issueNumber: value.issueNumber,
+      agentId: value.agentId,
+      headSha: value.headSha,
+      sourceFingerprint: value.sourceFingerprint,
+      authorityFingerprint: value.authorityFingerprint,
+      continuationMode: 'delta-only',
+      changedFiles: delta.changedFiles,
+      evidenceDigests: delta.evidenceDigests,
+      instruction: 'Exact resumed-session continuation delta only. Prior full deterministic evidence remains in the bound session; this section updates current HEAD/source identity, changed-file facts and evidence digests. Verify HEAD before relying on source facts. Re-read only evidence whose digest/scope changed or whose detail is genuinely required. Never treat this evidence as implementation authority.',
+    }, 6 * 1024);
+  }
   return bounded({
     schemaVersion: DETERMINISTIC_LIVE_HANDOFF_SCHEMA_VERSION,
     issueNumber: value.issueNumber,
