@@ -14,8 +14,13 @@ import {
 import {
   parseManagerPreflightPacket,
   resolveManagerPreflightExecutionMetadata,
+  resolveManagerPreflightRequiredCapabilities,
 } from './agent-runner-manager-authority.mjs';
 import { executionLabelAuthority } from './agent-runner-label-authority.mjs';
+import {
+  AVAILABLE_CAPABILITY_IDS,
+  evaluateCapabilityCompatibility,
+} from './claude-runner-capability-model.mjs';
 import {
   commentRevision,
   normalizeCommentIdentity,
@@ -32,6 +37,7 @@ export const CANDIDATE_REVALIDATION_FAILURE_EXIT_CODE = 1;
 export const CANDIDATE_REVALIDATION_FAILURE_SCOPE = 'candidate_revalidation';
 export const DEFAULT_CANDIDATE_SELECTION_TIMEOUT_MS = 30_000;
 export const NEW_CLAIM_AUTHORIZATION_MODE = 'preflight-direct';
+export const IMPLEMENTATION_TOOL_CAPABILITY_MISMATCH = 'implementation-tool-capability-mismatch';
 
 const MIN_CANDIDATE_SELECTION_TIMEOUT_MS = 50;
 const MAX_CANDIDATE_SELECTION_TIMEOUT_MS = 60_000;
@@ -69,12 +75,6 @@ export function candidateSnapshot(selected = {}) {
     agentLabel: null,
     evidence: { statusLabels: [], agentLabels: [] },
   };
-  // `labelAuthority.agentLabel` is the literal authoritative GitHub
-  // execution label (e.g. a combined/alias label like `agent:codex-claude`);
-  // `resolvedAgentId` is the concrete adapter it deterministically resolves
-  // to via the canonical catalogue. Atomic revalidation needs both kept
-  // distinct so an unchanged alias never gets compared against a resolved
-  // identity built from a different representation (issue #189).
   const resolvedAgentId = labelAuthority.agentLabel
     ? resolveAgentForLabels([labelAuthority.agentLabel])?.agentId ?? null
     : null;
@@ -201,14 +201,80 @@ export function evaluateCandidateAdmission({ initial, current, approvers = [] } 
 }
 
 /**
- * Issue #226: pure candidate machine/profile cost decision. Reuses
- * `resolveManagerPreflightExecutionMetadata()` for quote-safe profile/model/
- * effort scalars and the canonical `resolveProfile()`/
- * `evaluateClaudeCostAdmission()` semantics claude-runner.mjs already uses
- * for a real attempt -- no second model/effort policy. Performs no GitHub, attempt,
- * workspace or provider mutation; it only inspects the immutable manager
- * preflight and issue already supplied by the caller.
+ * #229: compare the immutable manager-declared implementation capabilities
+ * with the exact currently-available #228 Claude capability contract before
+ * any attempt, workspace, child or provider launch. This is pure and does not
+ * infer capabilities from prose or broaden the accepted mapping.
  */
+export function evaluateCandidateCapabilityAdmission({
+  preflight = null,
+  adapterId = 'claude-code-cli',
+} = {}) {
+  const required = resolveManagerPreflightRequiredCapabilities(preflight);
+  if (!required.valid) {
+    return {
+      allowed: false,
+      scope: 'machine_profile',
+      reason: IMPLEMENTATION_TOOL_CAPABILITY_MISMATCH,
+      requiredCapabilities: required.capabilities || Object.freeze([]),
+      grantedCapabilities: Object.freeze([]),
+      missingCapabilities: Object.freeze([]),
+      unavailableCapabilities: Object.freeze([]),
+      unknownCapabilities: required.unknown || Object.freeze([]),
+      safeNextAction: 'Issue a fresh reviewed manager authority using only known implementation capability identifiers. Do not edit the existing immutable packet or infer permissions from prose.',
+      childLaunched: false,
+      providerInvocation: false,
+    };
+  }
+
+  if (adapterId !== 'claude-code-cli') {
+    return {
+      allowed: false,
+      scope: 'machine_profile',
+      reason: IMPLEMENTATION_TOOL_CAPABILITY_MISMATCH,
+      requiredCapabilities: required.capabilities,
+      grantedCapabilities: Object.freeze([]),
+      missingCapabilities: required.capabilities,
+      unavailableCapabilities: required.capabilities,
+      unknownCapabilities: Object.freeze([]),
+      safeNextAction: 'The selected adapter has no accepted #228 implementation-tool capability contract in this admission path. Qualify its own bounded capability contract before routing implementation work.',
+      childLaunched: false,
+      providerInvocation: false,
+    };
+  }
+
+  const compatibility = evaluateCapabilityCompatibility({
+    requiredCapabilities: required.capabilities,
+    grantedCapabilities: AVAILABLE_CAPABILITY_IDS,
+  });
+  if (!compatibility.compatible) {
+    return {
+      allowed: false,
+      scope: 'machine_profile',
+      reason: IMPLEMENTATION_TOOL_CAPABILITY_MISMATCH,
+      requiredCapabilities: compatibility.requiredCapabilities,
+      grantedCapabilities: compatibility.grantedCapabilities,
+      missingCapabilities: compatibility.missingCapabilities,
+      unavailableCapabilities: compatibility.unavailableCapabilities,
+      unknownCapabilities: compatibility.unknownCapabilities,
+      safeNextAction: 'Revise manager intent or add a separately reviewed bounded tool/harness mapping before provider launch. Do not broaden Bash/network/GitHub authority or interactively escalate permissions.',
+      childLaunched: false,
+      providerInvocation: false,
+    };
+  }
+
+  return {
+    allowed: true,
+    scope: 'machine_profile',
+    reason: 'candidate-tool-capability-admitted',
+    requiredCapabilities: compatibility.requiredCapabilities,
+    grantedCapabilities: compatibility.grantedCapabilities,
+    missingCapabilities: compatibility.missingCapabilities,
+    unavailableCapabilities: compatibility.unavailableCapabilities,
+    unknownCapabilities: compatibility.unknownCapabilities,
+  };
+}
+
 export function evaluateCandidateMachineProfileAdmission({
   issue = {},
   preflight = null,
@@ -247,16 +313,6 @@ export function evaluateCandidateMachineProfileAdmission({
   };
 }
 
-/**
- * Issue #227: production placement of the accepted #226 evaluator and the
- * accepted #235 candidate-effective circuit against the freshly re-read
- * candidate. Only reached once `evaluateCandidateAdmission()` already
- * admitted the candidate on identity/authority grounds -- this never
- * substitutes for, or relaxes, that issue-level check. Every refusal here is
- * recorded/deduped through the accepted #235 breaker so a repeated identical
- * refusal stays a single bounded/deduped circuit incident rather than an
- * unbounded history.
- */
 export function evaluateCandidateCostAdmission({
   issue = {},
   preflight = null,
@@ -287,6 +343,25 @@ export function evaluateCandidateCostAdmission({
 }
 
 export function candidatePausePayload(admission, snapshot) {
+  if (admission.scope === 'machine_profile' && admission.reason === IMPLEMENTATION_TOOL_CAPABILITY_MISMATCH) {
+    return {
+      candidatePaused: true,
+      failureScope: 'machine_profile',
+      reason: admission.reason,
+      safeNextAction: admission.safeNextAction,
+      requiredCapabilities: admission.requiredCapabilities || [],
+      grantedCapabilities: admission.grantedCapabilities || [],
+      missingCapabilities: admission.missingCapabilities || [],
+      unavailableCapabilities: admission.unavailableCapabilities || [],
+      unknownCapabilities: admission.unknownCapabilities || [],
+      selectedIssue: snapshot?.issueNumber || null,
+      attemptCreated: false,
+      childLaunched: false,
+      providerInvocation: false,
+      issueMutation: false,
+      systemdOutcome: 'handled',
+    };
+  }
   if (admission.scope === 'machine_profile') {
     return candidateProfileCircuitPausePayload({
       reason: admission.reason,
@@ -438,13 +513,15 @@ export function revalidateCandidateInChild({
   return candidateRevalidationFailure('candidate-revalidation-unavailable', initial);
 }
 
-// Issue #227: once identity/authority admits the freshly re-read candidate,
-// apply the accepted #226 evaluator and #235 circuit against the freshly
-// re-read candidate before returning `allowed: true`. A `machine_profile`
-// refusal here carries its own bounded scope/reason/fingerprint rather than
-// being folded into the issue-level `issue_not_runnable` shape.
-function admitCandidateCost({ identityAdmission, currentSelected, env }) {
+function admitCandidatePreProvider({ identityAdmission, currentSelected, env }) {
   if (identityAdmission.allowed !== true) return identityAdmission;
+
+  const capability = evaluateCandidateCapabilityAdmission({
+    preflight: currentSelected?.currentPreflight || null,
+    adapterId: resolveAgentForLabels(currentSelected?.issue?.labels || [])?.agentId || null,
+  });
+  if (!capability.allowed) return capability;
+
   const cost = evaluateCandidateCostAdmission({
     issue: currentSelected?.issue || {},
     preflight: currentSelected?.currentPreflight || null,
@@ -482,7 +559,7 @@ export async function admitExpectedCandidate({
   const currentSelected = observed.selected;
   const current = candidateSnapshot(currentSelected);
   const identityAdmission = evaluateCandidateAdmission({ initial, current, approvers: policy.approvers });
-  const admission = admitCandidateCost({ identityAdmission, currentSelected, env });
+  const admission = admitCandidatePreProvider({ identityAdmission, currentSelected, env });
   return { admission, initial, current };
 }
 
@@ -507,17 +584,13 @@ export async function admitCurrentCandidate({
 
   const initial = candidateSnapshot(firstObservation.selected);
 
-  // Tests that inject a selector keep the original deterministic two-read
-  // seam. Production uses a fresh child process for the second observation,
-  // matching the already-accepted atomic revalidation architecture and
-  // preventing one selector instance from having to be re-entered.
   if (select) {
     const secondObservation = await selectBounded(resolved.selector, selectorTimeoutMs);
     if (!secondObservation.ok) return candidateRevalidationFailure(secondObservation.reason, initial);
     const currentSelected = secondObservation.selected;
     const current = candidateSnapshot(currentSelected);
     const identityAdmission = evaluateCandidateAdmission({ initial, current, approvers: policy.approvers });
-    const admission = admitCandidateCost({ identityAdmission, currentSelected, env });
+    const admission = admitCandidatePreProvider({ identityAdmission, currentSelected, env });
     return { admission, initial, current };
   }
 
