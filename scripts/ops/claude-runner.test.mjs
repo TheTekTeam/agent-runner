@@ -6,6 +6,8 @@ import test from 'node:test';
 
 import {
   buildClaudeArgs,
+  buildClaudeContextPolicyShadow,
+  buildClaudeOutputBudgetShadow,
   buildClaudePrompt,
   buildClaudeProcessEnv,
   buildPreflightDirectPrompt,
@@ -339,6 +341,98 @@ test('clear policy defaults to fresh context', () => {
   assert.equal(shouldUseClear({}), true);
   assert.equal(shouldUseClear({ resumeSession: 'issue-123' }), false);
   assert.equal(shouldUseClear({ noClear: true }), false);
+});
+
+test('#320 lifecycle shadow observes fresh, override, exact-recovery and unbound-resume states without changing clear policy', () => {
+  const taskIdentity = {
+    projectId: 'agent-runner',
+    githubRepo: 'TheTekTeam/agent-runner',
+    issueNumber: 320,
+    prNumber: 349,
+    branch: 'chatgpt/context-policy-shadow-320',
+    sourceFingerprint: `sha256:${'a'.repeat(64)}`,
+    authorityRevision: 'AR320-SHADOW-1',
+  };
+  const profile = { profile: 'narrow', model: 'sonnet', effort: 'low' };
+
+  const fresh = buildClaudeContextPolicyShadow({
+    taskIdentity,
+    profile,
+    clearContext: true,
+  });
+  assert.equal(fresh.lifecycleDecision, 'fresh-task');
+  assert.equal(fresh.policyResume, false);
+  assert.equal(fresh.actualResumeRequested, false);
+  assert.equal(fresh.actualClearContext, true);
+  assert.equal(fresh.behaviourMatchesPolicy, true);
+  assert.equal(fresh.maxOutputBytes, 6 * 1024);
+  assert.equal(fresh.measurementOnly, true);
+
+  const explicitNoClear = buildClaudeContextPolicyShadow({
+    taskIdentity,
+    profile,
+    clearContext: false,
+  });
+  assert.equal(explicitNoClear.lifecycleDecision, 'fresh-task');
+  assert.equal(explicitNoClear.behaviourMatchesPolicy, false);
+
+  const sessionId = 'synthetic-secret-session-id';
+  const recovered = buildClaudeContextPolicyShadow({
+    taskIdentity,
+    profile,
+    resumeSession: sessionId,
+    recoveryMode: 'native_resume',
+    clearContext: false,
+  });
+  assert.equal(recovered.lifecycleDecision, 'same-attempt-continuation');
+  assert.equal(recovered.policyResume, true);
+  assert.equal(recovered.actualResumeRequested, true);
+  assert.equal(recovered.actualClearContext, false);
+  assert.equal(recovered.behaviourMatchesPolicy, true);
+  assert.doesNotMatch(JSON.stringify(recovered), /synthetic-secret-session-id/);
+
+  const unboundResume = buildClaudeContextPolicyShadow({
+    taskIdentity,
+    profile,
+    resumeSession: sessionId,
+    clearContext: false,
+  });
+  assert.equal(unboundResume.lifecycleDecision, 'provider-context-incompatible');
+  assert.equal(unboundResume.lifecycleReason, 'session-binding-unproven');
+  assert.equal(unboundResume.policyResume, false);
+  assert.equal(unboundResume.actualResumeRequested, true);
+  assert.equal(unboundResume.behaviourMatchesPolicy, false);
+  assert.doesNotMatch(JSON.stringify(unboundResume), /synthetic-secret-session-id/);
+
+  assert.equal(shouldUseClear({}), true);
+  assert.equal(shouldUseClear({ resumeSession: sessionId }), false);
+  assert.equal(shouldUseClear({ noClear: true }), false);
+});
+
+test('#320 output shadow measures terminal bytes against task-class budget without retaining provider output', () => {
+  const secretOutput = `synthetic-secret-output-${'x'.repeat((4 * 1024) + 32)}`;
+  const shadow = buildClaudeOutputBudgetShadow({
+    profile: { profile: 'docs', model: 'haiku', effort: 'low' },
+    output: secretOutput,
+  });
+
+  assert.equal(shadow.taskClass, 'routine');
+  assert.equal(shadow.maxOutputBytes, 4 * 1024);
+  assert.equal(shadow.measuredOutputBytes, Buffer.byteLength(secretOutput, 'utf8'));
+  assert.equal(shadow.outputWithinTaskBudget, false);
+  assert.ok(shadow.overBudgetBytes > 0);
+  assert.equal(shadow.measurementBasis, 'terminal-result-text-plus-errors');
+  assert.equal(shadow.measurementOnly, true);
+  assert.doesNotMatch(JSON.stringify(shadow), /synthetic-secret-output/);
+
+  const within = buildClaudeOutputBudgetShadow({
+    profile: { profile: 'critical' },
+    output: 'bounded result',
+  });
+  assert.equal(within.taskClass, 'critical');
+  assert.equal(within.maxOutputBytes, 16 * 1024);
+  assert.equal(within.outputWithinTaskBudget, true);
+  assert.equal(within.overBudgetBytes, 0);
 });
 
 test('Claude args include model and effort without interaction or dollar-budget caps', () => {
