@@ -35,5 +35,29 @@ jobs:
         with:
           node-version: 22.23.0
 
+      - name: Diagnostic — agent-runner tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(find scripts/ops -maxdepth 2 -type f -name 'agent-runner*.test.mjs' | sort)
+          node --test "${tests[@]}"
+
+      - name: Diagnostic — claude-runner tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(find scripts/ops -maxdepth 2 -type f -name 'claude-runner*.test.mjs' | sort)
+          node --test "${tests[@]}"
+
+      - name: Diagnostic — installer tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t tests < <(find scripts/ops -maxdepth 2 -type f -name 'install-claude-runner*.test.mjs' | sort)
+          node --test "${tests[@]}"
+
       - name: Run canonical repository validation
         run: npm run validate
