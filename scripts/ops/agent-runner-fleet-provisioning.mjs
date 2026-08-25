@@ -23,6 +23,22 @@ const INITIAL_FLEET_ADAPTERS = Object.freeze([
   'ollama-agent',
 ]);
 
+const CLAUDE_CODE_APT_INSTALLATION = Object.freeze({
+  kind: 'apt-repository',
+  operatingSystems: Object.freeze(['ubuntu', 'debian']),
+  channel: 'stable',
+  packageName: 'claude-code',
+  repositoryUrl: 'https://downloads.claude.ai/claude-code/apt/stable',
+  suite: 'stable',
+  component: 'main',
+  signingKeyUrl: 'https://downloads.claude.ai/keys/claude-code.asc',
+  signingKeyFingerprint: '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE',
+  installer: 'scripts/install-agent-runner-fleet-runtime.sh',
+  automaticProviderAuth: false,
+  automaticQualification: false,
+  automaticRoutingActivation: false,
+});
+
 function stable(value) {
   if (Array.isArray(value)) return value.map(stable);
   if (value && typeof value === 'object') {
@@ -91,7 +107,9 @@ export function fleetAdapterRuntimeContract(adapterId) {
     versionProbe: sourceSupported && id === 'claude-code-cli'
       ? Object.freeze({ command: adapter.command, args: Object.freeze(['--version']) })
       : null,
-    installationMechanism: null,
+    installationMechanism: sourceSupported && id === 'claude-code-cli'
+      ? CLAUDE_CODE_APT_INSTALLATION
+      : null,
     reason: sourceSupported ? null : 'adapter-foundation-not-live',
   });
 }
