@@ -19,12 +19,26 @@ test('fleet adapter set covers the initial owner-requested runtime set', () => {
   ]);
 });
 
-test('only the currently implemented canonical adapter exposes a runtime command', () => {
+test('only the currently implemented canonical adapter exposes a reviewed runtime and install contract', () => {
   const claude = fleetAdapterRuntimeContract('claude-code-cli');
   assert.equal(claude.sourceSupported, true);
   assert.equal(claude.executable, 'claude');
   assert.deepEqual(claude.versionProbe, { command: 'claude', args: ['--version'] });
-  assert.equal(claude.installationMechanism, null);
+  assert.deepEqual(claude.installationMechanism, {
+    kind: 'apt-repository',
+    operatingSystems: ['ubuntu', 'debian'],
+    channel: 'stable',
+    packageName: 'claude-code',
+    repositoryUrl: 'https://downloads.claude.ai/claude-code/apt/stable',
+    suite: 'stable',
+    component: 'main',
+    signingKeyUrl: 'https://downloads.claude.ai/keys/claude-code.asc',
+    signingKeyFingerprint: '31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE',
+    installer: 'scripts/install-agent-runner-fleet-runtime.sh',
+    automaticProviderAuth: false,
+    automaticQualification: false,
+    automaticRoutingActivation: false,
+  });
 
   for (const adapterId of ['codex-cli', 'grok-cli', 'ollama-agent']) {
     const contract = fleetAdapterRuntimeContract(adapterId);
