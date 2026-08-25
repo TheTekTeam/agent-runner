@@ -73,7 +73,7 @@ const FLEET_RUNTIME_FOUNDATIONS = Object.freeze({
 function stable(value) {
   if (Array.isArray(value)) return value.map(stable);
   if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key]) ]));
   }
   return value;
 }
@@ -113,22 +113,27 @@ export function supportedFleetAdapterIds() {
   return [...INITIAL_FLEET_ADAPTERS];
 }
 
+function unsupportedRuntimeContract(adapterId, reason) {
+  return Object.freeze({
+    adapterId,
+    sourceSupported: false,
+    executable: null,
+    versionProbe: null,
+    installationMechanism: null,
+    liveDispatchImplemented: false,
+    qualificationEligible: false,
+    reason,
+  });
+}
+
 export function fleetAdapterRuntimeContract(adapterId) {
   const id = token(adapterId, 'adapterId');
   const adapter = AGENT_ADAPTERS[id];
-  const foundation = FLEET_RUNTIME_FOUNDATIONS[id];
-  if (!adapter || !INITIAL_FLEET_ADAPTERS.includes(id) || !foundation) {
-    return Object.freeze({
-      adapterId: id,
-      sourceSupported: false,
-      executable: null,
-      versionProbe: null,
-      installationMechanism: null,
-      liveDispatchImplemented: false,
-      qualificationEligible: false,
-      reason: 'adapter-foundation-not-live',
-    });
+  if (!adapter || !INITIAL_FLEET_ADAPTERS.includes(id)) {
+    return unsupportedRuntimeContract(id, 'adapter-not-registered-for-fleet');
   }
+  const foundation = FLEET_RUNTIME_FOUNDATIONS[id];
+  if (!foundation) return unsupportedRuntimeContract(id, 'adapter-foundation-not-live');
 
   // Fleet runtime provisioning is intentionally separate from live adapter
   // dispatch. A runtime may be installed/version-probed before its execution
