@@ -191,8 +191,11 @@ export function agentRunMetadata(agent, profile = {}) {
   };
 }
 
-export function hydratePromptWithDeterministicHandoff(prompt, env = process.env, { agentId = 'claude-code-cli' } = {}) {
-  return appendLiveDeterministicHandoff(prompt, env, { agentId });
+export function hydratePromptWithDeterministicHandoff(prompt, env = process.env, {
+  agentId = 'claude-code-cli',
+  deltaOnly = false,
+} = {}) {
+  return appendLiveDeterministicHandoff(prompt, env, { agentId, deltaOnly });
 }
 
 export function buildAgentCommandArgs({
@@ -260,6 +263,11 @@ export function buildAgentCommandArgs({
     args.push(agent.controls.settingSources.flag, profile.settingSources);
   }
   args.push(agent.controls.outputFormat.flag, outputFormat || agent.controls.outputFormat.default);
-  args.push(hydratePromptWithDeterministicHandoff(prompt, env, { agentId: agent.agentId }));
+  // Only an explicitly bound resume session may receive a delta-only handoff.
+  // Fresh tasks continue to receive the full bounded deterministic capsule.
+  args.push(hydratePromptWithDeterministicHandoff(prompt, env, {
+    agentId: agent.agentId,
+    deltaOnly: Boolean(resumeSession),
+  }));
   return args;
 }
