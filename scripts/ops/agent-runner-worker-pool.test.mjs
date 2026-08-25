@@ -102,6 +102,21 @@ test('route selection chooses an eligible exact agent@node and honours preferred
   assert.ok(route.eligible.includes('claude-code-cli@dev-cluster-z790'));
 });
 
+test('ordered node preference remains controller policy rather than alphabetical token order', () => {
+  const reg = registry();
+  const route = selectWorkerRoute(reg, {
+    adapterId: 'claude-code-cli',
+    model: 'sonnet',
+    profile: 'narrow',
+    jobClass: 'implementation',
+    preferredNodeIds: ['dev-cluster-z790', 'dev-cluster-dell'],
+  });
+  assert.deepEqual(route.selected, {
+    nodeId: 'dev-cluster-z790',
+    instanceId: 'claude-code-cli@dev-cluster-z790',
+  });
+});
+
 test('full or unavailable preferred node falls through to another qualified node', () => {
   const base = registry();
   const nodes = base.nodes.map((node) => node.nodeId === 'dev-cluster-dell'

@@ -37,6 +37,11 @@ function boundedTokens(values, name, max = 64) {
   return [...new Set(values.map((value) => token(value, name)))].sort();
 }
 
+function boundedOrderedTokens(values, name, max = 64) {
+  if (!Array.isArray(values) || values.length > max) throw new Error(`${name} is invalid`);
+  return [...new Set(values.map((value) => token(value, name)))];
+}
+
 function positiveInteger(value, name, max = 128) {
   const number = Number(value);
   if (!Number.isSafeInteger(number) || number < 0 || number > max) throw new Error(`${name} is invalid`);
@@ -171,7 +176,9 @@ export function selectWorkerRoute(registry, request = {}) {
     model: request.model ? token(request.model, 'model') : null,
     profile: request.profile ? token(request.profile, 'profile') : null,
     requiredCapabilities,
-    preferredNodeIds: boundedTokens(request.preferredNodeIds || [], 'preferredNodeIds'),
+    // Preference order is semantic: the controller's first qualified node
+    // must remain first rather than being alphabetically canonicalised.
+    preferredNodeIds: boundedOrderedTokens(request.preferredNodeIds || [], 'preferredNodeIds'),
   };
   const order = new Map(normalizedRequest.preferredNodeIds.map((nodeId, index) => [nodeId, index]));
   const candidates = registry.agentInstances
