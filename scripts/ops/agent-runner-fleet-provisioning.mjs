@@ -124,9 +124,12 @@ export function evaluateFleetAdapterEvidence({ nodeId, adapterId, evidence = {} 
   } else if (!runtimeInstalled) {
     state = 'runtime-missing';
     reason = 'runtime-not-installed';
-  } else if (authAvailable !== true) {
+  } else if (authAvailable === null) {
+    state = 'runtime-installed';
+    reason = 'machine-local-auth-unknown';
+  } else if (authAvailable === false) {
     state = 'auth-required';
-    reason = authAvailable === false ? 'machine-local-auth-unavailable' : 'machine-local-auth-unknown';
+    reason = 'machine-local-auth-unavailable';
   } else if (!qualified) {
     state = 'authenticated';
     reason = 'per-node-qualification-required';
