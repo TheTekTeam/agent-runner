@@ -33,16 +33,18 @@ function run(args) {
   });
 }
 
-test('fleet runtime installer documents the bounded Claude-only contract', () => {
+test('fleet runtime installer documents bounded Claude and Codex contracts', () => {
   const result = run(['--help']);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /claude-code-cli/);
+  assert.match(result.stdout, /codex-cli/);
   assert.match(result.stdout, /Ubuntu\/Debian/);
   assert.match(result.stdout, /signed stable apt repository/);
-  assert.match(result.stdout, /does not perform\s+provider login\/authentication/i);
+  assert.match(result.stdout, /@openai\/codex npm package/);
+  assert.match(result.stdout, /does not perform provider\s+login\/authentication/i);
 });
 
-test('fleet runtime installer dry-run performs no package, auth, scheduler or routing mutation', () => {
+test('Claude fleet runtime installer dry-run performs no package, auth, scheduler or routing mutation', () => {
   const result = run(['--adapter', 'claude-code-cli', '--worker-only', '--dry-run']);
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   assert.match(result.stdout, /worker-only mode/);
@@ -52,15 +54,26 @@ test('fleet runtime installer dry-run performs no package, auth, scheduler or ro
   assert.match(result.stdout, /install package claude-code through apt/);
 });
 
-test('fleet runtime installer refuses foundation-only adapters instead of guessing install commands', () => {
-  for (const adapterId of ['codex-cli', 'grok-cli', 'ollama-agent']) {
+test('Codex fleet runtime installer dry-run uses only the reviewed official npm package and performs no auth', () => {
+  const result = run(['--adapter', 'codex-cli', '--worker-only', '--dry-run']);
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /worker-only mode/);
+  assert.match(result.stdout, /existing reviewed Node\/npm toolchain/);
+  assert.match(result.stdout, /@openai\/codex@latest globally from https:\/\/registry\.npmjs\.org\//);
+  assert.match(result.stdout, /verify codex --version/);
+  assert.match(result.stdout, /would not run codex login/);
+  assert.match(result.stdout, /would not .*inspect\/copy ~\/\.codex authentication state/);
+});
+
+test('fleet runtime installer refuses Grok/Ollama foundations instead of guessing install commands', () => {
+  for (const adapterId of ['grok-cli', 'ollama-agent']) {
     const result = run(['--adapter', adapterId, '--dry-run']);
     assert.notEqual(result.status, 0, adapterId);
     assert.match(result.stderr, /no reviewed live fleet installation mechanism/);
   }
 });
 
-test('fleet runtime installer source pins signed Anthropic apt inputs and excludes forbidden authority/auth paths', async () => {
+test('fleet runtime installer source pins reviewed package inputs and excludes forbidden authority/auth paths', async () => {
   const source = await readFile(SCRIPT, 'utf8');
 
   assert.match(source, /https:\/\/downloads\.claude\.ai\/keys\/claude-code\.asc/);
@@ -69,9 +82,20 @@ test('fleet runtime installer source pins signed Anthropic apt inputs and exclud
   assert.match(source, /sudo apt-get install -y claude-code/);
   assert.match(source, /gpg --show-keys --with-colons/);
 
-  assert.doesNotMatch(source, /curl[^\n]*\|[^\n]*bash/);
+  assert.match(source, /CODEX_NPM_PACKAGE="@openai\/codex"/);
+  assert.match(source, /CODEX_NPM_PACKAGE_SPEC="@openai\/codex@latest"/);
+  assert.match(source, /CODEX_NPM_REGISTRY="https:\/\/registry\.npmjs\.org\/"/);
+  assert.match(source, /sudo "\$NPM_BIN" install --global/);
+  assert.match(source, /--no-audit/);
+  assert.match(source, /--no-fund/);
+  assert.match(source, /codex --version/);
+
+  assert.doesNotMatch(source, /curl[^\n]*\|[^\n]*(bash|sh)/);
   assert.doesNotMatch(source, /ANTHROPIC_API_KEY/);
   assert.doesNotMatch(source, /CLAUDE_CODE_OAUTH_TOKEN/);
+  assert.doesNotMatch(source, /OPENAI_API_KEY/);
+  assert.doesNotMatch(source, /CODEX_API_KEY/);
+  assert.doesNotMatch(source, /codex[[:space:]]+login/);
   assert.doesNotMatch(source, /systemctl[^\n]*(enable|start|restart)/);
   assert.doesNotMatch(source, /actions\.runner/);
   assert.doesNotMatch(source, /ollama[^\n]*(pull|run)/);
