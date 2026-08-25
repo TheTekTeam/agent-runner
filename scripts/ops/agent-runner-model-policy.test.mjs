@@ -5,141 +5,180 @@ import {
   assertAttemptModelBinding,
   classifyHistoricalModelIdentity,
   inspectModelIdentity,
-  registeredClaudeModelIdentities,
-  resolveProfileModelCandidate,
+  registeredClaudeCompatibilityAliases,
+  resolveQualifiedProfileCandidate,
 } from './agent-runner-model-policy.mjs';
 
-const sonnetQualification = {
+const exactQualification = {
   qualified: true,
-  revision: 'claude-sonnet5-dell-1',
+  revision: 'claude-exact-model-dell-1',
   adapterId: 'claude-code-cli',
-  modelId: 'claude-sonnet-5',
-  cliVersion: '2.1.233',
+  modelId: 'verified-exact-model',
+  cliVersion: 'current-cli-version',
+  documentationRevision: 'official-docs-verified-revision',
+  documentationVerified: true,
   supportedEfforts: ['low', 'medium'],
 };
 
-const opusQualification = {
-  qualified: true,
-  revision: 'claude-opus5-dell-1',
-  adapterId: 'claude-code-cli',
-  modelId: 'claude-opus-5',
-  cliVersion: '2.1.233',
-  supportedEfforts: ['high'],
-};
+test('live Claude aliases remain compatibility identities without being reinterpreted as exact models', () => {
+  for (const modelId of ['haiku', 'sonnet', 'opus']) {
+    const identity = inspectModelIdentity({ adapterId: 'claude-code-cli', modelId });
+    assert.equal(identity.state, 'compatibility-alias');
+    assert.equal(identity.selectable, true);
+    assert.equal(identity.exactIdentity, false);
+    assert.equal(identity.historical, true);
+    assert.equal(identity.qualificationRevision, null);
+    assert.equal(identity.documentationRevision, null);
+    assert.deepEqual(identity.supportedEfforts, []);
+    assert.equal(classifyHistoricalModelIdentity({ adapterId: 'claude-code-cli', modelId }).historicallyValid, true);
+  }
+  assert.equal(inspectModelIdentity({ adapterId: 'claude-code-cli', modelId: 'opus' }).requiresExplicitMachineOptIn, true);
+});
 
-test('current explicit Claude identities are candidates until exact installed-CLI qualification exists', () => {
-  const candidate = inspectModelIdentity({ adapterId: 'claude-code-cli', modelId: 'claude-sonnet-5' });
-  assert.equal(candidate.state, 'candidate');
+test('no unverified exact model name becomes selectable without current docs plus installed CLI qualification', () => {
+  const candidate = inspectModelIdentity({ adapterId: 'claude-code-cli', modelId: 'unverified-exact-model' });
+  assert.equal(candidate.state, 'unsupported');
   assert.equal(candidate.selectable, false);
-  assert.deepEqual(candidate.supportedEfforts, []);
-  assert.equal(candidate.reason, 'exact-installed-cli-qualification-required');
+  assert.equal(candidate.exactIdentity, true);
+  assert.equal(candidate.reason, 'exact-model-documentation-and-cli-qualification-required');
+});
 
+test('exact model qualification binds documentation, installed CLI, adapter and model identity', () => {
   const qualified = inspectModelIdentity({
     adapterId: 'claude-code-cli',
-    modelId: 'claude-sonnet-5',
-    qualification: sonnetQualification,
+    modelId: 'verified-exact-model',
+    qualification: exactQualification,
   });
   assert.equal(qualified.state, 'qualified');
   assert.equal(qualified.selectable, true);
-  assert.equal(qualified.qualificationRevision, 'claude-sonnet5-dell-1');
+  assert.equal(qualified.exactIdentity, true);
+  assert.equal(qualified.qualificationRevision, 'claude-exact-model-dell-1');
+  assert.equal(qualified.cliVersion, 'current-cli-version');
+  assert.equal(qualified.documentationRevision, 'official-docs-verified-revision');
   assert.deepEqual(qualified.supportedEfforts, ['low', 'medium']);
-});
 
-test('qualification is bound to exact adapter and model rather than a generic provider approval', () => {
   assert.equal(inspectModelIdentity({
     adapterId: 'claude-code-cli',
-    modelId: 'claude-opus-5',
-    qualification: sonnetQualification,
+    modelId: 'different-exact-model',
+    qualification: exactQualification,
   }).selectable, false);
 
   assert.equal(inspectModelIdentity({
     adapterId: 'codex-cli',
-    modelId: 'claude-sonnet-5',
-    qualification: sonnetQualification,
+    modelId: 'verified-exact-model',
+    qualification: exactQualification,
   }).state, 'unsupported');
 });
 
-test('historical aliases remain verifiable but cannot become new-attempt selections', () => {
-  for (const modelId of ['haiku', 'sonnet', 'opus']) {
-    const identity = inspectModelIdentity({ adapterId: 'claude-code-cli', modelId });
-    assert.equal(identity.state, 'historically-valid');
-    assert.equal(identity.historical, true);
+test('documentation evidence is mandatory and cannot be inferred from qualified=true', () => {
+  for (const patch of [
+    { documentationVerified: false },
+    { documentationRevision: null },
+    { cliVersion: null },
+    { revision: null },
+  ]) {
+    const identity = inspectModelIdentity({
+      adapterId: 'claude-code-cli',
+      modelId: 'verified-exact-model',
+      qualification: { ...exactQualification, ...patch },
+    });
+    assert.equal(identity.state, 'unsupported');
     assert.equal(identity.selectable, false);
-    assert.deepEqual(identity.supportedEfforts, []);
-    assert.equal(classifyHistoricalModelIdentity({ adapterId: 'claude-code-cli', modelId }).historicallyValid, true);
   }
 });
 
-test('unknown and cross-adapter identities fail closed', () => {
-  assert.deepEqual(inspectModelIdentity({ adapterId: 'claude-code-cli', modelId: 'future-unknown' }), {
-    schemaVersion: 1,
-    adapterId: 'claude-code-cli',
-    modelId: 'future-unknown',
-    state: 'unsupported',
-    selectable: false,
-    historical: false,
-    qualificationRevision: null,
-    supportedEfforts: [],
-    reason: 'model-not-registered-for-adapter',
+test('profile migration helper never chooses a model name itself', () => {
+  const refused = resolveQualifiedProfileCandidate({
+    profileName: 'narrow',
+    modelId: 'unverified-exact-model',
+    effort: 'low',
   });
+  assert.equal(refused.selected, false);
+  assert.equal(refused.reason, 'exact-qualified-model-required');
+
+  const selected = resolveQualifiedProfileCandidate({
+    profileName: 'narrow',
+    modelId: 'verified-exact-model',
+    effort: 'low',
+    qualification: exactQualification,
+  });
+  assert.equal(selected.selected, true);
+  assert.equal(selected.modelId, 'verified-exact-model');
+  assert.equal(selected.effort, 'low');
 });
 
-test('profile candidates do not change live defaults before exact model and effort qualification', () => {
-  const docs = resolveProfileModelCandidate('docs');
-  assert.equal(docs.selected, false);
-  assert.equal(docs.candidate.modelId, 'claude-sonnet-5');
-
-  const qualified = resolveProfileModelCandidate('docs', { qualification: sonnetQualification });
-  assert.equal(qualified.selected, true);
-  assert.equal(qualified.candidate.effort, 'low');
-
-  const effortMissing = resolveProfileModelCandidate('complex', {
-    qualification: { ...sonnetQualification, supportedEfforts: ['low'] },
+test('exact model effort must be independently qualified', () => {
+  const result = resolveQualifiedProfileCandidate({
+    profileName: 'complex',
+    modelId: 'verified-exact-model',
+    effort: 'high',
+    qualification: exactQualification,
   });
-  assert.equal(effortMissing.selected, false);
-  assert.equal(effortMissing.reason, 'profile-effort-not-qualified');
+  assert.equal(result.selected, false);
+  assert.equal(result.reason, 'profile-effort-not-qualified');
 });
 
-test('critical Opus requires exact model/effort qualification and explicit machine-local opt-in', () => {
-  const noOptIn = resolveProfileModelCandidate('critical', { qualification: opusQualification });
-  assert.equal(noOptIn.selected, false);
-  assert.equal(noOptIn.reason, 'opus-requires-explicit-machine-opt-in');
+test('machine-local opt-in remains a separate gate when qualification requires it', () => {
+  const qualification = { ...exactQualification, requiresExplicitMachineOptIn: true };
+  const blocked = resolveQualifiedProfileCandidate({
+    profileName: 'critical',
+    modelId: 'verified-exact-model',
+    effort: 'medium',
+    qualification,
+  });
+  assert.equal(blocked.selected, false);
+  assert.equal(blocked.reason, 'model-requires-explicit-machine-opt-in');
 
-  const admitted = resolveProfileModelCandidate('critical', { qualification: opusQualification, allowOpus: true });
+  const admitted = resolveQualifiedProfileCandidate({
+    profileName: 'critical',
+    modelId: 'verified-exact-model',
+    effort: 'medium',
+    qualification,
+    allowExplicitMachineOptIn: true,
+  });
   assert.equal(admitted.selected, true);
-  assert.equal(admitted.candidate.modelId, 'claude-opus-5');
-  assert.equal(admitted.candidate.effort, 'high');
 });
 
-test('captured attempt model identity is immutable', () => {
+test('captured attempt model identity is immutable for aliases and exact identities', () => {
   assert.equal(assertAttemptModelBinding({
-    capturedModelId: 'claude-sonnet-5',
-    requestedModelId: 'claude-sonnet-5',
-  }), 'claude-sonnet-5');
+    capturedModelId: 'sonnet',
+    requestedModelId: 'sonnet',
+  }), 'sonnet');
+  assert.equal(assertAttemptModelBinding({
+    capturedModelId: 'verified-exact-model',
+    requestedModelId: 'verified-exact-model',
+  }), 'verified-exact-model');
   assert.throws(() => assertAttemptModelBinding({
-    capturedModelId: 'claude-sonnet-5',
-    requestedModelId: 'claude-opus-5',
+    capturedModelId: 'sonnet',
+    requestedModelId: 'verified-exact-model',
   }), /attempt model identity changed after capture/);
 });
 
 test('invalid qualification effort identities fail closed rather than being guessed', () => {
   assert.throws(() => inspectModelIdentity({
     adapterId: 'claude-code-cli',
-    modelId: 'claude-sonnet-5',
-    qualification: { ...sonnetQualification, supportedEfforts: ['turbo'] },
+    modelId: 'verified-exact-model',
+    qualification: { ...exactQualification, supportedEfforts: ['turbo'] },
   }), /unsupported effort identity/);
 });
 
-test('registry distinguishes exact current identities from historical aliases without claiming CLI effort support', () => {
-  const values = registeredClaudeModelIdentities();
-  assert.deepEqual(values.map((entry) => entry.modelId), [
-    'claude-sonnet-5',
-    'claude-opus-5',
-    'haiku',
-    'sonnet',
-    'opus',
-  ]);
-  assert.equal(values.find((entry) => entry.modelId === 'claude-sonnet-5').historical, false);
-  assert.equal(values.find((entry) => entry.modelId === 'sonnet').historical, true);
-  assert.equal(Object.hasOwn(values[0], 'supportedEfforts'), false);
+test('compatibility registry contains only the aliases already accepted by the live runner', () => {
+  const values = registeredClaudeCompatibilityAliases();
+  assert.deepEqual(values.map((entry) => entry.modelId), ['haiku', 'sonnet', 'opus']);
+  assert.equal(values.every((entry) => entry.adapterId === 'claude-code-cli'), true);
+  assert.equal(values.every((entry) => entry.capabilityTier === 'compatibility-alias'), true);
+});
+
+test('unknown provider model policy remains outside this Claude qualification slice', () => {
+  const identity = inspectModelIdentity({
+    adapterId: 'codex-cli',
+    modelId: 'some-model',
+    qualification: {
+      ...exactQualification,
+      adapterId: 'codex-cli',
+      modelId: 'some-model',
+    },
+  });
+  assert.equal(identity.state, 'unsupported');
+  assert.equal(identity.reason, 'adapter-model-policy-not-qualified-here');
 });
