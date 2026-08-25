@@ -42,8 +42,10 @@ test('Z790 workflow has no control-plane, deployment or mutation authority', () 
   }
 });
 
-test('canonical validation remains on Dell until Z790 field acceptance', () => {
+test('canonical validation targets the accepted Z790 build-worker capability', () => {
   const source = workflow(canonicalPath);
-  assert.match(source, /- self-hosted\n\s+- dev-cluster-dell/);
-  assert.doesNotMatch(source, /dev-cluster-z790/);
+  assert.match(source, /- self-hosted\n\s+- dev-cluster-z790\n\s+- build-worker/);
+  assert.doesNotMatch(source, /dev-cluster-dell/);
+  assert.match(source, /permissions:\n\s+contents: read/);
+  assert.match(source, /npm run validate/);
 });
