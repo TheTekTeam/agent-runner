@@ -26,9 +26,36 @@ The projection can be converted to #327 `agent@node` records, but the readiness 
 
 ## Provisioning boundary
 
-The repository must not invent installation package sources from issue prose. `fleetAdapterRuntimeContract()` exposes an installation/version mechanism only after that adapter's canonical implementation foundation has reviewed it. At the current source state this means the fleet probe can positively inspect the accepted Claude Code runtime; Codex, Grok and Ollama/OpenCode remain explicit `adapter-foundation-not-live` until their canonical adapters expose reviewed executable/install contracts.
+The repository must not invent installation package sources from issue prose. `fleetAdapterRuntimeContract()` exposes an installation/version mechanism only after that adapter's canonical implementation foundation and current upstream package source have been reviewed.
 
-This is deliberate fail-closed behaviour, not evidence that those runtimes are absent from a machine.
+### Claude Code
+
+For Ubuntu/Debian fleet nodes, the reviewed Claude Code runtime installation contract uses Anthropic's signed **stable** apt repository:
+
+- package: `claude-code`;
+- repository: `https://downloads.claude.ai/claude-code/apt/stable`;
+- suite/component: `stable main`;
+- signing key: `https://downloads.claude.ai/keys/claude-code.asc`;
+- required signing-key fingerprint: `31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE`;
+- installer: `scripts/install-agent-runner-fleet-runtime.sh`.
+
+The installer is deliberately bounded. It verifies host/platform and signing-key identity, installs only the reviewed runtime package, and verifies `claude --version`. It does **not** perform provider login, inspect/copy credentials or sessions, qualify the resulting `agent@node`, mutate the worker registry, enable routing, install/enable a scheduler/controller, register a GitHub Actions runner, or download a model.
+
+Example dry run on a worker node:
+
+```text
+bash scripts/install-agent-runner-fleet-runtime.sh \
+  --adapter claude-code-cli \
+  --node dev-cluster-z790 \
+  --worker-only \
+  --dry-run
+```
+
+After an authorised installation, rerun the readiness probe. `runtime-installed` remains distinct from `authenticated` and `qualified`.
+
+### Foundation-only adapters
+
+Codex, Grok and Ollama/OpenCode remain explicit `adapter-foundation-not-live` in the current fleet installation contract. The installer refuses them rather than guessing a package/executable/source from issue prose or from what may happen to be installed manually on a machine. This is deliberate fail-closed behaviour, not evidence that those runtimes are absent from a node.
 
 ## Authentication and qualification
 
