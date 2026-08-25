@@ -3,7 +3,7 @@ import test from 'node:test';
 
 import { buildNoSelectionPayload, candidateFromSelection } from './claude-runner-candidate-probe.mjs';
 
-test('candidate probe reports no candidate for an empty queue', () => {
+test('candidate probe reports no candidate for an empty queue without changing the legacy payload shape', () => {
   assert.deepEqual(candidateFromSelection({ issue: null, skipped: [] }), {
     candidate: false,
     selectedIssue: null,
@@ -12,7 +12,7 @@ test('candidate probe reports no candidate for an empty queue', () => {
   });
 });
 
-test('candidate probe recognises an already-runnable selected issue', () => {
+test('candidate probe recognises an already-runnable unlabelled issue without changing the legacy payload shape', () => {
   assert.deepEqual(candidateFromSelection({
     issue: { number: 711 },
     selection: { mode: 'preflight-direct' },
@@ -20,6 +20,20 @@ test('candidate probe recognises an already-runnable selected issue', () => {
   }), {
     candidate: true,
     selectedIssue: 711,
+    selectionMode: 'preflight-direct',
+    skipCount: 0,
+  });
+});
+
+test('candidate probe adds exact adapter identity only when an assignment label resolves it', () => {
+  assert.deepEqual(candidateFromSelection({
+    issue: { number: 712, labels: [{ name: 'agent:codex-claude' }] },
+    selection: { mode: 'preflight-direct' },
+    skipped: [],
+  }), {
+    candidate: true,
+    selectedIssue: 712,
+    selectedAgentId: 'claude-code-cli',
     selectionMode: 'preflight-direct',
     skipCount: 0,
   });
