@@ -12,21 +12,21 @@ Run the repository probe on the machine being inspected:
 npm run fleet:readiness -- --node <node-id> [--worker-only]
 ```
 
-Use `--worker-only` on Z790 and every non-controller worker. The command is intentionally read-only. It executes only the version-probe command already accepted by the canonical live adapter catalogue, with a minimal environment containing `PATH`. It does not inspect or serialize credential files, auth tokens, sessions, home-directory paths or environment dumps.
+Use `--worker-only` on Z790 and every non-controller worker. The command is intentionally read-only. It executes only version-probe commands explicitly accepted by the fleet runtime contract, with a minimal environment containing `PATH`. It does not inspect or serialize credential files, auth tokens, sessions, home-directory paths or environment dumps.
 
 The output distinguishes:
 
 - source-supported adapter runtime present/missing;
 - installed version where the reviewed version probe returns one;
 - authentication as `unknown` unless separately proven by the adapter's accepted machine-local authentication workflow;
-- qualification as false unless separately supplied by the owning canary/qualification process;
+- qualification as false unless separately supplied by the owning canary/qualification process and permitted by the live adapter gate;
 - unsupported/foundation-only adapters without guessing their executable or installation mechanism.
 
 The projection can be converted to #327 `agent@node` records, but the readiness command itself performs no worker-registry mutation and grants no route authority.
 
 ## Provisioning boundary
 
-The repository must not invent installation package sources from issue prose. `fleetAdapterRuntimeContract()` exposes an installation/version mechanism only after that adapter's canonical implementation foundation and current upstream package source have been reviewed.
+The repository must not invent installation package sources from issue prose. `fleetAdapterRuntimeContract()` exposes an installation/version mechanism only after that runtime foundation and current upstream package source have been reviewed. Runtime provisioning is deliberately separate from live Agent Runner dispatch: installing a CLI does not make its execution adapter qualification-eligible or routable.
 
 ### Claude Code
 
@@ -53,15 +53,39 @@ bash scripts/install-agent-runner-fleet-runtime.sh \
 
 After an authorised installation, rerun the readiness probe. `runtime-installed` remains distinct from `authenticated` and `qualified`.
 
+### Codex CLI
+
+OpenAI's current Codex CLI documentation publishes the official npm package `@openai/codex` and the command `npm install -g @openai/codex`. For the current Ubuntu/Debian Agent Runner fleet, the reviewed runtime contract therefore uses:
+
+- executable/version probe: `codex --version`;
+- npm package: `@openai/codex`;
+- reviewed package spec: `@openai/codex@latest`;
+- registry: `https://registry.npmjs.org/`;
+- installer: `scripts/install-agent-runner-fleet-runtime.sh`.
+
+Example dry run:
+
+```text
+bash scripts/install-agent-runner-fleet-runtime.sh \
+  --adapter codex-cli \
+  --node dev-cluster-z790 \
+  --worker-only \
+  --dry-run
+```
+
+This step installs/version-probes the runtime only. It does not run `codex login`, inspect or copy `~/.codex` state, read `OPENAI_API_KEY`/`CODEX_API_KEY`, infer ChatGPT authentication, inspect account balance, infer quota, perform a model call, qualify the instance or activate routing.
+
+The canonical `codex-cli` Agent Runner execution adapter remains default-disabled/non-routable until the owning #186 canary proves the intended ChatGPT-account authentication path, current quota/headroom admission and bounded task/profile qualification. Fleet evidence cannot bypass that gate: even fabricated `authAvailable:true` / `qualified:true` evidence remains non-routable while the live adapter is not qualification-eligible.
+
 ### Foundation-only adapters
 
-Codex, Grok and Ollama/OpenCode remain explicit `adapter-foundation-not-live` in the current fleet installation contract. The installer refuses them rather than guessing a package/executable/source from issue prose or from what may happen to be installed manually on a machine. This is deliberate fail-closed behaviour, not evidence that those runtimes are absent from a node.
+Grok and Ollama/OpenCode remain explicit `adapter-foundation-not-live` in the current fleet installation contract. The installer refuses them rather than guessing a package/executable/source from issue prose or from what may happen to be installed manually on a machine. This is deliberate fail-closed behaviour, not evidence that those runtimes are absent from a node.
 
 ## Authentication and qualification
 
 Authentication is established independently per machine through the provider/runtime's accepted local flow. Never copy Claude/Codex/Grok session or credential material between Dell and Z790. Ollama model inventory is node-local and no readiness/provisioning command may auto-download a model.
 
-Only the owning canary/qualification issue may advance an instance from runtime-present/authenticated to qualified. #327 routing consumes only positively qualified `agent@node` instances.
+Only the owning canary/qualification issue may advance an instance from runtime-present/authenticated to qualified, and only after the canonical adapter itself permits qualification. #327 routing consumes only positively qualified `agent@node` instances.
 
 ## Topology
 
