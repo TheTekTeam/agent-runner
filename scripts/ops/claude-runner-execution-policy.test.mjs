@@ -170,7 +170,16 @@ test('#228: buildImplementationToolPolicy stays baseline-compatible with no decl
     requiredCapabilities: [CAPABILITY_DEPENDENCY_AUDIT_READ],
   });
   const added = withCapability.allowedTools.filter((rule) => !baseline.allowedTools.includes(rule));
-  assert.deepEqual(added.sort(), ['Bash(npm audit *)', 'Bash(npm audit)', 'Bash(npm outdated *)', 'Bash(npm outdated)'].sort());
+  assert.deepEqual(added, [
+    'Bash(pnpm audit --registry=https://registry.npmjs.org/ --json)',
+    'Bash(pnpm audit --registry=https://registry.npmjs.org/ --audit-level=low --json)',
+    'Bash(pnpm audit --registry=https://registry.npmjs.org/ --audit-level=moderate --json)',
+    'Bash(pnpm audit --registry=https://registry.npmjs.org/ --audit-level=high --json)',
+    'Bash(pnpm audit --registry=https://registry.npmjs.org/ --audit-level=critical --json)',
+  ]);
+  assert.ok(added.every((rule) => !rule.includes('*')));
+  assert.ok(added.every((rule) => !/--fix|install|update|add/i.test(rule)));
+  assert.ok(added.every((rule) => rule.includes('--registry=https://registry.npmjs.org/')));
   assert.deepEqual([...withCapability.grantedCapabilities], [CAPABILITY_DEPENDENCY_AUDIT_READ]);
 });
 
