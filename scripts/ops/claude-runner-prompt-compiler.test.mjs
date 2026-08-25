@@ -122,6 +122,58 @@ test('buildPromptCacheMetadata never contains prompt text, only bounded content-
   assert.doesNotMatch(serialized, /must never leak/);
 });
 
+test('#320 live prompt metadata reports task-class context-budget shadow evidence without changing provider input', () => {
+  const expected = [
+    ['docs', 'routine', 24 * 1024],
+    ['narrow', 'narrow', 32 * 1024],
+    ['complex', 'complex', 72 * 1024],
+    ['critical', 'critical', 96 * 1024],
+    ['unknown-profile', 'normal', 48 * 1024],
+  ];
+
+  for (const [profile, taskClass, maxContextBytes] of expected) {
+    const metadata = buildPromptCacheMetadata({
+      stableText: 'stable',
+      dynamicText: 'dynamic',
+      adapterId: 'claude-code-cli',
+      model: 'sonnet',
+      profile,
+      cacheStrategy: 'provider-managed',
+      env: {},
+    });
+    assert.equal(metadata.contextBudgetShadow.taskClass, taskClass);
+    assert.equal(metadata.contextBudgetShadow.maxContextBytes, maxContextBytes);
+    assert.equal(metadata.contextBudgetShadow.measuredCompiledSectionsBytes, 13);
+    assert.equal(metadata.contextBudgetShadow.promptWithinTaskBudget, true);
+    assert.equal(metadata.contextBudgetShadow.overBudgetBytes, 0);
+    assert.equal(
+      metadata.contextBudgetShadow.measurementBasis,
+      'stable-prefix-plus-effective-dynamic-suffix',
+    );
+    assert.match(
+      metadata.contextBudgetShadow.policyRevision,
+      /^context-budget-/,
+    );
+  }
+
+  const oversized = buildPromptCacheMetadata({
+    stableText: 'stable',
+    dynamicText: 'x'.repeat(25 * 1024),
+    adapterId: 'claude-code-cli',
+    model: 'haiku',
+    profile: 'docs',
+    cacheStrategy: 'provider-managed',
+    env: {},
+  });
+
+  assert.equal(oversized.contextBudgetShadow.taskClass, 'routine');
+  assert.equal(oversized.contextBudgetShadow.promptWithinTaskBudget, false);
+  assert.ok(oversized.contextBudgetShadow.overBudgetBytes > 0);
+
+  const serialized = JSON.stringify(oversized);
+  assert.doesNotMatch(serialized, /x{100}/);
+});
+
 test('buildPromptCacheMetadata rejects an unrecognised cache strategy rather than guessing one', () => {
   assert.throws(() => buildPromptCacheMetadata({ stableText: 'x', dynamicText: 'y', cacheStrategy: 'made-up-strategy' }));
   for (const strategy of CACHE_STRATEGIES) {

@@ -1,5 +1,9 @@
 import { createHash } from 'node:crypto';
 
+import {
+  CONTEXT_BUDGET_POLICY_REVISION,
+  chooseContextBudget,
+} from './agent-runner-context-budget.mjs';
 import { liveDeterministicHandoffPromptSection } from './agent-runner-deterministic-live-handoff.mjs';
 import { EXECUTION_PHASE_IMPLEMENTATION } from './claude-runner-execution-policy.mjs';
 
@@ -156,6 +160,43 @@ function tokenEstimate(bytes) {
   return Math.ceil(bytes / 4);
 }
 
+function contextTaskClassForProfile(profile) {
+  const value = String(profile || '').trim().toLowerCase();
+  if (value === 'docs') return 'routine';
+  if (value === 'narrow') return 'narrow';
+  if (value === 'complex') return 'complex';
+  if (value === 'critical') return 'critical';
+  return 'normal';
+}
+
+/**
+ * #320 shadow-only comparison between the exact compiler sections already
+ * measured for cache telemetry and the accepted task-class context budget.
+ *
+ * This does not truncate, omit, compact or otherwise alter provider input.
+ * It deliberately measures only the stable prefix plus effective dynamic
+ * suffix represented by this metadata contract; it does not claim that the
+ * remainder of a provider session/tool history is inside the task budget.
+ */
+function buildContextBudgetShadow({ profile, stableBytes, dynamicBytes }) {
+  const taskClass = contextTaskClassForProfile(profile);
+  const budget = chooseContextBudget({
+    taskClass,
+    risk: taskClass === 'critical' ? 'critical' : 'normal',
+  });
+  const measuredCompiledSectionsBytes = stableBytes + dynamicBytes;
+
+  return Object.freeze({
+    policyRevision: CONTEXT_BUDGET_POLICY_REVISION,
+    taskClass: budget.taskClass,
+    maxContextBytes: budget.maxContextBytes,
+    measuredCompiledSectionsBytes,
+    promptWithinTaskBudget: measuredCompiledSectionsBytes <= budget.maxContextBytes,
+    overBudgetBytes: Math.max(0, measuredCompiledSectionsBytes - budget.maxContextBytes),
+    measurementBasis: 'stable-prefix-plus-effective-dynamic-suffix',
+  });
+}
+
 export const CACHE_STRATEGIES = Object.freeze([
   'provider-managed',
   'explicit-prefix',
@@ -190,6 +231,11 @@ export function buildPromptCacheMetadata({
   const stableBytes = byteEstimate(stableText);
   const dynamicBytes = byteEstimate(effectiveDynamicText);
   const liveHandoffBytes = byteEstimate(liveHandoffSection);
+  const contextBudgetShadow = buildContextBudgetShadow({
+    profile,
+    stableBytes,
+    dynamicBytes,
+  });
   return {
     schemaVersion: PROMPT_SCHEMA_VERSION,
     stablePrefixFingerprint: `sha256:${sha256Hex(stableText)}`,
@@ -204,6 +250,7 @@ export function buildPromptCacheMetadata({
       byteEstimate: liveHandoffBytes,
       tokenEstimate: tokenEstimate(liveHandoffBytes),
     },
+    contextBudgetShadow,
     adapterId: adapterId || null,
     model: model || null,
     profile: profile || null,
