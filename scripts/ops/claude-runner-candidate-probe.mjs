@@ -16,7 +16,7 @@ export function candidateFromSelection(selected = {}) {
   return {
     candidate: Boolean(selected.issue),
     selectedIssue: selected.issue?.number || null,
-    selectedAgentId: agent?.agentId || null,
+    ...(agent?.agentId ? { selectedAgentId: agent.agentId } : {}),
     selectionMode: selected.selection?.mode || null,
     skipCount: (selected.skipped || []).length,
   };
