@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-// #51: Dell remains the one scheduler/controller, but scheduling and worker
-// execution are no longer the same global critical section. One short
+// #51/#327: Dell remains the one scheduler/controller, but scheduling and
+// worker execution are no longer the same global critical section. One short
 // scheduler mutex protects registry probing/selection/admission; selected
-// independent issue lanes then execute concurrently and acquire their own
-// recoverable lane locks inside the project runner.
+// independent issue lanes then execute concurrently under exact agent@node
+// routing and acquire their own recoverable lane locks inside the worker path.
 
 import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -21,6 +21,12 @@ import {
   resolveGlobalLockPath,
 } from './agent-runner-implementation-slot.mjs';
 import { admitLaneBatch, normalizeLaneCaps } from './agent-runner-lane-admission.mjs';
+import {
+  parseLiveWorkerRegistry,
+  remoteWorkerDispatchEnabled,
+  resolveLiveWorkerRoute,
+  safeWorkerRouteEvidence,
+} from './agent-runner-live-worker-routing.mjs';
 import { computeManagerProfileShadow } from './agent-runner-manager-profile-shadow.mjs';
 import {
   readProjectRegistryEntries,
@@ -205,21 +211,26 @@ export function implementationLaneForSelection(entry, outcome) {
   return `${entry.config.projectId}:issue:${Number(issue)}`;
 }
 
-export function laneAdmissionCandidateForSelection(entry, outcome, { nodeId = DEFAULT_LOCAL_WORKER_NODE_ID } = {}) {
+export function laneAdmissionCandidateForSelection(entry, outcome, {
+  nodeId = DEFAULT_LOCAL_WORKER_NODE_ID,
+  workerRoute = null,
+} = {}) {
   const issueNumber = Number(outcome?.selectedIssue);
   const laneId = implementationLaneForSelection(entry, outcome);
-  // Existing production execution is Claude-only; old/custom probes that do
-  // not yet expose selectedAgentId therefore preserve that exact compatibility
-  // identity. A positively returned different adapter is retained verbatim.
+  // Old/custom probes that do not yet expose selectedAgentId preserve the
+  // already-qualified Claude compatibility identity. A positive worker route
+  // may replace only the host/instance dimension, never the selected adapter.
   const adapterId = String(outcome?.selectedAgentId || 'claude-code-cli');
+  const selectedNodeId = String(workerRoute?.nodeId || nodeId);
+  const agentInstanceId = String(workerRoute?.agentInstanceId || `${adapterId}@${selectedNodeId}`);
   return {
     laneId,
     projectId: entry.config.projectId,
     repository: entry.config.githubRepo,
     issueNumber,
-    agentInstanceId: `${adapterId}@${nodeId}`,
+    agentInstanceId,
     adapterId,
-    nodeId,
+    nodeId: selectedNodeId,
     branch: `${entry.config.projectId}/issue/${issueNumber}`,
     worktree: `${entry.config.projectId}/issue/${issueNumber}`,
     files: [],
@@ -227,14 +238,57 @@ export function laneAdmissionCandidateForSelection(entry, outcome, { nodeId = DE
   };
 }
 
-export function admitRecurrenceSelections(selected, { env = process.env, maxParallel } = {}) {
+export function admitRecurrenceSelections(selected, {
+  env = process.env,
+  maxParallel,
+  remoteTransportAvailable = false,
+} = {}) {
   const caps = resolveRecurrenceLaneCaps(env, maxParallel);
   const nodeId = resolveLocalWorkerNodeId(env);
-  const candidates = selected.map(({ entry, outcome }) => laneAdmissionCandidateForSelection(entry, outcome, { nodeId }));
+  const workerRegistry = parseLiveWorkerRegistry(env, { expectedControllerNodeId: nodeId });
+  const remoteRouteEnabled = remoteTransportAvailable === true && remoteWorkerDispatchEnabled(env);
+
+  const routed = selected.map(({ entry, outcome }) => {
+    const adapterId = String(outcome?.selectedAgentId || 'claude-code-cli');
+    const workerRoute = resolveLiveWorkerRoute({
+      adapterId,
+      localNodeId: nodeId,
+      registry: workerRegistry,
+      env,
+      jobClass: 'implementation',
+      remoteDispatchAvailable: remoteRouteEnabled,
+    });
+    return { entry, outcome, workerRoute };
+  });
+
+  const routeRejected = routed
+    .filter(({ workerRoute }) => workerRoute.allowed !== true)
+    .map(({ entry, outcome, workerRoute }) => ({
+      laneId: implementationLaneForSelection(entry, outcome),
+      reasons: [workerRoute.reason],
+      workerRoute: safeWorkerRouteEvidence(workerRoute),
+    }));
+  const routable = routed.filter(({ workerRoute }) => workerRoute.allowed === true);
+  const candidates = routable.map(({ entry, outcome, workerRoute }) => laneAdmissionCandidateForSelection(entry, outcome, {
+    nodeId,
+    workerRoute,
+  }));
   const admission = admitLaneBatch(candidates, { active: [], caps });
   const admittedIds = new Set(admission.admitted.map((candidate) => candidate.laneId));
-  const admittedSelections = selected.filter(({ entry, outcome }) => admittedIds.has(implementationLaneForSelection(entry, outcome)));
-  return { caps, nodeId, admission, admittedSelections };
+  const admittedSelections = routable.filter(({ entry, outcome }) => admittedIds.has(implementationLaneForSelection(entry, outcome)));
+  return {
+    caps,
+    nodeId,
+    registryFingerprint: workerRegistry?.registryFingerprint || null,
+    remoteRouteEnabled,
+    routes: routed.map(({ entry, outcome, workerRoute }) => ({
+      laneId: implementationLaneForSelection(entry, outcome),
+      workerRoute: safeWorkerRouteEvidence(workerRoute),
+    })),
+    admission,
+    routeRejected,
+    admittedSelections,
+  };
 }
 
 function writeEvidence(evidenceDir, payload) {
@@ -247,8 +301,10 @@ function writeEvidence(evidenceDir, payload) {
 
 /**
  * One Dell scheduler recurrence with concurrent independent execution lanes.
- * The scheduler lock is held only while probing/selecting/admitting; provider
- * and repo mutation happen after release, inside exact issue-scoped lane locks.
+ * The scheduler lock is held only while probing/selecting/routing/admitting;
+ * provider and repo mutation happen after release. Remote execution can be
+ * selected only when both the reviewed route flag and an injected bounded
+ * transport are present; the default production path remains local-only.
  */
 export async function runImplementationRecurrence({
   argv = [],
@@ -256,6 +312,7 @@ export async function runImplementationRecurrence({
   registryPath,
   probeProject = defaultProbeProject,
   invokeProject = defaultInvokeProject,
+  invokeRemoteProject = null,
   acquireLock = acquireRecoverableCronLock,
   now = () => new Date().toISOString(),
   writeEvidenceFile = writeEvidence,
@@ -273,20 +330,27 @@ export async function runImplementationRecurrence({
   try {
     ({ selected, probed } = selectRunnableProjects(projects, { probeProject, argv, env, maxParallel }));
     profileShadow = computeProfileShadow(projects);
-    const admitted = admitRecurrenceSelections(selected, { env, maxParallel });
+    const admitted = admitRecurrenceSelections(selected, {
+      env,
+      maxParallel,
+      remoteTransportAvailable: typeof invokeRemoteProject === 'function',
+    });
     selected = admitted.admittedSelections;
     laneAdmission = {
       nodeId: admitted.nodeId,
+      registryFingerprint: admitted.registryFingerprint,
+      remoteRouteEnabled: admitted.remoteRouteEnabled,
       caps: admitted.caps,
+      routes: admitted.routes,
       admitted: admitted.admission.admitted.map((candidate) => candidate.laneId),
-      rejected: admitted.admission.rejected,
+      rejected: [...admitted.routeRejected, ...admitted.admission.rejected],
     };
   } finally {
     release();
   }
 
   const base = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     recordedAt: now(),
     registryPath: resolvedRegistryPath,
     schedulerLockPath: lockPath,
@@ -310,18 +374,30 @@ export async function runImplementationRecurrence({
     return payload;
   }
 
-  const jobs = selected.map(({ entry, outcome }) => {
+  const jobs = selected.map(({ entry, outcome, workerRoute }) => {
     const laneId = implementationLaneForSelection(entry, outcome);
-    return { entry, outcome, laneId };
+    return { entry, outcome, workerRoute, laneId };
   });
 
-  const results = await Promise.all(jobs.map(async ({ entry, outcome, laneId }) => {
-    const invokeResult = await Promise.resolve(invokeProject(entry, { argv, env, laneId }));
+  const results = await Promise.all(jobs.map(async ({ entry, outcome, workerRoute, laneId }) => {
+    let invokeResult;
+    if (workerRoute.remote) {
+      if (typeof invokeRemoteProject !== 'function') {
+        invokeResult = { status: 1, error: 'remote-worker-transport-unavailable' };
+      } else {
+        invokeResult = await Promise.resolve(invokeRemoteProject(entry, { argv, env, laneId, workerRoute }));
+      }
+    } else {
+      invokeResult = await Promise.resolve(invokeProject(entry, { argv, env, laneId, workerRoute }));
+    }
     return {
       projectId: entry.config.projectId,
       repository: entry.config.githubRepo,
       selectedIssue: outcome.selectedIssue,
       laneId,
+      nodeId: workerRoute.nodeId,
+      agentInstanceId: workerRoute.agentInstanceId,
+      remote: workerRoute.remote === true,
       invokeExitCode: invokeResult?.status ?? null,
       signal: invokeResult?.signal ?? null,
       error: invokeResult?.error ?? null,
