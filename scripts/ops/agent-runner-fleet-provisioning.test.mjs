@@ -35,10 +35,19 @@ test('only the currently implemented canonical adapter exposes a runtime command
   }
 });
 
-test('missing runtime, machine-local auth and per-node qualification remain distinct', () => {
+test('missing runtime, unknown auth, unavailable auth and qualification remain distinct', () => {
   const missing = evaluateFleetAdapterEvidence({ nodeId: 'dev-cluster-z790', adapterId: 'claude-code-cli' });
   assert.equal(missing.state, 'runtime-missing');
   assert.equal(missing.qualified, false);
+
+  const installed = evaluateFleetAdapterEvidence({
+    nodeId: 'dev-cluster-z790',
+    adapterId: 'claude-code-cli',
+    evidence: { runtimeInstalled: true, version: '2.1.233' },
+  });
+  assert.equal(installed.state, 'runtime-installed');
+  assert.equal(installed.reason, 'machine-local-auth-unknown');
+  assert.equal(installed.authAvailable, null);
 
   const auth = evaluateFleetAdapterEvidence({
     nodeId: 'dev-cluster-z790',
