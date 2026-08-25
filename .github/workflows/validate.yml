@@ -21,7 +21,8 @@ jobs:
     name: Validate Agent Runner
     runs-on:
       - self-hosted
-      - dev-cluster-dell
+      - dev-cluster-z790
+      - build-worker
     timeout-minutes: 30
 
     steps:
