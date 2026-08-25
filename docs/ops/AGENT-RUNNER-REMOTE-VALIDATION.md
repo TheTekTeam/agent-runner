@@ -49,14 +49,15 @@ Before any validation command executes, the worker proves:
 2. the request is for this exact worker-only node;
 3. current registry/node/toolchain fingerprints still match;
 4. the requested validation profile is locally allowlisted and its contract fingerprint is unchanged;
-5. the exact commit exists in the trusted local repository;
-6. the exact Git tree equals the request;
-7. a derived, collision-free detached Git worktree can be created at that exact commit;
-8. the worktree is clean and at the exact requested commit/tree.
+5. the trusted local Git source has a GitHub `origin` whose exact `owner/repo` identity matches the request;
+6. the exact commit exists in that trusted local repository;
+7. the exact Git tree equals the request;
+8. a derived, collision-free detached Git worktree can be created at that exact commit;
+9. the worktree is clean and at the exact requested commit/tree.
 
-Only argv arrays stored in the repository-owned profile may execute. `shell:false` is mandatory. The request cannot add or alter commands.
+Only argv arrays stored in the repository-owned profile may execute. `shell:false` is mandatory. Executables themselves are also source-side allowlisted (`node`, `npm`, `pnpm` in v1). The request cannot add or alter commands.
 
-Child processes inherit only a fixed positive allowlist of harmless runtime variables (`PATH`, `HOME`, locale, `CI`, `NO_COLOR`). Provider/API/session variables are not inherited. No unrestricted environment dump is returned.
+Child processes receive only a fixed positive allowlist of runtime variables (`PATH`, locale, `CI`, `NO_COLOR`). If a profile declares `HOME`, it is **replaced with a newly-created empty disposable HOME under the dedicated validation root**, never the worker user's real HOME. Provider/API/session variables are not inherited, so machine-local Claude/Codex/session material is outside the child boundary. The disposable HOME is removed after execution. No unrestricted environment dump is returned.
 
 After execution, the worker re-verifies exact commit, exact tree and clean worktree state. A clean exact worktree is removed through ordinary `git worktree remove`; no `--force`, reset, clean, stash or rebase recovery is provided. Drift or unsafe cleanup fails closed.
 
@@ -101,7 +102,7 @@ The source contract enforces:
 - total profile duration contract;
 - per-command output-buffer bounds;
 - bounded request/result size;
-- isolated detached worktree scope.
+- isolated detached worktree and disposable-HOME scope.
 
 Host-level CPU/RAM/disk/cgroup limits are a **field-activation gate** for #199 and must be applied by the reviewed Z790 service/forced-command wrapper where supported. Do not mark #199 complete merely because source CI passes.
 
@@ -112,11 +113,11 @@ After this source is merged and activated:
 1. configure the restricted worker entrypoint on Z790 without scheduler authority;
 2. retain the accepted Z790 kernel baseline `7.0.0-28-generic`; this is intentional because `7.0.0-30` caused NIC-speed regressions on this host;
 3. Dell builds one request for exact current Agent Runner main and its exact tree;
-4. Z790 executes the `agent-runner-canonical` profile in the isolated detached worktree;
+4. Z790 executes the `agent-runner-canonical` profile in the isolated detached worktree and disposable HOME;
 5. Dell independently accepts the returned result;
 6. repeat the exact request and prove replay does not re-execute validation;
-7. induce wrong-SHA/tree and tampered-result fixtures and prove refusal;
-8. prove provider/API environment values do not cross the worker boundary;
+7. induce wrong-repository/SHA/tree and tampered-result fixtures and prove refusal;
+8. prove provider/API environment values and the worker's real HOME/session material do not cross the worker boundary;
 9. make Z790 unavailable and prove Dell queue/control safety is unchanged;
 10. leave remote validation enabled only when host resource limits and all field gates are green.
 
