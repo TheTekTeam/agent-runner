@@ -4,6 +4,7 @@ import test from 'node:test';
 import {
   CLAUDE_MAX_TURNS_ENABLE_ENV,
   CLAUDE_MAX_TURNS_QUALIFICATION_ENV,
+  CLAUDE_NATIVE_RESUME_ENABLE_ENV,
   buildAgentCommandArgs,
   claudeMaxTurnsPolicy,
   resolveAgentById,
@@ -24,6 +25,7 @@ function qualifiedEnv(extra = {}) {
   return {
     [CLAUDE_MAX_TURNS_ENABLE_ENV]: '1',
     [CLAUDE_MAX_TURNS_QUALIFICATION_ENV]: 'DELL-CLAUDE-MAX-TURNS-QUALIFIED-1',
+    [CLAUDE_NATIVE_RESUME_ENABLE_ENV]: '1',
     ...extra,
   };
 }
@@ -39,6 +41,7 @@ test('Claude turn ceilings are fail-closed and disabled without machine qualific
 
   const enabledWithoutQualification = claudeMaxTurnsPolicy(profile('narrow'), {
     [CLAUDE_MAX_TURNS_ENABLE_ENV]: '1',
+    [CLAUDE_NATIVE_RESUME_ENABLE_ENV]: '1',
   });
   assert.equal(enabledWithoutQualification.active, false);
   assert.equal(enabledWithoutQualification.reason, 'machine-qualification-missing');
@@ -47,9 +50,20 @@ test('Claude turn ceilings are fail-closed and disabled without machine qualific
 test('qualification alone does not activate a material live behaviour change', () => {
   const policy = claudeMaxTurnsPolicy(profile('narrow'), {
     [CLAUDE_MAX_TURNS_QUALIFICATION_ENV]: 'DELL-CLAUDE-MAX-TURNS-QUALIFIED-1',
+    [CLAUDE_NATIVE_RESUME_ENABLE_ENV]: '1',
   });
   assert.equal(policy.active, false);
   assert.equal(policy.reason, 'machine-enable-gate-off');
+});
+
+test('turn ceilings remain off when exact recovery capability is not enabled', () => {
+  const policy = claudeMaxTurnsPolicy(profile('narrow'), {
+    [CLAUDE_MAX_TURNS_ENABLE_ENV]: '1',
+    [CLAUDE_MAX_TURNS_QUALIFICATION_ENV]: 'DELL-CLAUDE-MAX-TURNS-QUALIFIED-1',
+  });
+  assert.equal(policy.active, false);
+  assert.equal(policy.maxTurns, null);
+  assert.equal(policy.reason, 'native-resume-recovery-gate-off');
 });
 
 test('qualified task classes map to the accepted context-budget ceilings', () => {
