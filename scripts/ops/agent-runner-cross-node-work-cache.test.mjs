@@ -262,7 +262,7 @@ test('failed or missing local cache entries cannot be exported as cross-node suc
     writeFileSync(stored.path, '{"corrupt":true}\n', 'utf8');
     const corrupt = exportCrossNodeCacheEnvelope({ root: value.root, descriptor: input, producer: node('dev-cluster-z790') });
     assert.equal(corrupt.exported, false);
-    assert.equal(corrupt.reason, 'identity-mismatch');
+    assert.equal(corrupt.reason, 'schema-mismatch');
   } finally {
     value.cleanup();
   }
