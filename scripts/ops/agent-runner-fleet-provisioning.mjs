@@ -39,6 +39,37 @@ const CLAUDE_CODE_APT_INSTALLATION = Object.freeze({
   automaticRoutingActivation: false,
 });
 
+// OpenAI's current Codex CLI documentation publishes the npm package below as
+// a supported installation mechanism. This fleet contract only installs and
+// version-probes the runtime. It does not make the existing default-disabled
+// #48 adapter routable, authenticate ChatGPT/OpenAI, inspect API keys or infer
+// quota/qualification. Those remain separate #186 machine-local gates.
+const CODEX_CLI_NPM_INSTALLATION = Object.freeze({
+  kind: 'npm-global-package',
+  operatingSystems: Object.freeze(['ubuntu', 'debian']),
+  channel: 'latest',
+  packageName: '@openai/codex',
+  packageSpec: '@openai/codex@latest',
+  registryUrl: 'https://registry.npmjs.org/',
+  installer: 'scripts/install-agent-runner-fleet-runtime.sh',
+  automaticProviderAuth: false,
+  automaticQualification: false,
+  automaticRoutingActivation: false,
+});
+
+const FLEET_RUNTIME_FOUNDATIONS = Object.freeze({
+  'claude-code-cli': Object.freeze({
+    executable: 'claude',
+    versionProbe: Object.freeze({ command: 'claude', args: Object.freeze(['--version']) }),
+    installationMechanism: CLAUDE_CODE_APT_INSTALLATION,
+  }),
+  'codex-cli': Object.freeze({
+    executable: 'codex',
+    versionProbe: Object.freeze({ command: 'codex', args: Object.freeze(['--version']) }),
+    installationMechanism: CODEX_CLI_NPM_INSTALLATION,
+  }),
+});
+
 function stable(value) {
   if (Array.isArray(value)) return value.map(stable);
   if (value && typeof value === 'object') {
@@ -85,32 +116,38 @@ export function supportedFleetAdapterIds() {
 export function fleetAdapterRuntimeContract(adapterId) {
   const id = token(adapterId, 'adapterId');
   const adapter = AGENT_ADAPTERS[id];
-  if (!adapter || !INITIAL_FLEET_ADAPTERS.includes(id)) {
+  const foundation = FLEET_RUNTIME_FOUNDATIONS[id];
+  if (!adapter || !INITIAL_FLEET_ADAPTERS.includes(id) || !foundation) {
     return Object.freeze({
       adapterId: id,
       sourceSupported: false,
       executable: null,
       versionProbe: null,
       installationMechanism: null,
-      reason: 'adapter-not-registered-for-fleet',
+      liveDispatchImplemented: false,
+      qualificationEligible: false,
+      reason: 'adapter-foundation-not-live',
     });
   }
 
-  // A fleet-provisioning contract may only expose an executable already
-  // accepted by the canonical adapter catalogue. It must never guess an
-  // installer, package source or future CLI command from issue prose.
-  const sourceSupported = adapter.implemented === true && typeof adapter.command === 'string' && adapter.command.length > 0;
+  // Fleet runtime provisioning is intentionally separate from live adapter
+  // dispatch. A runtime may be installed/version-probed before its execution
+  // adapter is qualified. Only an already-implemented canonical adapter whose
+  // executable matches this reviewed runtime may accept qualified fleet
+  // evidence. This prevents fabricated host evidence from promoting Codex
+  // merely because its binary was installed.
+  const liveDispatchImplemented = adapter.implemented === true
+    && typeof adapter.command === 'string'
+    && adapter.command === foundation.executable;
   return Object.freeze({
     adapterId: id,
-    sourceSupported,
-    executable: sourceSupported ? adapter.command : null,
-    versionProbe: sourceSupported && id === 'claude-code-cli'
-      ? Object.freeze({ command: adapter.command, args: Object.freeze(['--version']) })
-      : null,
-    installationMechanism: sourceSupported && id === 'claude-code-cli'
-      ? CLAUDE_CODE_APT_INSTALLATION
-      : null,
-    reason: sourceSupported ? null : 'adapter-foundation-not-live',
+    sourceSupported: true,
+    executable: foundation.executable,
+    versionProbe: foundation.versionProbe,
+    installationMechanism: foundation.installationMechanism,
+    liveDispatchImplemented,
+    qualificationEligible: liveDispatchImplemented,
+    reason: null,
   });
 }
 
@@ -148,6 +185,9 @@ export function evaluateFleetAdapterEvidence({ nodeId, adapterId, evidence = {} 
   } else if (authAvailable === false) {
     state = 'auth-required';
     reason = 'machine-local-auth-unavailable';
+  } else if (!contract.qualificationEligible) {
+    state = 'authenticated';
+    reason = 'adapter-qualification-not-live';
   } else if (!qualified) {
     state = 'authenticated';
     reason = 'per-node-qualification-required';
