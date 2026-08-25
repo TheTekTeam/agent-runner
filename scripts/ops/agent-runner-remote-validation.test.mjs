@@ -21,6 +21,7 @@ const AUTHORITY = `sha256:${'a'.repeat(64)}`;
 const REQUESTED = '2026-08-25T12:00:00.000Z';
 const EXPIRES = '2026-08-25T12:30:00.000Z';
 const NOW = new Date('2026-08-25T12:05:00.000Z');
+const SENSITIVE_HOME = '/sensitive-machine-home';
 
 function registry({ toolchains = ['node22'] } = {}) {
   return buildWorkerRegistry({
@@ -70,7 +71,7 @@ const profiles = Object.freeze({
         argv: Object.freeze([
           'node',
           '-e',
-          'process.exit(process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY ? 9 : 0)',
+          `process.exit(process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY || process.env.HOME === ${JSON.stringify(SENSITIVE_HOME)} ? 9 : 0)`,
         ]),
         workingDirectory: '.',
         environment: Object.freeze(['PATH', 'HOME']),
@@ -90,7 +91,7 @@ function git(cwd, args) {
   return String(result.stdout || '').trim();
 }
 
-function sourceFixture(t) {
+function sourceFixture(t, { origin = 'https://github.com/TheTekTeam/agent-runner.git' } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'agent-runner-remote-validation-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const source = join(root, 'source');
@@ -101,6 +102,7 @@ function sourceFixture(t) {
   spawnSync('git', ['init', '-q', source], { encoding: 'utf8' });
   git(source, ['config', 'user.email', 'agent-runner@example.invalid']);
   git(source, ['config', 'user.name', 'Agent Runner Test']);
+  git(source, ['remote', 'add', 'origin', origin]);
   writeFileSync(join(source, 'fixture.txt'), 'remote validation fixture\n');
   git(source, ['add', 'fixture.txt']);
   git(source, ['commit', '-q', '-m', 'fixture']);
@@ -163,7 +165,7 @@ test('remote validation request is exact-node, exact-source and profile-contract
   }).reason, 'job-fingerprint-mismatch');
 });
 
-test('profile commands are source-side allowlists and reject unsafe environment inheritance', () => {
+test('profile commands are source-side allowlists and reject unsafe executable/environment inheritance', () => {
   const normalized = normalizeRemoteValidationProfiles(profiles);
   assert.deepEqual(normalized.fixture.commands[0].environment, ['HOME', 'PATH']);
   assert.throws(() => normalizeRemoteValidationProfiles({
@@ -188,9 +190,20 @@ test('profile commands are source-side allowlists and reject unsafe environment 
       }],
     },
   }), /executable is invalid/);
+  assert.throws(() => normalizeRemoteValidationProfiles({
+    bad: {
+      revision: '1',
+      commands: [{
+        argv: ['curl', 'https://example.invalid'],
+        workingDirectory: '.',
+        environment: ['PATH'],
+        timeoutSeconds: 30,
+      }],
+    },
+  }), /executable is invalid/);
 });
 
-test('worker execution uses an isolated detached exact worktree, strips provider credentials and replays exact successful jobs', (t) => {
+test('worker execution uses exact repository identity, isolated HOME/worktree, strips provider credentials and replays success', (t) => {
   const fixture = sourceFixture(t);
   const reg = registry();
   const request = requestFixture(fixture.sourceSha, fixture.sourceTreeSha, reg);
@@ -212,7 +225,7 @@ test('worker execution uses an isolated detached exact worktree, strips provider
     profiles,
     env: {
       PATH: process.env.PATH,
-      HOME: process.env.HOME,
+      HOME: SENSITIVE_HOME,
       OPENAI_API_KEY: 'must-not-cross-worker-boundary',
       ANTHROPIC_API_KEY: 'must-not-cross-worker-boundary',
     },
@@ -248,13 +261,30 @@ test('worker execution uses an isolated detached exact worktree, strips provider
     worktreeRoot: fixture.worktrees,
     replayStore,
     profiles,
-    env: { PATH: process.env.PATH, HOME: process.env.HOME },
+    env: { PATH: process.env.PATH, HOME: SENSITIVE_HOME },
     spawn: observedSpawn,
     clock,
   });
   assert.equal(replayed.replay, true);
   assert.equal(replayed.result.resultFingerprint, first.result.resultFingerprint);
   assert.equal(nodeExecutions, 1);
+});
+
+test('worker refuses a trusted local source whose GitHub origin does not match the request', (t) => {
+  const fixture = sourceFixture(t, { origin: 'https://github.com/TheTekTeam/modelspend.git' });
+  const reg = registry();
+  const request = requestFixture(fixture.sourceSha, fixture.sourceTreeSha, reg);
+  assert.throws(() => executeRemoteValidationRequest({
+    request,
+    registry: reg,
+    executingNodeId: 'dev-cluster-z790',
+    sourceRepositoryPath: fixture.source,
+    worktreeRoot: fixture.worktrees,
+    replayStore: new RemoteValidationReplayStore(fixture.replay),
+    profiles,
+    env: { PATH: process.env.PATH, HOME: SENSITIVE_HOME },
+    clock: () => NOW,
+  }), (error) => error?.code === 'repository-identity-mismatch');
 });
 
 test('Dell result acceptance fails closed on wrong source, node/toolchain identity and tampering', () => {
