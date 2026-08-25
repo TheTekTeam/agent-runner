@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
+  rmSync,
   writeFileSync,
 } from 'node:fs';
 import { isAbsolute, relative, resolve, sep } from 'node:path';
@@ -22,63 +23,25 @@ const SHA = /^[a-f0-9]{40,64}$/i;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
 const EXECUTABLE = /^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$/;
 const ENVIRONMENT_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
+const SAFE_EXECUTABLES = new Set(['node', 'npm', 'pnpm']);
 const SAFE_ENVIRONMENT_NAMES = new Set(['PATH', 'HOME', 'LANG', 'LC_ALL', 'CI', 'NO_COLOR']);
 const RESULT_STATES = new Set(['succeeded', 'failed', 'blocked']);
 
 const REQUEST_FIELDS = Object.freeze([
-  'schemaVersion',
-  'revision',
-  'controllerNodeId',
-  'registryFingerprint',
-  'nodeId',
-  'nodeCapabilityFingerprint',
-  'toolchainFingerprint',
-  'projectId',
-  'repository',
-  'sourceSha',
-  'sourceTreeSha',
-  'profileId',
-  'profileRevision',
-  'profileContractFingerprint',
-  'resourceClass',
-  'maxDurationSeconds',
-  'authorityFingerprint',
-  'authorityRevision',
-  'requestedAt',
-  'expiresAt',
-  'jobFingerprint',
+  'schemaVersion', 'revision', 'controllerNodeId', 'registryFingerprint', 'nodeId',
+  'nodeCapabilityFingerprint', 'toolchainFingerprint', 'projectId', 'repository',
+  'sourceSha', 'sourceTreeSha', 'profileId', 'profileRevision', 'profileContractFingerprint',
+  'resourceClass', 'maxDurationSeconds', 'authorityFingerprint', 'authorityRevision',
+  'requestedAt', 'expiresAt', 'jobFingerprint',
 ]);
 
 const RESULT_FIELDS = Object.freeze([
-  'schemaVersion',
-  'revision',
-  'jobFingerprint',
-  'controllerNodeId',
-  'registryFingerprint',
-  'nodeId',
-  'nodeCapabilityFingerprint',
-  'toolchainFingerprint',
-  'projectId',
-  'repository',
-  'observedSha',
-  'observedTreeSha',
-  'profileId',
-  'profileRevision',
-  'profileContractFingerprint',
-  'resourceClass',
-  'status',
-  'exitCode',
-  'errorCode',
-  'durationMs',
-  'stdoutBytes',
-  'stdoutDigest',
-  'stderrBytes',
-  'stderrDigest',
-  'startedAt',
-  'completedAt',
-  'idempotencyKey',
-  'replayable',
-  'resultFingerprint',
+  'schemaVersion', 'revision', 'jobFingerprint', 'controllerNodeId', 'registryFingerprint',
+  'nodeId', 'nodeCapabilityFingerprint', 'toolchainFingerprint', 'projectId', 'repository',
+  'observedSha', 'observedTreeSha', 'profileId', 'profileRevision', 'profileContractFingerprint',
+  'resourceClass', 'status', 'exitCode', 'errorCode', 'durationMs', 'stdoutBytes',
+  'stdoutDigest', 'stderrBytes', 'stderrDigest', 'startedAt', 'completedAt',
+  'idempotencyKey', 'replayable', 'resultFingerprint',
 ]);
 
 export const AGENT_RUNNER_REMOTE_VALIDATION_PROFILES = Object.freeze({
@@ -154,12 +117,11 @@ function iso(value, name) {
   return date.toISOString();
 }
 
-function exactFields(value, expected, reason) {
+function exactFields(value, expected) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const actual = Object.keys(value).sort();
   const wanted = [...expected].sort();
-  if (actual.length !== wanted.length || actual.some((field, index) => field !== wanted[index])) return false;
-  return true;
+  return actual.length === wanted.length && actual.every((field, index) => field === wanted[index]);
 }
 
 function inside(root, target) {
@@ -192,7 +154,7 @@ function commandContract(raw, ordinal) {
     }
     return value;
   });
-  if (!EXECUTABLE.test(argv[0])) {
+  if (!EXECUTABLE.test(argv[0]) || !SAFE_EXECUTABLES.has(argv[0])) {
     throw new RemoteValidationError('invalid-profile', `command ${ordinal} executable is invalid`);
   }
   if (!Array.isArray(raw.environment) || raw.environment.length > SAFE_ENVIRONMENT_NAMES.size) {
@@ -514,10 +476,11 @@ export function acceptRemoteValidationResult({
   });
 }
 
-function safeChildEnv(environmentNames, env) {
+function safeChildEnv(environmentNames, env, { homeOverride = null } = {}) {
   const child = {};
   for (const name of environmentNames) {
-    if (env[name] != null) child[name] = String(env[name]);
+    if (name === 'HOME' && homeOverride) child.HOME = homeOverride;
+    else if (env[name] != null) child[name] = String(env[name]);
   }
   child.NO_COLOR = '1';
   child.CI = '1';
@@ -538,19 +501,38 @@ function run(spawn, command, args, options, errorCode) {
   return child;
 }
 
-function gitValue(spawn, repositoryPath, args, timeout = 30_000) {
+function gitValue(spawn, repositoryPath, args, env, timeout = 30_000) {
   const child = run(spawn, 'git', ['-C', repositoryPath, ...args], {
     timeout,
     maxBuffer: 2 * 1024 * 1024,
-    env: safeChildEnv(['PATH', 'HOME', 'LANG', 'LC_ALL'], process.env),
+    env: safeChildEnv(['PATH', 'HOME', 'LANG', 'LC_ALL'], env),
   }, 'git-operation-failed');
   return String(child.stdout || '').trim();
 }
 
-function verifyWorktree(spawn, path, request) {
-  const observedSha = gitValue(spawn, path, ['rev-parse', 'HEAD']).toLowerCase();
-  const observedTreeSha = gitValue(spawn, path, ['rev-parse', 'HEAD^{tree}']).toLowerCase();
-  const status = gitValue(spawn, path, ['status', '--porcelain=v1', '--untracked-files=all']);
+function githubRepositoryFromRemote(value) {
+  const remote = String(value || '').trim();
+  let candidate = null;
+  if (remote.startsWith('https://github.com/')) {
+    try {
+      const url = new URL(remote);
+      if (url.hostname !== 'github.com' || url.username || url.password || url.search || url.hash) return null;
+      candidate = url.pathname.replace(/^\/+|\/+$/g, '').replace(/\.git$/, '');
+    } catch {
+      return null;
+    }
+  } else {
+    const scp = remote.match(/^git@github\.com:([^/]+\/[^/]+?)(?:\.git)?$/);
+    const ssh = remote.match(/^ssh:\/\/git@github\.com\/([^/]+\/[^/]+?)(?:\.git)?$/);
+    candidate = scp?.[1] || ssh?.[1] || null;
+  }
+  return candidate && REPOSITORY.test(candidate) ? candidate : null;
+}
+
+function verifyWorktree(spawn, path, request, env) {
+  const observedSha = gitValue(spawn, path, ['rev-parse', 'HEAD'], env).toLowerCase();
+  const observedTreeSha = gitValue(spawn, path, ['rev-parse', 'HEAD^{tree}'], env).toLowerCase();
+  const status = gitValue(spawn, path, ['status', '--porcelain=v1', '--untracked-files=all'], env);
   return Object.freeze({
     observedSha,
     observedTreeSha,
@@ -637,18 +619,25 @@ export function executeRemoteValidationRequest({
   }
 
   const sourceRoot = realpathSync(resolve(sourceRepositoryPath));
+  const sourceOrigin = gitValue(spawn, sourceRoot, ['remote', 'get-url', 'origin'], env);
+  if (githubRepositoryFromRemote(sourceOrigin) !== request.repository) {
+    throw new RemoteValidationError('repository-identity-mismatch', 'trusted source repository does not match request');
+  }
+
   const rootCandidate = resolve(worktreeRoot);
   if (!existsSync(rootCandidate)) mkdirSync(rootCandidate, { recursive: true, mode: 0o700 });
   const worktreeBase = realpathSync(rootCandidate);
   const suffix = request.jobFingerprint.slice('sha256:'.length, 'sha256:'.length + 24);
   const target = resolve(worktreeBase, `remote-validation-${suffix}`);
-  if (!inside(worktreeBase, target) || target === worktreeBase) {
-    throw new RemoteValidationError('worktree-path-invalid', 'derived worktree path is invalid');
+  const isolatedHome = resolve(worktreeBase, `remote-validation-home-${suffix}`);
+  if (!inside(worktreeBase, target) || target === worktreeBase || !inside(worktreeBase, isolatedHome) || isolatedHome === worktreeBase) {
+    throw new RemoteValidationError('worktree-path-invalid', 'derived validation path is invalid');
   }
   if (existsSync(target)) throw new RemoteValidationError('worktree-collision', 'derived validation worktree already exists');
+  if (existsSync(isolatedHome)) throw new RemoteValidationError('isolated-home-collision', 'derived validation home already exists');
 
-  const sourceCommit = gitValue(spawn, sourceRoot, ['rev-parse', `${request.sourceSha}^{commit}`]).toLowerCase();
-  const sourceTree = gitValue(spawn, sourceRoot, ['rev-parse', `${request.sourceSha}^{tree}`]).toLowerCase();
+  const sourceCommit = gitValue(spawn, sourceRoot, ['rev-parse', `${request.sourceSha}^{commit}`], env).toLowerCase();
+  const sourceTree = gitValue(spawn, sourceRoot, ['rev-parse', `${request.sourceSha}^{tree}`], env).toLowerCase();
   if (sourceCommit !== request.sourceSha) throw new RemoteValidationError('source-sha-unavailable', 'exact source commit is unavailable');
   if (sourceTree !== request.sourceTreeSha) throw new RemoteValidationError('source-tree-mismatch', 'exact source tree differs from request');
 
@@ -657,6 +646,7 @@ export function executeRemoteValidationRequest({
     maxBuffer: 2 * 1024 * 1024,
     env: safeChildEnv(['PATH', 'HOME', 'LANG', 'LC_ALL'], env),
   }, 'worktree-create-failed');
+  mkdirSync(isolatedHome, { mode: 0o700 });
 
   const startedAt = clock();
   const startedNs = process.hrtime.bigint();
@@ -670,7 +660,7 @@ export function executeRemoteValidationRequest({
   let post = null;
 
   try {
-    const before = verifyWorktree(spawn, target, request);
+    const before = verifyWorktree(spawn, target, request, env);
     if (!before.exact || !before.clean) {
       state = 'blocked';
       exitCode = null;
@@ -702,7 +692,7 @@ export function executeRemoteValidationRequest({
       }
       const child = spawn(command.argv[0], command.argv.slice(1), {
         cwd,
-        env: safeChildEnv(command.environment, env),
+        env: safeChildEnv(command.environment, env, { homeOverride: isolatedHome }),
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'pipe'],
         timeout: command.timeoutSeconds * 1_000,
@@ -729,7 +719,7 @@ export function executeRemoteValidationRequest({
       }
     }
 
-    post = verifyWorktree(spawn, target, request);
+    post = verifyWorktree(spawn, target, request, env);
     if (!post.exact) {
       state = 'blocked';
       exitCode = null;
@@ -739,6 +729,10 @@ export function executeRemoteValidationRequest({
       exitCode = null;
       errorCode = 'worktree-not-clean-after';
     }
+  } catch (error) {
+    state = 'blocked';
+    exitCode = null;
+    errorCode = error instanceof RemoteValidationError ? error.code : 'validation-executor-failed';
   } finally {
     if (post?.clean && post?.exact) {
       try {
@@ -752,6 +746,13 @@ export function executeRemoteValidationRequest({
         exitCode = null;
         errorCode = 'worktree-cleanup-failed';
       }
+    }
+    try {
+      rmSync(isolatedHome, { recursive: true, force: true });
+    } catch {
+      state = 'blocked';
+      exitCode = null;
+      errorCode = 'isolated-home-cleanup-failed';
     }
   }
 
