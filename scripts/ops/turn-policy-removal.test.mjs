@@ -7,6 +7,13 @@ import {
   evaluateClaudeCostAdmission,
   resolveProfile,
 } from './claude-runner.mjs';
+import {
+  CLAUDE_MAX_TURNS_ENABLE_ENV,
+  CLAUDE_MAX_TURNS_QUALIFICATION_ENV,
+  CLAUDE_NATIVE_RESUME_ENABLE_ENV,
+  buildAgentCommandArgs,
+  resolveAgentById,
+} from './agent-runner-agents.mjs';
 
 test('resolved execution profiles contain neither turn nor dollar-budget limits', () => {
   for (const name of ['docs', 'narrow', 'complex', 'critical']) {
@@ -16,13 +23,36 @@ test('resolved execution profiles contain neither turn nor dollar-budget limits'
   }
 });
 
-test('Claude command construction contains neither interaction-count nor dollar-budget flags', () => {
+test('default Claude command construction contains neither interaction-count nor dollar-budget flags', () => {
   const profile = resolveProfile('complex', { permissionMode: 'dontAsk' });
   const args = buildClaudeArgs({ prompt: 'complete the issue', profile });
 
+  // #264 removed unconditional execution-limit policy from the ordinary
+  // subscription path. #320 may add a measured task-class turn ceiling only
+  // behind separate machine-local qualification, enablement and recovery
+  // gates; the default command therefore remains uncapped exactly as #264
+  // required.
   assert.equal(args.includes('--max-turns'), false);
   assert.equal(args.includes('--max-budget-usd'), false);
   assert.ok(args.includes('--permission-mode'));
+});
+
+test('#320 qualified turn ceilings do not reintroduce dollar-budget policy', () => {
+  const profile = resolveProfile('complex', { permissionMode: 'dontAsk' });
+  const args = buildAgentCommandArgs({
+    agent: resolveAgentById('claude-code-cli'),
+    prompt: 'complete the issue',
+    profile,
+    env: {
+      [CLAUDE_MAX_TURNS_ENABLE_ENV]: '1',
+      [CLAUDE_MAX_TURNS_QUALIFICATION_ENV]: 'DELL-CLAUDE-MAX-TURNS-QUALIFIED-1',
+      [CLAUDE_NATIVE_RESUME_ENABLE_ENV]: '1',
+    },
+    allowDisabledPromptCaching: true,
+  });
+
+  assert.ok(args.includes('--max-turns'));
+  assert.equal(args.includes('--max-budget-usd'), false);
 });
 
 test('generated implementation prompt directs completion without turn or dollar-budget language', () => {

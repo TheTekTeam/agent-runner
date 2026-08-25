@@ -1,8 +1,12 @@
 import { assertClaudePromptCacheEnabled } from './claude-runner-cache-policy.mjs';
 import { appendLiveDeterministicHandoff } from './agent-runner-deterministic-live-handoff.mjs';
+import { chooseContextBudget } from './agent-runner-context-budget.mjs';
 
 export const SHARED_CODEX_CLAUDE_LABEL = 'agent:codex-claude';
 export const DETERMINISTIC_HANDOFF_ENV = 'AGENT_RUNNER_DETERMINISTIC_HANDOFF_JSON';
+export const CLAUDE_MAX_TURNS_ENABLE_ENV = 'AGENT_RUNNER_CLAUDE_MAX_TURNS_ENABLED';
+export const CLAUDE_MAX_TURNS_QUALIFICATION_ENV = 'AGENT_RUNNER_CLAUDE_MAX_TURNS_QUALIFICATION_REVISION';
+export const CLAUDE_NATIVE_RESUME_ENABLE_ENV = 'CLAUDE_RUNNER_ENABLE_NATIVE_RESUME';
 
 export const AGENT_ASSIGNMENT_DISPLAY_NAMES = Object.freeze({
   [SHARED_CODEX_CLAUDE_LABEL]: 'Codex / Claude',
@@ -11,6 +15,7 @@ export const AGENT_ASSIGNMENT_DISPLAY_NAMES = Object.freeze({
 const FUTURE_CONTROLS = {
   model: { supported: false },
   effort: { supported: false },
+  maxTurns: { supported: false },
   permissionMode: { supported: false },
   resumeSession: { supported: false },
   outputFormat: { supported: false },
@@ -38,6 +43,12 @@ export const AGENT_ADAPTERS = Object.freeze({
     controls: Object.freeze({
       model: Object.freeze({ supported: true, flag: '--model' }),
       effort: Object.freeze({ supported: true, flag: '--effort' }),
+      // #320: source support is present, but live use is separately gated by
+      // a machine-local qualification revision plus explicit enablement. The
+      // current official Claude Code CLI reference documents --max-turns for
+      // print mode; repository source must not assume an installed binary is
+      // qualified merely because the documentation says the flag exists.
+      maxTurns: Object.freeze({ supported: true, flag: '--max-turns' }),
       permissionMode: Object.freeze({ supported: true, flag: '--permission-mode' }),
       resumeSession: Object.freeze({ supported: true, flag: '--resume' }),
       tools: Object.freeze({ supported: true, flag: '--tools' }),
@@ -66,6 +77,54 @@ export const AGENT_ADAPTERS = Object.freeze({
 });
 
 const LABEL_TO_AGENT_ID = new Map(Object.values(AGENT_ADAPTERS).flatMap((adapter) => adapter.labels.map((label) => [label, adapter.agentId])));
+
+function truthy(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function qualificationRevision(value) {
+  const revision = String(value || '').trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,160}$/.test(revision) ? revision : null;
+}
+
+function taskClassForProfile(profile = {}) {
+  const name = String(profile.profile || '').trim().toLowerCase();
+  if (name === 'docs') return 'routine';
+  if (name === 'narrow') return 'narrow';
+  if (name === 'complex') return 'complex';
+  if (name === 'critical') return 'critical';
+  return 'normal';
+}
+
+export function claudeMaxTurnsPolicy(profile = {}, env = process.env) {
+  const revision = qualificationRevision(env[CLAUDE_MAX_TURNS_QUALIFICATION_ENV]);
+  const enabled = truthy(env[CLAUDE_MAX_TURNS_ENABLE_ENV]);
+  const recoveryEnabled = truthy(env[CLAUDE_NATIVE_RESUME_ENABLE_ENV]);
+  const taskClass = taskClassForProfile(profile);
+  const adapterCapable = Boolean(revision && enabled && recoveryEnabled);
+  const budget = chooseContextBudget({
+    taskClass,
+    risk: taskClass === 'critical' ? 'critical' : 'normal',
+    adapterCapabilities: { maxTurns: adapterCapable },
+    requestedReasoningEffort: profile.effort || null,
+  });
+  const active = Boolean(adapterCapable && Number.isInteger(budget.providerControls.maxTurns));
+  return Object.freeze({
+    active,
+    qualificationRevision: revision,
+    taskClass,
+    maxTurns: active ? budget.providerControls.maxTurns : null,
+    reason: active
+      ? 'machine-qualified-task-class-turn-budget'
+      : !revision
+        ? 'machine-qualification-missing'
+        : !enabled
+          ? 'machine-enable-gate-off'
+          : !recoveryEnabled
+            ? 'native-resume-recovery-gate-off'
+            : 'turn-budget-unavailable',
+  });
+}
 
 export function allAgentLabels({ includeFuture = true } = {}) {
   return Object.values(AGENT_ADAPTERS)
@@ -132,8 +191,11 @@ export function agentRunMetadata(agent, profile = {}) {
   };
 }
 
-export function hydratePromptWithDeterministicHandoff(prompt, env = process.env, { agentId = 'claude-code-cli' } = {}) {
-  return appendLiveDeterministicHandoff(prompt, env, { agentId });
+export function hydratePromptWithDeterministicHandoff(prompt, env = process.env, {
+  agentId = 'claude-code-cli',
+  deltaOnly = false,
+} = {}) {
+  return appendLiveDeterministicHandoff(prompt, env, { agentId, deltaOnly });
 }
 
 export function buildAgentCommandArgs({
@@ -148,6 +210,7 @@ export function buildAgentCommandArgs({
   if (!agent?.implemented) throw new Error(`Agent '${agent?.agentId || 'unknown'}' is not implemented`);
 
   const cacheStableImplementation = agent.type === 'claude' && profile.permissionMode === 'dontAsk';
+  const maxTurnsPolicy = agent.type === 'claude' ? claudeMaxTurnsPolicy(profile, env) : null;
   if (agent.type === 'claude') {
     assertClaudePromptCacheEnabled({
       model: profile.model,
@@ -159,6 +222,7 @@ export function buildAgentCommandArgs({
   validateAgentControls(agent, {
     model: profile.model,
     effort: profile.effort,
+    maxTurns: maxTurnsPolicy?.maxTurns,
     permissionMode: profile.permissionMode,
     resumeSession,
     outputFormat: outputFormat || agent.controls.outputFormat?.default,
@@ -179,6 +243,7 @@ export function buildAgentCommandArgs({
   if (cacheStableImplementation) args.push(agent.controls.excludeDynamicSystemPromptSections.flag);
   args.push(agent.controls.model.flag, profile.model);
   args.push(agent.controls.effort.flag, profile.effort);
+  if (maxTurnsPolicy?.active) args.push(agent.controls.maxTurns.flag, String(maxTurnsPolicy.maxTurns));
   // Subscription-backed Claude execution has no dollar-denominated attempt
   // ceiling. Mandatory quota/headroom admission remains the provider gate.
   args.push(agent.controls.permissionMode.flag, profile.permissionMode);
@@ -198,6 +263,11 @@ export function buildAgentCommandArgs({
     args.push(agent.controls.settingSources.flag, profile.settingSources);
   }
   args.push(agent.controls.outputFormat.flag, outputFormat || agent.controls.outputFormat.default);
-  args.push(hydratePromptWithDeterministicHandoff(prompt, env, { agentId: agent.agentId }));
+  // Only an explicitly bound resume session may receive a delta-only handoff.
+  // Fresh tasks continue to receive the full bounded deterministic capsule.
+  args.push(hydratePromptWithDeterministicHandoff(prompt, env, {
+    agentId: agent.agentId,
+    deltaOnly: Boolean(resumeSession),
+  }));
   return args;
 }
