@@ -1,0 +1,42 @@
+name: Validate Agent Runner on Z790
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-runner-z790-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-z790:
+    name: Validate Agent Runner on Z790
+    runs-on:
+      - self-hosted
+      - dev-cluster-z790
+      - build-worker
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out exact requested revision
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.23.0
+
+      - name: Record bounded worker identity
+        shell: bash
+        run: |
+          printf 'runner_name=%s\n' "$RUNNER_NAME"
+          printf 'runner_os=%s\n' "$RUNNER_OS"
+          printf 'runner_arch=%s\n' "$RUNNER_ARCH"
+          printf 'commit=%s\n' "$GITHUB_SHA"
+
+      - name: Run canonical repository validation
+        run: npm run validate
