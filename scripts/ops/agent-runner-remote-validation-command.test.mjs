@@ -9,6 +9,7 @@ import test from 'node:test';
 const here = dirname(fileURLToPath(import.meta.url));
 const commandPath = join(here, 'agent-runner-remote-validation-command.mjs');
 const AUTHORITY = `sha256:${'a'.repeat(64)}`;
+const SENSITIVE_HOME = '/sensitive-machine-home';
 
 function rawRegistry() {
   return {
@@ -65,7 +66,7 @@ function run(mode, input, env) {
   });
 }
 
-test('build/execute/accept command path is bounded, credential-free and replayable', (t) => {
+test('build/execute/accept command path is bounded, credential/HOME-isolated and replayable', (t) => {
   const root = mkdtempSync(join(tmpdir(), 'agent-runner-remote-validation-command-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const source = join(root, 'source');
@@ -78,11 +79,12 @@ test('build/execute/accept command path is bounded, credential-free and replayab
   spawnSync('git', ['init', '-q', source], { encoding: 'utf8' });
   git(source, ['config', 'user.email', 'agent-runner@example.invalid']);
   git(source, ['config', 'user.name', 'Agent Runner Test']);
+  git(source, ['remote', 'add', 'origin', 'https://github.com/TheTekTeam/agent-runner.git']);
   writeFileSync(join(source, 'package.json'), `${JSON.stringify({
     name: 'remote-validation-command-fixture',
     private: true,
     scripts: {
-      validate: 'node -e "process.exit(process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY ? 9 : 0)"',
+      validate: `node -e "process.exit(process.env.OPENAI_API_KEY || process.env.ANTHROPIC_API_KEY || process.env.HOME === ${JSON.stringify(SENSITIVE_HOME).replaceAll('"', '\\"')} ? 9 : 0)"`,
     },
   }, null, 2)}\n`);
   git(source, ['add', 'package.json']);
@@ -106,6 +108,7 @@ test('build/execute/accept command path is bounded, credential-free and replayab
 
   const baseEnv = {
     ...process.env,
+    HOME: SENSITIVE_HOME,
     AGENT_RUNNER_WORKER_REGISTRY_JSON: JSON.stringify(rawRegistry()),
     AGENT_RUNNER_CONTROLLER_NODE_ID: 'dev-cluster-dell',
   };
