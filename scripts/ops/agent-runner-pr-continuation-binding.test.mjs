@@ -93,6 +93,9 @@ function fixture(overrides = {}) {
         calls.workspace += 1;
         assert.equal(input.worktreeIdentity.expectedBranch, BRANCH);
         assert.equal(input.implementationCheckout, '/repo');
+        // #314: the binding must offer rehydration only at the exact PR head
+        // it just verified — never a different or unverified SHA.
+        assert.deepEqual(input.rehydrate, { expectedHeadSha: HEAD });
         return workspace;
       },
       captureEvidence: (input) => {
@@ -120,8 +123,15 @@ test('binds a claimed current manager packet to the exact authorised clean PR wo
   assert.equal(result.preRunHeadSha, HEAD);
   assert.equal(result.authority.alreadyClaimed, true);
   assert.equal(result.workspace.baseHead, HEAD);
+  assert.equal(result.workspace.rehydrated, false);
   assert.equal(result.worktreeEvidence.dirtyEntryCount, 0);
   assert.deepEqual(calls, { dispatch: 1, workspace: 1, evidence: 1 });
+});
+
+test('#314 surfaces bounded rehydration evidence when prepareWorkspace reconstructed a missing worktree', () => {
+  const { result } = resolve({ workspace: { rehydrated: true } });
+  assert.equal(result.allowed, true);
+  assert.equal(result.workspace.rehydrated, true);
 });
 
 test('fails before dispatch when the PR has no explicit linked issue', () => {

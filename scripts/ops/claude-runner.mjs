@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
@@ -966,6 +968,99 @@ export function prepareImplementationWorkspace(input = {}) {
   };
 }
 
+const CONTINUATION_HEAD_SHA_PATTERN = /^[0-9a-f]{40}$/i;
+
+function pathHasUnownedContent(path) {
+  if (!existsSync(path)) return false;
+  try {
+    return readdirSync(path).length > 0;
+  } catch {
+    // Exists but is not a readable directory (e.g. a stray file) — treat as
+    // a conflicting target rather than silently overwriting it.
+    return true;
+  }
+}
+
+function parseWorktreeListEntries(worktreeListText) {
+  return String(worktreeListText || '')
+    .split(/\n\s*\n/)
+    .map((block) => block.trim())
+    .filter(Boolean)
+    .map((block) => {
+      const lines = block.split('\n');
+      const pathLine = lines.find((line) => line.startsWith('worktree '));
+      const branchLine = lines.find((line) => line.startsWith('branch refs/heads/'));
+      return {
+        path: pathLine ? pathLine.slice('worktree '.length).trim() : null,
+        branch: branchLine ? branchLine.slice('branch refs/heads/'.length).trim() : null,
+      };
+    });
+}
+
+/**
+ * #314: reconstruct only the deterministic local runner worktree for an
+ * already-authorised, already-published PR branch when it is genuinely
+ * absent — never a new remote branch, never a different SHA. Every check is
+ * read-only proof until the single `git worktree add` at the very end, and
+ * any failed proof returns a bounded pre-provider refusal without touching
+ * an existing path, branch, or worktree it does not own.
+ */
+function rehydrateContinuationWorktree({
+  rootPath, worktreePath, expectedBranch, expectedHeadSha, worktreeList, remote = 'origin', baseRef, runner,
+}) {
+  const fail = (failureReason) => ({ allowed: false, failureReason, baseRef, rootPath, worktreePath });
+
+  const entries = parseWorktreeListEntries(worktreeList);
+  if (entries.some((entry) => entry.path === worktreePath)) {
+    return fail('continuation-worktree-rehydrate-path-registration-conflict');
+  }
+  if (entries.some((entry) => entry.branch === expectedBranch)) {
+    return fail('continuation-worktree-rehydrate-branch-owned-elsewhere');
+  }
+  if (pathHasUnownedContent(worktreePath)) {
+    return fail('continuation-worktree-rehydrate-target-path-conflict');
+  }
+
+  const localBranchResult = runGit(['show-ref', '--verify', '--quiet', `refs/heads/${expectedBranch}`], { cwd: rootPath, runner });
+  const localBranchExists = localBranchResult?.status === 0;
+  if (localBranchExists) {
+    const localBranchHead = successfulGitText(['rev-parse', `refs/heads/${expectedBranch}`], { cwd: rootPath, runner });
+    if (localBranchHead !== expectedHeadSha) {
+      return fail('continuation-worktree-rehydrate-local-branch-mismatch');
+    }
+  }
+
+  const fetchResult = runGit(['fetch', '--quiet', remote, expectedBranch], { cwd: rootPath, runner });
+  if (fetchResult?.status !== 0) {
+    return fail('continuation-worktree-rehydrate-remote-fetch-failed');
+  }
+  const remoteHead = successfulGitText(['rev-parse', `refs/remotes/${remote}/${expectedBranch}`], { cwd: rootPath, runner });
+  if (!remoteHead || remoteHead !== expectedHeadSha) {
+    return fail('continuation-worktree-rehydrate-remote-head-mismatch');
+  }
+
+  mkdirSync(dirname(worktreePath), { recursive: true });
+  const createArgs = localBranchExists
+    ? ['worktree', 'add', '--quiet', worktreePath, expectedBranch]
+    : ['worktree', 'add', '--quiet', '-b', expectedBranch, worktreePath, `refs/remotes/${remote}/${expectedBranch}`];
+  const createResult = runGit(createArgs, { cwd: rootPath, runner });
+  if (createResult?.status !== 0) {
+    return fail('continuation-worktree-rehydrate-create-failed');
+  }
+
+  const worktreeAfter = captureGitRepositoryEvidence({ cwd: worktreePath, includeUntracked: true, runner });
+  if (!worktreeAfter) {
+    return fail('continuation-worktree-rehydrate-evidence-unavailable');
+  }
+  if (worktreeAfter.branch !== expectedBranch || worktreeAfter.head !== expectedHeadSha || worktreeAfter.dirtyEntryCount !== 0) {
+    return fail('continuation-worktree-rehydrate-post-create-mismatch');
+  }
+
+  return {
+    allowed: true, failureReason: null, baseRef, rootPath, worktreePath, baseHead: worktreeAfter.head,
+  };
+}
+
 /**
  * The `native_resume`/`same_agent_continuation` counterpart to
  * `prepareImplementationWorkspace`. A fresh attempt must refuse an existing
@@ -973,8 +1068,18 @@ export function prepareImplementationWorkspace(input = {}) {
  * opposite — the exact preserved worktree/branch from the original attempt,
  * matching the deterministic identity derived from the same issue/comment
  * (#698 finding 2). Never creates a new worktree or branch.
+ *
+ * #314: when the deterministic worktree is genuinely absent and the caller
+ * positively supplies `rehydrate.expectedHeadSha` (the exact, freshly
+ * re-read PR head this continuation is bound to), the runner-owned local
+ * worktree for the already-existing remote branch may be reconstructed at
+ * that exact SHA. Without `rehydrate`, or when the proof fails, this
+ * function is unchanged: a missing worktree/branch is a bounded refusal and
+ * nothing is created.
  */
-export function prepareContinuationWorkspace({ worktreeIdentity, implementationCheckout, env = process.env, runner = spawnSync } = {}) {
+export function prepareContinuationWorkspace({
+  worktreeIdentity, implementationCheckout, env = process.env, runner = spawnSync, rehydrate = null,
+} = {}) {
   const baseRef = String(env.CLAUDE_RUNNER_BASE_REF || 'origin/main').trim();
   if (!/^origin\/[A-Za-z0-9._/-]+$/.test(baseRef)) {
     return { allowed: false, failureReason: 'continuation-base-ref-invalid', baseRef };
@@ -987,14 +1092,47 @@ export function prepareContinuationWorkspace({ worktreeIdentity, implementationC
 
   const expectedBranch = worktreeIdentity?.expectedBranch;
   const branchResult = runGit(['show-ref', '--verify', '--quiet', `refs/heads/${expectedBranch}`], { cwd: rootPath, runner });
-  if (branchResult?.status !== 0) {
-    return { allowed: false, failureReason: 'continuation-branch-missing', baseRef, rootPath };
-  }
+  const localBranchExists = branchResult?.status === 0;
   const worktreeList = successfulGitText(['worktree', 'list', '--porcelain'], { cwd: rootPath, runner }) || '';
-  const worktreeEntryPresent = worktreeList.split(/\n\s*\n/)
+  const worktreeEntryPresent = localBranchExists && worktreeList.split(/\n\s*\n/)
     .some((entry) => entry.includes(`/.claude/worktrees/${worktreeIdentity?.name}`) && entry.includes(`branch refs/heads/${expectedBranch}`));
+
   if (!worktreeEntryPresent) {
-    return { allowed: false, failureReason: 'continuation-worktree-missing', baseRef, rootPath };
+    const expectedHeadSha = rehydrate?.expectedHeadSha;
+    const rehydrationRequested = typeof expectedHeadSha === 'string' && CONTINUATION_HEAD_SHA_PATTERN.test(expectedHeadSha);
+    if (!rehydrationRequested) {
+      return { allowed: false, failureReason: localBranchExists ? 'continuation-worktree-missing' : 'continuation-branch-missing', baseRef, rootPath };
+    }
+
+    const worktreePath = join(rootPath, '.claude', 'worktrees', worktreeIdentity?.name || '');
+    const rehydration = rehydrateContinuationWorktree({
+      rootPath,
+      worktreePath,
+      expectedBranch,
+      expectedHeadSha,
+      worktreeList,
+      remote: rehydrate?.remote || 'origin',
+      baseRef,
+      runner,
+    });
+    if (rehydration.allowed !== true) return rehydration;
+
+    const rootBefore = captureGitRepositoryEvidence({ cwd: rootPath, includeUntracked: false, runner });
+    if (!rootBefore) {
+      return { allowed: false, failureReason: 'runner-checkout-evidence-unavailable', baseRef, rootPath, worktreePath };
+    }
+
+    return {
+      allowed: true,
+      failureReason: null,
+      baseRef,
+      baseHead: rehydration.baseHead,
+      rootPath,
+      rootBefore,
+      worktreePath,
+      workspacePreparedByRunner: !nativeClaudeWorktreeName(worktreeIdentity),
+      rehydrated: true,
+    };
   }
 
   const worktreePath = join(rootPath, '.claude', 'worktrees', worktreeIdentity.name);
@@ -1954,8 +2092,19 @@ async function executeOrPlanClaudeRun({
     // branch/worktree, so it always uses the same reconnect path regardless
     // of --recovery-mode.
     const implementationCheckout = runPlan.repositoryContext?.implementationCheckout;
+    // #314: the binding-time prepareWorkspace call (resolvePrContinuationBinding)
+    // already rehydrated a missing worktree, if any, at the exact verified PR
+    // head; runPlan.preRunHeadSha is that same bound SHA, so a second missing
+    // worktree here (unexpected — recovery is idempotent once created) can
+    // only ever be rehydrated at that identical proven identity, never a
+    // different one.
     implementationWorkspace = (args.recoveryMode || isPrContinuation)
-      ? prepareContinuationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env })
+      ? prepareContinuationWorkspace({
+        worktreeIdentity: runPlan.worktreeIdentity,
+        implementationCheckout,
+        env,
+        rehydrate: isPrContinuation && runPlan.preRunHeadSha ? { expectedHeadSha: runPlan.preRunHeadSha } : null,
+      })
       : prepareImplementationWorkspace({ worktreeIdentity: runPlan.worktreeIdentity, implementationCheckout, env });
     // #316 committed-ahead recovery: the binding already proved the exact
     // preserved one-commit-ahead checkpoint against the published PR head
@@ -1989,6 +2138,7 @@ async function executeOrPlanClaudeRun({
         failureReason: implementationWorkspace.failureReason,
         baseRef: implementationWorkspace.baseRef || null,
         baseHead: implementationWorkspace.baseHead || null,
+        rehydrated: implementationWorkspace.rehydrated === true,
       },
     };
     if (!implementationWorkspace.allowed) {

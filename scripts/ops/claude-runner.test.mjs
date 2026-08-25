@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -2179,6 +2181,259 @@ test('continuation workspace preparation fails closed when the preserved worktre
   });
   assert.equal(result.allowed, false);
   assert.equal(result.failureReason, 'continuation-worktree-branch-mismatch');
+});
+
+const REHYDRATE_HEAD_SHA = 'a'.repeat(40);
+
+function rehydrationRunner({
+  rootPath,
+  expectedBranch,
+  worktreeName,
+  expectedHeadSha = REHYDRATE_HEAD_SHA,
+  localBranchExists = false,
+  worktreeListExtra = '',
+  remoteHead = expectedHeadSha,
+  fetchStatus = 0,
+  createStatus = 0,
+  postCreate = { branch: expectedBranch, head: expectedHeadSha, dirty: '' },
+} = {}) {
+  const worktreePath = join(rootPath, '.claude', 'worktrees', worktreeName);
+  const createArgsJoined = localBranchExists
+    ? `worktree add --quiet ${worktreePath} ${expectedBranch}`
+    : `worktree add --quiet -b ${expectedBranch} ${worktreePath} refs/remotes/origin/${expectedBranch}`;
+  return (_command, args, options = {}) => {
+    const joined = args.join(' ');
+    const cwd = options.cwd;
+    if (joined === 'rev-parse --show-toplevel') return { status: 0, stdout: `${rootPath}\n` };
+    if (joined === `show-ref --verify --quiet refs/heads/${expectedBranch}`) {
+      return { status: localBranchExists ? 0 : 1, stdout: '' };
+    }
+    if (joined === 'worktree list --porcelain') {
+      return { status: 0, stdout: `worktree ${rootPath}\nHEAD base-sha\nbranch refs/heads/main\n${worktreeListExtra}` };
+    }
+    if (localBranchExists && cwd === rootPath && joined === `rev-parse refs/heads/${expectedBranch}`) {
+      return { status: 0, stdout: `${expectedHeadSha}\n` };
+    }
+    if (joined === `fetch --quiet origin ${expectedBranch}`) return { status: fetchStatus, stdout: '' };
+    if (joined === `rev-parse refs/remotes/origin/${expectedBranch}`) {
+      return remoteHead ? { status: 0, stdout: `${remoteHead}\n` } : { status: 1, stdout: '' };
+    }
+    if (joined === createArgsJoined) return { status: createStatus, stdout: '' };
+    if (cwd === worktreePath) {
+      if (joined === 'rev-parse HEAD') return { status: 0, stdout: `${postCreate.head}\n` };
+      if (joined === 'branch --show-current') return { status: 0, stdout: `${postCreate.branch}\n` };
+      if (joined === 'status --porcelain=v1 --untracked-files=all') return { status: 0, stdout: postCreate.dirty || '' };
+    }
+    if (cwd === rootPath) {
+      if (joined === 'rev-parse HEAD') return { status: 0, stdout: 'base-sha\n' };
+      if (joined === 'branch --show-current') return { status: 0, stdout: 'main\n' };
+      if (joined === 'status --porcelain=v1 --untracked-files=no') return { status: 0, stdout: '' };
+    }
+    return { status: 1, stdout: '', stderr: `unexpected: ${joined} cwd=${cwd}` };
+  };
+}
+
+test('#314 continuation workspace rehydration recreates a missing worktree from an existing local branch at the exact proven PR head', () => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'rehydrate-'));
+  const expectedBranch = 'worktree-agent-runner-314-1';
+  const result = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-1', expectedBranch },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: rehydrationRunner({ rootPath, expectedBranch, worktreeName: 'agent-runner-314-1', localBranchExists: true }),
+  });
+  assert.equal(result.allowed, true);
+  assert.equal(result.rehydrated, true);
+  assert.equal(result.baseHead, REHYDRATE_HEAD_SHA);
+  assert.equal(result.worktreePath, join(rootPath, '.claude', 'worktrees', 'agent-runner-314-1'));
+  rmSync(rootPath, { recursive: true, force: true });
+});
+
+test('#314 continuation workspace rehydration recreates a missing worktree AND missing local branch ref from the verified remote PR branch without pushing a new branch', () => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'rehydrate-'));
+  const expectedBranch = 'worktree-agent-runner-314-2';
+  const result = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-2', expectedBranch },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: rehydrationRunner({ rootPath, expectedBranch, worktreeName: 'agent-runner-314-2', localBranchExists: false }),
+  });
+  assert.equal(result.allowed, true);
+  assert.equal(result.rehydrated, true);
+  assert.equal(result.baseHead, REHYDRATE_HEAD_SHA);
+  rmSync(rootPath, { recursive: true, force: true });
+});
+
+test('#314 continuation workspace rehydration is never attempted when the worktree already exists', () => {
+  const runner = continuationWorktreeRunner();
+  const calls = [];
+  const wrapped = (command, args, options = {}) => {
+    calls.push(args.join(' '));
+    return runner(command, args, options);
+  };
+  const result = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-698-41', expectedBranch: 'worktree-agent-runner-698-41' },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: wrapped,
+  });
+  assert.equal(result.allowed, true);
+  assert.equal(result.rehydrated, undefined);
+  assert.equal(calls.some((call) => call.startsWith('worktree add') || call.startsWith('fetch ')), false);
+});
+
+test('#314 continuation workspace rehydration fails closed when the target path already contains unowned/unknown content', () => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'rehydrate-'));
+  const expectedBranch = 'worktree-agent-runner-314-3';
+  const worktreePath = join(rootPath, '.claude', 'worktrees', 'agent-runner-314-3');
+  mkdirSync(worktreePath, { recursive: true });
+  writeFileSync(join(worktreePath, 'stray-file.txt'), 'leftover');
+  const result = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-3', expectedBranch },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: rehydrationRunner({ rootPath, expectedBranch, worktreeName: 'agent-runner-314-3', localBranchExists: true }),
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.failureReason, 'continuation-worktree-rehydrate-target-path-conflict');
+  rmSync(rootPath, { recursive: true, force: true });
+});
+
+test('#314 continuation workspace rehydration fails closed when the branch is already checked out in another worktree', () => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'rehydrate-'));
+  const expectedBranch = 'worktree-agent-runner-314-4';
+  const result = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-4', expectedBranch },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: rehydrationRunner({
+      rootPath,
+      expectedBranch,
+      worktreeName: 'agent-runner-314-4',
+      localBranchExists: true,
+      worktreeListExtra: `\nworktree ${join(rootPath, '.claude', 'worktrees', 'some-other-owner')}\nHEAD ${REHYDRATE_HEAD_SHA}\nbranch refs/heads/${expectedBranch}\n`,
+    }),
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.failureReason, 'continuation-worktree-rehydrate-branch-owned-elsewhere');
+  rmSync(rootPath, { recursive: true, force: true });
+});
+
+test('#314 continuation workspace rehydration fails closed when a conflicting registration already owns the exact target path', () => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'rehydrate-'));
+  const expectedBranch = 'worktree-agent-runner-314-5';
+  const worktreePath = join(rootPath, '.claude', 'worktrees', 'agent-runner-314-5');
+  const result = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-5', expectedBranch },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: rehydrationRunner({
+      rootPath,
+      expectedBranch,
+      worktreeName: 'agent-runner-314-5',
+      localBranchExists: true,
+      worktreeListExtra: `\nworktree ${worktreePath}\nHEAD deadbeef\nbranch refs/heads/some-unrelated-branch\n`,
+    }),
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.failureReason, 'continuation-worktree-rehydrate-path-registration-conflict');
+  rmSync(rootPath, { recursive: true, force: true });
+});
+
+test('#314 continuation workspace rehydration fails closed when the local branch ref exists at a different SHA', () => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'rehydrate-'));
+  const expectedBranch = 'worktree-agent-runner-314-6';
+  const result = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-6', expectedBranch },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: rehydrationRunner({
+      rootPath, expectedBranch, worktreeName: 'agent-runner-314-6', localBranchExists: true, remoteHead: REHYDRATE_HEAD_SHA,
+    }),
+  });
+  // Override the local branch's own recorded SHA to differ from the expected head.
+  const baseRunner = rehydrationRunner({ rootPath, expectedBranch, worktreeName: 'agent-runner-314-6', localBranchExists: true });
+  const mismatchRunner = (command, args, options = {}) => {
+    if (args.join(' ') === `rev-parse refs/heads/${expectedBranch}` && options.cwd === rootPath) {
+      return { status: 0, stdout: `${'b'.repeat(40)}\n` };
+    }
+    return baseRunner(command, args, options);
+  };
+  const mismatchResult = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-6', expectedBranch },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: mismatchRunner,
+  });
+  assert.equal(mismatchResult.allowed, false);
+  assert.equal(mismatchResult.failureReason, 'continuation-worktree-rehydrate-local-branch-mismatch');
+  assert.equal(result.allowed, true);
+  rmSync(rootPath, { recursive: true, force: true });
+});
+
+test('#314 continuation workspace rehydration fails closed when the remote branch is missing or differs from the exact PR head', () => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'rehydrate-'));
+  const expectedBranch = 'worktree-agent-runner-314-7';
+  const result = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-7', expectedBranch },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: rehydrationRunner({
+      rootPath, expectedBranch, worktreeName: 'agent-runner-314-7', localBranchExists: true, remoteHead: `${'c'.repeat(40)}`,
+    }),
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.failureReason, 'continuation-worktree-rehydrate-remote-head-mismatch');
+  rmSync(rootPath, { recursive: true, force: true });
+});
+
+test('#314 continuation workspace rehydration fails closed when the worktree creation command fails', () => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'rehydrate-'));
+  const expectedBranch = 'worktree-agent-runner-314-8';
+  const result = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-8', expectedBranch },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: rehydrationRunner({
+      rootPath, expectedBranch, worktreeName: 'agent-runner-314-8', localBranchExists: true, createStatus: 1,
+    }),
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.failureReason, 'continuation-worktree-rehydrate-create-failed');
+  rmSync(rootPath, { recursive: true, force: true });
+});
+
+test('#314 continuation workspace rehydration fails closed when the post-create worktree is dirty, on the wrong branch, or at the wrong SHA', () => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'rehydrate-'));
+  const expectedBranch = 'worktree-agent-runner-314-9';
+  const dirtyResult = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-9', expectedBranch },
+    env: {},
+    rehydrate: { expectedHeadSha: REHYDRATE_HEAD_SHA },
+    runner: rehydrationRunner({
+      rootPath,
+      expectedBranch,
+      worktreeName: 'agent-runner-314-9',
+      localBranchExists: true,
+      postCreate: { branch: expectedBranch, head: REHYDRATE_HEAD_SHA, dirty: '?? untracked-file\n' },
+    }),
+  });
+  assert.equal(dirtyResult.allowed, false);
+  assert.equal(dirtyResult.failureReason, 'continuation-worktree-rehydrate-post-create-mismatch');
+  rmSync(rootPath, { recursive: true, force: true });
+});
+
+test('#314 continuation-worktree-missing refusal remains truthful when no rehydration proof is supplied', () => {
+  const rootPath = mkdtempSync(join(tmpdir(), 'rehydrate-'));
+  const expectedBranch = 'worktree-agent-runner-314-10';
+  const result = prepareContinuationWorkspace({
+    worktreeIdentity: { name: 'agent-runner-314-10', expectedBranch },
+    env: {},
+    runner: rehydrationRunner({ rootPath, expectedBranch, worktreeName: 'agent-runner-314-10', localBranchExists: true }),
+  });
+  assert.equal(result.allowed, false);
+  assert.equal(result.failureReason, 'continuation-worktree-missing');
+  rmSync(rootPath, { recursive: true, force: true });
 });
 
 test('classifyClaudeRunFailure emits stable process and fallback failure codes', () => {
