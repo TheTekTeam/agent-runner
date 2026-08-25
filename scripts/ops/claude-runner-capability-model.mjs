@@ -16,11 +16,14 @@ export const CAPABILITY_REPO_VALIDATION = 'repo-validation';
 export const CAPABILITY_HOST_FINGERPRINT_READ = 'host-fingerprint-read';
 export const CAPABILITY_BOUNDED_BENCHMARK_RUN = 'bounded-benchmark-run';
 
+const REVIEWED_NPM_REGISTRY = 'https://registry.npmjs.org/';
+
 /**
  * Capability mappings are positive allowlists only. Dynamic package-manager
  * command wildcards are deliberately prohibited because the permission rule
  * itself must not be able to select arbitrary packages, registries, mutation
- * flags or shell syntax.
+ * flags or shell syntax. Network-capable pnpm operations pin the reviewed
+ * public registry rather than inheriting repository/user registry overrides.
  *
  * `bounded-benchmark-run` remains a known vocabulary item but is intentionally
  * unavailable until a reviewed fixed benchmark harness exists. Treating that
@@ -31,11 +34,11 @@ const CAPABILITY_TOOL_RULES = Object.freeze({
   [CAPABILITY_DEPENDENCY_AUDIT_READ]: Object.freeze({
     available: true,
     allowedTools: Object.freeze([
-      'Bash(pnpm audit --json)',
-      'Bash(pnpm audit --audit-level=low --json)',
-      'Bash(pnpm audit --audit-level=moderate --json)',
-      'Bash(pnpm audit --audit-level=high --json)',
-      'Bash(pnpm audit --audit-level=critical --json)',
+      `Bash(pnpm audit --registry=${REVIEWED_NPM_REGISTRY} --json)`,
+      `Bash(pnpm audit --registry=${REVIEWED_NPM_REGISTRY} --audit-level=low --json)`,
+      `Bash(pnpm audit --registry=${REVIEWED_NPM_REGISTRY} --audit-level=moderate --json)`,
+      `Bash(pnpm audit --registry=${REVIEWED_NPM_REGISTRY} --audit-level=high --json)`,
+      `Bash(pnpm audit --registry=${REVIEWED_NPM_REGISTRY} --audit-level=critical --json)`,
     ]),
   }),
   [CAPABILITY_DEPENDENCY_ANCESTRY_READ]: Object.freeze({
@@ -47,13 +50,13 @@ const CAPABILITY_TOOL_RULES = Object.freeze({
   [CAPABILITY_PACKAGE_INSTALL_FROZEN]: Object.freeze({
     available: true,
     allowedTools: Object.freeze([
-      'Bash(pnpm install --frozen-lockfile --ignore-scripts)',
+      `Bash(pnpm install --registry=${REVIEWED_NPM_REGISTRY} --frozen-lockfile --ignore-scripts)`,
     ]),
   }),
   [CAPABILITY_PACKAGE_RESOLUTION_UPDATE]: Object.freeze({
     available: true,
     allowedTools: Object.freeze([
-      'Bash(pnpm install --lockfile-only --ignore-scripts)',
+      `Bash(pnpm install --registry=${REVIEWED_NPM_REGISTRY} --lockfile-only --ignore-scripts)`,
     ]),
   }),
   // Ordinary repository editing/validation is already part of the baseline

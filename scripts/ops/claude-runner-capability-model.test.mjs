@@ -22,6 +22,7 @@ const BASE_POLICY = Object.freeze({
   allowedTools: Object.freeze(['Read', 'Glob', 'Grep', 'Edit', 'Write', 'Bash(git status)']),
   disallowedTools: Object.freeze(['Agent', 'Bash(git push *)', 'Bash(gh *)', 'Bash(curl *)', 'Bash(wget *)', 'Bash(sudo *)']),
 });
+const REVIEWED_REGISTRY = 'https://registry.npmjs.org/';
 
 function addedRules(policy) {
   return policy.allowedTools.filter((rule) => !BASE_POLICY.allowedTools.includes(rule));
@@ -66,17 +67,18 @@ test('no declared extra capabilities keeps the baseline tool policy unchanged an
   assert.deepEqual([...extended.unavailableCapabilities], []);
 });
 
-test('dependency-audit-read grants only exact pnpm read-only audit forms', () => {
+test('dependency-audit-read grants only exact pnpm read-only audit forms pinned to the reviewed registry', () => {
   const auditOnly = extendImplementationToolPolicyForCapabilities(BASE_POLICY, [CAPABILITY_DEPENDENCY_AUDIT_READ]);
   assert.deepEqual(addedRules(auditOnly), [
-    'Bash(pnpm audit --json)',
-    'Bash(pnpm audit --audit-level=low --json)',
-    'Bash(pnpm audit --audit-level=moderate --json)',
-    'Bash(pnpm audit --audit-level=high --json)',
-    'Bash(pnpm audit --audit-level=critical --json)',
+    `Bash(pnpm audit --registry=${REVIEWED_REGISTRY} --json)`,
+    `Bash(pnpm audit --registry=${REVIEWED_REGISTRY} --audit-level=low --json)`,
+    `Bash(pnpm audit --registry=${REVIEWED_REGISTRY} --audit-level=moderate --json)`,
+    `Bash(pnpm audit --registry=${REVIEWED_REGISTRY} --audit-level=high --json)`,
+    `Bash(pnpm audit --registry=${REVIEWED_REGISTRY} --audit-level=critical --json)`,
   ]);
   assert.ok(addedRules(auditOnly).every((rule) => !rule.includes('*')));
-  assert.ok(addedRules(auditOnly).every((rule) => !/--fix|install|update|add|registry/i.test(rule)));
+  assert.ok(addedRules(auditOnly).every((rule) => !/--fix|install|update|add/i.test(rule)));
+  assert.ok(addedRules(auditOnly).every((rule) => rule.includes(`--registry=${REVIEWED_REGISTRY}`)));
 });
 
 test('unknown capability fails closed when extending a tool policy', () => {
@@ -86,28 +88,32 @@ test('unknown capability fails closed when extending a tool policy', () => {
   );
 });
 
-test('dependency read capabilities cannot install, update, fix, select registries, or widen shell syntax', () => {
+test('dependency read capabilities cannot install, update, fix, or widen shell syntax', () => {
   const readOnly = extendImplementationToolPolicyForCapabilities(BASE_POLICY, [
     CAPABILITY_DEPENDENCY_AUDIT_READ,
     CAPABILITY_DEPENDENCY_ANCESTRY_READ,
   ]);
   const added = addedRules(readOnly);
   assert.ok(added.includes('Bash(pnpm list --depth Infinity --json)'));
-  assert.ok(added.every((rule) => !/pnpm (?:install|update|add)|--fix|--registry|npm /i.test(rule)));
+  assert.ok(added.every((rule) => !/pnpm (?:install|update|add)|--fix|npm /i.test(rule)));
   assert.ok(added.every((rule) => !/[;|&`$<>]/.test(rule)));
   assert.ok(added.every((rule) => !rule.includes('*')));
 });
 
-test('frozen install is exact, script-suppressed, and cannot repair or update resolution', () => {
+test('frozen install is exact, registry-pinned, script-suppressed, and cannot repair resolution', () => {
   const frozen = extendImplementationToolPolicyForCapabilities(BASE_POLICY, [CAPABILITY_PACKAGE_INSTALL_FROZEN]);
-  assert.deepEqual(addedRules(frozen), ['Bash(pnpm install --frozen-lockfile --ignore-scripts)']);
-  assert.ok(addedRules(frozen).every((rule) => !/update|add|lockfile-only|--registry|\*/i.test(rule)));
+  assert.deepEqual(addedRules(frozen), [
+    `Bash(pnpm install --registry=${REVIEWED_REGISTRY} --frozen-lockfile --ignore-scripts)`,
+  ]);
+  assert.ok(addedRules(frozen).every((rule) => !/update|add|lockfile-only|--filter|\*/i.test(rule)));
 });
 
-test('package-resolution update is a separate exact lockfile-only operation', () => {
+test('package-resolution update is a separate exact registry-pinned lockfile-only operation', () => {
   const update = extendImplementationToolPolicyForCapabilities(BASE_POLICY, [CAPABILITY_PACKAGE_RESOLUTION_UPDATE]);
-  assert.deepEqual(addedRules(update), ['Bash(pnpm install --lockfile-only --ignore-scripts)']);
-  assert.ok(addedRules(update).every((rule) => !/pnpm update|pnpm add|--registry|--filter|\*/i.test(rule)));
+  assert.deepEqual(addedRules(update), [
+    `Bash(pnpm install --registry=${REVIEWED_REGISTRY} --lockfile-only --ignore-scripts)`,
+  ]);
+  assert.ok(addedRules(update).every((rule) => !/pnpm update|pnpm add|--filter|\*/i.test(rule)));
   assert.ok(addedRules(update).every((rule) => !/[;|&`$<>]/.test(rule)));
 });
 
