@@ -12,7 +12,7 @@ Run the repository probe on the machine being inspected:
 npm run fleet:readiness -- --node <node-id> [--worker-only]
 ```
 
-Use `--worker-only` on Z790 and every non-controller worker. The command is intentionally read-only. It executes only version-probe commands explicitly accepted by the fleet runtime contract, with a minimal environment containing `PATH`. It does not inspect or serialize credential files, auth tokens, sessions, home-directory paths or environment dumps.
+Use `--worker-only` on Z790 and every non-controller worker. The command is intentionally read-only. It executes only version-probe commands explicitly accepted by the fleet runtime contract, with a minimal environment containing `PATH`; the Ollama component additionally receives the current `HOME` because Ollama 0.32.x panics before version handling when `HOME` is absent. No other parent environment keys are inherited for that probe. The command does not inspect or serialize credential files, auth tokens, sessions, home-directory paths or environment dumps.
 
 The output distinguishes:
 
@@ -84,7 +84,7 @@ The fleet contract now consumes the accepted #40 `ollama-agent` foundation witho
 
 Readiness is deliberately component-aware:
 
-- Ollama runtime probe: `ollama -v`;
+- Ollama runtime probe: `ollama -v`, executed with only `PATH` plus the reviewed `HOME` process-context key; `HOME` is required for Ollama CLI initialisation but is never serialized into readiness evidence;
 - because Ollama's version command can consult the daemon, a non-zero exit still proves **binary/runtime presence** only when that exact reviewed command emits a bounded version after the reviewed phrases `client version is` or `ollama version is`; client version is preferred when both are present, the extracted Ollama version must contain a dotted numeric version (`x.y…`), and unrelated numeric warning text is never treated as a version; this Ollama-specific parser does not alter Claude/Codex/OpenCode parsing and does not prove daemon, model or route readiness;
 - OpenCode harness probe: `opencode --version`;
 - both must be present before the fleet runtime is considered installed;
