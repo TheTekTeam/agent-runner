@@ -2,13 +2,17 @@
 
 import { pathToFileURL } from 'node:url';
 
-import { candidatePausePayload } from './agent-runner-candidate-admission.mjs';
+import {
+  IMPLEMENTATION_TOOL_CAPABILITY_MISMATCH,
+  candidatePausePayload,
+} from './agent-runner-candidate-admission.mjs';
 import {
   createAtomicAdmissionStore,
   revalidationFailureEvidence,
   runAtomicCandidateRevalidation,
 } from './agent-runner-atomic-candidate-store.mjs';
 import { acquireRecoverableCronLock } from './agent-runner-cron-lock.mjs';
+import { safeDeriveFailureProjection } from './agent-runner-failure-attention-projection.mjs';
 import {
   createLivenessFilteredStore,
   inspectDueRecoveryLiveness,
@@ -16,7 +20,65 @@ import {
 import { withRecoveryIdentityGuard } from './agent-runner-recovery-identity-guard.mjs';
 import { parseStructuredOutput, serviceExitCode } from './agent-runner-service-semantics.mjs';
 import { openRunnerStateStore } from './claude-runner-state.mjs';
-import { main as schedulerMain, parseArgs as schedulerParseArgs } from './claude-runner-cron.mjs';
+import { main as schedulerMain, parseArgs as schedulerParseArgs, upsertGitHubAttentionComment } from './claude-runner-cron.mjs';
+
+const PRE_CLAIM_PROJECTABLE_SCOPES = Object.freeze(['machine_profile', 'issue_not_runnable']);
+
+/**
+ * #231: the *only* production path a candidate cost-admission refusal or
+ * #229 tool-capability mismatch pause currently reaches is this function's
+ * own stdout JSON (`candidatePausePayload`) -- a shell-only artifact. This
+ * publishes the same bounded #230 projection through the existing canonical
+ * `upsertGitHubAttentionComment()` GitHub channel, content-equality
+ * deduplicated exactly like every other attention comment, so a normal
+ * manager session can read the exact machine-profile reason, the zero-
+ * side-effect evidence and the safe next action from the issue itself.
+ * Never throws: a broken GitHub write here must never turn a handled
+ * candidate-pause exit (0, durably audited above) into a failure.
+ */
+function publishCandidatePauseAttention({ repo, project, admission, current, ghRunner }) {
+  if (!repo || !PRE_CLAIM_PROJECTABLE_SCOPES.includes(admission?.scope)) return;
+  const issueNumber = current?.issueNumber;
+  if (!Number.isInteger(issueNumber) || issueNumber <= 0) return;
+  const reasonDomain = admission.scope === 'issue_not_runnable'
+    ? 'candidate_admission'
+    : (admission.reason === IMPLEMENTATION_TOOL_CAPABILITY_MISMATCH ? 'capability_admission' : 'cost_admission');
+  const safeNextAction = typeof admission.safeNextAction === 'string' && admission.safeNextAction.trim()
+    ? admission.safeNextAction.trim()
+    : 'Provide an explicit manager decision before any further dispatch. Do not retry automatically.';
+  const projection = safeDeriveFailureProjection({
+    repository: repo, project: project ?? null, issueNumber,
+    // Pre-attempt: no attempt has been created for this refusal (see
+    // `attemptCreated: false` below), so there is no real attempt identity
+    // to project -- `null` is the correct, honest value here, not a guess.
+    attemptId: null,
+    executionPhase: reasonDomain,
+    candidateAdmissionCompleted: admission.scope === 'machine_profile',
+    attemptCreated: false, managerPacketConsumed: null, issueMutation: false,
+    workspaceCreated: false, childLaunched: false, providerInvocationObserved: 'no',
+    failureScope: admission.scope, reasonDomain, reason: admission.reason,
+    missingCapabilities: reasonDomain === 'capability_admission' ? (admission.missingCapabilities || []) : [],
+    checkpointPresent: false, worktreePresent: false, branchPresent: false, commitPresent: false, prPresent: false,
+    dirty: false, hasChanges: false,
+    recoveryStatus: 'forbidden', recoveryAction: 'attention_required', recoveryEligible: false,
+    circuitState: reasonDomain === 'cost_admission' && admission.effectiveFingerprint ? 'tripped' : null,
+    circuitDomain: reasonDomain === 'cost_admission' && admission.effectiveFingerprint ? 'cost_admission' : null,
+    safeNextAction,
+    deeperDiagnosticsRequired: false,
+  });
+  const failure = {
+    failureScope: admission.scope,
+    reason: admission.reason,
+    recoveryStatus: 'forbidden',
+    nextAction: safeNextAction,
+    finishedAt: new Date().toISOString(),
+    policyRevision: 'runner-recovery-v1',
+    projection,
+  };
+  try {
+    upsertGitHubAttentionComment({ repo }, { number: issueNumber }, failure, ghRunner);
+  } catch { /* a GitHub write failure must never change this handled pause's exit semantics */ }
+}
 
 export * from './claude-runner-cron.mjs';
 
@@ -168,6 +230,11 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       admissionBoundary: 'recordRecoveryAttempt',
       durableAudit: true,
     };
+    publishCandidatePauseAttention({
+      repo: parsedArgs.repo, project: parsedArgs.project?.id,
+      admission: pauseState.result.admission, current: pauseState.result.current,
+      ghRunner: dependencies.ghRunner,
+    });
     baseLogger.log(JSON.stringify(payload, null, 2));
     return 0;
   }

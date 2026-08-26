@@ -229,6 +229,92 @@ test('atomic cron leaves a genuine candidate denial (not a revalidation-subproce
   }
 });
 
+test('#231: a pre-claim cost-admission refusal publishes a bounded #230 projection through the canonical GitHub attention comment, without changing the handled exit-0 pause outcome', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'atomic-cron-cost-denied-'));
+  const lockPath = join(dir, 'cron.lock');
+  const stateDbPath = join(dir, 'state.sqlite');
+  const comments = [managerPacket(690)];
+  const mutatingCalls = [];
+  const originalLog = console.log;
+  let printed = null;
+  try {
+    console.log = (value) => { printed = String(value); };
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
+      '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
+    ], { GH_TOKEN: 'test-token', CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true' }, {
+      ghRunner: readyIssueGhRunner({ number: 690, comments, mutatingCalls }),
+      inspectWorkspaceOwnership: async () => ({ allowed: true }),
+      revalidateCandidate: ({ expected }) => ({
+        admission: {
+          allowed: false, scope: 'machine_profile', reason: 'candidate-machine-profile-cost-denied',
+          safeNextAction: 'A changed manager intent requires a fresh superseding immutable manager-preflight authority.',
+        },
+        initial: expected,
+        current: { ...expected, issueNumber: 690 },
+      }),
+      runChild: async () => { throw new Error('must not launch child'); },
+    });
+    assert.equal(exitCode, 0, 'a candidate cost-admission refusal remains the pre-existing handled (exit 0) outcome');
+    const payload = JSON.parse(printed);
+    assert.equal(payload.circuitPaused, true);
+    assert.equal(payload.reason, 'candidate-machine-profile-cost-denied');
+
+    const posted = mutatingCalls.find((args) => args[0] === 'issue' && args[1] === 'comment');
+    assert.ok(posted, 'the pre-claim cost refusal must publish a GitHub attention comment, not only stdout');
+    const body = posted[posted.indexOf('--body') + 1];
+    assert.match(body, /candidate-machine-profile-cost-denied/);
+    assert.match(body, /### Failure projection/);
+    assert.match(body, /Attempt created: `false`/);
+    assert.match(body, /Child launched: `false`/);
+    assert.doesNotMatch(body, /unknown_failure/);
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#231: a GitHub attention-publish failure on a pre-claim admission pause never turns the handled exit-0 outcome into a failure', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'atomic-cron-cost-denied-gh-failure-'));
+  const lockPath = join(dir, 'cron.lock');
+  const stateDbPath = join(dir, 'state.sqlite');
+  const comments = [managerPacket(691)];
+  const mutatingCalls = [];
+  const originalLog = console.log;
+  let printed = null;
+  try {
+    console.log = (value) => { printed = String(value); };
+    const baseGhRunner = readyIssueGhRunner({ number: 691, comments, mutatingCalls });
+    const flakyGhRunner = (args) => {
+      if (args[0] === 'issue' && args[1] === 'comment') throw new Error('simulated GitHub outage');
+      return baseGhRunner(args);
+    };
+    const exitCode = await main([
+      '--execute', '--allow-root', '--skip-quota-preflight', '--output-dir', dir,
+      '--state-db', stateDbPath, '--lock-path', lockPath, '--agent-labels', 'agent:claude-code-cli',
+    ], { GH_TOKEN: 'test-token', CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola', CLAUDE_RUNNER_ALLOW_IMPLEMENTATION: 'true' }, {
+      ghRunner: flakyGhRunner,
+      inspectWorkspaceOwnership: async () => ({ allowed: true }),
+      revalidateCandidate: ({ expected }) => ({
+        admission: {
+          allowed: false, scope: 'machine_profile', reason: 'implementation-tool-capability-mismatch',
+          safeNextAction: 'Issue a fresh reviewed manager authority using only known implementation capability identifiers.',
+        },
+        initial: expected,
+        current: { ...expected, issueNumber: 691 },
+      }),
+      runChild: async () => { throw new Error('must not launch child'); },
+    });
+    assert.equal(exitCode, 0, 'a broken attention publish must never turn a handled pause into a failure');
+    const payload = JSON.parse(printed);
+    assert.equal(payload.candidatePaused, true);
+    assert.equal(payload.reason, 'implementation-tool-capability-mismatch');
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('atomic cron reaches durable attempt-start persistence through the production wrapped store, with no nested transaction, no GitHub mutation and no child launch', async () => {
   // #158: the production entrypoint (`bin/run-project.sh` ->
   // `agent-runner-pinned-atomic-cron.mjs` -> this module) composes the

@@ -91,6 +91,7 @@ import { redactExecutableArgs } from './lib/redact.mjs';
 import { reconcileNotifications } from './agent-runner-notifications.mjs';
 import { runAttentionReconciliation } from './agent-runner-attention-reconcile-command.mjs';
 import { GhCliAttentionReadClient } from './agent-runner-attention-github-client.mjs';
+import { attentionProjectionAttemptId, renderFailureProjectionSection, safeDeriveFailureProjection } from './agent-runner-failure-attention-projection.mjs';
 
 const DEFAULT_REPO = 'TheTekTeam/modelspend';
 const DEFAULT_LOCK = '.var/claude-runner/cron.lock';
@@ -1164,8 +1165,18 @@ Do not add another manager preflight until workspace ownership is resolved.
 `;
 }
 
+const PRE_ATTEMPT_ATTENTION_SCOPES = Object.freeze(['machine_profile', 'issue_not_runnable']);
+
 export function runnerAttentionCommentBody(issue, failure = {}) {
-  const outcome = normalizeTerminalOutcome(failure.reason);
+  // #231: a pre-attempt candidate/capability/cost admission refusal is not a
+  // `TERMINAL_OUTCOMES` member -- `normalizeTerminalOutcome()` would
+  // silently collapse its exact typed reason into `unknown_failure`
+  // (forbidden by #231 scope item 4). `failure.failureScope` only ever
+  // carries one of the bounded #230 `FAILURE_PROJECTION_SCOPES` values, so
+  // this is a positive, narrow bypass -- every existing post-attempt caller
+  // (which never sets `failureScope`) is completely unaffected.
+  const preAttempt = PRE_ATTEMPT_ATTENTION_SCOPES.includes(failure.failureScope);
+  const outcome = preAttempt ? String(failure.reason || 'unknown_failure') : normalizeTerminalOutcome(failure.reason);
   const finishedAt = failure.detectedAt || failure.finishedAt || failure.startedAt || 'unknown';
   const recoveryStatus = String(failure.recoveryStatus || 'forbidden');
   const nextAction = String(failure.nextAction || 'Inspect the sanitized failure evidence and provide an explicit manager decision.');
@@ -1189,7 +1200,7 @@ ${heading}
 - Safe next action: ${nextAction}
 - Queue action: ${queueAction}
 - Recovery rule: retry or hand off only from a safe checkpoint. Do not blind-retry a fresh session.
-${workspaceOwnershipDetailBlock(issue, failure, outcome)}
+${workspaceOwnershipDetailBlock(issue, failure, outcome)}${renderFailureProjectionSection(failure.projection)}
 ${footer}`;
 }
 
@@ -3874,17 +3885,54 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       },
     });
     const transitionBlocked = recoveryClaim && outcome === 'completed' && recoveryTransition?.allowed !== true;
+    const terminalReason = transitionBlocked ? 'unknown_failure' : outcome;
+    const terminalNextAction = preflightRevisionDisagreement
+      ? (!childPreflightIdentity
+        ? 'The child result did not provide a matching manager preflight comment id even though one is required. Confirm the current preflight and provide a new manager decision before retrying.'
+        : 'The child-observed manager preflight comment disagreed with the scheduler\'s authoritative revision. Confirm the current preflight and provide a new manager decision before retrying.')
+      : transitionBlocked
+        ? `Successful child result was not applied because recovery authority changed: ${(recoveryTransition.failedChecks || []).join(', ')}.`
+        : decision.nextAction;
+    // #231: production-lifecycle population of the accepted #230 bounded
+    // failure projection for the single site every task-attempt terminal
+    // outcome (budget exhaustion, no-change, worker failure, checkpoint
+    // preserved, workspace-ownership, unknown) already flows through.
+    // Never thrown on: an incomplete/inconsistent mapping degrades to no
+    // projection section rather than blocking this attempt's durable write.
+    const terminalProjection = outcome === 'completed' && !transitionBlocked ? null : safeDeriveFailureProjection({
+      repository: args.repo, project: args.project?.id, issueNumber: selected.issue.number,
+      attemptId: attentionProjectionAttemptId(attemptId), agent: actualAgent, model: actualModel,
+      policyRevision: decision.policyRevision, managerAuthorityFingerprint: schedulerPreflightFingerprint,
+      executionPhase: 'completed',
+      candidateAdmissionCompleted: true, attemptCreated: true, managerPacketConsumed: true,
+      // At the 'completed' execution phase, workspace preparation is
+      // already required to have happened -- `deriveFailureProjection()`
+      // refuses an asserted `false` this late. A child that never reported
+      // a worktree identity (e.g. it crashed before reporting) is absent
+      // *evidence*, not proof preparation never ran, so this stays `null`
+      // (unknown) rather than a false assertion.
+      workspaceCreated: childPayload?.worktreeIdentity ? true : null, childLaunched: true,
+      providerInvocationObserved: childEnded ? 'yes' : 'unknown',
+      failureScope: 'task_attempt', reasonDomain: 'terminal_outcome', reason: terminalReason, terminalOutcome: terminalReason,
+      checkpointPresent: Boolean(childPayload?.checkpointAvailable),
+      worktreePresent: Boolean(childPayload?.worktreeIdentity),
+      branchPresent: Boolean(childPayload?.implementationPublication?.branch),
+      commitPresent: childPayload?.implementationEvidence?.repositoryMutated ?? null,
+      prPresent: Boolean(childPayload?.implementationPublication?.pullRequest),
+      hasChanges: childPayload?.implementationEvidence?.repositoryMutated ?? null,
+      recoveryStatus: transitionBlocked ? 'forbidden' : decision.status,
+      recoveryAction: transitionBlocked ? 'attention_required' : decision.action,
+      recoveryEligible: transitionBlocked ? false : Boolean(decision.eligible),
+      safeNextAction: terminalNextAction,
+      deeperDiagnosticsRequired: terminalReason === 'unknown_failure',
+      diagnosticDomain: terminalReason === 'unknown_failure' ? 'terminal_outcome' : null,
+    });
     const attentionEvent = outcome === 'completed' && !transitionBlocked ? null : buildAttentionEvent({
       repository: args.repo, project: args.project?.id, issueNumber: selected.issue.number, attemptId,
-      reason: transitionBlocked ? 'unknown_failure' : outcome, agent: actualAgent, startedAt, finishedAt,
+      reason: terminalReason, agent: actualAgent, startedAt, finishedAt,
       recoveryStatus: transitionBlocked ? 'forbidden' : decision.status,
-      nextAction: preflightRevisionDisagreement
-        ? (!childPreflightIdentity
-          ? 'The child result did not provide a matching manager preflight comment id even though one is required. Confirm the current preflight and provide a new manager decision before retrying.'
-          : 'The child-observed manager preflight comment disagreed with the scheduler\'s authoritative revision. Confirm the current preflight and provide a new manager decision before retrying.')
-        : transitionBlocked
-          ? `Successful child result was not applied because recovery authority changed: ${(recoveryTransition.failedChecks || []).join(', ')}.`
-          : decision.nextAction,
+      nextAction: terminalNextAction,
+      projection: terminalProjection,
       dashboardReference: `issue-${selected.issue.number}`, policyRevision: decision.policyRevision,
     });
     if (!state.record('recordRecoveryAttempt', {
