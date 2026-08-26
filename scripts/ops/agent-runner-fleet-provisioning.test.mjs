@@ -69,7 +69,7 @@ test('Claude, Codex and Ollama expose reviewed runtime contracts while only Clau
   assert.equal(ollama.qualificationEligible, false);
   assert.deepEqual(ollama.versionProbe, { command: 'opencode', args: ['--version'] });
   assert.deepEqual(ollama.componentProbes, [
-    { componentId: 'ollama-runtime', command: 'ollama', args: ['-v'] },
+    { componentId: 'ollama-runtime', command: 'ollama', args: ['-v'], acceptVersionOnNonZero: true },
     { componentId: 'opencode-harness', command: 'opencode', args: ['--version'] },
   ]);
   assert.deepEqual(ollama.installationMechanism, {
