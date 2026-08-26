@@ -69,7 +69,17 @@ test('runtime probes execute only reviewed Claude/Codex/Ollama/OpenCode version 
     ],
     modelInventoryState: 'not-probed',
   });
-  for (const call of calls) assert.deepEqual(Object.keys(call.options.env), ['PATH']);
+  const claudeCall = calls.find((call) => call.command === 'claude');
+  const codexCall = calls.find((call) => call.command === 'codex');
+  const ollamaCall = calls.find((call) => call.command === 'ollama');
+  const opencodeCall = calls.find((call) => call.command === 'opencode');
+
+  assert.deepEqual(Object.keys(claudeCall.options.env), ['PATH']);
+  assert.deepEqual(Object.keys(codexCall.options.env), ['PATH']);
+  assert.deepEqual(Object.keys(opencodeCall.options.env), ['PATH']);
+  assert.deepEqual(Object.keys(ollamaCall.options.env), ['PATH', 'HOME']);
+  assert.equal(ollamaCall.options.env.HOME, process.env.HOME || '');
+  assert.equal('OLLAMA_HOST' in ollamaCall.options.env, false);
 });
 
 test('Grok foundation remains fail-closed and executes no guessed version command', () => {
@@ -286,5 +296,8 @@ test('bounded readiness output contains no environment, credential, session or f
   const serialized = JSON.stringify(result).toLowerCase();
   for (const forbidden of ['credential', 'password', 'sessionid', 'api_key', 'api-key', 'homedir', 'cwd', 'executablepath']) {
     assert.equal(serialized.includes(forbidden), false, `restricted readiness field leaked: ${forbidden}`);
+  }
+  if (process.env.HOME) {
+    assert.equal(JSON.stringify(result).includes(process.env.HOME), false, 'HOME path leaked into readiness evidence');
   }
 });
