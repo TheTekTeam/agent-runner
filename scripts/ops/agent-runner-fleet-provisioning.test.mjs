@@ -250,6 +250,23 @@ test('unsupported Grok foundation cannot be promoted by fabricated host evidence
   assert.equal(instance.qualified, false);
 });
 
+test('Ollama runtime absence keeps local auth unavailable and cannot imply readiness', () => {
+  const evaluated = evaluateFleetAdapterEvidence({
+    nodeId: 'dev-cluster-z790',
+    adapterId: 'ollama-agent',
+  });
+  assert.equal(evaluated.state, 'runtime-missing');
+  assert.equal(evaluated.reason, 'runtime-not-installed');
+  assert.equal(evaluated.runtimeInstalled, false);
+  assert.equal(evaluated.authAvailable, null);
+  assert.equal(evaluated.qualified, false);
+
+  const instance = buildFleetAgentInstance(evaluated);
+  assert.equal(instance.lifecycle, 'disabled');
+  assert.equal(instance.readiness, 'unavailable');
+  assert.equal(instance.authenticated, false);
+});
+
 test('Ollama runtime evidence remains non-routable until #152 qualification enables the live adapter', () => {
   const evaluated = evaluateFleetAdapterEvidence({
     nodeId: 'dev-cluster-z790',
