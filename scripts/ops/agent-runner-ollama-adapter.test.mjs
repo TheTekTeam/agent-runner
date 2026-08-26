@@ -340,7 +340,11 @@ test('buildOpenCodeLocalOllamaConfig creates a loopback-only Ollama provider all
   });
   const config = JSON.parse(content);
 
+  assert.equal(config.autoupdate, false);
+  assert.equal(config.share, 'disabled');
   assert.deepEqual(config.enabled_providers, ['ollama']);
+  assert.equal(config.model, 'ollama/modelspend-docs-local:latest');
+  assert.equal(config.small_model, 'ollama/modelspend-docs-local:latest');
   assert.equal(config.provider.ollama.npm, '@ai-sdk/openai-compatible');
   assert.equal(config.provider.ollama.options.baseURL, 'http://127.0.0.1:11434/v1');
   assert.deepEqual(Object.keys(config.provider.ollama.models), ['modelspend-docs-local:latest']);
