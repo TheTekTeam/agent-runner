@@ -21,10 +21,12 @@ Usage:
 Currently supported installer contracts:
   claude-code-cli  Ubuntu/Debian via Anthropic's signed stable apt repository.
   codex-cli        Ubuntu/Debian via OpenAI's official @openai/codex npm package.
+  ollama-agent     Ubuntu/Debian via Ollama's official Linux tarball plus
+                   OpenCode's official opencode-ai npm package.
 
-Grok and Ollama/OpenCode remain fail-closed until separately reviewed runtime
-installation mechanisms are committed. Installation does not perform provider
-login/authentication, qualification or routing activation.
+Grok remains fail-closed/deferred. Installation does not perform provider
+login/authentication, download or pull Ollama models, qualify an agent, start
+Ollama as a service, or activate routing.
 USAGE
 }
 
@@ -39,6 +41,10 @@ CLAUDE_APT_SOURCE="deb [signed-by=/etc/apt/keyrings/claude-code.asc] ${CLAUDE_AP
 CODEX_NPM_PACKAGE="@openai/codex"
 CODEX_NPM_PACKAGE_SPEC="@openai/codex@latest"
 CODEX_NPM_REGISTRY="https://registry.npmjs.org/"
+OLLAMA_DOWNLOAD_BASE="https://ollama.com/download"
+OPENCODE_NPM_PACKAGE="opencode-ai"
+OPENCODE_NPM_PACKAGE_SPEC="opencode-ai@latest"
+OPENCODE_NPM_REGISTRY="https://registry.npmjs.org/"
 
 fail() {
   printf '[install-agent-runner-fleet-runtime] ERROR: %s\n' "$1" >&2
@@ -69,9 +75,9 @@ if [[ -n "$NODE_ID" ]]; then
 fi
 
 case "$ADAPTER" in
-  claude-code-cli|codex-cli) ;;
-  grok-cli|ollama-agent)
-    fail "$ADAPTER has no reviewed live fleet installation mechanism; refusing to guess one"
+  claude-code-cli|codex-cli|ollama-agent) ;;
+  grok-cli)
+    fail "$ADAPTER is owner-deferred and has no active fleet installation authority"
     ;;
   *)
     fail "unsupported fleet adapter: $ADAPTER"
@@ -105,6 +111,11 @@ if [[ "$ADAPTER" == "codex-cli" ]] && command -v codex >/dev/null 2>&1; then
   exit 0
 fi
 
+if [[ "$ADAPTER" == "ollama-agent" ]]   && command -v ollama >/dev/null 2>&1   && command -v opencode >/dev/null 2>&1; then
+  info "ollama-agent runtime already installed: ollama=$(ollama -v 2>/dev/null || printf 'version-probe-failed') opencode=$(opencode --version 2>/dev/null || printf 'version-probe-failed')"
+  exit 0
+fi
+
 if [[ "$DRY_RUN" -eq 1 ]]; then
   if [[ "$ADAPTER" == "claude-code-cli" ]]; then
     info '--dry-run: would ensure curl, ca-certificates and gnupg are installed through apt'
@@ -112,11 +123,18 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     info "--dry-run: would require signing-key fingerprint $EXPECTED_CLAUDE_KEY_FINGERPRINT"
     info "--dry-run: would configure stable repository $CLAUDE_APT_REPOSITORY"
     info '--dry-run: would install package claude-code through apt'
-  else
+  elif [[ "$ADAPTER" == "codex-cli" ]]; then
     info '--dry-run: would require the existing reviewed Node/npm toolchain'
     info "--dry-run: would install $CODEX_NPM_PACKAGE_SPEC globally from $CODEX_NPM_REGISTRY"
     info '--dry-run: would verify codex --version'
     info '--dry-run: would not run codex login or inspect/copy ~/.codex authentication state'
+  else
+    info '--dry-run: would detect amd64/arm64 and install the official Ollama Linux tarball only if the ollama runtime is absent'
+    info "--dry-run: Ollama download base is $OLLAMA_DOWNLOAD_BASE"
+    info '--dry-run: would not create/start/enable an Ollama service and would not pull or run any model'
+    info '--dry-run: would require the existing reviewed Node/npm toolchain for OpenCode'
+    info "--dry-run: would install $OPENCODE_NPM_PACKAGE_SPEC globally from $OPENCODE_NPM_REGISTRY only if the harness is absent"
+    info '--dry-run: would verify ollama -v and opencode --version'
   fi
   exit 0
 fi
@@ -142,6 +160,59 @@ if [[ "$ADAPTER" == "codex-cli" ]]; then
 
   info "codex-cli runtime installed from $CODEX_NPM_PACKAGE: $VERSION"
   info 'authentication remains machine-local and unproven; no route was qualified or enabled'
+  exit 0
+fi
+
+if [[ "$ADAPTER" == "ollama-agent" ]]; then
+  if ! command -v ollama >/dev/null 2>&1; then
+    command -v apt-get >/dev/null 2>&1 || fail 'apt-get is required to install reviewed Ollama download prerequisites'
+    command -v curl >/dev/null 2>&1 || {
+      sudo apt-get update
+      sudo apt-get install -y curl ca-certificates zstd
+    }
+    command -v zstd >/dev/null 2>&1 || {
+      sudo apt-get update
+      sudo apt-get install -y zstd
+    }
+
+    case "$(uname -m)" in
+      x86_64|amd64) OLLAMA_ARCH="amd64" ;;
+      aarch64|arm64) OLLAMA_ARCH="arm64" ;;
+      *) fail "unsupported Ollama Linux architecture: $(uname -m)" ;;
+    esac
+
+    TMP_DIR="$(mktemp -d)"
+    cleanup_ollama() {
+      rm -rf "$TMP_DIR"
+    }
+    trap cleanup_ollama EXIT
+
+    OLLAMA_ARCHIVE="$TMP_DIR/ollama-linux-$OLLAMA_ARCH.tar.zst"
+    OLLAMA_URL="$OLLAMA_DOWNLOAD_BASE/ollama-linux-$OLLAMA_ARCH.tar.zst"
+    curl -fsSL "$OLLAMA_URL" -o "$OLLAMA_ARCHIVE"
+    sudo tar --zstd -xf "$OLLAMA_ARCHIVE" -C /usr
+
+    command -v ollama >/dev/null 2>&1 || fail 'Ollama archive installed but executable is not on PATH'
+  fi
+
+  if ! command -v opencode >/dev/null 2>&1; then
+    command -v npm >/dev/null 2>&1 || fail 'npm is required for the reviewed OpenCode installation mechanism'
+    NPM_BIN="$(command -v npm)"
+    sudo "$NPM_BIN" install --global \
+      --registry="$OPENCODE_NPM_REGISTRY" \
+      --no-audit \
+      --no-fund \
+      "$OPENCODE_NPM_PACKAGE_SPEC"
+    command -v opencode >/dev/null 2>&1 || fail 'OpenCode package installed but executable is not on PATH'
+  fi
+
+  OLLAMA_VERSION="$(ollama -v 2>/dev/null || true)"
+  OPENCODE_VERSION="$(opencode --version 2>/dev/null || true)"
+  [[ -n "$OLLAMA_VERSION" ]] || fail 'ollama -v did not return a bounded version string'
+  [[ -n "$OPENCODE_VERSION" ]] || fail 'opencode --version did not return a bounded version string'
+
+  info "ollama-agent runtime installed: ollama=$OLLAMA_VERSION opencode=$OPENCODE_VERSION"
+  info 'no Ollama service was started/enabled, no model was pulled/run, and no route was qualified or enabled'
   exit 0
 fi
 

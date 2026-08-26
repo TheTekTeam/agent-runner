@@ -57,6 +57,33 @@ const CODEX_CLI_NPM_INSTALLATION = Object.freeze({
   automaticRoutingActivation: false,
 });
 
+const OLLAMA_OPENCODE_INSTALLATION = Object.freeze({
+  kind: 'composite-runtime-harness',
+  operatingSystems: Object.freeze(['ubuntu', 'debian']),
+  installer: 'scripts/install-agent-runner-fleet-runtime.sh',
+  components: Object.freeze([
+    Object.freeze({
+      componentId: 'ollama-runtime',
+      kind: 'official-linux-tarball',
+      downloadBaseUrl: 'https://ollama.com/download',
+      architectures: Object.freeze(['amd64', 'arm64']),
+      executable: 'ollama',
+    }),
+    Object.freeze({
+      componentId: 'opencode-harness',
+      kind: 'npm-global-package',
+      packageName: 'opencode-ai',
+      packageSpec: 'opencode-ai@latest',
+      registryUrl: 'https://registry.npmjs.org/',
+      executable: 'opencode',
+    }),
+  ]),
+  automaticProviderAuth: false,
+  automaticModelDownload: false,
+  automaticQualification: false,
+  automaticRoutingActivation: false,
+});
+
 const FLEET_RUNTIME_FOUNDATIONS = Object.freeze({
   'claude-code-cli': Object.freeze({
     executable: 'claude',
@@ -67,6 +94,24 @@ const FLEET_RUNTIME_FOUNDATIONS = Object.freeze({
     executable: 'codex',
     versionProbe: Object.freeze({ command: 'codex', args: Object.freeze(['--version']) }),
     installationMechanism: CODEX_CLI_NPM_INSTALLATION,
+  }),
+  'ollama-agent': Object.freeze({
+    executable: 'opencode',
+    versionProbe: Object.freeze({ command: 'opencode', args: Object.freeze(['--version']) }),
+    componentProbes: Object.freeze([
+      Object.freeze({
+        componentId: 'ollama-runtime',
+        command: 'ollama',
+        args: Object.freeze(['-v']),
+      }),
+      Object.freeze({
+        componentId: 'opencode-harness',
+        command: 'opencode',
+        args: Object.freeze(['--version']),
+      }),
+    ]),
+    installationMechanism: OLLAMA_OPENCODE_INSTALLATION,
+    authenticationRequired: false,
   }),
 });
 
@@ -119,7 +164,9 @@ function unsupportedRuntimeContract(adapterId, reason) {
     sourceSupported: false,
     executable: null,
     versionProbe: null,
+    componentProbes: null,
     installationMechanism: null,
+    authenticationRequired: true,
     liveDispatchImplemented: false,
     qualificationEligible: false,
     reason,
@@ -149,7 +196,9 @@ export function fleetAdapterRuntimeContract(adapterId) {
     sourceSupported: true,
     executable: foundation.executable,
     versionProbe: foundation.versionProbe,
+    componentProbes: foundation.componentProbes || null,
     installationMechanism: foundation.installationMechanism,
+    authenticationRequired: foundation.authenticationRequired !== false,
     liveDispatchImplemented,
     qualificationEligible: liveDispatchImplemented,
     reason: null,
@@ -163,7 +212,10 @@ export function evaluateFleetAdapterEvidence({ nodeId, adapterId, evidence = {} 
 
   const enabled = evidence.enabled !== false;
   const runtimeInstalled = evidence.runtimeInstalled === true;
-  const authAvailable = booleanOrNull(evidence.authAvailable, 'authAvailable');
+  const suppliedAuthAvailable = booleanOrNull(evidence.authAvailable, 'authAvailable');
+  const authAvailable = contract.authenticationRequired === false
+    ? (runtimeInstalled ? true : null)
+    : suppliedAuthAvailable;
   const qualified = evidence.qualified === true;
   const version = normalizeVersion(evidence.version);
   const qualificationRevision = optionalToken(evidence.qualificationRevision, 'qualificationRevision');

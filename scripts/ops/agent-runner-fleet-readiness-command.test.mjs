@@ -6,21 +6,26 @@ import {
   probeFleetRuntime,
 } from './agent-runner-fleet-readiness-command.mjs';
 
-test('runtime probes execute only reviewed Claude/Codex version commands and infer no authentication', () => {
+test('runtime probes execute only reviewed Claude/Codex/Ollama/OpenCode version commands', () => {
   const calls = [];
   const runner = (command, args, options) => {
     calls.push({ command, args, options });
     if (command === 'claude') return { status: 0, stdout: '2.1.233 (Claude Code)\n', stderr: '' };
     if (command === 'codex') return { status: 0, stdout: 'codex-cli 0.128.0\n', stderr: '' };
+    if (command === 'ollama') return { status: 0, stdout: 'ollama version is 0.32.1\n', stderr: '' };
+    if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
     throw new Error(`unexpected command: ${command}`);
   };
 
   const claude = probeFleetRuntime('claude-code-cli', { runner });
   const codex = probeFleetRuntime('codex-cli', { runner });
+  const ollama = probeFleetRuntime('ollama-agent', { runner });
 
   assert.deepEqual(calls.map(({ command, args }) => ({ command, args })), [
     { command: 'claude', args: ['--version'] },
     { command: 'codex', args: ['--version'] },
+    { command: 'ollama', args: ['-v'] },
+    { command: 'opencode', args: ['--version'] },
   ]);
   assert.deepEqual(claude, {
     adapterId: 'claude-code-cli',
@@ -40,21 +45,74 @@ test('runtime probes execute only reviewed Claude/Codex version commands and inf
     qualified: false,
     probeState: 'runtime-installed-auth-unchecked',
   });
-  assert.deepEqual(Object.keys(calls[0].options.env), ['PATH']);
-  assert.deepEqual(Object.keys(calls[1].options.env), ['PATH']);
+  assert.deepEqual(ollama, {
+    adapterId: 'ollama-agent',
+    sourceSupported: true,
+    runtimeInstalled: true,
+    version: '1.18.4',
+    authAvailable: true,
+    qualified: false,
+    probeState: 'runtime-installed-auth-unchecked',
+    components: [
+      {
+        componentId: 'ollama-runtime',
+        runtimeInstalled: true,
+        version: '0.32.1',
+        probeState: 'runtime-installed',
+      },
+      {
+        componentId: 'opencode-harness',
+        runtimeInstalled: true,
+        version: '1.18.4',
+        probeState: 'runtime-installed',
+      },
+    ],
+    modelInventoryState: 'not-probed',
+  });
+  for (const call of calls) assert.deepEqual(Object.keys(call.options.env), ['PATH']);
 });
 
-test('Grok/Ollama foundations do not execute guessed install/version commands', () => {
+test('Grok foundation remains fail-closed and executes no guessed version command', () => {
   let calls = 0;
   const runner = () => { calls += 1; return { status: 0, stdout: 'unexpected' }; };
-  for (const adapterId of ['grok-cli', 'ollama-agent']) {
-    const probe = probeFleetRuntime(adapterId, { runner });
-    assert.equal(probe.sourceSupported, false);
-    assert.equal(probe.runtimeInstalled, false);
-    assert.equal(probe.authAvailable, null);
-    assert.equal(probe.qualified, false);
-  }
+  const probe = probeFleetRuntime('grok-cli', { runner });
+  assert.equal(probe.sourceSupported, false);
+  assert.equal(probe.runtimeInstalled, false);
+  assert.equal(probe.authAvailable, null);
+  assert.equal(probe.qualified, false);
   assert.equal(calls, 0);
+});
+
+test('Ollama readiness distinguishes missing runtime from missing OpenCode harness without probing models', () => {
+  const missingRuntime = probeFleetRuntime('ollama-agent', {
+    runner(command) {
+      if (command === 'ollama') {
+        const error = new Error('spawn ENOENT');
+        error.code = 'ENOENT';
+        return { status: null, stdout: '', stderr: '', error };
+      }
+      if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
+      throw new Error(`unexpected command: ${command}`);
+    },
+  });
+  assert.equal(missingRuntime.runtimeInstalled, false);
+  assert.equal(missingRuntime.probeState, 'ollama-runtime-not-installed');
+  assert.equal(missingRuntime.modelInventoryState, 'not-probed');
+
+  const missingHarness = probeFleetRuntime('ollama-agent', {
+    runner(command) {
+      if (command === 'ollama') return { status: 0, stdout: 'ollama version is 0.32.1\n', stderr: '' };
+      if (command === 'opencode') {
+        const error = new Error('spawn ENOENT');
+        error.code = 'ENOENT';
+        return { status: null, stdout: '', stderr: '', error };
+      }
+      throw new Error(`unexpected command: ${command}`);
+    },
+  });
+  assert.equal(missingHarness.runtimeInstalled, false);
+  assert.equal(missingHarness.probeState, 'opencode-harness-not-installed');
+  assert.equal(missingHarness.modelInventoryState, 'not-probed');
 });
 
 test('worker-only readiness projection grants no scheduler/controller authority and no false qualification', () => {
@@ -64,9 +122,14 @@ test('worker-only readiness projection grants no scheduler/controller authority 
     platform: 'linux',
     arch: 'x64',
     runner(command, args) {
+      if (command === 'ollama') {
+        assert.deepEqual(args, ['-v']);
+        return { status: 0, stdout: 'ollama version is 0.32.1\n', stderr: '' };
+      }
       assert.deepEqual(args, ['--version']);
       if (command === 'claude') return { status: 0, stdout: '2.1.233\n', stderr: '' };
       if (command === 'codex') return { status: 0, stdout: 'codex-cli 0.128.0\n', stderr: '' };
+      if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
       throw new Error(`unexpected command: ${command}`);
     },
   });
@@ -87,6 +150,12 @@ test('worker-only readiness projection grants no scheduler/controller authority 
   assert.equal(codex.reason, 'machine-local-auth-unknown');
   assert.equal(codex.authAvailable, null);
   assert.equal(codex.qualified, false);
+
+  const ollama = result.provisioningProjection.adapters.find((entry) => entry.adapterId === 'ollama-agent');
+  assert.equal(ollama.state, 'authenticated');
+  assert.equal(ollama.reason, 'adapter-qualification-not-live');
+  assert.equal(ollama.authAvailable, true);
+  assert.equal(ollama.qualified, false);
 
   assert.equal(result.agentInstances.every((instance) => instance.lifecycle === 'disabled'), true);
 });
@@ -114,6 +183,8 @@ test('bounded readiness output contains no environment, credential, session or f
     runner(command) {
       if (command === 'claude') return { status: 0, stdout: '2.1.233\n', stderr: '' };
       if (command === 'codex') return { status: 0, stdout: 'codex-cli 0.128.0\n', stderr: '' };
+      if (command === 'ollama') return { status: 0, stdout: 'ollama version is 0.32.1\n', stderr: '' };
+      if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
       return { status: 1, stdout: '', stderr: '' };
     },
   });

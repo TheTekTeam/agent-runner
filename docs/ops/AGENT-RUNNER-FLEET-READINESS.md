@@ -18,9 +18,10 @@ The output distinguishes:
 
 - source-supported adapter runtime present/missing;
 - installed version where the reviewed version probe returns one;
-- authentication as `unknown` unless separately proven by the adapter's accepted machine-local authentication workflow;
+- authentication as `unknown` for credential-backed adapters unless separately proven; local Ollama has no provider-auth requirement but still remains unqualified/non-routable until #152;
 - qualification as false unless separately supplied by the owning canary/qualification process and permitted by the live adapter gate;
-- unsupported/foundation-only adapters without guessing their executable or installation mechanism.
+- unsupported/foundation-only adapters without guessing their executable or installation mechanism;
+- for Ollama/OpenCode, separate Ollama-runtime and OpenCode-harness presence while leaving model inventory explicitly unprobed.
 
 The projection can be converted to #327 `agent@node` records, but the readiness command itself performs no worker-registry mutation and grants no route authority.
 
@@ -77,13 +78,43 @@ This step installs/version-probes the runtime only. It does not run `codex login
 
 The canonical `codex-cli` Agent Runner execution adapter remains default-disabled/non-routable until the owning #186 canary proves the intended ChatGPT-account authentication path, current quota/headroom admission and bounded task/profile qualification. Fleet evidence cannot bypass that gate: even fabricated `authAvailable:true` / `qualified:true` evidence remains non-routable while the live adapter is not qualification-eligible.
 
+### Ollama / OpenCode
+
+The fleet contract now consumes the accepted #40 `ollama-agent` foundation without enabling live routing.
+
+Readiness is deliberately component-aware:
+
+- Ollama runtime probe: `ollama -v`;
+- OpenCode harness probe: `opencode --version`;
+- both must be present before the fleet runtime is considered installed;
+- model inventory is reported as `not-probed` by the fleet readiness command;
+- no readiness probe calls `/api/tags`, a generation endpoint, or any model-management command;
+- runtime presence cannot make `ollama-agent` qualification-eligible while the canonical live adapter remains disabled pending #152.
+
+For compatible Ubuntu/Debian nodes, the reviewed installer uses the current official upstream mechanisms:
+
+- Ollama: official Linux `amd64` / `arm64` tarball from `https://ollama.com/download`, extracted to `/usr` without creating, starting or enabling a service;
+- OpenCode: official npm package `opencode-ai@latest` from `https://registry.npmjs.org/`.
+
+Example dry run:
+
+```text
+bash scripts/install-agent-runner-fleet-runtime.sh \
+  --adapter ollama-agent \
+  --node dev-cluster-z790 \
+  --worker-only \
+  --dry-run
+```
+
+The installer never runs `ollama pull`, `ollama run`, OpenCode task execution, provider authentication, model discovery/download, route activation, or qualification. Model inventory remains node-specific and is separately owned by #152.
+
 ### Foundation-only adapters
 
-Grok and Ollama/OpenCode remain explicit `adapter-foundation-not-live` in the current fleet installation contract. The installer refuses them rather than guessing a package/executable/source from issue prose or from what may happen to be installed manually on a machine. This is deliberate fail-closed behaviour, not evidence that those runtimes are absent from a node.
+Grok remains explicit `adapter-foundation-not-live` / owner-deferred in the current fleet installation contract. The installer refuses Grok rather than guessing a package/executable/source. Grok remains a supported future fleet adapter but is not required for the urgent Ollama addition.
 
 ## Authentication and qualification
 
-Authentication is established independently per machine through the provider/runtime's accepted local flow. Never copy Claude/Codex/Grok session or credential material between Dell and Z790. Ollama model inventory is node-local and no readiness/provisioning command may auto-download a model.
+Authentication is established independently per machine through the provider/runtime's accepted local flow. Never copy Claude/Codex/Grok session or credential material between Dell and Z790. Ollama is a local zero-provider-cost runtime and requires no provider credential for the fleet presence check; its model inventory remains node-local and no readiness/provisioning command may auto-download a model.
 
 Only the owning canary/qualification issue may advance an instance from runtime-present/authenticated to qualified, and only after the canonical adapter itself permits qualification. #327 routing consumes only positively qualified `agent@node` instances.
 

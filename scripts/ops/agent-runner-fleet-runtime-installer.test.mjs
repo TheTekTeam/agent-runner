@@ -33,14 +33,17 @@ function run(args) {
   });
 }
 
-test('fleet runtime installer documents bounded Claude and Codex contracts', () => {
+test('fleet runtime installer documents bounded Claude, Codex and Ollama/OpenCode contracts', () => {
   const result = run(['--help']);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /claude-code-cli/);
   assert.match(result.stdout, /codex-cli/);
+  assert.match(result.stdout, /ollama-agent/);
   assert.match(result.stdout, /Ubuntu\/Debian/);
   assert.match(result.stdout, /signed stable apt repository/);
   assert.match(result.stdout, /@openai\/codex npm package/);
+  assert.match(result.stdout, /official Linux tarball/);
+  assert.match(result.stdout, /opencode-ai npm package/);
   assert.match(result.stdout, /does not perform provider\s+login\/authentication/i);
 });
 
@@ -65,12 +68,22 @@ test('Codex fleet runtime installer dry-run uses only the reviewed official npm 
   assert.match(result.stdout, /would not .*inspect\/copy ~\/\.codex authentication state/);
 });
 
-test('fleet runtime installer refuses Grok/Ollama foundations instead of guessing install commands', () => {
-  for (const adapterId of ['grok-cli', 'ollama-agent']) {
-    const result = run(['--adapter', adapterId, '--dry-run']);
-    assert.notEqual(result.status, 0, adapterId);
-    assert.match(result.stderr, /no reviewed live fleet installation mechanism/);
-  }
+test('Ollama fleet runtime installer dry-run binds official runtime and OpenCode sources without models or services', () => {
+  const result = run(['--adapter', 'ollama-agent', '--worker-only', '--dry-run']);
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /worker-only mode/);
+  assert.match(result.stdout, /official Ollama Linux tarball/);
+  assert.match(result.stdout, /https:\/\/ollama\.com\/download/);
+  assert.match(result.stdout, /would not create\/start\/enable an Ollama service/);
+  assert.match(result.stdout, /would not pull or run any model/);
+  assert.match(result.stdout, /opencode-ai@latest globally from https:\/\/registry\.npmjs\.org\//);
+  assert.match(result.stdout, /verify ollama -v and opencode --version/);
+});
+
+test('fleet runtime installer keeps Grok owner-deferred instead of guessing install commands', () => {
+  const result = run(['--adapter', 'grok-cli', '--dry-run']);
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /owner-deferred/);
 });
 
 test('fleet runtime installer source pins reviewed package inputs and excludes forbidden authority/auth paths', async () => {
@@ -90,6 +103,13 @@ test('fleet runtime installer source pins reviewed package inputs and excludes f
   assert.match(source, /--no-fund/);
   assert.match(source, /codex --version/);
 
+  assert.match(source, /OLLAMA_DOWNLOAD_BASE="https:\/\/ollama\.com\/download"/);
+  assert.match(source, /ollama-linux-\$OLLAMA_ARCH\.tar\.zst/);
+  assert.match(source, /sudo tar --zstd -xf/);
+  assert.match(source, /OPENCODE_NPM_PACKAGE="opencode-ai"/);
+  assert.match(source, /OPENCODE_NPM_PACKAGE_SPEC="opencode-ai@latest"/);
+  assert.match(source, /opencode --version/);
+
   assert.doesNotMatch(source, /curl[^\n]*\|[^\n]*(bash|sh)/);
   assert.doesNotMatch(source, /ANTHROPIC_API_KEY/);
   assert.doesNotMatch(source, /CLAUDE_CODE_OAUTH_TOKEN/);
@@ -98,6 +118,8 @@ test('fleet runtime installer source pins reviewed package inputs and excludes f
   assert.doesNotMatch(source, /codex[[:space:]]+login/);
   assert.doesNotMatch(source, /systemctl[^\n]*(enable|start|restart)/);
   assert.doesNotMatch(source, /actions\.runner/);
-  assert.doesNotMatch(source, /ollama[^\n]*(pull|run)/);
+  // Reject executable model-management commands, not safety/help text such
+  // as "would not pull or run any model".
+  assert.doesNotMatch(source, /^[ \t]*(?:sudo[ \t]+)?ollama[ \t]+(?:pull|run)\b/m);
   assert.doesNotMatch(source, /git[^\n]*(reset|clean|rebase|stash)/);
 });
