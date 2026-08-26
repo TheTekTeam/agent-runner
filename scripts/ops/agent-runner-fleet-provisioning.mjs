@@ -103,6 +103,12 @@ const FLEET_RUNTIME_FOUNDATIONS = Object.freeze({
         componentId: 'ollama-runtime',
         command: 'ollama',
         args: Object.freeze(['-v']),
+        // Ollama's version command may consult the configured daemon before
+        // printing the local/client version. Runtime presence is proven by a
+        // bounded version token from this reviewed command even if daemon
+        // connectivity causes a non-zero exit. This does not prove service,
+        // model or routing readiness.
+        acceptVersionOnNonZero: true,
       }),
       Object.freeze({
         componentId: 'opencode-harness',
