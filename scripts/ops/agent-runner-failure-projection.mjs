@@ -1,33 +1,8 @@
 #!/usr/bin/env node
 
 /**
- * #230: the one canonical, positive-allowlisted, bounded failure/status
- * projection deterministically derived from existing runner state.
- *
- * This is the first bounded slice of #209: it owns only the typed schema,
- * the strict validating builder (`buildFailureProjection`) and the lenient
- * source-state extractor (`deriveFailureProjection`). Neither function ever
- * calls GitHub, mutates state or launches a process -- this module is pure.
- *
- * Two properties matter most and are enforced here rather than at call
- * sites:
- *
- *  1. **Positive allowlist.** Every field is named, typed and bounded.
- *     `buildFailureProjection` throws on any unrecognized top-level field
- *     rather than passing it through, and `deriveFailureProjection` never
- *     spreads a raw source object -- it only reads the exact named
- *     properties this module knows about, so a new/unrecognized
- *     source-state field (prompts, provider stdout/stderr, raw logs,
- *     credentials, manager packet bodies, restricted handles, local paths,
- *     process command lines, diffs, file contents) is excluded by default,
- *     never serialized.
- *
- *  2. **Exact known reasons.** The reason vocabulary is imported directly
- *     from the existing typed terminal-outcome (`claude-runner-recovery.mjs`)
- *     and tool-capability (`agent-runner-candidate-admission.mjs`) sources
- *     rather than re-invented, so a known cost/tool-capability/budget/
- *     no-change/workspace reason is never collapsed into a generic
- *     `unknown_failure` here.
+ * #230: canonical positive-allowlisted, bounded failure/status projection.
+ * Pure projection only: no GitHub mutation, state mutation or process launch.
  */
 
 import {
@@ -48,8 +23,8 @@ import {
 } from './agent-runner-manager-planner-safety.mjs';
 
 export const FAILURE_PROJECTION_SCHEMA_VERSION = 'agent-runner-failure-projection/v1';
+export const FAILURE_PROJECTION_INCIDENT_IDENTITY_VERSION = 'agent-runner-failure-incident/v1';
 
-/** The furthest execution phase this attempt/candidate is known to have reached. */
 export const FAILURE_PROJECTION_EXECUTION_PHASES = Object.freeze([
   'candidate_admission',
   'capability_admission',
@@ -62,12 +37,8 @@ export const FAILURE_PROJECTION_EXECUTION_PHASES = Object.freeze([
   'systemic',
 ]);
 
-// Ordering used for internal boolean/phase consistency checks. `systemic` is
-// deliberately excluded -- it is an escape hatch for a state that could not
-// be classified into the ordered lifecycle at all.
 const ORDERED_PHASES = FAILURE_PROJECTION_EXECUTION_PHASES.filter((phase) => phase !== 'systemic');
 
-/** Where, structurally, a failure/status originates. */
 export const FAILURE_PROJECTION_SCOPES = Object.freeze([
   'none',
   'machine_profile',
@@ -76,7 +47,6 @@ export const FAILURE_PROJECTION_SCOPES = Object.freeze([
   'systemic',
 ]);
 
-/** The bounded reason-vocabulary domain the `reason` field belongs to. */
 export const FAILURE_PROJECTION_REASON_DOMAINS = Object.freeze([
   'none',
   'candidate_admission',
@@ -86,14 +56,6 @@ export const FAILURE_PROJECTION_REASON_DOMAINS = Object.freeze([
   'unclassified',
 ]);
 
-/**
- * Pre-attempt candidate-admission identity/label/preflight refusal reasons
- * (`agent-runner-candidate-admission.mjs` `evaluateCandidateAdmission()` /
- * `approverPolicy()` / revalidation failures). Deliberately excludes the
- * `candidate-admitted` success reason -- this projection's `reason` field is
- * scoped to failure/status evidence, not positive admission outcomes, which
- * are already represented by the `candidateAdmissionCompleted` boolean.
- */
 export const CANDIDATE_ADMISSION_REASONS = Object.freeze([
   'candidate-no-longer-runnable',
   'candidate-selection-changed',
@@ -116,17 +78,8 @@ export const CANDIDATE_ADMISSION_REASONS = Object.freeze([
   'candidate-revalidation-timeout',
 ]);
 
-/** Pre-provider #228 tool-capability admission refusal reasons. */
 export const CAPABILITY_ADMISSION_REASONS = Object.freeze([IMPLEMENTATION_TOOL_CAPABILITY_MISMATCH]);
-
-/** Pre-attempt machine-profile/cost admission refusal reasons. */
 export const COST_ADMISSION_REASONS = Object.freeze(['candidate-machine-profile-cost-denied']);
-
-/**
- * Post-launch typed terminal outcomes (`claude-runner-recovery.mjs`),
- * excluding `completed` -- a completed attempt is represented by
- * `failureScope: 'none'`, not a `task_attempt` failure reason.
- */
 export const TERMINAL_OUTCOME_REASONS = Object.freeze(TERMINAL_OUTCOMES.filter((outcome) => outcome !== 'completed'));
 
 const REASON_DOMAIN_VOCABULARY = Object.freeze({
@@ -136,17 +89,10 @@ const REASON_DOMAIN_VOCABULARY = Object.freeze({
   terminal_outcome: TERMINAL_OUTCOME_REASONS,
 });
 
-/** The recovery decision `status` vocabulary from `decideRecovery()`. */
 export const RECOVERY_STATUSES = Object.freeze(['not_needed', 'forbidden', 'eligible', 'exhausted', 'waiting']);
-
-/** The recovery `action` vocabulary: `decideRecovery()`'s non-retry actions plus every bounded retry action. */
 export const RECOVERY_DISPOSITION_ACTIONS = Object.freeze(['none', 'attention_required', ...RECOVERY_ACTIONS]);
-
 export const CIRCUIT_STATES = Object.freeze(['tripped', 'clear', 'unknown']);
-
 export const PROVIDER_INVOCATION_STATES = Object.freeze(['yes', 'no', 'unknown']);
-
-/** Small allowlisted diagnostic-domain enum for when safe evidence cannot determine a next action. */
 export const DIAGNOSTIC_DOMAINS = Object.freeze([
   'candidate_admission',
   'capability_admission',
@@ -160,24 +106,20 @@ export const DIAGNOSTIC_DOMAINS = Object.freeze([
 
 const REPOSITORY_PATTERN = /^[A-Za-z0-9._-]{1,100}\/[A-Za-z0-9._-]{1,100}$/;
 const TOKEN_PATTERN = /^[a-z0-9][a-z0-9._:-]{0,63}$/;
+const POLICY_REVISION_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,198}$/;
 const ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:#-]{0,127}$/;
+const FINGERPRINT_PATTERN = /^sha256:[0-9a-f]{64}$/;
 
 const TOP_LEVEL_FIELDS = new Set([
-  'policyRevision', 'repository', 'project', 'issueNumber', 'attemptId', 'agent', 'profile', 'model',
-  'executionPhase', 'candidateAdmissionCompleted', 'attemptCreated', 'managerPacketConsumed', 'issueMutation',
-  'workspaceCreated', 'childLaunched', 'providerInvocationObserved', 'failureScope', 'reasonDomain', 'reason',
-  'missingCapabilities', 'terminalOutcome', 'checkpointPresent', 'worktreePresent', 'branchPresent',
-  'commitPresent', 'prPresent', 'dirty', 'hasChanges', 'recoveryStatus', 'recoveryAction', 'recoveryEligible',
-  'circuitState', 'circuitDomain', 'safeNextAction', 'deeperDiagnosticsRequired', 'diagnosticDomain',
+  'policyRevision', 'managerAuthorityFingerprint', 'repository', 'project', 'issueNumber', 'attemptId',
+  'agent', 'profile', 'model', 'executionPhase', 'candidateAdmissionCompleted', 'attemptCreated',
+  'managerPacketConsumed', 'issueMutation', 'workspaceCreated', 'childLaunched', 'providerInvocationObserved',
+  'failureScope', 'reasonDomain', 'reason', 'missingCapabilities', 'terminalOutcome', 'checkpointPresent',
+  'worktreePresent', 'branchPresent', 'commitPresent', 'prPresent', 'dirty', 'hasChanges', 'recoveryStatus',
+  'recoveryAction', 'recoveryEligible', 'circuitState', 'circuitDomain', 'safeNextAction',
+  'deeperDiagnosticsRequired', 'diagnosticDomain',
 ]);
 
-/**
- * Field names refused at any depth of a raw source-state object handed to
- * `deriveFailureProjection`. Defense in depth alongside the fact that the
- * derivation function only ever reads specific named properties: an
- * adversarial source object can carry any of these under any key path and
- * they must never reach the projection.
- */
 const FORBIDDEN_SOURCE_FIELD_PATTERN = /^(?:prompt|prompts|provider[-_]?output|provider[-_]?response|raw[-_]?output|transcript|stdout|stderr|logs?|stack|stacktrace|env|environment|token|claim[-_]?token|credential|secret|cookie|api[-_]?key|command|command[-_]?line|argv|worktree[-_]?path|local[-_]?path|path|cwd|packet[-_]?body|comment[-_]?body|restricted[-_]?handle|session[-_]?id|diff|file[-_]?contents?)$/i;
 
 function assertNoForbiddenFieldNamesRecursive(value, path, errors, depth = 0) {
@@ -193,14 +135,6 @@ function assertNoForbiddenFieldNamesRecursive(value, path, errors, depth = 0) {
     }
     assertNoForbiddenFieldNamesRecursive(nested, `${path}.${key}`, errors, depth + 1);
   }
-}
-
-function requiredBoolean(value, label, errors) {
-  if (typeof value !== 'boolean') {
-    errors.push(`${label} must be a boolean`);
-    return false;
-  }
-  return value;
 }
 
 function nullableBoolean(value, label, errors) {
@@ -238,12 +172,28 @@ function phaseIndex(phase) {
   return ORDERED_PHASES.indexOf(phase);
 }
 
-/**
- * Fail-closed lifecycle consistency: side-effect booleans must not claim
- * something happened before the phase that would allow it, and must not
- * claim a later phase happened while denying its own prerequisite.
- */
-function assertLifecycleConsistency({ executionPhase, candidateAdmissionCompleted, attemptCreated, workspaceCreated, childLaunched, providerInvocationObserved, failureScope, deeperDiagnosticsRequired, diagnosticDomain }, errors) {
+function beforePhase(executionPhase, threshold) {
+  if (executionPhase === 'systemic') return false;
+  return phaseIndex(executionPhase) < phaseIndex(threshold);
+}
+
+function phaseAwareAbsentBoolean(value, executionPhase, threshold = null) {
+  if (value === true || value === false) return value;
+  if (threshold && beforePhase(executionPhase, threshold)) return false;
+  return null;
+}
+
+function assertLifecycleConsistency({
+  executionPhase,
+  candidateAdmissionCompleted,
+  attemptCreated,
+  workspaceCreated,
+  childLaunched,
+  providerInvocationObserved,
+  failureScope,
+  deeperDiagnosticsRequired,
+  diagnosticDomain,
+}, errors) {
   if (executionPhase === 'systemic') {
     if (failureScope !== 'systemic') errors.push('failureScope must be systemic when executionPhase is systemic');
     if (deeperDiagnosticsRequired !== true) errors.push('deeperDiagnosticsRequired must be true when executionPhase is systemic');
@@ -254,19 +204,42 @@ function assertLifecycleConsistency({ executionPhase, candidateAdmissionComplete
   const index = phaseIndex(executionPhase);
   const atLeast = (phase) => index >= phaseIndex(phase);
 
-  if (!candidateAdmissionCompleted && atLeast('attempt_creation')) {
-    errors.push('attemptCreated-bearing executionPhase requires candidateAdmissionCompleted to be true');
+  if (candidateAdmissionCompleted === false && atLeast('attempt_creation')) {
+    errors.push('executionPhase at/after attempt_creation cannot assert candidateAdmissionCompleted false');
   }
-  if (attemptCreated && !atLeast('attempt_creation')) errors.push('attemptCreated cannot be true before executionPhase reaches attempt_creation');
-  if (!attemptCreated && atLeast('attempt_creation') && index > phaseIndex('attempt_creation')) {
-    errors.push('executionPhase beyond attempt_creation requires attemptCreated to be true');
+  if (attemptCreated === true && !atLeast('attempt_creation')) {
+    errors.push('attemptCreated cannot be true before executionPhase reaches attempt_creation');
   }
-  if (workspaceCreated && !atLeast('workspace_preparation')) errors.push('workspaceCreated cannot be true before executionPhase reaches workspace_preparation');
-  if (childLaunched && !atLeast('child_launch')) errors.push('childLaunched cannot be true before executionPhase reaches child_launch');
-  if (!attemptCreated && (workspaceCreated || childLaunched)) errors.push('workspaceCreated/childLaunched cannot be true when attemptCreated is false');
-  if (!workspaceCreated && childLaunched) errors.push('childLaunched cannot be true when workspaceCreated is false');
-  if (!childLaunched && providerInvocationObserved === 'yes') errors.push('providerInvocationObserved cannot be yes when childLaunched is false');
-  if (!childLaunched && providerInvocationObserved !== 'no') errors.push('providerInvocationObserved must be no when childLaunched is false');
+  if (attemptCreated === false && index > phaseIndex('attempt_creation')) {
+    errors.push('executionPhase beyond attempt_creation cannot assert attemptCreated false');
+  }
+  if (workspaceCreated === true && !atLeast('workspace_preparation')) {
+    errors.push('workspaceCreated cannot be true before executionPhase reaches workspace_preparation');
+  }
+  if (workspaceCreated === false && index > phaseIndex('workspace_preparation')) {
+    errors.push('executionPhase beyond workspace_preparation cannot assert workspaceCreated false');
+  }
+  if (childLaunched === true && !atLeast('child_launch')) {
+    errors.push('childLaunched cannot be true before executionPhase reaches child_launch');
+  }
+  if (childLaunched === false && index > phaseIndex('child_launch')) {
+    errors.push('executionPhase beyond child_launch cannot assert childLaunched false');
+  }
+  if (attemptCreated === false && (workspaceCreated === true || childLaunched === true)) {
+    errors.push('workspaceCreated/childLaunched cannot be true when attemptCreated is false');
+  }
+  if (workspaceCreated === false && childLaunched === true) {
+    errors.push('childLaunched cannot be true when workspaceCreated is false');
+  }
+  if (childLaunched === false && providerInvocationObserved === 'yes') {
+    errors.push('providerInvocationObserved cannot be yes when childLaunched is false');
+  }
+  if (childLaunched === false && providerInvocationObserved !== 'no') {
+    errors.push('providerInvocationObserved must be no when childLaunched is false');
+  }
+  if (providerInvocationObserved === 'yes' && !atLeast('provider_invocation')) {
+    errors.push('providerInvocationObserved cannot be yes before executionPhase reaches provider_invocation');
+  }
 }
 
 function assertReasonConsistency({ failureScope, reasonDomain, reason, terminalOutcome, missingCapabilities }, errors) {
@@ -300,6 +273,12 @@ function assertReasonConsistency({ failureScope, reasonDomain, reason, terminalO
   }
 }
 
+function assertAttemptIdentityConsistency({ attemptId, attemptCreated, failureScope }, errors) {
+  if ((attemptCreated === true || failureScope === 'task_attempt') && !attemptId) {
+    errors.push('a real attemptId is required when attemptCreated is true or failureScope is task_attempt');
+  }
+}
+
 function validateMissingCapabilities(input, errors) {
   if (input == null) return freezeArray([]);
   if (!Array.isArray(input)) {
@@ -319,13 +298,57 @@ function validateMissingCapabilities(input, errors) {
   return freezeArray(bounded);
 }
 
-/**
- * Build one validated, deterministic failure/status projection.
- *
- * Throws on anything that is not positively allowlisted or internally
- * inconsistent, so a caller can never accidentally widen what this
- * projection publishes or assert an impossible lifecycle state.
- */
+function buildCandidateFingerprint({ repository, project, issueNumber, agent, policyRevision, managerAuthorityFingerprint }) {
+  return contentFingerprint(Object.freeze({
+    identityVersion: 'agent-runner-failure-candidate/v1',
+    repository,
+    project,
+    issueNumber,
+    agent,
+    policyRevision,
+    managerAuthorityFingerprint,
+  }));
+}
+
+function buildIncidentFingerprint({
+  repository,
+  issueNumber,
+  policyRevision,
+  candidateFingerprint,
+  managerAuthorityFingerprint,
+  attemptId,
+  failureScope,
+  reason,
+  terminalOutcome,
+  attemptCreated,
+}) {
+  const postAttempt = attemptCreated === true || failureScope === 'task_attempt';
+  const material = postAttempt
+    ? Object.freeze({
+        identityVersion: FAILURE_PROJECTION_INCIDENT_IDENTITY_VERSION,
+        phase: 'post-attempt',
+        repository,
+        issueNumber,
+        attemptId,
+        failureScope,
+        reason,
+        terminalOutcome,
+        policyRevision,
+      })
+    : Object.freeze({
+        identityVersion: FAILURE_PROJECTION_INCIDENT_IDENTITY_VERSION,
+        phase: 'pre-attempt',
+        repository,
+        issueNumber,
+        candidateFingerprint,
+        managerAuthorityFingerprint,
+        failureScope,
+        reason,
+        policyRevision,
+      });
+  return contentFingerprint(material);
+}
+
 export function buildFailureProjection(input) {
   if (!isPlainObject(input)) throw new Error('Invalid agent runner failure projection: input must be an object');
   const errors = [];
@@ -333,8 +356,19 @@ export function buildFailureProjection(input) {
   assertNoUnknownFields(input, TOP_LEVEL_FIELDS, 'projection', errors);
   if (errors.length) throw new Error(`Invalid agent runner failure projection: ${errors.join('; ')}`);
 
-  const policyRevision = nullableToken(input.policyRevision, 'policyRevision', errors, { max: 199 });
-  if (!nonEmptyString(input.repository) || !REPOSITORY_PATTERN.test(input.repository)) errors.push('repository must be a bounded "owner/name" identity');
+  const policyRevision = nullableToken(input.policyRevision, 'policyRevision', errors, {
+    pattern: POLICY_REVISION_PATTERN,
+    max: 199,
+  });
+  const managerAuthorityFingerprint = nullableToken(
+    input.managerAuthorityFingerprint,
+    'managerAuthorityFingerprint',
+    errors,
+    { pattern: FINGERPRINT_PATTERN, max: 71 },
+  );
+  if (!nonEmptyString(input.repository) || !REPOSITORY_PATTERN.test(input.repository)) {
+    errors.push('repository must be a bounded "owner/name" identity');
+  }
   const project = nullableToken(input.project, 'project', errors, { max: 128 });
   if (!Number.isInteger(input.issueNumber) || input.issueNumber <= 0) errors.push('issueNumber must be a positive integer');
   const attemptId = nullableToken(input.attemptId, 'attemptId', errors, { pattern: ID_PATTERN, max: 128 });
@@ -343,17 +377,20 @@ export function buildFailureProjection(input) {
   const model = nullableToken(input.model, 'model', errors, { max: 64 });
 
   const executionPhase = requiredEnum(input.executionPhase, 'executionPhase', FAILURE_PROJECTION_EXECUTION_PHASES, errors);
-  const candidateAdmissionCompleted = requiredBoolean(input.candidateAdmissionCompleted, 'candidateAdmissionCompleted', errors);
-  const attemptCreated = requiredBoolean(input.attemptCreated, 'attemptCreated', errors);
-  const managerPacketConsumed = requiredBoolean(input.managerPacketConsumed, 'managerPacketConsumed', errors);
-  const issueMutation = requiredBoolean(input.issueMutation, 'issueMutation', errors);
-  const workspaceCreated = requiredBoolean(input.workspaceCreated, 'workspaceCreated', errors);
-  const childLaunched = requiredBoolean(input.childLaunched, 'childLaunched', errors);
+  const candidateAdmissionCompleted = nullableBoolean(input.candidateAdmissionCompleted, 'candidateAdmissionCompleted', errors);
+  const attemptCreated = nullableBoolean(input.attemptCreated, 'attemptCreated', errors);
+  const managerPacketConsumed = nullableBoolean(input.managerPacketConsumed, 'managerPacketConsumed', errors);
+  const issueMutation = nullableBoolean(input.issueMutation, 'issueMutation', errors);
+  const workspaceCreated = nullableBoolean(input.workspaceCreated, 'workspaceCreated', errors);
+  const childLaunched = nullableBoolean(input.childLaunched, 'childLaunched', errors);
   const providerInvocationObserved = requiredEnum(input.providerInvocationObserved, 'providerInvocationObserved', PROVIDER_INVOCATION_STATES, errors);
 
   const failureScope = requiredEnum(input.failureScope, 'failureScope', FAILURE_PROJECTION_SCOPES, errors);
   const reasonDomain = requiredEnum(input.reasonDomain, 'reasonDomain', FAILURE_PROJECTION_REASON_DOMAINS, errors);
-  const reason = nullableToken(input.reason, 'reason', errors, { pattern: /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/, max: 128 });
+  const reason = nullableToken(input.reason, 'reason', errors, {
+    pattern: /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/,
+    max: 128,
+  });
   const missingCapabilities = validateMissingCapabilities(input.missingCapabilities, errors);
   const terminalOutcome = nullableEnum(input.terminalOutcome, 'terminalOutcome', TERMINAL_OUTCOMES, errors);
 
@@ -375,24 +412,47 @@ export function buildFailureProjection(input) {
   assertBoundedSafeText(input.safeNextAction, 'safeNextAction', errors, { max: 500, allowWriteActionScan: false });
   const safeNextAction = errors.length === safeNextActionErrorsBefore ? input.safeNextAction.trim() : 'invalid';
 
-  const deeperDiagnosticsRequired = requiredBoolean(input.deeperDiagnosticsRequired, 'deeperDiagnosticsRequired', errors);
+  const deeperDiagnosticsRequired = nullableBoolean(input.deeperDiagnosticsRequired, 'deeperDiagnosticsRequired', errors);
   const diagnosticDomain = nullableEnum(input.diagnosticDomain, 'diagnosticDomain', DIAGNOSTIC_DOMAINS, errors);
-  if (deeperDiagnosticsRequired === true && !diagnosticDomain) errors.push('diagnosticDomain is required when deeperDiagnosticsRequired is true');
-  if (deeperDiagnosticsRequired === false && diagnosticDomain) errors.push('diagnosticDomain must be null when deeperDiagnosticsRequired is false');
+  if (deeperDiagnosticsRequired === true && !diagnosticDomain) {
+    errors.push('diagnosticDomain is required when deeperDiagnosticsRequired is true');
+  }
+  if (deeperDiagnosticsRequired !== true && diagnosticDomain) {
+    errors.push('diagnosticDomain requires deeperDiagnosticsRequired to be true');
+  }
 
   if (errors.length === 0) {
     assertLifecycleConsistency({
-      executionPhase, candidateAdmissionCompleted, attemptCreated, workspaceCreated, childLaunched,
-      providerInvocationObserved, failureScope, deeperDiagnosticsRequired, diagnosticDomain,
+      executionPhase,
+      candidateAdmissionCompleted,
+      attemptCreated,
+      workspaceCreated,
+      childLaunched,
+      providerInvocationObserved,
+      failureScope,
+      deeperDiagnosticsRequired,
+      diagnosticDomain,
     }, errors);
     assertReasonConsistency({ failureScope, reasonDomain, reason, terminalOutcome, missingCapabilities }, errors);
+    assertAttemptIdentityConsistency({ attemptId, attemptCreated, failureScope }, errors);
   }
 
   if (errors.length) throw new Error(`Invalid agent runner failure projection: ${errors.join('; ')}`);
 
+  const candidateFingerprint = buildCandidateFingerprint({
+    repository: input.repository,
+    project,
+    issueNumber: input.issueNumber,
+    agent,
+    policyRevision,
+    managerAuthorityFingerprint,
+  });
+
   const projection = Object.freeze({
     schemaVersion: FAILURE_PROJECTION_SCHEMA_VERSION,
     policyRevision,
+    managerAuthorityFingerprint,
+    candidateFingerprint,
     repository: input.repository,
     project,
     issueNumber: input.issueNumber,
@@ -429,22 +489,29 @@ export function buildFailureProjection(input) {
     deeperDiagnosticsRequired,
     diagnosticDomain,
   });
-  return Object.freeze({ ...projection, projectionFingerprint: contentFingerprint(projection) });
+
+  const incidentFingerprint = buildIncidentFingerprint({ ...projection, candidateFingerprint });
+  return Object.freeze({
+    ...projection,
+    incidentFingerprint,
+    projectionFingerprint: contentFingerprint(projection),
+  });
 }
 
-/**
- * Lenient extraction boundary: reads only the exact named safe properties
- * this module knows about from an arbitrary/untrusted-shaped source-state
- * object, ignoring every other property (including adversarial ones such as
- * `prompt`, `stdout`, credentials, local paths or manager packet bodies),
- * then validates the derived canonical object exactly like
- * `buildFailureProjection`. New/unrecognized source-state fields are
- * excluded by default because they are never read in the first place.
- */
 export function deriveFailureProjection(source = {}) {
   if (!isPlainObject(source)) throw new Error('deriveFailureProjection requires a source-state object');
+
+  const executionPhase = source.executionPhase;
+  const attemptCreated = phaseAwareAbsentBoolean(source.attemptCreated, executionPhase, 'attempt_creation');
+  const workspaceCreated = phaseAwareAbsentBoolean(source.workspaceCreated, executionPhase, 'workspace_preparation');
+  const childLaunched = phaseAwareAbsentBoolean(source.childLaunched, executionPhase, 'child_launch');
+  const providerInvocationObserved = source.providerInvocationObserved
+    ?? (executionPhase !== 'systemic' && beforePhase(executionPhase, 'provider_invocation') ? 'no' : null)
+    ?? (childLaunched === false ? 'no' : 'unknown');
+
   return buildFailureProjection({
     policyRevision: source.policyRevision ?? null,
+    managerAuthorityFingerprint: source.managerAuthorityFingerprint ?? source.preflightFingerprint ?? null,
     repository: source.repository,
     project: source.project ?? null,
     issueNumber: source.issueNumber,
@@ -452,14 +519,14 @@ export function deriveFailureProjection(source = {}) {
     agent: source.agent ?? null,
     profile: source.profile ?? null,
     model: source.model ?? null,
-    executionPhase: source.executionPhase,
-    candidateAdmissionCompleted: source.candidateAdmissionCompleted === true,
-    attemptCreated: source.attemptCreated === true,
-    managerPacketConsumed: source.managerPacketConsumed === true,
-    issueMutation: source.issueMutation === true,
-    workspaceCreated: source.workspaceCreated === true,
-    childLaunched: source.childLaunched === true,
-    providerInvocationObserved: source.providerInvocationObserved ?? (source.childLaunched === true ? 'unknown' : 'no'),
+    executionPhase,
+    candidateAdmissionCompleted: source.candidateAdmissionCompleted ?? null,
+    attemptCreated,
+    managerPacketConsumed: source.managerPacketConsumed ?? null,
+    issueMutation: source.issueMutation ?? null,
+    workspaceCreated,
+    childLaunched,
+    providerInvocationObserved,
     failureScope: source.failureScope,
     reasonDomain: source.reasonDomain,
     reason: source.reason ?? null,
@@ -478,7 +545,7 @@ export function deriveFailureProjection(source = {}) {
     circuitState: source.circuitState ?? null,
     circuitDomain: source.circuitDomain ?? null,
     safeNextAction: source.safeNextAction,
-    deeperDiagnosticsRequired: source.deeperDiagnosticsRequired === true,
+    deeperDiagnosticsRequired: source.deeperDiagnosticsRequired ?? null,
     diagnosticDomain: source.diagnosticDomain ?? null,
   });
 }
