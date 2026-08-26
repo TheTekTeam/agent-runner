@@ -35,8 +35,14 @@ const PRE_CLAIM_PROJECTABLE_SCOPES = Object.freeze(['machine_profile', 'issue_no
  * side-effect evidence and the safe next action from the issue itself.
  * Never throws: a broken GitHub write here must never turn a handled
  * candidate-pause exit (0, durably audited above) into a failure.
+ *
+ * Exported so `agent-runner-candidate-pause-publish.mjs` -- the outer
+ * `bin/run-project.sh` wrapper's own pre-claim candidate-admission call,
+ * which never enters this module's atomic revalidation transaction -- can
+ * publish through the exact same rendering and GitHub mutation logic
+ * instead of a second, duplicated implementation (#231).
  */
-function publishCandidatePauseAttention({ repo, project, admission, current, ghRunner }) {
+export function publishCandidatePauseAttention({ repo, project, admission, current, ghRunner }) {
   if (!repo || !PRE_CLAIM_PROJECTABLE_SCOPES.includes(admission?.scope)) return;
   const issueNumber = current?.issueNumber;
   if (!Number.isInteger(issueNumber) || issueNumber <= 0) return;
