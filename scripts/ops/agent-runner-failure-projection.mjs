@@ -6,9 +6,6 @@
  */
 
 import {
-  IMPLEMENTATION_TOOL_CAPABILITY_MISMATCH,
-} from './agent-runner-candidate-admission.mjs';
-import {
   RECOVERY_ACTIONS,
   TERMINAL_OUTCOMES,
 } from './claude-runner-recovery.mjs';
@@ -78,7 +75,12 @@ export const CANDIDATE_ADMISSION_REASONS = Object.freeze([
   'candidate-revalidation-timeout',
 ]);
 
-export const CAPABILITY_ADMISSION_REASONS = Object.freeze([IMPLEMENTATION_TOOL_CAPABILITY_MISMATCH]);
+// Keep the pure #230 schema independent from executable candidate-admission
+// modules. Importing this fixed accepted reason from candidate admission would
+// create an ESM cycle when standalone admission dynamically loads the canonical
+// cron graph (#283/#231 regression). The literal remains the already-accepted
+// #229 reason vocabulary; this changes dependency direction only, not schema.
+export const CAPABILITY_ADMISSION_REASONS = Object.freeze(['implementation-tool-capability-mismatch']);
 export const COST_ADMISSION_REASONS = Object.freeze(['candidate-machine-profile-cost-denied']);
 export const TERMINAL_OUTCOME_REASONS = Object.freeze(TERMINAL_OUTCOMES.filter((outcome) => outcome !== 'completed'));
 
