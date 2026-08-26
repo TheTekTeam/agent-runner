@@ -107,9 +107,11 @@ in the installed CLI and are no longer emitted.
 provider endpoint is represented as
 `provider.ollama.options.baseURL = <allowlisted-endpoint>/v1`, and
 `enabled_providers: ["ollama"]` prevents an already-configured cloud
-provider from becoming an implicit fallback. The generated config contains
-no credential, auth, session, refresh, download, cloud-provider, or fallback
-field.
+provider from becoming an implicit fallback. It also pins both the default
+and small-model choices to the same local Ollama model, sets
+`share: "disabled"`, and sets `autoupdate: false`. The generated config
+contains no credential, auth, session, refresh, download, cloud-provider, or
+fallback field.
 
 `buildOpenCodeCommandArgs()` builds the bounded argv array
 (`<executable> run --model ollama/<model> --format json --dir <worktree>
@@ -143,10 +145,12 @@ a typed `machine_profile` result and nothing else.
   evidence and stop on parser drift before any routing enablement.
 - The runtime Ollama provider config uses OpenCode's documented
   `OPENCODE_CONFIG_CONTENT` provider configuration with
-  `enabled_providers: ["ollama"]`. The later supervised canary must still
-  prove that the installed `@ai-sdk/openai-compatible` provider path is
-  available locally without an unexpected package download or non-Ollama
-  network dependency.
+  `enabled_providers: ["ollama"]`, local-only default/small-model choices,
+  sharing disabled, and `autoupdate: false`. The supervised canary must
+  additionally set OpenCode's explicit auto-update disable environment gate
+  and still prove that the installed `@ai-sdk/openai-compatible` provider
+  path is available locally without an unexpected package download or
+  non-Ollama network dependency.
 - `probeVersion()` reads the version banner but does not itself enforce a
   minimum-version policy; a future enablement issue can add that check once
   a real minimum is captured.
