@@ -47,12 +47,21 @@ function runVersionProbe(probe, runner) {
   if (result?.error?.code === 'ENOENT') {
     return Object.freeze({ runtimeInstalled: false, version: null, probeState: 'runtime-not-installed' });
   }
+
+  const version = boundedVersion(result.stdout, result.stderr);
   if (result?.status !== 0) {
+    if (probe.acceptVersionOnNonZero === true && version) {
+      return Object.freeze({
+        runtimeInstalled: true,
+        version,
+        probeState: 'runtime-installed-version-exit-nonzero',
+      });
+    }
     return Object.freeze({ runtimeInstalled: false, version: null, probeState: 'runtime-version-probe-failed' });
   }
   return Object.freeze({
     runtimeInstalled: true,
-    version: boundedVersion(result.stdout, result.stderr),
+    version,
     probeState: 'runtime-installed',
   });
 }
