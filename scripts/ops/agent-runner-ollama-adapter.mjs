@@ -243,7 +243,8 @@ export const OPENCODE_RUN_SUBCOMMAND = 'run';
  *
  * The returned value is JSON text suitable for OPENCODE_CONFIG_CONTENT. It
  * contains no credential, auth, session, cloud-provider, download, refresh,
- * or fallback field.
+ * or fallback field. Sharing is disabled and both default/small-model
+ * selections are pinned to the same local Ollama model.
  */
 export function buildOpenCodeLocalOllamaConfig({
   model,
@@ -262,7 +263,11 @@ export function buildOpenCodeLocalOllamaConfig({
   const baseURL = new URL('/v1', endpoint.url).toString().replace(/\/$/, '');
   return JSON.stringify({
     $schema: 'https://opencode.ai/config.json',
+    autoupdate: false,
+    share: 'disabled',
     enabled_providers: ['ollama'],
+    model: `ollama/${model}`,
+    small_model: `ollama/${model}`,
     provider: {
       ollama: {
         npm: '@ai-sdk/openai-compatible',
