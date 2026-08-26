@@ -36,6 +36,27 @@ function boundedVersion(stdout = '', stderr = '') {
   return null;
 }
 
+function runVersionProbe(probe, runner) {
+  const result = runner(probe.command, [...probe.args], {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 10_000,
+    maxBuffer: 64 * 1024,
+    env: { PATH: process.env.PATH || '' },
+  });
+  if (result?.error?.code === 'ENOENT') {
+    return Object.freeze({ runtimeInstalled: false, version: null, probeState: 'runtime-not-installed' });
+  }
+  if (result?.status !== 0) {
+    return Object.freeze({ runtimeInstalled: false, version: null, probeState: 'runtime-version-probe-failed' });
+  }
+  return Object.freeze({
+    runtimeInstalled: true,
+    version: boundedVersion(result.stdout, result.stderr),
+    probeState: 'runtime-installed',
+  });
+}
+
 export function probeFleetRuntime(adapterId, { runner = spawnSync } = {}) {
   const contract = fleetAdapterRuntimeContract(adapterId);
   if (!contract.sourceSupported || !contract.versionProbe) {
@@ -44,23 +65,56 @@ export function probeFleetRuntime(adapterId, { runner = spawnSync } = {}) {
       sourceSupported: contract.sourceSupported,
       runtimeInstalled: false,
       version: null,
-      authAvailable: null,
+      authAvailable: probe.authAvailable,
       qualified: false,
       probeState: contract.reason || 'version-probe-unavailable',
+    });
+  }
+
+  // Ollama execution requires two independently installed runtime components:
+  // the local Ollama runtime plus the OpenCode repository-tool harness. Probe
+  // only their reviewed version commands. Never query /api/tags here: model
+  // inventory remains node-local and is deliberately left to #152.
+  if (Array.isArray(contract.componentProbes) && contract.componentProbes.length > 0) {
+    const components = contract.componentProbes.map((probe) => {
+      const outcome = runVersionProbe(probe, runner);
+      return Object.freeze({
+        componentId: probe.componentId,
+        runtimeInstalled: outcome.runtimeInstalled,
+        version: outcome.version,
+        probeState: outcome.probeState,
+      });
+    });
+    const ollama = components.find((entry) => entry.componentId === 'ollama-runtime');
+    const harness = components.find((entry) => entry.componentId === 'opencode-harness');
+    let probeState = 'runtime-installed-auth-unchecked';
+    if (!ollama?.runtimeInstalled) {
+      probeState = ollama?.probeState === 'runtime-version-probe-failed'
+        ? 'ollama-runtime-version-probe-failed'
+        : 'ollama-runtime-not-installed';
+    } else if (!harness?.runtimeInstalled) {
+      probeState = harness?.probeState === 'runtime-version-probe-failed'
+        ? 'opencode-harness-version-probe-failed'
+        : 'opencode-harness-not-installed';
+    }
+    return Object.freeze({
+      adapterId,
+      sourceSupported: true,
+      runtimeInstalled: Boolean(ollama?.runtimeInstalled && harness?.runtimeInstalled),
+      version: harness?.version || null,
+      authAvailable: contract.authenticationRequired === false ? true : null,
+      qualified: false,
+      probeState,
+      components: Object.freeze(components),
+      modelInventoryState: 'not-probed',
     });
   }
 
   // The command/argv come exclusively from the reviewed canonical adapter
   // contract. No issue text, environment value or operator-provided shell
   // fragment can become executable input here.
-  const result = runner(contract.versionProbe.command, [...contract.versionProbe.args], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'pipe'],
-    timeout: 10_000,
-    maxBuffer: 64 * 1024,
-    env: { PATH: process.env.PATH || '' },
-  });
-  if (result?.error?.code === 'ENOENT') {
+  const outcome = runVersionProbe(contract.versionProbe, runner);
+  if (!outcome.runtimeInstalled) {
     return Object.freeze({
       adapterId,
       sourceSupported: true,
@@ -68,25 +122,14 @@ export function probeFleetRuntime(adapterId, { runner = spawnSync } = {}) {
       version: null,
       authAvailable: null,
       qualified: false,
-      probeState: 'runtime-not-installed',
-    });
-  }
-  if (result?.status !== 0) {
-    return Object.freeze({
-      adapterId,
-      sourceSupported: true,
-      runtimeInstalled: false,
-      version: null,
-      authAvailable: null,
-      qualified: false,
-      probeState: 'runtime-version-probe-failed',
+      probeState: outcome.probeState,
     });
   }
   return Object.freeze({
     adapterId,
     sourceSupported: true,
     runtimeInstalled: true,
-    version: boundedVersion(result.stdout, result.stderr),
+    version: outcome.version,
     // Version discovery never attempts authentication and never infers it
     // from credential files, environment variables or another machine.
     authAvailable: null,
