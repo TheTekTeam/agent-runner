@@ -118,6 +118,8 @@ test('fleet runtime installer source pins reviewed package inputs and excludes f
   assert.doesNotMatch(source, /codex[[:space:]]+login/);
   assert.doesNotMatch(source, /systemctl[^\n]*(enable|start|restart)/);
   assert.doesNotMatch(source, /actions\.runner/);
-  assert.doesNotMatch(source, /ollama[^\n]*(pull|run)/);
+  // Reject executable model-management commands, not safety/help text such
+  // as "would not pull or run any model".
+  assert.doesNotMatch(source, /^[ \t]*(?:sudo[ \t]+)?ollama[ \t]+(?:pull|run)\b/m);
   assert.doesNotMatch(source, /git[^\n]*(reset|clean|rebase|stash)/);
 });
