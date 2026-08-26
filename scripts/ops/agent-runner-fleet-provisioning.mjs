@@ -109,6 +109,12 @@ const FLEET_RUNTIME_FOUNDATIONS = Object.freeze({
         // connectivity causes a non-zero exit. This does not prove service,
         // model or routing readiness.
         acceptVersionOnNonZero: true,
+        // Prefer the local/client version over a running daemon/server version.
+        // These exact phrases are emitted by Ollama's reviewed version command.
+        versionOutputPhrases: Object.freeze([
+          'client version is',
+          'ollama version is',
+        ]),
       }),
       Object.freeze({
         componentId: 'opencode-harness',
