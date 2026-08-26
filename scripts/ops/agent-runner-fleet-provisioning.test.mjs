@@ -76,6 +76,7 @@ test('Claude, Codex and Ollama expose reviewed runtime contracts while only Clau
       acceptVersionOnNonZero: true,
       versionOutputPhrases: ['client version is', 'ollama version is'],
       requireDottedVersion: true,
+      environmentKeys: ['HOME'],
     },
     { componentId: 'opencode-harness', command: 'opencode', args: ['--version'] },
   ]);
