@@ -122,10 +122,13 @@ test('worker-only readiness projection grants no scheduler/controller authority 
     platform: 'linux',
     arch: 'x64',
     runner(command, args) {
+      if (command === 'ollama') {
+        assert.deepEqual(args, ['-v']);
+        return { status: 0, stdout: 'ollama version is 0.32.1\n', stderr: '' };
+      }
       assert.deepEqual(args, ['--version']);
       if (command === 'claude') return { status: 0, stdout: '2.1.233\n', stderr: '' };
       if (command === 'codex') return { status: 0, stdout: 'codex-cli 0.128.0\n', stderr: '' };
-      if (command === 'ollama') return { status: 0, stdout: 'ollama version is 0.32.1\n', stderr: '' };
       if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
       throw new Error(`unexpected command: ${command}`);
     },
