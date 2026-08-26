@@ -67,6 +67,7 @@ import { RUNNER_STATE_TABLES, openRunnerStateStore } from './claude-runner-state
 import { createSyntheticNotificationTransport, reconcileNotifications } from './agent-runner-notifications.mjs';
 import { readRestrictedRecoveryHandle, restrictedHandleBindingDigest, restrictedRecoveryDir, writeRestrictedRecoveryHandle } from './claude-runner-recovery-adapter.mjs';
 import { withRecoveryIdentityGuard } from './agent-runner-recovery-identity-guard.mjs';
+import { safeDeriveFailureProjection } from './agent-runner-failure-attention-projection.mjs';
 
 
 const AVAILABLE_QUOTA_RUNNER = () => ({
@@ -1259,6 +1260,33 @@ test('successful recovery conservatively moves blocked to in-progress and never 
   assert.match(body, /status:blocked.*status:in-progress/);
   assert.match(body, /without auto-closing/);
   assert.doesNotMatch(body, /task-local failure/);
+});
+
+test('#231: runnerAttentionCommentBody preserves an exact pre-attempt machine-profile reason instead of collapsing it to unknown_failure', () => {
+  const projection = safeDeriveFailureProjection({
+    repository: 'TheTekTeam/agent-runner', issueNumber: 231, executionPhase: 'cost_admission',
+    candidateAdmissionCompleted: true, attemptCreated: false, workspaceCreated: false, childLaunched: false,
+    providerInvocationObserved: 'no', failureScope: 'machine_profile', reasonDomain: 'cost_admission',
+    reason: 'candidate-machine-profile-cost-denied',
+    checkpointPresent: false, worktreePresent: false, branchPresent: false, commitPresent: false, prPresent: false,
+    dirty: false, hasChanges: false, recoveryStatus: 'forbidden', recoveryAction: 'attention_required', recoveryEligible: false,
+    safeNextAction: 'Provide an explicit manager decision before any further dispatch.', deeperDiagnosticsRequired: false,
+  });
+  const body = runnerAttentionCommentBody({ number: 231 }, {
+    failureScope: 'machine_profile', reason: 'candidate-machine-profile-cost-denied',
+    recoveryStatus: 'forbidden', nextAction: 'Provide an explicit manager decision before any further dispatch.',
+    finishedAt: '2026-08-26T00:00:00.000Z', projection,
+  });
+  assert.match(body, /Outcome: `candidate-machine-profile-cost-denied`/);
+  assert.doesNotMatch(body, /unknown_failure/);
+  assert.match(body, /### Failure projection/);
+  assert.match(body, /Attempt created: `false`/);
+  assert.match(body, /Reason: `candidate-machine-profile-cost-denied`/);
+});
+
+test('#231: runnerAttentionCommentBody omits the failure projection section when no projection was built', () => {
+  const body = runnerAttentionCommentBody({ number: 698 }, { reason: 'unknown_failure', finishedAt: '2026-08-26T00:00:00.000Z' });
+  assert.doesNotMatch(body, /### Failure projection/);
 });
 
 const SAFE_RECOVERY_REVALIDATION_EVIDENCE = Object.freeze({

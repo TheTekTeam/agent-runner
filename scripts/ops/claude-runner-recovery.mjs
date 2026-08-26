@@ -282,6 +282,17 @@ export function buildAttentionEvent(input) {
     reason, attemptId: String(input.attemptId || ''), agent: String(input.agent || ''), startedAt: input.startedAt || null,
     finishedAt: input.finishedAt || null, recoveryStatus: input.recoveryStatus || 'forbidden', nextAction: String(input.nextAction || ''),
     dashboardReference: String(input.dashboardReference || ''), policyRevision: input.policyRevision || RECOVERY_POLICY_REVISION,
+    // #231: an already-built, already-validated #230 bounded failure
+    // projection (built by `safeDeriveFailureProjection()` in
+    // `agent-runner-failure-attention-projection.mjs`), passed through
+    // untouched -- this function never derives one itself (that belongs to
+    // the caller, which alone has the real lifecycle facts, and importing
+    // the #230 module here would also create a circular dependency, since
+    // it already imports TERMINAL_OUTCOMES/RECOVERY_ACTIONS from this one).
+    // Anything that is not a plain object is dropped rather than trusted,
+    // the same positive-allowlist discipline every other field here gets;
+    // `safeDeriveFailureProjection()` never returns anything else.
+    projection: (input.projection && typeof input.projection === 'object' && !Array.isArray(input.projection)) ? input.projection : null,
   };
   return Object.freeze({ ...allowed, dedupeKey: input.dedupeKey || attentionDedupeKey({ repository: allowed.repository, issueNumber: allowed.issueNumber, attemptId: allowed.attemptId, reason, policyRevision: allowed.policyRevision }) });
 }
