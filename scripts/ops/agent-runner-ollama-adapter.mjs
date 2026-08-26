@@ -235,23 +235,77 @@ export async function admitOllamaDispatch({
 export const OPENCODE_RUN_SUBCOMMAND = 'run';
 
 /**
- * Bounded OpenCode CLI command construction. There is no concurrency flag
- * (serial only), no pull/download flag (no automatic model download), and
- * no fallback/other-provider flag (no paid fallback) — those capabilities
- * are simply never emitted, not merely disabled by a flag.
+ * Build the runtime-only OpenCode provider configuration for a local Ollama
+ * dispatch. OpenCode 1.18.4 exposes provider base URLs through configuration,
+ * not a run-subcommand flag. The enabled-provider allowlist is deliberately
+ * closed to `ollama` so an existing global/project cloud provider cannot
+ * become an implicit fallback for this local zero-provider-cost route.
+ *
+ * The returned value is JSON text suitable for OPENCODE_CONFIG_CONTENT. It
+ * contains no credential, auth, session, cloud-provider, download, refresh,
+ * or fallback field. Sharing is disabled and both default/small-model
+ * selections are pinned to the same local Ollama model.
  */
-export function buildOpenCodeCommandArgs({ executablePath, model, endpointUrl, prompt } = {}) {
+export function buildOpenCodeLocalOllamaConfig({
+  model,
+  endpointUrl,
+  endpointAllowlistHosts = [],
+} = {}) {
+  if (!model) throw new Error('buildOpenCodeLocalOllamaConfig requires a model');
+  const endpoint = resolveOllamaEndpoint({
+    endpoint: endpointUrl,
+    endpointAllowlistHosts,
+  });
+  if (!endpoint.ok) {
+    throw new Error(`buildOpenCodeLocalOllamaConfig rejected endpoint: ${endpoint.reason}`);
+  }
+
+  const baseURL = new URL('/v1', endpoint.url).toString().replace(/\/$/, '');
+  return JSON.stringify({
+    $schema: 'https://opencode.ai/config.json',
+    autoupdate: false,
+    share: 'disabled',
+    enabled_providers: ['ollama'],
+    model: `ollama/${model}`,
+    small_model: `ollama/${model}`,
+    provider: {
+      ollama: {
+        npm: '@ai-sdk/openai-compatible',
+        name: 'Ollama (local)',
+        options: { baseURL },
+        models: {
+          [model]: { name: model },
+        },
+      },
+    },
+  });
+}
+
+/**
+ * Bounded OpenCode 1.18.4 run-command construction.
+ *
+ * The live Dell help surface proves `run` supports `--model`,
+ * `--format json`, and `--dir`; interactive mode defaults false. Provider
+ * endpoint selection belongs in buildOpenCodeLocalOllamaConfig(), not argv.
+ * There is no concurrency, pull/download, refresh, share, attach, session,
+ * fallback-provider, or interactive flag here.
+ */
+export function buildOpenCodeCommandArgs({
+  executablePath,
+  model,
+  workingDirectory,
+  prompt,
+} = {}) {
   if (!executablePath) throw new Error('buildOpenCodeCommandArgs requires an executable path');
   if (!model) throw new Error('buildOpenCodeCommandArgs requires a model');
-  if (!endpointUrl) throw new Error('buildOpenCodeCommandArgs requires an endpoint url');
+  if (!workingDirectory) throw new Error('buildOpenCodeCommandArgs requires a working directory');
   if (!prompt) throw new Error('buildOpenCodeCommandArgs requires a prompt');
   return [
     executablePath,
     OPENCODE_RUN_SUBCOMMAND,
     '--model', `ollama/${model}`,
-    '--api-base', endpointUrl,
-    '--non-interactive',
-    '--print',
+    '--format', 'json',
+    '--dir', workingDirectory,
     prompt,
   ];
 }

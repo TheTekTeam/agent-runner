@@ -8,6 +8,7 @@ import { FAILURE_SCOPES } from './agent-runner-adapter-contract.mjs';
 import {
   admitOllamaDispatch,
   buildOpenCodeCommandArgs,
+  buildOpenCodeLocalOllamaConfig,
   classifyOpenCodeExecutionError,
   isAllowlistedOllamaHost,
   OLLAMA_AGENT_ID,
@@ -332,32 +333,76 @@ test('#194: parser keeps absent Ollama runtime evidence unknown rather than zero
 
 // --- 10. No mutation (command construction is pure, no paid fallback / concurrency / auto-pull flags) ----
 
-test('buildOpenCodeCommandArgs constructs a bounded, serial, no-fallback, no-download command', () => {
+test('buildOpenCodeLocalOllamaConfig creates a loopback-only Ollama provider allowlist with no credential or fallback surface', () => {
+  const content = buildOpenCodeLocalOllamaConfig({
+    model: 'modelspend-docs-local:latest',
+    endpointUrl: 'http://127.0.0.1:11434',
+  });
+  const config = JSON.parse(content);
+
+  assert.equal(config.autoupdate, false);
+  assert.equal(config.share, 'disabled');
+  assert.deepEqual(config.enabled_providers, ['ollama']);
+  assert.equal(config.model, 'ollama/modelspend-docs-local:latest');
+  assert.equal(config.small_model, 'ollama/modelspend-docs-local:latest');
+  assert.equal(config.provider.ollama.npm, '@ai-sdk/openai-compatible');
+  assert.equal(config.provider.ollama.options.baseURL, 'http://127.0.0.1:11434/v1');
+  assert.deepEqual(Object.keys(config.provider.ollama.models), ['modelspend-docs-local:latest']);
+  assert.equal(config.provider.ollama.models['modelspend-docs-local:latest'].name, 'modelspend-docs-local:latest');
+
+  const serialized = JSON.stringify(config);
+  assert.equal(/api.?key|credential|secret|token|fallback|download|refresh|cloud/i.test(serialized), false);
+});
+
+test('buildOpenCodeLocalOllamaConfig rejects a non-allowlisted remote endpoint and accepts an explicitly allowlisted one', () => {
+  assert.throws(
+    () => buildOpenCodeLocalOllamaConfig({
+      model: 'm',
+      endpointUrl: 'http://10.0.0.5:11434',
+    }),
+    /ollama-endpoint-not-allowlisted/,
+  );
+
+  const config = JSON.parse(buildOpenCodeLocalOllamaConfig({
+    model: 'm',
+    endpointUrl: 'http://10.0.0.5:11434',
+    endpointAllowlistHosts: ['10.0.0.5'],
+  }));
+  assert.equal(config.provider.ollama.options.baseURL, 'http://10.0.0.5:11434/v1');
+});
+
+test('buildOpenCodeCommandArgs matches the live OpenCode 1.18.4 headless run surface', () => {
   const args = buildOpenCodeCommandArgs({
     executablePath: '/usr/local/bin/opencode',
     model: 'qwen2.5-coder:7b',
-    endpointUrl: 'http://127.0.0.1:11434',
+    workingDirectory: '/tmp/isolated-worktree',
     prompt: 'fix the failing test',
   });
+
   assert.deepEqual(args, [
     '/usr/local/bin/opencode',
     'run',
     '--model', 'ollama/qwen2.5-coder:7b',
-    '--api-base', 'http://127.0.0.1:11434',
-    '--non-interactive',
-    '--print',
+    '--format', 'json',
+    '--dir', '/tmp/isolated-worktree',
     'fix the failing test',
   ]);
+
   const joined = args.join(' ');
-  assert.equal(/--pull|--download/i.test(joined), false);
-  assert.equal(/--fallback|--concurrency/i.test(joined), false);
+  assert.equal(/--api-base|--non-interactive|--print/i.test(joined), false);
+  assert.equal(/--interactive|--share|--attach|--continue|--session|--fork/i.test(joined), false);
+  assert.equal(/--pull|--download|--refresh|--fallback|--concurrency/i.test(joined), false);
 });
 
 test('buildOpenCodeCommandArgs requires every argument explicitly', () => {
   assert.throws(() => buildOpenCodeCommandArgs({}), /executable path/);
   assert.throws(() => buildOpenCodeCommandArgs({ executablePath: 'x' }), /model/);
-  assert.throws(() => buildOpenCodeCommandArgs({ executablePath: 'x', model: 'm' }), /endpoint url/);
-  assert.throws(() => buildOpenCodeCommandArgs({ executablePath: 'x', model: 'm', endpointUrl: 'http://127.0.0.1:11434' }), /prompt/);
+  assert.throws(() => buildOpenCodeCommandArgs({ executablePath: 'x', model: 'm' }), /working directory/);
+  assert.throws(() => buildOpenCodeCommandArgs({
+    executablePath: 'x',
+    model: 'm',
+    workingDirectory: '/tmp/worktree',
+  }), /prompt/);
 });
 
 test('probeEndpoint and probeVersion fail closed instead of throwing when no I/O function is injected', async () => {

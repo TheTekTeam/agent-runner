@@ -95,18 +95,36 @@ reused, not reinvented.
 
 ## Command construction and result parsing
 
-`buildOpenCodeCommandArgs()` builds a bounded argv array
-(`<executable> run --model ollama/<model> --api-base <endpoint>
---non-interactive --print <prompt>`). There is no concurrency flag, no
-pull/download flag, and no fallback-provider flag — those capabilities are
-simply never emitted by this function, not merely disabled behind a switch.
+Issue #152 revalidated the installed Dell OpenCode `1.18.4` binary
+non-generatively with `opencode run --help`. The supported headless run
+surface used here is `--model`, `--format json`, and `--dir`;
+`--interactive` defaults to false. The previously assumed
+`--api-base`, `--non-interactive`, and `--print` flags are not present
+in the installed CLI and are no longer emitted.
 
-`parseOpenCodeResultEnvelope()` parses a structured JSON result
-(`{status: 'ok'|'no-op'|'error', output, error, mutated}`) into the shared
-`normalizedAdapterResult` shape, always with `usage.costUsd: 0`.
+`buildOpenCodeLocalOllamaConfig()` builds runtime-only
+`OPENCODE_CONFIG_CONTENT` JSON for a single local Ollama provider. The
+provider endpoint is represented as
+`provider.ollama.options.baseURL = <allowlisted-endpoint>/v1`, and
+`enabled_providers: ["ollama"]` prevents an already-configured cloud
+provider from becoming an implicit fallback. It also pins both the default
+and small-model choices to the same local Ollama model, sets
+`share: "disabled"`, and sets `autoupdate: false`. The generated config
+contains no credential, auth, session, refresh, download, cloud-provider, or
+fallback field.
+
+`buildOpenCodeCommandArgs()` builds the bounded argv array
+(`<executable> run --model ollama/<model> --format json --dir <worktree>
+<prompt>`). It emits no interactive/share/attach/session/continue/fork,
+concurrency, pull/download/refresh, or fallback-provider flag.
+
+`parseOpenCodeResultEnvelope()` still represents the foundation's assumed
+structured result shape
+(`{status: 'ok'|'no-op'|'error', output, error, mutated}`) and therefore
+remains fail-closed pending the supervised #152 live JSON-event capture.
 `classifyOpenCodeExecutionError()` separately classifies process-level
 timeout vs. cancellation vs. a generic execution error for cases that never
-produced parseable output.
+produce parseable output.
 
 ## Serial execution and no paid fallback
 
@@ -118,13 +136,21 @@ a typed `machine_profile` result and nothing else.
 
 ## Known limitations
 
-- The OpenCode CLI argument/result contract here is an explicitly assumed,
-  documented shape (`run --model ollama/<model> --api-base <url>
-  --non-interactive --print <prompt>` in, `{status, output, error,
-  mutated}` JSON out). It has not been verified against a live captured
-  OpenCode payload from the sealed Dell qualification evidence referenced in
-  `#40`; that verification is deferred to the live-enablement issue so this
-  foundation slice does not require repeating that qualification.
+- The OpenCode **run argument surface** is now verified against the installed
+  Dell OpenCode `1.18.4` help output: `--model`, `--format json`, and
+  `--dir` are supported; `--api-base`, `--non-interactive`, and
+  `--print` are not. The **JSON event/result schema** remains deliberately
+  unverified because proving it requires a real model-backed run. The first
+  supervised #152 canary must capture only bounded/redacted event-shape
+  evidence and stop on parser drift before any routing enablement.
+- The runtime Ollama provider config uses OpenCode's documented
+  `OPENCODE_CONFIG_CONTENT` provider configuration with
+  `enabled_providers: ["ollama"]`, local-only default/small-model choices,
+  sharing disabled, and `autoupdate: false`. The supervised canary must
+  additionally set OpenCode's explicit auto-update disable environment gate
+  and still prove that the installed `@ai-sdk/openai-compatible` provider
+  path is available locally without an unexpected package download or
+  non-Ollama network dependency.
 - `probeVersion()` reads the version banner but does not itself enforce a
   minimum-version policy; a future enablement issue can add that check once
   a real minimum is captured.
