@@ -89,7 +89,7 @@ test('Ollama bounded version output proves runtime presence even when daemon-awa
       if (command === 'ollama') {
         return {
           status: 1,
-          stdout: 'Warning: could not connect to a running Ollama instance\nWarning: client version is 0.32.1\n',
+          stdout: 'Warning: could not connect to 127.0.0.1:11434\nWarning: client version is 0.32.1\n',
           stderr: '',
         };
       }
@@ -114,6 +114,26 @@ test('Ollama bounded version output proves runtime presence even when daemon-awa
   });
 });
 
+test('Ollama version parsing prefers client version over daemon/server version', () => {
+  const probe = probeFleetRuntime('ollama-agent', {
+    runner(command) {
+      if (command === 'ollama') {
+        return {
+          status: 0,
+          stdout: 'ollama version is 0.31.9\nWarning: client version is 0.32.1\n',
+          stderr: '',
+        };
+      }
+      if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
+      throw new Error(`unexpected command: ${command}`);
+    },
+  });
+
+  const ollama = probe.components.find((entry) => entry.componentId === 'ollama-runtime');
+  assert.equal(ollama.runtimeInstalled, true);
+  assert.equal(ollama.version, '0.32.1');
+});
+
 test('non-zero OpenCode or unversioned Ollama probe remains a hard runtime failure', () => {
   const missingHarness = probeFleetRuntime('ollama-agent', {
     runner(command) {
@@ -127,7 +147,13 @@ test('non-zero OpenCode or unversioned Ollama probe remains a hard runtime failu
 
   const unversionedOllama = probeFleetRuntime('ollama-agent', {
     runner(command) {
-      if (command === 'ollama') return { status: 1, stdout: 'Warning: daemon unavailable\n', stderr: '' };
+      if (command === 'ollama') {
+        return {
+          status: 1,
+          stdout: 'Warning: could not connect to 127.0.0.1:11434 after 1 attempt\n',
+          stderr: '',
+        };
+      }
       if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
       throw new Error(`unexpected command: ${command}`);
     },
