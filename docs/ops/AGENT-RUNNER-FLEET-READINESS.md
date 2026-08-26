@@ -84,7 +84,7 @@ The fleet contract now consumes the accepted #40 `ollama-agent` foundation witho
 
 Readiness is deliberately component-aware:
 
-- Ollama runtime probe: `ollama -v`, executed with only `PATH` plus the reviewed `HOME` process-context key; `HOME` is required for Ollama CLI initialisation but is never serialized into readiness evidence;
+- Ollama runtime probe: `ollama -v`, executed with only `PATH` plus the reviewed `HOME` process-context key; Dell #364 field evidence proved PATH-only exits with `panic: $HOME is not defined`, while PATH + HOME returns the installed version; `HOME` is required for Ollama CLI initialisation but is never serialized into readiness evidence;
 - because Ollama's version command can consult the daemon, a non-zero exit still proves **binary/runtime presence** only when that exact reviewed command emits a bounded version after the reviewed phrases `client version is` or `ollama version is`; client version is preferred when both are present, the extracted Ollama version must contain a dotted numeric version (`x.y…`), and unrelated numeric warning text is never treated as a version; this Ollama-specific parser does not alter Claude/Codex/OpenCode parsing and does not prove daemon, model or route readiness;
 - OpenCode harness probe: `opencode --version`;
 - both must be present before the fleet runtime is considered installed;
