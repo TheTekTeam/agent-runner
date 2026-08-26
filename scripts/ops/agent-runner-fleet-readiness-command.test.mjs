@@ -83,6 +83,59 @@ test('Grok foundation remains fail-closed and executes no guessed version comman
   assert.equal(calls, 0);
 });
 
+test('Ollama bounded version output proves runtime presence even when daemon-aware version probe exits non-zero', () => {
+  const probe = probeFleetRuntime('ollama-agent', {
+    runner(command) {
+      if (command === 'ollama') {
+        return {
+          status: 1,
+          stdout: 'Warning: could not connect to a running Ollama instance\nWarning: client version is 0.32.1\n',
+          stderr: '',
+        };
+      }
+      if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
+      throw new Error(`unexpected command: ${command}`);
+    },
+  });
+
+  assert.equal(probe.runtimeInstalled, true);
+  assert.equal(probe.version, '1.18.4');
+  assert.equal(probe.authAvailable, true);
+  assert.equal(probe.qualified, false);
+  assert.equal(probe.probeState, 'runtime-installed-auth-unchecked');
+  assert.equal(probe.modelInventoryState, 'not-probed');
+
+  const ollama = probe.components.find((entry) => entry.componentId === 'ollama-runtime');
+  assert.deepEqual(ollama, {
+    componentId: 'ollama-runtime',
+    runtimeInstalled: true,
+    version: '0.32.1',
+    probeState: 'runtime-installed-version-exit-nonzero',
+  });
+});
+
+test('non-zero OpenCode or unversioned Ollama probe remains a hard runtime failure', () => {
+  const missingHarness = probeFleetRuntime('ollama-agent', {
+    runner(command) {
+      if (command === 'ollama') return { status: 0, stdout: 'ollama version is 0.32.1\n', stderr: '' };
+      if (command === 'opencode') return { status: 1, stdout: 'opencode 1.18.4\n', stderr: '' };
+      throw new Error(`unexpected command: ${command}`);
+    },
+  });
+  assert.equal(missingHarness.runtimeInstalled, false);
+  assert.equal(missingHarness.probeState, 'opencode-harness-version-probe-failed');
+
+  const unversionedOllama = probeFleetRuntime('ollama-agent', {
+    runner(command) {
+      if (command === 'ollama') return { status: 1, stdout: 'Warning: daemon unavailable\n', stderr: '' };
+      if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
+      throw new Error(`unexpected command: ${command}`);
+    },
+  });
+  assert.equal(unversionedOllama.runtimeInstalled, false);
+  assert.equal(unversionedOllama.probeState, 'ollama-runtime-version-probe-failed');
+});
+
 test('Ollama readiness distinguishes missing runtime from missing OpenCode harness without probing models', () => {
   const missingRuntime = probeFleetRuntime('ollama-agent', {
     runner(command) {
