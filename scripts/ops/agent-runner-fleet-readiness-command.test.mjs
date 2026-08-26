@@ -160,6 +160,22 @@ test('non-zero OpenCode or unversioned Ollama probe remains a hard runtime failu
   });
   assert.equal(unversionedOllama.runtimeInstalled, false);
   assert.equal(unversionedOllama.probeState, 'ollama-runtime-version-probe-failed');
+
+  const malformedPhrase = probeFleetRuntime('ollama-agent', {
+    runner(command) {
+      if (command === 'ollama') {
+        return {
+          status: 1,
+          stdout: 'Warning: client version is 1\n',
+          stderr: '',
+        };
+      }
+      if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
+      throw new Error(`unexpected command: ${command}`);
+    },
+  });
+  assert.equal(malformedPhrase.runtimeInstalled, false);
+  assert.equal(malformedPhrase.probeState, 'ollama-runtime-version-probe-failed');
 });
 
 test('Ollama readiness distinguishes missing runtime from missing OpenCode harness without probing models', () => {
