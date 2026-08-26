@@ -115,6 +115,7 @@ const FLEET_RUNTIME_FOUNDATIONS = Object.freeze({
           'client version is',
           'ollama version is',
         ]),
+        requireDottedVersion: true,
       }),
       Object.freeze({
         componentId: 'opencode-harness',
