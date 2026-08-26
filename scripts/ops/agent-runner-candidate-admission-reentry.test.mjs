@@ -13,6 +13,7 @@ import {
 
 const candidateAdmissionPath = fileURLToPath(new URL('./agent-runner-candidate-admission.mjs', import.meta.url));
 const controlReadinessUrl = new URL('./agent-runner-control-readiness.mjs', import.meta.url).href;
+const canonicalCronUrl = new URL('./claude-runner-cron.mjs', import.meta.url).href;
 
 function fixtureSelection(issueNumber = 702) {
   const fingerprint = `sha256:${'a'.repeat(64)}`;
@@ -126,6 +127,29 @@ test('direct candidate admission can load the control-readiness graph without an
   const stable = JSON.stringify(fixtureSelection());
   const moduleUrl = writeSelectorModule(`
 import ${JSON.stringify(controlReadinessUrl)};
+export function parseArgs() { return {}; }
+export async function selectIssue() { return ${stable}; }
+`);
+
+  const result = runStandalone(moduleUrl, {
+    AGENT_RUNNER_CANDIDATE_SELECTION_TIMEOUT_MS: '1000',
+  });
+
+  assert.equal(result.signal, null, `process timed out or was signalled\nstderr:\n${result.stderr || ''}`);
+  assert.equal(result.status, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /unsettled top-level await/i);
+
+  const payload = JSON.parse(result.stdout.trim());
+  assert.equal(payload.admission.allowed, true);
+  assert.equal(payload.admission.reason, 'candidate-admitted');
+  assert.equal(payload.initial.issueNumber, 702);
+  assert.equal(payload.current.issueNumber, 702);
+});
+
+test('direct candidate admission can load the full canonical cron graph without an ESM evaluation cycle', () => {
+  const stable = JSON.stringify(fixtureSelection());
+  const moduleUrl = writeSelectorModule(`
+import ${JSON.stringify(canonicalCronUrl)};
 export function parseArgs() { return {}; }
 export async function selectIssue() { return ${stable}; }
 `);
