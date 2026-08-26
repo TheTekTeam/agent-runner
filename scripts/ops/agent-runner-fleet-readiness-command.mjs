@@ -61,7 +61,9 @@ function boundedVersionForProbe(probe, stdout = '', stderr = '') {
       if (index < 0) continue;
       const tail = line.slice(index + needle.length).trim();
       const candidate = normalizeVersionToken(tail.split(/\s+/)[0] || '');
-      if (candidate) return candidate;
+      if (!candidate) continue;
+      if (probe.requireDottedVersion === true && !/\d+\.\d+/.test(candidate)) continue;
+      return candidate;
     }
   }
   return null;
