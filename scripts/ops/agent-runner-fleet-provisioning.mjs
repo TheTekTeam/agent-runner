@@ -116,6 +116,10 @@ const FLEET_RUNTIME_FOUNDATIONS = Object.freeze({
           'ollama version is',
         ]),
         requireDottedVersion: true,
+        // Ollama 0.32.x initialises model-path configuration even for -v and
+        // panics when HOME is absent. Pass through this single reviewed
+        // process-context key; never inherit the rest of the parent env.
+        environmentKeys: Object.freeze(['HOME']),
       }),
       Object.freeze({
         componentId: 'opencode-harness',
