@@ -225,6 +225,14 @@ if [ "$EXECUTE_REQUESTED" -eq 1 ]; then
         try { parsed = JSON.parse(process.argv[1]); } catch { parsed = null; }
         process.stdout.write(String(parsed?.admission?.scope || "issue_not_runnable"));
       ' "$CANDIDATE_OUTPUT")"
+      # This pre-claim refusal never entered the pinned atomic runner's own
+      # revalidation transaction, so publish through the same canonical #230
+      # projection/GitHub-attention path here. Never allowed to affect the
+      # handled exit-0 outcome below (#231).
+      set +e
+      AGENT_RUNNER_CANDIDATE_ADMISSION_JSON="$CANDIDATE_OUTPUT" \
+        "$NODE_BIN" "$ROOT/scripts/ops/agent-runner-candidate-pause-publish.mjs" "${ARGS[@]}" >/dev/null 2>&1
+      set -e
       if [ "$CANDIDATE_FAILURE_SCOPE" = "machine_profile" ]; then
         write_run_result handled_noop candidate-machine-profile-refused 0
         echo "[agent-runner] candidate-specific cost/profile policy refused and circuit recorded; no attempt created or issue mutated"
