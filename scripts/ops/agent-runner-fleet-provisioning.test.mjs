@@ -19,7 +19,7 @@ test('fleet adapter set covers the initial owner-requested runtime set', () => {
   ]);
 });
 
-test('Claude and Codex expose reviewed runtime contracts while only Claude is qualification-eligible', () => {
+test('Claude, Codex and Ollama expose reviewed runtime contracts while only Claude is qualification-eligible', () => {
   const claude = fleetAdapterRuntimeContract('claude-code-cli');
   assert.equal(claude.sourceSupported, true);
   assert.equal(claude.executable, 'claude');
@@ -61,15 +61,51 @@ test('Claude and Codex expose reviewed runtime contracts while only Claude is qu
     automaticRoutingActivation: false,
   });
 
-  for (const adapterId of ['grok-cli', 'ollama-agent']) {
-    const contract = fleetAdapterRuntimeContract(adapterId);
-    assert.equal(contract.sourceSupported, false);
-    assert.equal(contract.executable, null);
-    assert.equal(contract.installationMechanism, null);
-    assert.equal(contract.liveDispatchImplemented, false);
-    assert.equal(contract.qualificationEligible, false);
-    assert.equal(contract.reason, 'adapter-foundation-not-live');
-  }
+  const ollama = fleetAdapterRuntimeContract('ollama-agent');
+  assert.equal(ollama.sourceSupported, true);
+  assert.equal(ollama.executable, 'opencode');
+  assert.equal(ollama.authenticationRequired, false);
+  assert.equal(ollama.liveDispatchImplemented, false);
+  assert.equal(ollama.qualificationEligible, false);
+  assert.deepEqual(ollama.versionProbe, { command: 'opencode', args: ['--version'] });
+  assert.deepEqual(ollama.componentProbes, [
+    { componentId: 'ollama-runtime', command: 'ollama', args: ['-v'] },
+    { componentId: 'opencode-harness', command: 'opencode', args: ['--version'] },
+  ]);
+  assert.deepEqual(ollama.installationMechanism, {
+    kind: 'composite-runtime-harness',
+    operatingSystems: ['ubuntu', 'debian'],
+    installer: 'scripts/install-agent-runner-fleet-runtime.sh',
+    components: [
+      {
+        componentId: 'ollama-runtime',
+        kind: 'official-linux-tarball',
+        downloadBaseUrl: 'https://ollama.com/download',
+        architectures: ['amd64', 'arm64'],
+        executable: 'ollama',
+      },
+      {
+        componentId: 'opencode-harness',
+        kind: 'npm-global-package',
+        packageName: 'opencode-ai',
+        packageSpec: 'opencode-ai@latest',
+        registryUrl: 'https://registry.npmjs.org/',
+        executable: 'opencode',
+      },
+    ],
+    automaticProviderAuth: false,
+    automaticModelDownload: false,
+    automaticQualification: false,
+    automaticRoutingActivation: false,
+  });
+
+  const grok = fleetAdapterRuntimeContract('grok-cli');
+  assert.equal(grok.sourceSupported, false);
+  assert.equal(grok.executable, null);
+  assert.equal(grok.installationMechanism, null);
+  assert.equal(grok.liveDispatchImplemented, false);
+  assert.equal(grok.qualificationEligible, false);
+  assert.equal(grok.reason, 'adapter-foundation-not-live');
 });
 
 test('missing runtime, unknown auth, unavailable auth and qualification remain distinct', () => {
@@ -185,35 +221,63 @@ test('Codex runtime evidence cannot bypass the default-disabled execution/qualif
   assert.equal(instance.qualified, false);
 });
 
-test('unsupported Grok/Ollama foundations cannot be promoted by fabricated host evidence', () => {
-  for (const adapterId of ['grok-cli', 'ollama-agent']) {
-    const evaluated = evaluateFleetAdapterEvidence({
-      nodeId: 'dev-cluster-z790',
-      adapterId,
-      evidence: {
-        runtimeInstalled: true,
-        version: '9.9.9',
-        authAvailable: true,
-        qualified: true,
-        qualificationRevision: 'fabricated',
-        models: ['future-model'],
-        profiles: ['critical'],
-        jobClasses: ['implementation'],
-      },
-    });
-    assert.equal(evaluated.state, 'unsupported');
-    assert.equal(evaluated.runtimeInstalled, false);
-    assert.equal(evaluated.authAvailable, null);
-    assert.equal(evaluated.qualified, false);
-    assert.equal(evaluated.qualificationRevision, null);
-    assert.deepEqual(evaluated.models, []);
-    assert.deepEqual(evaluated.jobClasses, []);
+test('unsupported Grok foundation cannot be promoted by fabricated host evidence', () => {
+  const evaluated = evaluateFleetAdapterEvidence({
+    nodeId: 'dev-cluster-z790',
+    adapterId: 'grok-cli',
+    evidence: {
+      runtimeInstalled: true,
+      version: '9.9.9',
+      authAvailable: true,
+      qualified: true,
+      qualificationRevision: 'fabricated',
+      models: ['future-model'],
+      profiles: ['critical'],
+      jobClasses: ['implementation'],
+    },
+  });
+  assert.equal(evaluated.state, 'unsupported');
+  assert.equal(evaluated.runtimeInstalled, false);
+  assert.equal(evaluated.authAvailable, null);
+  assert.equal(evaluated.qualified, false);
+  assert.equal(evaluated.qualificationRevision, null);
+  assert.deepEqual(evaluated.models, []);
+  assert.deepEqual(evaluated.jobClasses, []);
 
-    const instance = buildFleetAgentInstance(evaluated);
-    assert.equal(instance.lifecycle, 'disabled');
-    assert.equal(instance.readiness, 'unavailable');
-    assert.equal(instance.qualified, false);
-  }
+  const instance = buildFleetAgentInstance(evaluated);
+  assert.equal(instance.lifecycle, 'disabled');
+  assert.equal(instance.readiness, 'unavailable');
+  assert.equal(instance.qualified, false);
+});
+
+test('Ollama runtime evidence remains non-routable until #152 qualification enables the live adapter', () => {
+  const evaluated = evaluateFleetAdapterEvidence({
+    nodeId: 'dev-cluster-z790',
+    adapterId: 'ollama-agent',
+    evidence: {
+      runtimeInstalled: true,
+      version: '1.2.3',
+      authAvailable: false,
+      qualified: true,
+      qualificationRevision: 'fabricated',
+      models: ['modelspend-code-local'],
+      profiles: ['narrow'],
+      jobClasses: ['implementation'],
+    },
+  });
+  assert.equal(evaluated.state, 'authenticated');
+  assert.equal(evaluated.reason, 'adapter-qualification-not-live');
+  assert.equal(evaluated.runtimeInstalled, true);
+  assert.equal(evaluated.authAvailable, true);
+  assert.equal(evaluated.qualified, false);
+  assert.equal(evaluated.qualificationRevision, null);
+  assert.deepEqual(evaluated.models, ['modelspend-code-local']);
+
+  const instance = buildFleetAgentInstance(evaluated);
+  assert.equal(instance.lifecycle, 'disabled');
+  assert.equal(instance.readiness, 'degraded');
+  assert.equal(instance.authenticated, true);
+  assert.equal(instance.qualified, false);
 });
 
 test('qualified evidence requires a bounded installed version and qualification revision', () => {
