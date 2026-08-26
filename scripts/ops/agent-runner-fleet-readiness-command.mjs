@@ -69,13 +69,23 @@ function boundedVersionForProbe(probe, stdout = '', stderr = '') {
   return null;
 }
 
+function versionProbeEnvironment(probe) {
+  const env = { PATH: process.env.PATH || '' };
+  const keys = Array.isArray(probe.environmentKeys) ? probe.environmentKeys : [];
+  for (const key of keys) {
+    if (key !== 'HOME') throw new Error(`unsupported version-probe environment key: ${key}`);
+    env[key] = process.env[key] || '';
+  }
+  return env;
+}
+
 function runVersionProbe(probe, runner) {
   const result = runner(probe.command, [...probe.args], {
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 10_000,
     maxBuffer: 64 * 1024,
-    env: { PATH: process.env.PATH || '' },
+    env: versionProbeEnvironment(probe),
   });
   if (result?.error?.code === 'ENOENT') {
     return Object.freeze({ runtimeInstalled: false, version: null, probeState: 'runtime-not-installed' });
