@@ -65,7 +65,7 @@ export function probeFleetRuntime(adapterId, { runner = spawnSync } = {}) {
       sourceSupported: contract.sourceSupported,
       runtimeInstalled: false,
       version: null,
-      authAvailable: probe.authAvailable,
+      authAvailable: null,
       qualified: false,
       probeState: contract.reason || 'version-probe-unavailable',
     });
