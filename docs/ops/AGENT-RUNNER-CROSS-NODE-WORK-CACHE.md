@@ -90,6 +90,18 @@ For #200 field acceptance, prefer a dedicated **internal-SFTP-only cache exchang
 
 The field setup must prove the SFTP identity cannot obtain a shell or access paths outside the exchange root. Do not widen the already-accepted #199 remote-validation credential into a general file-transfer account.
 
+### Z790 central `AuthorizedKeysFile` ownership rule
+
+Z790's OpenSSH privilege-separated authentication path has a proven machine-specific requirement for dedicated service identities that use `AuthorizedKeysFile /etc/ssh/authorized_keys/%u`:
+
+- keep `/etc/ssh/authorized_keys` itself root-controlled (`root:root`);
+- make each per-user leaf key file owned by the matching target service account and group, mode `0600` — for example `agentval:agentval 0600` or `agentcache:agentcache 0600`;
+- **do not provision the leaf as `root:root 0600`**: on this node the target-user pre-auth process cannot read it and sshd fails with `Could not open user '<user>' authorized keys ... Permission denied`;
+- do not compensate by weakening the parent directory, making the leaf broadly readable, disabling `StrictModes`, or widening shell/forwarding/password authority;
+- provisioning/recovery scripts must verify the parent ownership, leaf ownership/mode, `sshd -t`, effective `sshd -T -C ...` policy, and a real restricted public-key authentication test before claiming the transport works.
+
+This rule was first proven during #199 `agentval` field acceptance and applies equally to new dedicated identities such as #200 `agentcache`. Reuse this proven ownership pattern rather than rediscovering the same failure for each new restricted SSH/SFTP identity.
+
 ## Required field proof
 
 After source acceptance:
