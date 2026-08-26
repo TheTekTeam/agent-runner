@@ -18,7 +18,7 @@ The output distinguishes:
 
 - source-supported adapter runtime present/missing;
 - installed version where the reviewed version probe returns one;
-- authentication as `unknown` unless separately proven by the adapter's accepted machine-local authentication workflow;
+- authentication as `unknown` for credential-backed adapters unless separately proven; local Ollama has no provider-auth requirement but still remains unqualified/non-routable until #152;
 - qualification as false unless separately supplied by the owning canary/qualification process and permitted by the live adapter gate;
 - unsupported/foundation-only adapters without guessing their executable or installation mechanism;
 - for Ollama/OpenCode, separate Ollama-runtime and OpenCode-harness presence while leaving model inventory explicitly unprobed.
