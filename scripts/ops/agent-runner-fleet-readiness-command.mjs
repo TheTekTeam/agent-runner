@@ -26,12 +26,43 @@ function parseArgs(argv = []) {
   return args;
 }
 
+function normalizeVersionToken(raw = '') {
+  const candidate = String(raw)
+    .replace(/^[vV](?=\d)/, '')
+    .replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9._:+-]+$/g, '');
+  return candidate && VERSION_TOKEN.test(candidate) && /\d/.test(candidate)
+    ? candidate
+    : null;
+}
+
 function boundedVersion(stdout = '', stderr = '') {
   const source = `${stdout}\n${stderr}`.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 512);
   if (!source) return null;
   for (const raw of source.split(/\s+/)) {
-    const candidate = raw.replace(/^[vV](?=\d)/, '').replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9._:+-]+$/g, '');
-    if (candidate && VERSION_TOKEN.test(candidate) && /\d/.test(candidate)) return candidate;
+    const candidate = normalizeVersionToken(raw);
+    if (candidate) return candidate;
+  }
+  return null;
+}
+
+function boundedVersionForProbe(probe, stdout = '', stderr = '') {
+  const phrases = Array.isArray(probe.versionOutputPhrases)
+    ? probe.versionOutputPhrases
+    : [];
+  if (phrases.length === 0) return boundedVersion(stdout, stderr);
+
+  const source = `${stdout}\n${stderr}`.replace(/\r/g, '').slice(0, 2048);
+  const lines = source.split('\n');
+  for (const phrase of phrases) {
+    const needle = String(phrase).toLowerCase();
+    for (const line of lines) {
+      const lower = line.toLowerCase();
+      const index = lower.indexOf(needle);
+      if (index < 0) continue;
+      const tail = line.slice(index + needle.length).trim();
+      const candidate = normalizeVersionToken(tail.split(/\s+/)[0] || '');
+      if (candidate) return candidate;
+    }
   }
   return null;
 }
@@ -48,7 +79,7 @@ function runVersionProbe(probe, runner) {
     return Object.freeze({ runtimeInstalled: false, version: null, probeState: 'runtime-not-installed' });
   }
 
-  const version = boundedVersion(result.stdout, result.stderr);
+  const version = boundedVersionForProbe(probe, result.stdout, result.stderr);
   if (result?.status !== 0) {
     if (probe.acceptVersionOnNonZero === true && version) {
       return Object.freeze({
