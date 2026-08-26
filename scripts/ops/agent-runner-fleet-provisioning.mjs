@@ -213,7 +213,9 @@ export function evaluateFleetAdapterEvidence({ nodeId, adapterId, evidence = {} 
   const enabled = evidence.enabled !== false;
   const runtimeInstalled = evidence.runtimeInstalled === true;
   const suppliedAuthAvailable = booleanOrNull(evidence.authAvailable, 'authAvailable');
-  const authAvailable = contract.authenticationRequired === false ? true : suppliedAuthAvailable;
+  const authAvailable = contract.authenticationRequired === false
+    ? (runtimeInstalled ? true : null)
+    : suppliedAuthAvailable;
   const qualified = evidence.qualified === true;
   const version = normalizeVersion(evidence.version);
   const qualificationRevision = optionalToken(evidence.qualificationRevision, 'qualificationRevision');
