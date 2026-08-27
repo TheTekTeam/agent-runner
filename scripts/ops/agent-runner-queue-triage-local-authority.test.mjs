@@ -131,17 +131,25 @@ test('absence of authority stays read-only without opening local or controller s
   assert.equal(result.runControl.fallbackPerformed, false);
 });
 
-test('binds authority to exact source and enabled project configuration', () => {
-  assert.throws(() => runQueueTriageLocalAuthorityCycle({
+test('binds authority to exact source and enabled project configuration via bounded read-only fallback', () => {
+  const staleSource = runQueueTriageLocalAuthorityCycle({
     controllerDb: '/tmp/controller.sqlite', localStateDb: '/tmp/local.sqlite', registry: registry(),
     authority: authority(), sourceSha: 'b'.repeat(40), execute: true, allEnabled: true,
-  }), /source SHA mismatch/);
+  });
+  assert.equal(staleSource.status, 'read-only');
+  assert.equal(staleSource.reasonCode, 'queue-triage-authority-source-sha-stale');
+  assert.equal(staleSource.runControl.mutationsAttempted, 0);
+  assert.equal(staleSource.runControl.githubWritesPerformed, false);
+
   const bad = registry();
   bad.projectsById.modelspend.queueTriage.enabled = false;
-  assert.throws(() => runQueueTriageLocalAuthorityCycle({
+  const mismatch = runQueueTriageLocalAuthorityCycle({
     controllerDb: '/tmp/controller.sqlite', localStateDb: '/tmp/local.sqlite', registry: bad,
     authority: authority(), sourceSha: 'a'.repeat(40), execute: true, allEnabled: true,
-  }), /not enabled/);
+  });
+  assert.equal(mismatch.status, 'read-only');
+  assert.equal(mismatch.reasonCode, 'queue-triage-authority-project-opt-in-mismatch');
+  assert.equal(mismatch.runControl.mutationsAttempted, 0);
 });
 
 test('authority release selector filters in SQL and preserves fair project rank ordering', () => {
@@ -364,6 +372,25 @@ test('runs polling before triage and reports actual fallback status', async () =
   });
   assert.deepEqual(order, ['polling', 'registry', 'authority', 'triage']);
   assert.equal(result.runControl.fallbackPerformed, false);
+});
+
+test('malformed local authority becomes a bounded read-only fallback after successful polling', async () => {
+  let triageCalled = false;
+  const result = await runClosedLoopCycle({
+    argv: ['--project-registry', '/tmp/projects.json', '--db', '/tmp/controller.sqlite', '--all-enabled', '--execute'],
+    env: {}, observedAt: '2026-07-31T00:00:00.000Z',
+    async runPolling() { return { schemaVersion: 1 }; },
+    parsePolling() { return { registryPath: '/tmp/projects.json', dbPath: '/tmp/controller.sqlite' }; },
+    loadRegistry() { return { projects: [], projectsById: {} }; },
+    loadAuthority() { throw new Error('invalid queue-triage local authority JSON'); },
+    runTriage() { triageCalled = true; return {}; },
+    readClientFactory: () => ({}), writeClientFactory: () => ({}),
+  });
+  assert.equal(triageCalled, false);
+  assert.equal(result.triage.status, 'read-only');
+  assert.equal(result.triage.reasonCode, 'queue-triage-authority-load-failed');
+  assert.equal(result.runControl.githubWritesPerformed, false);
+  assert.equal(result.runControl.mutationsAttempted, 0);
 });
 
 test('does not invoke triage when polling fails', async () => {
