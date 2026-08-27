@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
+import { main } from './agent-runner-live-worker-registry-command.mjs';
+
 const COMMAND = new URL('./agent-runner-live-worker-registry-command.mjs', import.meta.url);
 
 const CODEX_REVISION = 'codex-z790-58e9d9edf45669ac';
@@ -75,7 +77,7 @@ function run(args, { env, input = '' } = {}) {
   });
 }
 
-test('default CLI inspect/replace/transition path is deterministic and fail-closed', () => {
+test('default CLI inspect entrypoint is safe on any host and write path remains Dell-bound', () => {
   const root = mkdtempSync(join(tmpdir(), 'agent-runner-fleet-cli-'));
   const path = join(root, 'live-worker-registry.json');
   const env = {
@@ -90,47 +92,65 @@ test('default CLI inspect/replace/transition path is deterministic and fail-clos
     assert.equal(missingPayload.ok, true);
     assert.equal(missingPayload.registry.found, false);
 
-    const replace = run(['replace', '--expected-revision', '0'], {
+    let output = '';
+    const replaceExit = main(['replace', '--expected-revision', '0'], {
       env,
-      input: JSON.stringify(rawRegistry()),
+      hostnameFn: () => 'dev-cluster-dell',
+      readFn: () => JSON.stringify(rawRegistry()),
+      writeFn: (value) => { output += value; },
     });
-    assert.equal(replace.status, 0, replace.stderr || replace.stdout);
-    const replaced = JSON.parse(replace.stdout);
+    assert.equal(replaceExit, 0, output);
+    const replaced = JSON.parse(output);
     assert.equal(replaced.ok, true);
     assert.equal(replaced.registry.revision, 1);
     assert.equal(replaced.registry.instances[0].lifecycle, 'disabled');
 
-    const badTransition = run([
+    output = '';
+    const badTransitionExit = main([
       'transition',
       '--expected-revision', '1',
       '--instance', 'codex-cli@dev-cluster-z790',
       '--state', 'enabled',
-    ], { env });
-    assert.equal(badTransition.status, 1);
-    assert.equal(JSON.parse(badTransition.stdout).errorCode, 'live-worker-registry-activation-authority-revision-invalid');
+    ], {
+      env,
+      hostnameFn: () => 'dev-cluster-dell',
+      writeFn: (value) => { output += value; },
+    });
+    assert.equal(badTransitionExit, 1);
+    assert.equal(JSON.parse(output).errorCode, 'live-worker-registry-activation-authority-revision-invalid');
 
-    const transition = run([
+    output = '';
+    const transitionExit = main([
       'transition',
       '--expected-revision', '1',
       '--instance', 'codex-cli@dev-cluster-z790',
       '--state', 'enabled',
       '--authority-revision', 'AR402-FLEET-ACTIVATION-CLI-1',
       '--authority-fingerprint', `sha256:${'9'.repeat(64)}`,
-    ], { env });
-    assert.equal(transition.status, 0, transition.stderr || transition.stdout);
-    const transitioned = JSON.parse(transition.stdout);
+    ], {
+      env,
+      hostnameFn: () => 'dev-cluster-dell',
+      writeFn: (value) => { output += value; },
+    });
+    assert.equal(transitionExit, 0, output);
+    const transitioned = JSON.parse(output);
     assert.equal(transitioned.registry.revision, 2);
     assert.equal(transitioned.registry.instances[0].lifecycle, 'enabled');
     assert.equal(transitioned.registry.instances[0].qualificationRevision, CODEX_REVISION);
 
-    const stale = run([
+    output = '';
+    const wrongHostExit = main([
       'transition',
-      '--expected-revision', '1',
+      '--expected-revision', '2',
       '--instance', 'codex-cli@dev-cluster-z790',
       '--state', 'disabled',
-    ], { env });
-    assert.equal(stale.status, 1);
-    assert.equal(JSON.parse(stale.stdout).errorCode, 'live-worker-registry-stale-revision');
+    ], {
+      env,
+      hostnameFn: () => 'dev-cluster-z790',
+      writeFn: (value) => { output += value; },
+    });
+    assert.equal(wrongHostExit, 1);
+    assert.equal(JSON.parse(output).errorCode, 'live-worker-registry-controller-write-refused');
 
     const inspect = run(['inspect'], { env });
     assert.equal(inspect.status, 0);
