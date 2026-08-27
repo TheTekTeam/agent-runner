@@ -475,23 +475,58 @@ test('text-only local Ollama config denies all model tools while retaining local
   assert.equal(config.provider.ollama.options.baseURL, 'http://127.0.0.1:11434/v1');
 });
 
-test('bounded documentation output accepts exactly one full-document envelope', () => {
+test('bounded documentation output accepts envelope, code fence and raw full-document transports', () => {
+  const expected = '# Documentation Canary\n\nStatus: qualified-documentation-canary.';
+
+  assert.equal(
+    parseBoundedDocumentationContent(
+      '<modelspend-document>\n# Documentation Canary\n\nStatus: qualified-documentation-canary.\n</modelspend-document>',
+    ).content,
+    expected,
+  );
+
+  assert.equal(
+    parseBoundedDocumentationContent(
+      '~~~not-used~~~'.replaceAll('~~~', '```markdown') + '\n' + expected + '\n```',
+    ).content,
+    expected,
+  );
+
+  assert.equal(
+    parseBoundedDocumentationContent(expected).content,
+    expected,
+  );
+});
+
+test('expected documentation content is a deterministic semantic gate independent of harmless wrappers', () => {
+  const expected = '# Documentation Canary\n\nStatus: qualified-documentation-canary.';
+
   const result = parseBoundedDocumentationContent(
-    '<modelspend-document>\n# Documentation Canary\n\nStatus: qualified-documentation-canary.\n</modelspend-document>',
+    'Here is the updated document:\n\n```markdown\n' + expected + '\n```\n',
+    { expectedContent: expected },
   );
 
   assert.equal(result.ok, true);
-  assert.equal(result.content, '# Documentation Canary\n\nStatus: qualified-documentation-canary.');
-});
+  assert.equal(result.content, expected);
 
-test('bounded documentation output rejects prose wrappers, nested markers, NUL and oversize output', () => {
   assert.equal(
     parseBoundedDocumentationContent(
-      'Here you go:\n<modelspend-document>\ntext\n</modelspend-document>',
+      'Status: draft.',
+      { expectedContent: expected },
     ).reason,
-    'ollama-document-envelope-invalid',
+    'ollama-document-content-mismatch',
   );
 
+  assert.equal(
+    parseBoundedDocumentationContent(
+      expected + '\n---\n' + expected,
+      { expectedContent: expected },
+    ).reason,
+    'ollama-document-content-ambiguous',
+  );
+});
+
+test('bounded documentation output still fails closed on malformed markers, NUL and oversize output', () => {
   assert.equal(
     parseBoundedDocumentationContent(
       '<modelspend-document>\ninner <modelspend-document> bad\n</modelspend-document>',
