@@ -328,7 +328,24 @@ const OLLAMA_SHELL_METACHARACTERS = /[;&|><\`$(){}\n\r]/;
 const OLLAMA_DANGEROUS_SHELL = /^(?:sudo|su|systemctl|service|docker|podman|ssh|scp|sftp|curl|wget|nc|ncat|telnet|apt|apt-get|dnf|yum|pacman|snap|flatpak|npx)\b/i;
 const OLLAMA_INTERPRETER_ESCAPE = /^(?:bash|sh|zsh)\s+(?:-[^\s]*c\b|--command\b)|^(?:node|python|python3|perl|ruby)\s+(?:-e\b|-c\b|--eval\b)/i;
 const OLLAMA_DESTRUCTIVE_GIT = /^git\s+(?:reset|clean|stash|rebase|push|pull|merge|cherry-pick|revert|checkout|switch|branch|tag|remote|config|gc|prune|worktree)\b/i;
-const OLLAMA_SAFE_GIT = /^(?:pwd|git\s+(?:status|diff|log|show|grep|ls-files|rev-parse)(?:\s|$))/i;
+const OLLAMA_FIXED_INSPECTION_SHELL = new Set([
+  'pwd',
+  'git status',
+  'git status --short',
+  'git status --porcelain',
+  'git status --porcelain=v1',
+  'git diff',
+  'git diff --check',
+  'git diff --stat',
+  'git diff --name-only',
+  'git diff -- *',
+  'git diff HEAD -- *',
+  'git log --oneline -n 20',
+  'git log --oneline -n 50',
+  'git show --stat HEAD',
+  'git rev-parse HEAD',
+  'git rev-parse --show-toplevel',
+]);
 
 function normalizeOpenCodeWorktreePathPattern(value) {
   const path = String(value || '').trim();
@@ -346,7 +363,8 @@ export function isSafeOllamaShellPattern(value) {
   if (OLLAMA_DANGEROUS_SHELL.test(pattern)) return false;
   if (OLLAMA_INTERPRETER_ESCAPE.test(pattern)) return false;
   if (OLLAMA_DESTRUCTIVE_GIT.test(pattern)) return false;
-  if (OLLAMA_SAFE_GIT.test(pattern)) return true;
+  if (OLLAMA_FIXED_INSPECTION_SHELL.has(pattern)) return true;
+  if (pattern.startsWith('git ')) return false;
 
   const first = pattern.split(/\s+/)[0].toLowerCase();
   if (first === 'bash') {
