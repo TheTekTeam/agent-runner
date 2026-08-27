@@ -5,11 +5,20 @@ const STRIPPED_ENV_KEYS = Object.freeze([
   'CODEX_API_KEY',
   'CODEX_ACCESS_TOKEN',
   'OPENAI_BASE_URL',
+  'GH_TOKEN',
+  'GITHUB_TOKEN',
+  'GITLAB_TOKEN',
+  'SSH_AUTH_SOCK',
+  'SSH_ASKPASS',
+  'GIT_ASKPASS',
+  'GIT_SSH',
+  'GIT_SSH_COMMAND',
 ]);
 
 export function sanitizeCodexEnvironment(env = process.env) {
   const clean = { ...env };
   for (const key of STRIPPED_ENV_KEYS) delete clean[key];
+  clean.GIT_TERMINAL_PROMPT = '0';
   return clean;
 }
 
