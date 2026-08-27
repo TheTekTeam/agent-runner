@@ -1,10 +1,9 @@
 /**
  * Bounded, Codex-native command construction (issue #48).
  *
- * The flag surface here is grounded in `codex exec --help` captured locally
- * against the installed `codex-cli 0.144.6` binary (a no-cost, non-model
- * command run at implementation time) rather than copied from Claude's CLI
- * shape:
+ * The flag surface here is grounded in Codex's published 0.150.1 CLI
+ * contract and the locally installed `codex-cli 0.150.1` runtime rather than
+ * copied from Claude's CLI shape:
  *
  *   codex exec [OPTIONS] [PROMPT]
  *     -s, --sandbox <read-only|workspace-write|danger-full-access>
@@ -12,6 +11,8 @@
  *     -C, --cd <DIR>
  *     --json
  *     --output-schema <FILE>
+ *     --ephemeral
+ *     --ignore-user-config
  *     -c, --config <key=value>
  *
  * `exec` has no dedicated `-a/--ask-for-approval` flag (that only appears on
@@ -57,8 +58,9 @@ function requireEnum(value, allowed, label) {
 
 /**
  * Every argument is explicit and required except `reasoningEffort`,
- * `networkAccess` and `outputSchemaPath`, which are simply omitted (not
- * defaulted) when unset. When `networkAccess` is supplied it is valid only
+ * `networkAccess`, `outputSchemaPath`, `ephemeral` and
+ * `ignoreUserConfig`, which are simply omitted (not defaulted) when unset.
+ * When `networkAccess` is supplied it is valid only
  * for the `workspace-write` sandbox.
  * There is no code path in this function that can ever emit
  * `--dangerously-bypass-approvals-and-sandbox` or
@@ -74,6 +76,8 @@ export function buildCodexCommandArgs({
   reasoningEffort,
   networkAccess,
   outputSchemaPath,
+  ephemeral,
+  ignoreUserConfig,
   prompt,
 } = {}) {
   const resolvedExecutable = requireNonEmptyString(executablePath, 'an executable path');
@@ -92,6 +96,16 @@ export function buildCodexCommandArgs({
     '-c', `${APPROVAL_POLICY_CONFIG_KEY}=${resolvedApproval}`,
     '-m', resolvedModel,
   ];
+
+  if (ephemeral !== undefined && ephemeral !== null) {
+    if (typeof ephemeral !== 'boolean') throw new Error('buildCodexCommandArgs requires ephemeral to be boolean');
+    if (ephemeral) args.push('--ephemeral');
+  }
+
+  if (ignoreUserConfig !== undefined && ignoreUserConfig !== null) {
+    if (typeof ignoreUserConfig !== 'boolean') throw new Error('buildCodexCommandArgs requires ignoreUserConfig to be boolean');
+    if (ignoreUserConfig) args.push('--ignore-user-config');
+  }
 
   if (reasoningEffort !== undefined && reasoningEffort !== null) {
     const resolvedEffort = requireEnum(reasoningEffort, CODEX_REASONING_EFFORTS, 'a reasoning effort');
