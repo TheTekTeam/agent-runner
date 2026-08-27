@@ -128,7 +128,7 @@ function assertCanonicalQualification(instance, publication = publishedByInstanc
   }
 }
 
-export function assertLiveInstanceActivationEligible(instance) {
+export function assertLiveInstanceActivationEligible(instance, registry = null) {
   if (!instance || typeof instance !== 'object') throw new LiveWorkerRegistryError('live-worker-registry-instance-missing');
   assertCanonicalQualification(instance);
   if (instance.qualified !== true) throw new LiveWorkerRegistryError('live-worker-registry-instance-unqualified');
@@ -142,6 +142,12 @@ export function assertLiveInstanceActivationEligible(instance) {
   }
   if (instance.costPosture === 'included-subscription' && !instance.providerAccountClass) {
     throw new LiveWorkerRegistryError('live-worker-registry-provider-account-class-missing');
+  }
+  if (instance.costPosture === 'included-subscription' && registry) {
+    const cap = Number(registry.providerAccountCaps?.[instance.providerAccountClass]);
+    if (!Number.isSafeInteger(cap) || cap < 1) {
+      throw new LiveWorkerRegistryError('live-worker-registry-provider-account-cap-missing');
+    }
   }
   return instance;
 }
@@ -339,10 +345,13 @@ export function transitionLiveWorkerInstance({
       if (!current.registry) throw new LiveWorkerRegistryError('live-worker-registry-missing');
       const currentInstance = current.registry.agentInstances.find((entry) => entry.instanceId === instanceId);
       if (!currentInstance) throw new LiveWorkerRegistryError('live-worker-registry-instance-not-found');
+      if (currentInstance.active > 0 && targetState !== currentInstance.lifecycle) {
+        throw new LiveWorkerRegistryError('live-worker-registry-active-work-conflict');
+      }
       const authority = targetState === 'enabled'
         ? normalizeAuthority({ authorityRevision, authorityFingerprint })
         : null;
-      if (targetState === 'enabled') assertLiveInstanceActivationEligible(currentInstance);
+      if (targetState === 'enabled') assertLiveInstanceActivationEligible(currentInstance, current.registry);
 
       const agentInstances = current.registry.agentInstances.map((entry) => ({
         ...entry,
@@ -355,7 +364,7 @@ export function transitionLiveWorkerInstance({
         providerAccountCaps: current.registry.providerAccountCaps,
       }, nextRevision);
       const nextInstance = registry.agentInstances.find((entry) => entry.instanceId === instanceId);
-      if (targetState === 'enabled') assertLiveInstanceActivationEligible(nextInstance);
+      if (targetState === 'enabled') assertLiveInstanceActivationEligible(nextInstance, registry);
 
       return {
         schemaVersion: LIVE_WORKER_REGISTRY_DOCUMENT_SCHEMA_VERSION,
