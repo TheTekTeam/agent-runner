@@ -356,10 +356,10 @@ const invokedAsScript = process.argv[1]
 if (invokedAsScript) {
   try {
     process.exitCode = await main();
-  } catch (error) {
+  } catch {
     console.error(JSON.stringify({
       canary: 'failed',
-      reason: String(error?.message || error).replace(/[^A-Za-z0-9._:-]+/g, '-').slice(0, 120),
+      reason: 'codex-canary-failed',
       rawProviderOutputPersisted: false,
     }));
     process.exitCode = 1;
