@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import {
   chmodSync,
+  existsSync,
   lstatSync,
   mkdtempSync,
   mkdirSync,
@@ -225,6 +226,94 @@ test('replace creates a mode-0600 canonical registry and reload is deterministic
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test('first write safely creates a missing parent and private mode tampering fails closed', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-runner-fleet-registry-parent-'));
+  const path = join(root, 'missing', 'nested', 'live-worker-registry.json');
+  try {
+    const written = replaceLiveWorkerRegistry({
+      path,
+      expectedRevision: 0,
+      controllerNodeId: 'dev-cluster-dell',
+      registry: rawRegistry(),
+    });
+    assert.equal(written.revision, 1);
+    assert.equal(lstatSync(path).mode & 0o777, 0o600);
+
+    chmodSync(path, 0o644);
+    assert.throws(
+      () => loadLiveWorkerRegistryDocument({ path, allowMissing: false }),
+      /file-mode-invalid/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('promotion derives immutable qualification identity from canonical accepted evidence', () => {
+  const plan = planLiveWorkerRegistryPromotion({
+    expectedRevision: 0,
+    controllerNodeId: 'dev-cluster-dell',
+    nodes: nodes(),
+    runtimeInstances: [{
+      nodeId: 'dev-cluster-z790',
+      adapterId: 'codex-cli',
+      installedVersion: CODEX_PUBLISHED.installedVersion,
+      readiness: 'ready',
+      authenticated: true,
+      costPosture: 'included-subscription',
+      paid: false,
+      maxConcurrent: 1,
+      active: 0,
+    }],
+    providerAccountCaps: { [CODEX_PUBLISHED.providerAccountClass]: 1 },
+  });
+  const promoted = plan.registry.agentInstances[0];
+  assert.equal(promoted.lifecycle, 'disabled');
+  assert.equal(promoted.qualificationRevision, CODEX_PUBLISHED.qualificationRevision);
+  assert.equal(promoted.qualificationEvidenceFingerprint, CODEX_PUBLISHED.acceptedResultFingerprint);
+  assert.equal(promoted.installedVersion, CODEX_PUBLISHED.installedVersion);
+  assert.equal(promoted.qualificationContractFingerprint, CODEX_PUBLISHED.qualificationContractFingerprint);
+  assert.equal(promoted.qualificationCapabilityFingerprint, CODEX_PUBLISHED.capabilityFingerprint);
+  assert.deepEqual(promoted.models, [CODEX_PUBLISHED.model]);
+  assert.deepEqual(promoted.profiles, [CODEX_PUBLISHED.profile]);
+
+  assert.throws(
+    () => planLiveWorkerRegistryPromotion({
+      expectedRevision: 0,
+      nodes: nodes(),
+      runtimeInstances: [{
+        nodeId: 'dev-cluster-z790',
+        adapterId: 'codex-cli',
+        installedVersion: '0.145.0',
+        readiness: 'ready',
+        authenticated: true,
+        costPosture: 'included-subscription',
+        paid: false,
+      }],
+      providerAccountCaps: { [CODEX_PUBLISHED.providerAccountClass]: 1 },
+    }),
+    /qualified-version-mismatch/,
+  );
+
+  assert.throws(
+    () => planLiveWorkerRegistryPromotion({
+      expectedRevision: 0,
+      nodes: nodes(),
+      runtimeInstances: [{
+        nodeId: 'dev-cluster-dell',
+        adapterId: 'codex-cli',
+        installedVersion: CODEX_PUBLISHED.installedVersion,
+        readiness: 'ready',
+        authenticated: true,
+        costPosture: 'included-subscription',
+        paid: false,
+      }],
+      providerAccountCaps: { [CODEX_PUBLISHED.providerAccountClass]: 1 },
+    }),
+    /qualification-evidence-gap/,
+  );
 });
 
 test('stale expected revision is rejected before mutation', () => {
@@ -609,7 +698,9 @@ test('non-Dell writes and symlinked destination/path components are refused', ()
 
     const realDir = join(root, 'real');
     const linkDir = join(root, 'linked');
-    mkdirSync(realDir);
+    mkdirSync(realDir, { mode: 0o755 });
+    chmodSync(realDir, 0o755);
+    const modeBefore = lstatSync(realDir).mode & 0o777;
     symlinkSync(realDir, linkDir);
     const linkedPath = join(linkDir, 'live-worker-registry.json');
     assert.throws(
@@ -621,6 +712,9 @@ test('non-Dell writes and symlinked destination/path components are refused', ()
       }),
       /symlink-refused/,
     );
+    assert.equal(lstatSync(realDir).mode & 0o777, modeBefore);
+    assert.equal(existsSync(join(realDir, 'live-worker-registry.json')), false);
+    assert.equal(existsSync(join(realDir, 'live-worker-registry.json.lock')), false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
