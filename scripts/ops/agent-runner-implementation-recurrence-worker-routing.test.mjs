@@ -232,6 +232,7 @@ fingerprint: ${fingerprint}
       },
       maxParallel: 1,
       remoteTransportAvailable: true,
+      currentSourceCommit: sourceSha,
     });
     assert.equal(result.registrySource, 'canonical-store');
     assert.equal(result.registryDocumentRevision, 2);
