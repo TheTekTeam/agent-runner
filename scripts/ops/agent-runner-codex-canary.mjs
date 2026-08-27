@@ -7,6 +7,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { admitCodexDispatch, buildCodexCommandArgs, classifyCodexExecutionError, parseCodexResultEnvelope } from './agent-runner-codex-adapter.mjs';
+import { normalizeImplementationApprovers } from './agent-runner-admission.mjs';
 import { AGENT_ADAPTERS } from './agent-runner-agents.mjs';
 import { resolveDispatchAuthority } from './agent-runner-dispatch-authority.mjs';
 import { acquireImplementationSlot } from './agent-runner-implementation-slot.mjs';
@@ -65,12 +66,10 @@ function fetchIssueComments() {
 }
 
 function approvedManager(authority, env = process.env) {
-  const approved = String(env.CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS || '')
-    .split(',')
-    .map((value) => value.trim().toLowerCase())
-    .filter(Boolean);
+  const { approvers, invalid } = normalizeImplementationApprovers(env.CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS);
+  if (invalid.length > 0 || approvers.length === 0) return false;
   const author = String(authority?.comment?.user?.login || '').trim().toLowerCase();
-  return approved.length > 0 && approved.includes(author);
+  return approvers.includes(author);
 }
 
 function statePath(env = process.env) {
