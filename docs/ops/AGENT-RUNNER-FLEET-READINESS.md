@@ -74,7 +74,7 @@ bash scripts/install-agent-runner-fleet-runtime.sh \
   --dry-run
 ```
 
-This step installs/version-probes the runtime only. It does not run `codex login`, inspect or copy `~/.codex` state, read `OPENAI_API_KEY`/`CODEX_API_KEY`, infer ChatGPT authentication, inspect account balance, infer quota, perform a model call, qualify the instance or activate routing.
+This step installs/version-probes the runtime only. An explicit Codex provisioning run reconciles the reviewed `@openai/codex@latest` package even when a `codex` executable is already present; binary presence alone is not treated as proof of runtime currency. This prevents an older command earlier on `PATH` from silently blocking an authorised runtime refresh. It does not run `codex login`, inspect or copy `~/.codex` state, read `OPENAI_API_KEY`/`CODEX_API_KEY`, infer ChatGPT authentication, inspect account balance, infer quota, perform a model call, qualify the instance or activate routing.
 
 The canonical `codex-cli` Agent Runner execution adapter remains default-disabled/non-routable until the owning #186 canary proves the intended ChatGPT-account authentication path, current quota/headroom admission and bounded task/profile qualification. Fleet evidence cannot bypass that gate: even fabricated `authAvailable:true` / `qualified:true` evidence remains non-routable while the live adapter is not qualification-eligible.
 
