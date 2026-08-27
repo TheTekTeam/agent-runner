@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -33,6 +34,15 @@ async function withTempDir(prefix, fn) {
     rmSync(dir, { recursive: true, force: true });
   }
 }
+
+test('dashboard module can be imported when process.argv[1] is absent', () => {
+  const moduleUrl = new URL('./claude-runner-dashboard-api.mjs', import.meta.url).href;
+  assert.doesNotThrow(() => execFileSync(
+    process.execPath,
+    ['--input-type=module', '--eval', `await import(${JSON.stringify(moduleUrl)})`],
+    { stdio: 'pipe' },
+  ));
+});
 
 test('parseArgs defaults to env state DB and accepts dashboard options', () => {
   const args = parseArgs(['--limit', '7', '--strict'], { CLAUDE_RUNNER_STATE_DB: '/tmp/runner.sqlite' });
