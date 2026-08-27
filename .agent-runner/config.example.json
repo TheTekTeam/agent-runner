@@ -5,12 +5,21 @@
   "localRepoPath": "/srv/example-project/repository",
   "outputDir": ".var/agent-runner",
   "stateDbPath": ".var/agent-runner/runner-state.sqlite",
-  "acceptedAgentLabels": ["agent:claude", "agent:claude-code-cli"],
+  "acceptedAgentLabels": [
+    "agent:claude",
+    "agent:claude-code-cli",
+    "agent:ollama"
+  ],
   "statusLabels": {
     "ready": "status:ready",
     "inProgress": "status:in-progress"
   },
-  "priorityLabelRanking": ["priority:P0", "priority:P1", "priority:P2", "priority:P3"],
+  "priorityLabelRanking": [
+    "priority:P0",
+    "priority:P1",
+    "priority:P2",
+    "priority:P3"
+  ],
   "safeDefaultValidationCommands": [
     "npm run validate:quick:plan -- --files <changed files>",
     "npm test"
