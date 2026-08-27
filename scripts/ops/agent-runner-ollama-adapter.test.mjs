@@ -14,6 +14,7 @@ import {
   isAllowlistedOllamaHost,
   OLLAMA_AGENT_ID,
   parseBoundedDocumentationContent,
+  parseBoundedDocumentationReplacement,
   parseOpenCodeJsonEventStream,
   parseOpenCodeResultEnvelope,
   probeEndpoint,
@@ -547,5 +548,72 @@ test('bounded documentation output still fails closed on malformed markers, NUL 
       { maxBytes: 10 },
     ).reason,
     'ollama-document-output-too-large',
+  );
+});
+
+
+test('bounded documentation replacement accepts one exact harness-owned replacement amid harmless prose', () => {
+  const expected = 'Status: qualified-documentation-canary.';
+
+  const result = parseBoundedDocumentationReplacement(
+    'Use this replacement line:\n\n```text\n' + expected + '\n```',
+    { expectedReplacement: expected },
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.replacement, expected);
+});
+
+test('bounded documentation replacement fails closed on missing, ambiguous, NUL and oversize output', () => {
+  const expected = 'Status: qualified-documentation-canary.';
+
+  assert.equal(
+    parseBoundedDocumentationReplacement(
+      'Status: draft.',
+      { expectedReplacement: expected },
+    ).reason,
+    'ollama-document-replacement-mismatch',
+  );
+
+  assert.equal(
+    parseBoundedDocumentationReplacement(
+      expected + '\n' + expected,
+      { expectedReplacement: expected },
+    ).reason,
+    'ollama-document-replacement-ambiguous',
+  );
+
+  assert.equal(
+    parseBoundedDocumentationReplacement(
+      expected + '\u0000',
+      { expectedReplacement: expected },
+    ).reason,
+    'ollama-document-replacement-output-invalid',
+  );
+
+  assert.equal(
+    parseBoundedDocumentationReplacement(
+      expected.repeat(5),
+      { expectedReplacement: expected, maxBytes: 20 },
+    ).reason,
+    'ollama-document-replacement-output-too-large',
+  );
+});
+
+test('bounded documentation replacement requires exactly one non-empty replacement line', () => {
+  assert.throws(
+    () => parseBoundedDocumentationReplacement(
+      'anything',
+      { expectedReplacement: '' },
+    ),
+    /one bounded non-empty replacement line/,
+  );
+
+  assert.throws(
+    () => parseBoundedDocumentationReplacement(
+      'anything',
+      { expectedReplacement: 'line one\nline two' },
+    ),
+    /one bounded non-empty replacement line/,
   );
 });
