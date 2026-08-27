@@ -28,14 +28,22 @@ function nodePreference(env = process.env) {
   return [...new Set(values)];
 }
 
-export function parseLiveWorkerRegistry(env = process.env, { expectedControllerNodeId = null, currentSourceCommit = null } = {}) {
-  // Canonical Dell-owned state takes precedence whenever present. The legacy
-  // environment JSON remains a read-only compatibility source only while no
-  // canonical store exists, so stale environment cannot bypass hard admission.
-  const loaded = loadLiveWorkerRegistryDocument({
-    path: resolveLiveWorkerRegistryPath(env),
-    allowMissing: true,
-  });
+export function parseLiveWorkerRegistry(env = process.env, {
+  expectedControllerNodeId = null,
+  currentSourceCommit = null,
+  useCanonicalStore = true,
+  requireActivationSource = false,
+} = {}) {
+  // Canonical Dell-owned state participates only when the caller opts into the
+  // activation path. Production recurrence keeps prepared canonical state
+  // dormant while remote activation is off, preserving the accepted local
+  // compatibility route. Other read-only callers may continue to inspect it.
+  const loaded = useCanonicalStore
+    ? loadLiveWorkerRegistryDocument({
+      path: resolveLiveWorkerRegistryPath(env),
+      allowMissing: true,
+    })
+    : { registry: null, revision: 0, document: null };
   let registry = loaded.registry
     ? Object.freeze({
       ...loaded.registry,
