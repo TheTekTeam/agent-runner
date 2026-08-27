@@ -16,11 +16,24 @@ import {
 } from './agent-runner-agents.mjs';
 import {
   CLAUDE_AGENT_ID,
+  getAgentSettings,
   settingsRevisionUnchanged,
   snapshotAgentSettings,
 } from './agent-runner-agent-settings.mjs';
 import { executionLabelAuthority } from './agent-runner-label-authority.mjs';
 import { classifyIssueTaskRisk } from './agent-runner-qualification.mjs';
+import {
+  OLLAMA_AGENT_ID,
+  QUALIFIED_OLLAMA_CODING_MODEL,
+  QUALIFIED_OPENCODE_VERSION,
+  QUALIFIED_OLLAMA_VERSION,
+  admitOllamaDispatch,
+} from './agent-runner-ollama-adapter.mjs';
+import {
+  classifyBoundedOllamaShellCommand,
+  isShellTrustedRepository,
+} from './agent-runner-ollama-shell-policy.mjs';
+import { resolveBoundedOllamaManagerContract } from './agent-runner-ollama-worker-contract.mjs';
 import { selectAgentForIssue } from './agent-runner-routing.mjs';
 import { computeInstanceReadiness } from './agent-runner-control-readiness.mjs';
 import {
@@ -102,6 +115,7 @@ const DEFAULT_OUTPUT = '.var/claude-runner';
 // changed to the configured project's checkout -- silently running that
 // checkout's own vendored copy instead of this canonical implementation.
 export const CLAUDE_RUNNER_ENTRYPOINT = fileURLToPath(new URL('./claude-runner.mjs', import.meta.url));
+export const OLLAMA_RUNNER_ENTRYPOINT = fileURLToPath(new URL('./agent-runner-ollama-runner.mjs', import.meta.url));
 const DEFAULT_AGENT_LABELS = allAgentLabels({ includeFuture: false });
 // Issue #50 review round 3: the fixed, catalogue-derived label partition
 // execution discovery and reconciliation discovery each read from --
@@ -365,8 +379,8 @@ export function evaluateChildRunResult({ execute, exitCode, childPayload }) {
   return { failed: false, reason: null };
 }
 
-export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeSessionId, model } = {}) {
-  const out = [CLAUDE_RUNNER_ENTRYPOINT];
+export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeSessionId, model, agentId = CLAUDE_AGENT_ID } = {}) {
+  const out = [agentId === OLLAMA_AGENT_ID ? OLLAMA_RUNNER_ENTRYPOINT : CLAUDE_RUNNER_ENTRYPOINT];
   if (args.configPath) out.push('--config', args.configPath);
   out.push('--issue', String(issueNumber), '--output-dir', args.outputDir);
   if (args.execute) out.push('--execute');
@@ -387,6 +401,78 @@ export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeS
   // Never set for a recovery re-invocation or a non-implementation dispatch.
   if (model) out.push('--model', String(model));
   return out;
+}
+
+const OLLAMA_FORBIDDEN_TASK_CLASSES = new Set([
+  'security', 'auth', 'authentication', 'authorization', 'billing',
+  'database-migration', 'migration', 'deployment', 'deploy',
+  'architecture', 'broad-architecture',
+]);
+
+export async function preclaimOllamaAdmission({
+  agentId,
+  issue,
+  managerComment,
+  managerModel,
+  repo,
+  env = process.env,
+  execFileFn = execFileSync,
+  fetchFn = fetch,
+} = {}) {
+  if (agentId !== OLLAMA_AGENT_ID) return { allowed: true, reason: null, model: null };
+  if (managerModel !== QUALIFIED_OLLAMA_CODING_MODEL) {
+    return { allowed: false, reason: 'ollama-manager-model-mismatch', model: null };
+  }
+
+  const contract = resolveBoundedOllamaManagerContract(managerComment);
+  if (!contract.ok) return { allowed: false, reason: contract.reason, model: null };
+
+  const settings = getAgentSettings({ env, agentId: OLLAMA_AGENT_ID });
+  if (!settings.routable) return { allowed: false, reason: settings.reason || 'ollama-agent-not-routable', model: null };
+  if (!isShellTrustedRepository(repo, settings.entry?.shellTrustedRepositories)) {
+    return { allowed: false, reason: 'ollama-shell-repository-not-trusted', model: null };
+  }
+
+  const classification = classifyIssueTaskRisk(issue);
+  if (classification.conflicts?.length) return { allowed: false, reason: 'ollama-issue-classification-conflict', model: null };
+  if (OLLAMA_FORBIDDEN_TASK_CLASSES.has(classification.taskClass)) {
+    return { allowed: false, reason: 'ollama-task-class-forbidden', model: null };
+  }
+
+  for (const command of contract.validationCommands) {
+    const decision = classifyBoundedOllamaShellCommand(command, {
+      repository: repo,
+      trustedRepositories: settings.entry?.shellTrustedRepositories,
+      managerValidationCommands: contract.validationCommands,
+      machineCommandAllowlist: settings.entry?.commandAllowlist,
+    });
+    if (!decision.allowed) return { allowed: false, reason: decision.reason || 'ollama-shell-command-denied', model: null };
+  }
+
+  const admission = await admitOllamaDispatch({
+    env,
+    model: QUALIFIED_OLLAMA_CODING_MODEL,
+    settings,
+    execFileFn: (file, commandArgs) => execFileFn(file, commandArgs, {
+      encoding: 'utf8',
+      timeout: 5000,
+      env,
+    }),
+    fetchFn,
+    requiredExecutableVersion: QUALIFIED_OPENCODE_VERSION,
+    requiredOllamaVersion: QUALIFIED_OLLAMA_VERSION,
+  });
+  if (!admission.allowed) {
+    return { allowed: false, reason: admission.reason || 'ollama-admission-refused', model: null };
+  }
+
+  return {
+    allowed: true,
+    reason: null,
+    model: QUALIFIED_OLLAMA_CODING_MODEL,
+    targetFile: contract.filePath,
+    shellCommandCount: contract.validationCommands.length,
+  };
 }
 
 export function quotaPreflightArgs(args) {
@@ -2255,6 +2341,15 @@ export async function selectIssue(args, ghRunner = gh, {
     if (skipIfAmbiguous(issue)) continue;
 
     const agent = resolveAgentForLabels([...(issue.labels || []), issue.agentLabel]);
+    if (agent?.agentId === OLLAMA_AGENT_ID && !settingsSnapshot) {
+      skipped.push({
+        issue: issue.number,
+        statusLabel: issue.statusLabel,
+        reason: 'multi-agent-routing-disabled',
+        agentId: OLLAMA_AGENT_ID,
+      });
+      continue;
+    }
     if (!agent?.implemented) {
       skipped.push({
         ...unsupportedAgentSkip(agent, { issueNumber: issue.number }),
@@ -3208,6 +3303,35 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     const dueRecovery = args.execute ? (state.invoke('dueRecoveryAttempts', args.repo, now()) || [])[0] : null;
     if (!state.healthy) return emitSystemicStatePause(args, state, 'recovery-read', { now, logger: dependencies.logger }).exitCode;
     if (dueRecovery) {
+      if (dueRecovery.agent === OLLAMA_AGENT_ID) {
+        const denied = {
+          allowed: false,
+          stage: 'pre_claim',
+          failedChecks: ['ollama-recovery-not-qualified'],
+          reason: 'ollama-recovery-not-qualified',
+        };
+        const blocked = blockRecoveryBeforeLaunch(state, args, dueRecovery, denied, now, ghRunner);
+        if (!blocked.persisted) return emitSystemicStatePause(args, state, 'ollama-recovery-attention', { now, logger: dependencies.logger }).exitCode;
+        const payload = {
+          recoveryBlocked: true,
+          stage: 'pre_claim',
+          issue: dueRecovery.issue_number,
+          failedChecks: denied.failedChecks,
+          childLaunched: false,
+          agentId: OLLAMA_AGENT_ID,
+        };
+        const logPath = writeLog(args.outputDir, payload);
+        if (!state.record('recordRunResult', {
+          repo: args.repo,
+          issueNumber: dueRecovery.issue_number,
+          mode: 'ollama-recovery-not-qualified',
+          exitCode: 1,
+          logPath,
+          payload,
+        })) return emitSystemicStatePause(args, state, 'ollama-recovery-result', { now, logger: dependencies.logger }).exitCode;
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return 1;
+      }
       const revalidateRecovery = dependencies.revalidateRecovery || collectRecoveryRevalidation;
       const revalidationArgs = { ...args, currentQuotaPreflight: quotaPreflight };
       const preClaimInput = {
@@ -3257,7 +3381,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       if (!persistRecoveryRevalidation(state, recoveryClaim, recoveryPreLaunch, recoveryLeaseId)) {
         return emitSystemicStatePause(args, state, 'pre-launch-revalidation-persistence', { now, logger: dependencies.logger }).exitCode;
       }
-      const ordinaryInvocation = { command: process.execPath, args: runnerArgs(recoveryClaim.issue_number, args, { attemptId: recoveryClaim.attempt_id }), env: authEnv };
+      const ordinaryInvocation = { command: process.execPath, args: runnerArgs(recoveryClaim.issue_number, args, { attemptId: recoveryClaim.attempt_id, agentId: recoveryClaim.agent }), env: authEnv };
       const restrictedDispatch = buildRestrictedRecoveryDispatch({
         recoveryPreLaunch, issueNumber: recoveryClaim.issue_number, attemptId: recoveryClaim.attempt_id, args, authEnv, dependencies,
       });
@@ -3462,14 +3586,23 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     // non-implementation dispatch (recovery, plan phase, unauthorized): this
     // issue's forward-fix scope is limited to fresh implementation attempts,
     // and those keep their prior `plan.agent?.model` behavior below.
-    const resolvedProfile = freshImplementationDispatch
+    const freshAgentId = freshImplementationDispatch ? plan.agent?.agentId : null;
+    const freshOllamaDispatch = freshAgentId === OLLAMA_AGENT_ID;
+    const resolvedProfile = freshImplementationDispatch && !freshOllamaDispatch
       ? resolveProfile(dispatchIdentity.profileName, {
         model: dispatchIdentity.managerExecutionMeta?.model,
         effort: dispatchIdentity.managerExecutionMeta?.effort,
       }, authEnv)
       : null;
-    const resolvedModel = freshImplementationDispatch ? (resolvedProfile?.model ?? null) : null;
-    const modelResolutionValid = !freshImplementationDispatch || isSupportedModelId(resolvedModel);
+    const resolvedModel = !freshImplementationDispatch
+      ? null
+      : freshOllamaDispatch
+        ? QUALIFIED_OLLAMA_CODING_MODEL
+        : (resolvedProfile?.model ?? null);
+    const modelResolutionValid = !freshImplementationDispatch
+      || (freshOllamaDispatch
+        ? dispatchIdentity.managerExecutionMeta?.model === QUALIFIED_OLLAMA_CODING_MODEL
+        : isSupportedModelId(resolvedModel));
 
     // Every invocation — the first attempt and every recovery re-invocation
     // of the same attempt row — passes the same attemptId so the child can
@@ -3477,7 +3610,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     // identity) keyed consistently for a later native_resume/
     // same_agent_continuation to read back (#698 finding 2).
     let nodeArgs = recoveryInvocation?.args
-      || runnerArgs(selected.issue.number, args, { attemptId, model: resolvedModel });
+      || runnerArgs(selected.issue.number, args, { attemptId, model: resolvedModel, agentId: plan.agent?.agentId });
 
     // Issue #50 review, requirement 7: this settings-revision check must run
     // before any new attempt/ownership row, claim, GitHub mutation,
@@ -3596,6 +3729,54 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       })) return emitSystemicStatePause(args, state, 'model-resolution-result-persistence', { now, logger: dependencies.logger }).exitCode;
       console.log(JSON.stringify({ ...payload, logPath }, null, 2));
       return 1;
+    }
+
+    if (!recoveryClaim && freshImplementationDispatch && freshOllamaDispatch) {
+      const ollamaAdmission = await preclaimOllamaAdmission({
+        agentId: freshAgentId,
+        issue: selected.issue,
+        managerComment: selected.currentPreflight,
+        managerModel: dispatchIdentity.managerExecutionMeta?.model,
+        repo: args.repo,
+        env: authEnv,
+        execFileFn: dependencies.execFileFn || execFileSync,
+        fetchFn: dependencies.fetchFn || fetch,
+      });
+      if (!ollamaAdmission.allowed) {
+        const finishedAt = now();
+        const payload = {
+          ...plan,
+          claim: null,
+          startedAt,
+          finishedAt,
+          exitCode: 1,
+          childLaunched: false,
+          markerPosted: false,
+          packetConsumed: false,
+          attemptCreated: false,
+          issueMutation: false,
+          workspaceMutation: false,
+          failureScope: 'machine_profile',
+          terminalOutcome: ollamaAdmission.reason,
+          ollamaAdmission: {
+            allowed: false,
+            reason: ollamaAdmission.reason,
+          },
+        };
+        const logPath = writeLog(args.outputDir, payload);
+        if (!state.record('recordRunResult', {
+          repo: args.repo,
+          issueNumber: selected.issue.number,
+          mode: 'ollama-preclaim-admission-refused',
+          exitCode: 1,
+          logPath,
+          payload,
+          startedAt,
+          finishedAt,
+        })) return emitSystemicStatePause(args, state, 'ollama-preclaim-admission-result', { now, logger: dependencies.logger }).exitCode;
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return 1;
+      }
     }
 
     if (!recoveryClaim && args.execute && args.claimOnExecute) {
@@ -3751,7 +3932,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       const redispatch = (dependencies.dispatchRecovery || dispatchRecoveryAction)({
         action: recoveryClaim.claimed_recovery_action,
         revalidation: immediate,
-        ordinaryInvocation: { command: process.execPath, args: runnerArgs(selected.issue.number, args, { attemptId: recoveryClaim.attempt_id }), env: authEnv },
+        ordinaryInvocation: { command: process.execPath, args: runnerArgs(selected.issue.number, args, { attemptId: recoveryClaim.attempt_id, agentId: recoveryClaim.agent }), env: authEnv },
         quota: {
           knownResetReached: Boolean(currentAttempt.retry_at) && Date.parse(now()) >= Date.parse(currentAttempt.retry_at),
           freshPreflightPassed: quotaPreflight.blocked === false && quotaPreflight.skipped === false,
