@@ -46,7 +46,7 @@ export function parseLiveWorkerRegistry(env = process.env, { expectedControllerN
     })
     : null;
 
-  if (registry?.registrySource === 'canonical-store') {
+  if (registry?.registrySource === 'canonical-store' && requireActivationSource) {
     const enabledInstances = registry.agentInstances.filter((entry) => entry.lifecycle === 'enabled');
     if (enabledInstances.length > 0) {
       const source = String(currentSourceCommit || '').trim().toLowerCase();
