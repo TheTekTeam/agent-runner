@@ -132,6 +132,45 @@ export function admitCodexPaidUse({ entry = {}, labels = [] } = {}) {
 }
 
 /**
+ * Binding #184/#186 quota-only admission for the normal ChatGPT-authenticated
+ * Codex route. A current, positively resolved resource state is mandatory.
+ * Account credits, balances, paid-use approval and dollar/token caps are not
+ * inputs. Ambiguous/missing quota fails closed before provider launch.
+ */
+export function admitCodexQuotaUse({ resourceState = null } = {}) {
+  if (!isPlainObject(resourceState) || typeof resourceState.blocked !== 'boolean') {
+    const outcome = probeOutcome({
+      probe: 'quota-headroom',
+      ok: false,
+      reason: 'codex-quota-evidence-unavailable',
+    });
+    return {
+      ...foldProbeOutcomes([outcome], {
+        safeNextAction: 'Obtain current supported Codex quota/headroom evidence before provider launch.',
+      }),
+      probes: [outcome],
+    };
+  }
+
+  const outcome = resourceState.blocked
+    ? probeOutcome({
+      probe: 'quota-headroom',
+      ok: false,
+      reason: resourceState.reason || 'codex-quota-blocked',
+    })
+    : probeOutcome({ probe: 'quota-headroom', ok: true });
+
+  return {
+    ...foldProbeOutcomes([outcome], {
+      safeNextAction: resourceState.blocked
+        ? 'Wait for current Codex quota/headroom to become available before retrying.'
+        : null,
+    }),
+    probes: [outcome],
+  };
+}
+
+/**
  * Settings gate, then executable/version probes, then the paid-use gate —
  * in strict sequence, never `Promise.all`, stopping at the first failure.
  * Returns `probes: []` and calls no injected I/O function at all when the
@@ -142,6 +181,7 @@ export function admitCodexDispatch({
   env = process.env,
   labels = [],
   settings,
+  resourceState = null,
   accessFn,
   execFileFn,
 } = {}) {
@@ -175,8 +215,9 @@ export function admitCodexDispatch({
     return { ...readinessDecision, probes: outcomes };
   }
 
-  const paidUseDecision = admitCodexPaidUse({ entry, labels });
-  return { ...paidUseDecision, probes: [...outcomes, ...paidUseDecision.probes] };
+  void labels;
+  const quotaDecision = admitCodexQuotaUse({ resourceState });
+  return { ...quotaDecision, probes: [...outcomes, ...quotaDecision.probes] };
 }
 
 export { classifyCodexExecutionError, codexUsageEnvelope, parseCodexResultEnvelope } from './agent-runner-codex-parser.mjs';
