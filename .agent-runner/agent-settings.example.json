@@ -9,6 +9,8 @@
       "endpoint": "http://127.0.0.1:11434",
       "endpointAllowlistHosts": [],
       "installedModelAllowlist": [],
+      "shellTrustedRepositories": [],
+      "commandAllowlist": [],
       "minFreeMemoryBytes": 2147483648,
       "qualification": {
         "taskClasses": ["docs"],

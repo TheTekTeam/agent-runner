@@ -131,6 +131,14 @@ export const AGENT_SETTINGS_EXAMPLE = Object.freeze({
       endpoint: 'http://127.0.0.1:11434',
       endpointAllowlistHosts: Object.freeze([]),
       installedModelAllowlist: Object.freeze([]),
+      // Shell is never inferred from a configured project. An exact repository
+      // must be present here before the bounded Ollama shell policy can admit
+      // even its fixed read-only command set (#378).
+      shellTrustedRepositories: Object.freeze([]),
+      // Exact broader validation commands this host has separately accepted
+      // for the bounded Ollama shell policy (#378). No wildcard/prefix
+      // matching; the live manager packet must also name the same command.
+      commandAllowlist: Object.freeze([]),
       minFreeMemoryBytes: 2147483648,
       // Issue #50: explicit, conservative qualification only -- Ollama is
       // never eligible outside these named low-risk classes regardless of
