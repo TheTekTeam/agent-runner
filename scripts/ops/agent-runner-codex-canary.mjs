@@ -111,6 +111,21 @@ export function buildCanarySelection({ resourceState, model = CODEX_CANARY_DEFAU
   });
 }
 
+export function buildCanaryCommandArgs({ executablePath, cwd, model, effort, prompt } = {}) {
+  return buildCodexCommandArgs({
+    executablePath,
+    cwd,
+    model,
+    sandboxMode: 'workspace-write',
+    approvalMode: 'never',
+    reasoningEffort: effort,
+    networkAccess: false,
+    ephemeral: true,
+    ignoreUserConfig: true,
+    prompt,
+  });
+}
+
 export function validateCanaryWorkspace({ cwd, baseCommit } = {}) {
   const expected = join(cwd, CODEX_CANARY_EXPECTED_FILE);
   const head = runGit(['rev-parse', 'HEAD'], { cwd });
@@ -256,16 +271,11 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       'When the file is correct, stop.',
     ].join(' ');
 
-    const command = buildCodexCommandArgs({
+    const command = buildCanaryCommandArgs({
       executablePath: args.codexPath,
       cwd: worktree,
       model: metadata.model,
-      sandboxMode: 'workspace-write',
-      approvalMode: 'never',
-      reasoningEffort: metadata.effort,
-      networkAccess: false,
-      ephemeral: true,
-      ignoreUserConfig: true,
+      effort: metadata.effort,
       prompt,
     });
 
