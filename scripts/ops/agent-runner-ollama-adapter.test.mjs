@@ -487,7 +487,7 @@ test('bounded documentation output accepts envelope, code fence and raw full-doc
 
   assert.equal(
     parseBoundedDocumentationContent(
-      '~~~not-used~~~'.replaceAll('~~~', '```markdown') + '\n' + expected + '\n```',
+      '```markdown\n' + expected + '\n```',
     ).content,
     expected,
   );
