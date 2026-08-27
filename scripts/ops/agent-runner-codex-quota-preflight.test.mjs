@@ -15,6 +15,10 @@ test('sanitizes API/token/base-url overrides while preserving unrelated machine-
     CODEX_API_KEY: 'synthetic-secret',
     CODEX_ACCESS_TOKEN: 'synthetic-secret',
     OPENAI_BASE_URL: 'https://example.invalid',
+    GH_TOKEN: 'synthetic-gh-token',
+    GITHUB_TOKEN: 'synthetic-github-token',
+    SSH_AUTH_SOCK: '/tmp/synthetic-agent.sock',
+    GIT_ASKPASS: '/tmp/synthetic-askpass',
   });
 
   assert.equal(sanitized.PATH, '/usr/bin');
@@ -23,6 +27,11 @@ test('sanitizes API/token/base-url overrides while preserving unrelated machine-
   assert.equal('CODEX_API_KEY' in sanitized, false);
   assert.equal('CODEX_ACCESS_TOKEN' in sanitized, false);
   assert.equal('OPENAI_BASE_URL' in sanitized, false);
+  assert.equal('GH_TOKEN' in sanitized, false);
+  assert.equal('GITHUB_TOKEN' in sanitized, false);
+  assert.equal('SSH_AUTH_SOCK' in sanitized, false);
+  assert.equal('GIT_ASKPASS' in sanitized, false);
+  assert.equal(sanitized.GIT_TERMINAL_PROMPT, '0');
 });
 
 test('classifies ChatGPT login positively and rejects API/token login modes', () => {
