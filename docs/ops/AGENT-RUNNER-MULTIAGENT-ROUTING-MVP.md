@@ -1,5 +1,13 @@
 # Serial multi-agent selector and queued-only reassignment MVP (issue #50)
 
+> **Current-status note (#376/#378):** this document records the #50 MVP
+> state at the time it was implemented. Ollama is no longer foundation-only:
+> #378 adds the bounded trusted-repository shell policy and #376 adds a
+> dedicated implemented Ollama child. It remains disabled/unqualified in
+> committed machine settings and cannot execute unless the explicit
+> multi-agent gate plus all lifecycle/readiness/qualification/pre-claim
+> admission gates pass. Codex CLI and Grok CLI remain foundation-only.
+
 Status: **implementation and testable shadow/reconciliation MVP only.**
 Nothing in this document authorises live Codex, Grok, or Ollama execution,
 automatic paid routing, concurrency, or timer enablement. Codex CLI and
