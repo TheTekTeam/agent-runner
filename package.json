@@ -24,6 +24,7 @@
     "validation:profile": "node scripts/ops/agent-runner-validation-profile-command.mjs",
     "validation:remote": "node scripts/ops/agent-runner-remote-validation-command.mjs",
     "qualification:codex-z790": "node scripts/ops/agent-runner-codex-worker-qualification-command.mjs",
+    "qualification:claude-z790": "node scripts/ops/agent-runner-claude-worker-qualification-command.mjs",
     "recovery:model:reconcile": "node scripts/ops/agent-runner-recovery-model-reconcile-command.mjs",
     "pr:publish": "node scripts/ops/agent-runner-pr-publication-command.mjs",
     "pr:controller": "node scripts/ops/agent-runner-pr-controller-command.mjs",
