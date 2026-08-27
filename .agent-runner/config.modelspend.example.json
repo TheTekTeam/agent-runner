@@ -5,21 +5,12 @@
   "localRepoPath": "/workspace/modelspend",
   "outputDir": ".var/claude-runner",
   "stateDbPath": ".var/claude-runner/runner-state.sqlite",
-  "acceptedAgentLabels": [
-    "agent:claude",
-    "agent:claude-code-cli",
-    "agent:ollama"
-  ],
+  "acceptedAgentLabels": ["agent:claude", "agent:claude-code-cli", "agent:ollama"],
   "statusLabels": {
     "ready": "status:ready",
     "inProgress": "status:in-progress"
   },
-  "priorityLabelRanking": [
-    "priority:P0",
-    "priority:P1",
-    "priority:P2",
-    "priority:P3"
-  ],
+  "priorityLabelRanking": ["priority:P0", "priority:P1", "priority:P2", "priority:P3"],
   "safeDefaultValidationCommands": [
     "npm run validate:quick:plan -- --files <changed files>",
     "node --test scripts/ops/agent-runner-config.test.mjs"
