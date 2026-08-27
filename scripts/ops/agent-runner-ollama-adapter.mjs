@@ -310,12 +310,64 @@ export function buildOpenCodeCommandArgs({
   ];
 }
 
+
+export const OPENCODE_DOCUMENT_START = '<modelspend-document>';
+export const OPENCODE_DOCUMENT_END = '</modelspend-document>';
+export const DEFAULT_DOCUMENT_OUTPUT_MAX_BYTES = 64 * 1024;
+
 /**
- * Parse OpenCode's structured JSON result into the shared normalized
- * adapter-result contract. Assumed foundation-level contract shape
- * (`{ status: 'ok'|'no-op'|'error', output, error, mutated }`) — see the
- * "Known limitations" note in docs/ops for why this has not yet been
- * verified against a live captured OpenCode payload.
+ * Documentation profiles use OpenCode/Ollama as a text generator only.
+ *
+ * Dell field qualification proved the local provider/model/session path with
+ * every permission denied. Keeping the model tool-free avoids coupling safe
+ * documentation routing to model-specific tool-call support. The caller owns
+ * the exact allowlisted file path and applies validated text deterministically.
+ */
+export function buildOpenCodeTextOnlyLocalOllamaConfig(options = {}) {
+  const config = JSON.parse(buildOpenCodeLocalOllamaConfig(options));
+  config.permission = { '*': 'deny' };
+  return JSON.stringify(config);
+}
+
+/**
+ * Accept one bounded full-document proposal and nothing else.
+ *
+ * The model never receives write authority. Callers must still enforce the
+ * approved path, repository/worktree ownership, before/after bytes and normal
+ * validation before writing the returned content.
+ */
+export function parseBoundedDocumentationContent(resultText = '', {
+  maxBytes = DEFAULT_DOCUMENT_OUTPUT_MAX_BYTES,
+} = {}) {
+  const text = String(resultText || '');
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error('parseBoundedDocumentationContent requires a positive integer maxBytes');
+  }
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+    return { ok: false, reason: 'ollama-document-output-too-large', content: null };
+  }
+  if (text.includes('\u0000')) {
+    return { ok: false, reason: 'ollama-document-output-invalid', content: null };
+  }
+
+  const prefix = `${OPENCODE_DOCUMENT_START}\n`;
+  const suffix = `\n${OPENCODE_DOCUMENT_END}`;
+  if (!text.startsWith(prefix) || !text.endsWith(suffix)) {
+    return { ok: false, reason: 'ollama-document-envelope-invalid', content: null };
+  }
+
+  const body = text.slice(prefix.length, -suffix.length);
+  if (body.includes(OPENCODE_DOCUMENT_START) || body.includes(OPENCODE_DOCUMENT_END)) {
+    return { ok: false, reason: 'ollama-document-envelope-invalid', content: null };
+  }
+
+  return { ok: true, reason: null, content: body };
+}
+
+/**
+ * OpenCode 1.18.4 `run --format json` emits newline-delimited event objects,
+ * not the foundation's historical single result envelope. Keep the legacy
+ * envelope parser for compatibility, but prefer the verified JSONL contract.
  */
 function extractOllamaStructuredUsage(parsed) {
   if (!isPlainObject(parsed)) return null;
@@ -330,7 +382,15 @@ function extractOllamaStructuredUsage(parsed) {
   return Object.values(usage).some((value) => value !== undefined) ? usage : null;
 }
 
-export function parseOpenCodeResultEnvelope(stdout = '', { agentId = OLLAMA_AGENT_ID, model = null } = {}) {
+function safeOpenCodeErrorName(value) {
+  const text = String(value || '').trim();
+  return /^[A-Za-z][A-Za-z0-9_.:-]{0,79}$/.test(text) ? text : 'unknown';
+}
+
+export function parseOpenCodeJsonEventStream(stdout = '', {
+  agentId = OLLAMA_AGENT_ID,
+  model = null,
+} = {}) {
   const text = String(stdout || '').trim();
   if (!text) {
     return normalizedAdapterResult({
@@ -342,6 +402,98 @@ export function parseOpenCodeResultEnvelope(stdout = '', { agentId = OLLAMA_AGEN
     });
   }
 
+  const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  const events = [];
+  for (const line of lines) {
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      return normalizedAdapterResult({
+        ok: false,
+        agentId,
+        reason: 'ollama-invalid-output',
+        failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
+        resultText: '',
+      });
+    }
+    if (!isPlainObject(event) || typeof event.type !== 'string') {
+      return normalizedAdapterResult({
+        ok: false,
+        agentId,
+        reason: 'ollama-invalid-output',
+        failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
+        resultText: '',
+      });
+    }
+    events.push(event);
+  }
+
+  const errors = events.filter((event) => event.type === 'error');
+  if (errors.length) {
+    const name = safeOpenCodeErrorName(
+      errors[0]?.error?.name
+      ?? errors[0]?.error?.data?.name
+      ?? errors[0]?.name,
+    );
+    return normalizedAdapterResult({
+      ok: false,
+      agentId,
+      reason: `ollama-opencode-error:${name}`,
+      failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
+      resultText: '',
+    });
+  }
+
+  const textParts = events
+    .filter((event) => event.type === 'text' && typeof event?.part?.text === 'string')
+    .map((event) => event.part.text);
+
+  if (!textParts.length) {
+    return normalizedAdapterResult({
+      ok: false,
+      agentId,
+      reason: 'ollama-invalid-output',
+      failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
+      resultText: '',
+    });
+  }
+
+  const stepFinish = events.findLast((event) => event.type === 'step_finish');
+  const structuredUsage = extractOllamaStructuredUsage(stepFinish?.part);
+  const usageEfficiency = structuredUsage
+    ? normalizeOllamaUsageEfficiency({ usage: structuredUsage, model })
+    : null;
+
+  return normalizedAdapterResult({
+    ok: true,
+    agentId,
+    resultText: textParts.join('\n'),
+    usageEfficiency,
+    mutatedRepository: false,
+  });
+}
+
+export function parseOpenCodeResultEnvelope(stdout = '', {
+  agentId = OLLAMA_AGENT_ID,
+  model = null,
+} = {}) {
+  const text = String(stdout || '').trim();
+  if (!text) {
+    return normalizedAdapterResult({
+      ok: false,
+      agentId,
+      reason: 'ollama-invalid-output',
+      failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
+      resultText: '',
+    });
+  }
+
+  // Verified live OpenCode 1.18.4 event stream.
+  if (text.includes('\n')) {
+    return parseOpenCodeJsonEventStream(text, { agentId, model });
+  }
+
   let parsed;
   try {
     parsed = JSON.parse(text);
@@ -351,17 +503,22 @@ export function parseOpenCodeResultEnvelope(stdout = '', { agentId = OLLAMA_AGEN
       agentId,
       reason: 'ollama-invalid-output',
       failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
-      resultText: text,
+      resultText: '',
     });
   }
 
+  if (isPlainObject(parsed) && typeof parsed.type === 'string') {
+    return parseOpenCodeJsonEventStream(text, { agentId, model });
+  }
+
+  // Backward-compatible foundation envelope; no live routing depends on it.
   if (!isPlainObject(parsed) || typeof parsed.status !== 'string') {
     return normalizedAdapterResult({
       ok: false,
       agentId,
       reason: 'ollama-invalid-output',
       failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
-      resultText: text,
+      resultText: '',
     });
   }
 

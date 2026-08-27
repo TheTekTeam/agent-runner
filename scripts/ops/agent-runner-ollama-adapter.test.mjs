@@ -9,9 +9,12 @@ import {
   admitOllamaDispatch,
   buildOpenCodeCommandArgs,
   buildOpenCodeLocalOllamaConfig,
+  buildOpenCodeTextOnlyLocalOllamaConfig,
   classifyOpenCodeExecutionError,
   isAllowlistedOllamaHost,
   OLLAMA_AGENT_ID,
+  parseBoundedDocumentationContent,
+  parseOpenCodeJsonEventStream,
   parseOpenCodeResultEnvelope,
   probeEndpoint,
   probeExecutable,
@@ -408,4 +411,106 @@ test('buildOpenCodeCommandArgs requires every argument explicitly', () => {
 test('probeEndpoint and probeVersion fail closed instead of throwing when no I/O function is injected', async () => {
   assert.equal((await probeEndpoint({ endpointUrl: 'http://127.0.0.1:11434' })).reason, 'ollama-endpoint-probe-unavailable');
   assert.equal(probeVersion({ executablePath: '/bin/true' }).reason, 'ollama-version-probe-unavailable');
+});
+
+
+test('OpenCode 1.18.4 JSONL event stream parses the verified step/text/finish contract', () => {
+  const stdout = [
+    JSON.stringify({ type: 'step_start', timestamp: 1, sessionID: 'redacted', part: { type: 'step-start' } }),
+    JSON.stringify({ type: 'text', timestamp: 2, sessionID: 'redacted', part: { type: 'text', text: 'AR152_DIAGNOSTIC_OK' } }),
+    JSON.stringify({ type: 'step_finish', timestamp: 3, sessionID: 'redacted', part: { type: 'step-finish' } }),
+  ].join('\n');
+
+  const result = parseOpenCodeJsonEventStream(stdout, { model: 'modelspend-docs-local:latest' });
+  assert.equal(result.ok, true);
+  assert.equal(result.resultText, 'AR152_DIAGNOSTIC_OK');
+  assert.equal(result.mutatedRepository, false);
+});
+
+test('parseOpenCodeResultEnvelope auto-detects the verified JSONL stream', () => {
+  const stdout = [
+    JSON.stringify({ type: 'step_start', timestamp: 1, sessionID: 'redacted', part: { type: 'step-start' } }),
+    JSON.stringify({ type: 'text', timestamp: 2, sessionID: 'redacted', part: { type: 'text', text: 'hello' } }),
+    JSON.stringify({ type: 'step_finish', timestamp: 3, sessionID: 'redacted', part: { type: 'step-finish' } }),
+  ].join('\n');
+
+  const result = parseOpenCodeResultEnvelope(stdout);
+  assert.equal(result.ok, true);
+  assert.equal(result.resultText, 'hello');
+});
+
+test('JSONL parser fails closed and does not echo raw output on malformed or error events', () => {
+  const malformed = parseOpenCodeJsonEventStream('not-json');
+  assert.equal(malformed.ok, false);
+  assert.equal(malformed.reason, 'ollama-invalid-output');
+  assert.equal(malformed.resultText, '');
+
+  const error = parseOpenCodeJsonEventStream(JSON.stringify({
+    type: 'error',
+    timestamp: 1,
+    sessionID: 'redacted',
+    error: {
+      name: 'ProviderError',
+      data: {
+        message: 'must not be copied into normalized durable output',
+        request: 'must not leak',
+      },
+    },
+  }));
+  assert.equal(error.ok, false);
+  assert.equal(error.reason, 'ollama-opencode-error:ProviderError');
+  assert.equal(error.resultText, '');
+});
+
+test('text-only local Ollama config denies all model tools while retaining local-only provider pinning', () => {
+  const config = JSON.parse(buildOpenCodeTextOnlyLocalOllamaConfig({
+    model: 'modelspend-docs-local:latest',
+    endpointUrl: 'http://127.0.0.1:11434',
+  }));
+
+  assert.deepEqual(config.permission, { '*': 'deny' });
+  assert.deepEqual(config.enabled_providers, ['ollama']);
+  assert.equal(config.model, 'ollama/modelspend-docs-local:latest');
+  assert.equal(config.small_model, 'ollama/modelspend-docs-local:latest');
+  assert.equal(config.provider.ollama.options.baseURL, 'http://127.0.0.1:11434/v1');
+});
+
+test('bounded documentation output accepts exactly one full-document envelope', () => {
+  const result = parseBoundedDocumentationContent(
+    '<modelspend-document>\n# Documentation Canary\n\nStatus: qualified-documentation-canary.\n</modelspend-document>',
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.content, '# Documentation Canary\n\nStatus: qualified-documentation-canary.');
+});
+
+test('bounded documentation output rejects prose wrappers, nested markers, NUL and oversize output', () => {
+  assert.equal(
+    parseBoundedDocumentationContent(
+      'Here you go:\n<modelspend-document>\ntext\n</modelspend-document>',
+    ).reason,
+    'ollama-document-envelope-invalid',
+  );
+
+  assert.equal(
+    parseBoundedDocumentationContent(
+      '<modelspend-document>\ninner <modelspend-document> bad\n</modelspend-document>',
+    ).reason,
+    'ollama-document-envelope-invalid',
+  );
+
+  assert.equal(
+    parseBoundedDocumentationContent(
+      '<modelspend-document>\na\u0000b\n</modelspend-document>',
+    ).reason,
+    'ollama-document-output-invalid',
+  );
+
+  assert.equal(
+    parseBoundedDocumentationContent(
+      '<modelspend-document>\n1234567890\n</modelspend-document>',
+      { maxBytes: 10 },
+    ).reason,
+    'ollama-document-output-too-large',
+  );
 });
