@@ -41,6 +41,7 @@ CLAUDE_APT_SOURCE="deb [signed-by=/etc/apt/keyrings/claude-code.asc] ${CLAUDE_AP
 CODEX_NPM_PACKAGE="@openai/codex"
 CODEX_NPM_PACKAGE_SPEC="@openai/codex@latest"
 CODEX_NPM_REGISTRY="https://registry.npmjs.org/"
+CODEX_NPM_PREFIX="/usr/local"
 OLLAMA_DOWNLOAD_BASE="https://ollama.com/download"
 OPENCODE_NPM_PACKAGE="opencode-ai"
 OPENCODE_NPM_PACKAGE_SPEC="opencode-ai@latest"
@@ -125,7 +126,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     info '--dry-run: would install package claude-code through apt'
   elif [[ "$ADAPTER" == "codex-cli" ]]; then
     info '--dry-run: would require the existing reviewed Node/npm toolchain'
-    info "--dry-run: would reconcile $CODEX_NPM_PACKAGE_SPEC globally from $CODEX_NPM_REGISTRY even when codex is already present"
+    info "--dry-run: would reconcile $CODEX_NPM_PACKAGE_SPEC into reviewed prefix $CODEX_NPM_PREFIX from $CODEX_NPM_REGISTRY even when codex is already present"
     info '--dry-run: would verify codex --version'
     info '--dry-run: would not run codex login or inspect/copy ~/.codex authentication state'
   else
@@ -148,10 +149,10 @@ if [[ "$ADAPTER" == "codex-cli" ]]; then
   # OpenAI publishes `npm install -g @openai/codex` as a supported Codex CLI
   # installation path. Pin the registry host in this reviewed machine-wide
   # operation, but deliberately do not authenticate or inspect provider state.
-  ROOT_NPM_ROOT="$(sudo "$NPM_BIN" root --global)"
-  [[ -n "$ROOT_NPM_ROOT" ]] || fail 'root npm global package path is unavailable'
+  EXPECTED_PACKAGE_ROOT="$CODEX_NPM_PREFIX/lib/node_modules/$CODEX_NPM_PACKAGE"
 
   sudo "$NPM_BIN" install --global \
+    --prefix="$CODEX_NPM_PREFIX" \
     --registry="$CODEX_NPM_REGISTRY" \
     --no-audit \
     --no-fund \
@@ -160,7 +161,6 @@ if [[ "$ADAPTER" == "codex-cli" ]]; then
   command -v codex >/dev/null 2>&1 || fail 'Codex package installed but executable is not on PATH'
   ACTIVE_CODEX="$(command -v codex)"
   ACTIVE_CODEX_REALPATH="$(readlink -f "$ACTIVE_CODEX" 2>/dev/null || true)"
-  EXPECTED_PACKAGE_ROOT="$ROOT_NPM_ROOT/$CODEX_NPM_PACKAGE"
   case "$ACTIVE_CODEX_REALPATH" in
     "$EXPECTED_PACKAGE_ROOT"/*) ;;
     *) fail "active Codex executable does not resolve inside reconciled package root $EXPECTED_PACKAGE_ROOT" ;;
