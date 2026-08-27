@@ -13,8 +13,10 @@
       "commandAllowlist": [],
       "minFreeMemoryBytes": 2147483648,
       "qualification": {
-        "taskClasses": ["docs"],
-        "riskClasses": ["low"],
+        "taskClasses": [],
+        "riskClasses": [
+          "low"
+        ],
         "models": [],
         "harness": null
       }
