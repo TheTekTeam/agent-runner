@@ -5933,3 +5933,94 @@ test('#53 review round 5: a notification transport failure while notifying a sti
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+
+test('#376 categorically forbidden low-risk task classes are refused before any Ollama runtime probe', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ollama-preclaim-forbidden-task-'));
+  const settingsPath = join(dir, 'agent-settings.json');
+  try {
+    writeFileSync(settingsPath, JSON.stringify({
+      agents: {
+        'ollama-agent': {
+          enabled: true,
+          disabled: false,
+          paused: false,
+          draining: false,
+          executablePath: '/bin/true',
+          endpoint: 'http://127.0.0.1:11434',
+          endpointAllowlistHosts: [],
+          installedModelAllowlist: ['modelspend-code-local:latest'],
+          shellTrustedRepositories: ['TheTekTeam/modelspend'],
+          commandAllowlist: [],
+          minFreeMemoryBytes: 0,
+          qualification: { taskClasses: ['*'], riskClasses: ['low'], models: [], harness: null },
+        },
+      },
+    }));
+    const managerComment = {
+      body: '```yaml\nscope:\n  - file: src/add.mjs\n  - task: Make the bounded change.\nrequired_validation:\n  - git status --porcelain=v1\n```',
+    };
+    let fetchCalls = 0;
+    for (const taskClass of ['security', 'auth', 'billing', 'database-migration', 'deployment', 'broad-architecture']) {
+      const decision = await preclaimOllamaAdmission({
+        agentId: 'ollama-agent',
+        issue: { labels: [{ name: `task:${taskClass}` }, { name: 'risk:low' }] },
+        managerComment,
+        managerModel: 'modelspend-code-local:latest',
+        repo: 'TheTekTeam/modelspend',
+        env: { AGENT_RUNNER_AGENT_SETTINGS_PATH: settingsPath },
+        execFileFn: () => { throw new Error('forbidden class must not probe executable'); },
+        fetchFn: async () => { fetchCalls += 1; throw new Error('forbidden class must not fetch'); },
+      });
+      assert.equal(decision.allowed, false, taskClass);
+      assert.equal(decision.reason, 'ollama-task-class-forbidden', taskClass);
+    }
+    assert.equal(fetchCalls, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('#376 manager and machine text cannot enable a permanently denied network shell family', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ollama-preclaim-shell-family-'));
+  const settingsPath = join(dir, 'agent-settings.json');
+  const deniedCommand = 'curl https://example.com';
+  try {
+    writeFileSync(settingsPath, JSON.stringify({
+      agents: {
+        'ollama-agent': {
+          enabled: true,
+          disabled: false,
+          paused: false,
+          draining: false,
+          executablePath: '/bin/true',
+          endpoint: 'http://127.0.0.1:11434',
+          endpointAllowlistHosts: [],
+          installedModelAllowlist: ['modelspend-code-local:latest'],
+          shellTrustedRepositories: ['TheTekTeam/modelspend'],
+          commandAllowlist: [deniedCommand],
+          minFreeMemoryBytes: 0,
+          qualification: { taskClasses: ['narrow'], riskClasses: ['low'], models: [], harness: null },
+        },
+      },
+    }));
+    let fetchCalls = 0;
+    const decision = await preclaimOllamaAdmission({
+      agentId: 'ollama-agent',
+      issue: { labels: [{ name: 'task:narrow' }, { name: 'risk:low' }] },
+      managerComment: {
+        body: '```yaml\nscope:\n  - file: src/add.mjs\n  - task: Make the bounded change.\nrequired_validation:\n  - ' + deniedCommand + '\n```',
+      },
+      managerModel: 'modelspend-code-local:latest',
+      repo: 'TheTekTeam/modelspend',
+      env: { AGENT_RUNNER_AGENT_SETTINGS_PATH: settingsPath },
+      execFileFn: () => { throw new Error('denied shell family must not probe executable'); },
+      fetchFn: async () => { fetchCalls += 1; throw new Error('denied shell family must not fetch'); },
+    });
+    assert.equal(decision.allowed, false);
+    assert.equal(decision.reason, 'ollama-shell-command-family-denied');
+    assert.equal(fetchCalls, 0);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
