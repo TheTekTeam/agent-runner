@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import { hostname } from 'node:os';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   LIVE_WORKER_REGISTRY_CONTROLLER_NODE_ID,
@@ -14,7 +17,15 @@ import {
   safeLiveWorkerRegistrySummary,
   transitionLiveWorkerInstance,
 } from './agent-runner-live-worker-registry-store.mjs';
+import {
+  fetchFleetActivationComments,
+  resolveFleetActivationAuthority,
+  resolveFleetActivationControlIssue,
+} from './agent-runner-fleet-activation-authority.mjs';
 
+const HERE = dirname(fileURLToPath(import.meta.url));
+const REPOSITORY_ROOT = resolve(HERE, '../..');
+const FULL_SHA = /^[a-f0-9]{40}$/;
 const MAX_INPUT_BYTES = 128 * 1024;
 
 function parseInteger(value, name) {
@@ -37,16 +48,13 @@ function parseArgs(argv = []) {
     if (flag === '--expected-revision') args.expectedRevision = parseInteger(value, 'expected revision');
     else if (flag === '--instance') args.instanceId = value;
     else if (flag === '--state') args.targetState = value;
-    else if (flag === '--authority-revision') args.authorityRevision = value;
-    else if (flag === '--authority-fingerprint') args.authorityFingerprint = value;
-    else if (flag === '--authority-key') args.authorityKey = value;
-    else if (flag === '--authority-packet-digest') args.authorityPacketDigest = value;
+    else if (flag === '--authority-comment-id') args.authorityCommentId = parseInteger(value, 'authority comment id');
     else throw new LiveWorkerRegistryError('live-worker-registry-command-argument-invalid');
   }
   if (mode !== 'inspect' && args.expectedRevision === undefined) {
     throw new LiveWorkerRegistryError('live-worker-registry-command-expected-revision-required');
   }
-  if (mode === 'transition' && (!args.instanceId || !args.targetState)) {
+  if (mode === 'transition' && (!args.instanceId || !args.targetState || !args.authorityCommentId)) {
     throw new LiveWorkerRegistryError('live-worker-registry-command-transition-arguments-required');
   }
   return args;
@@ -77,9 +85,25 @@ function assertDellControllerHost(hostnameFn) {
   return observed;
 }
 
+function readCurrentSourceHead(spawnFn = spawnSync) {
+  const result = spawnFn('git', ['rev-parse', '--verify', 'HEAD^{commit}'], {
+    cwd: REPOSITORY_ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const head = String(result?.stdout || '').trim().toLowerCase();
+  if (result?.status !== 0 || !FULL_SHA.test(head)) {
+    const error = new Error('fleet activation source head unavailable');
+    error.code = 'fleet-activation-source-head-unavailable';
+    throw error;
+  }
+  return head;
+}
+
 function safeFailure(error) {
-  const code = error instanceof LiveWorkerRegistryError && /^[a-z0-9._:-]{1,128}$/i.test(error.code)
-    ? error.code
+  const candidate = String(error?.code || '');
+  const code = /^[a-z0-9._:-]{1,128}$/i.test(candidate)
+    ? candidate
     : 'live-worker-registry-command-failed';
   return Object.freeze({ schemaVersion: 1, ok: false, errorCode: code });
 }
@@ -89,6 +113,8 @@ export function main(argv = process.argv.slice(2), {
   hostnameFn = hostname,
   readFn = readFileSync,
   writeFn = (value) => process.stdout.write(value),
+  fetchCommentsFn = fetchFleetActivationComments,
+  readHeadFn = readCurrentSourceHead,
 } = {}) {
   try {
     const args = parseArgs(argv);
@@ -148,16 +174,38 @@ export function main(argv = process.argv.slice(2), {
         registry: raw,
       });
     } else {
+      const current = loadLiveWorkerRegistryDocument({ path, allowMissing: false });
+      if (current.revision !== args.expectedRevision) {
+        throw new LiveWorkerRegistryError(
+          'live-worker-registry-stale-revision',
+          `expected revision ${args.expectedRevision}, current ${current.revision}`,
+        );
+      }
+      const controlIssue = resolveFleetActivationControlIssue(env);
+      const comments = fetchCommentsFn(controlIssue, { env });
+      const currentSourceCommit = readHeadFn();
+      const registryWithDocumentRevision = Object.freeze({
+        ...current.registry,
+        documentRevision: current.revision,
+      });
+      const activationAuthority = resolveFleetActivationAuthority({
+        comments,
+        env,
+        controlIssue,
+        requestedCommentId: args.authorityCommentId,
+        currentSourceCommit,
+        registry: registryWithDocumentRevision,
+        instanceId: args.instanceId,
+        targetState: args.targetState,
+        previousTransition: current.document?.lastTransition || null,
+      });
       loaded = transitionLiveWorkerInstance({
         path,
         expectedRevision: args.expectedRevision,
         controllerNodeId,
         instanceId: args.instanceId,
         targetState: args.targetState,
-        authorityRevision: args.authorityRevision || null,
-        authorityFingerprint: args.authorityFingerprint || null,
-        authorityKey: args.authorityKey || null,
-        authorityPacketDigest: args.authorityPacketDigest || null,
+        activationAuthority,
       });
     }
     writeFn(`${JSON.stringify({ schemaVersion: 1, ok: true, registry: safeLiveWorkerRegistrySummary(loaded) })}\n`);
