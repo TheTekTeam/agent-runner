@@ -101,6 +101,9 @@ test('fleet runtime installer source pins reviewed package inputs and excludes f
   assert.match(source, /explicit Codex provisioning reconciles the reviewed \$CODEX_NPM_PACKAGE_SPEC package instead of accepting presence as currency/);
   assert.doesNotMatch(source, /codex-cli runtime already installed:[^\n]*\n[ \t]*exit 0/);
   assert.match(source, /sudo "\$NPM_BIN" install --global/);
+  assert.match(source, /ROOT_NPM_ROOT="\$\(sudo "\$NPM_BIN" root --global\)"/);
+  assert.match(source, /active Codex executable does not resolve inside reconciled package root/);
+  assert.match(source, /active Codex version does not match reconciled package version/);
   assert.match(source, /--no-audit/);
   assert.match(source, /--no-fund/);
   assert.match(source, /codex --version/);
