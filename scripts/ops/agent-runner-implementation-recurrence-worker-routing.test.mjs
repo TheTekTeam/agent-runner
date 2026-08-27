@@ -294,6 +294,21 @@ fingerprint: ${fingerprint}
     assert.equal(result.admittedSelections.length, 1);
     assert.equal(result.routes[0].workerRoute.hardAdmission, true);
     assert.equal(result.routes[0].workerRoute.agentInstanceId, 'claude-code-cli@dev-cluster-z790');
+
+    assert.throws(
+      () => admitRecurrenceSelections([selection()], {
+        env: {
+          HOME: root,
+          AGENT_RUNNER_WORKER_REGISTRY_PATH: path,
+          [REMOTE_WORKER_DISPATCH_ENV]: 'true',
+          [WORKER_NODE_PREFERENCE_ENV]: 'dev-cluster-z790',
+        },
+        maxParallel: 1,
+        remoteTransportAvailable: true,
+        currentSourceCommit: '2'.repeat(40),
+      }),
+      /activation source mismatch/,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
