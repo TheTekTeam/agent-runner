@@ -330,14 +330,18 @@ export function buildOpenCodeTextOnlyLocalOllamaConfig(options = {}) {
 }
 
 /**
- * Accept one bounded full-document proposal and nothing else.
+ * Accept one bounded full-document proposal without making presentation
+ * wrappers part of the authority boundary.
  *
  * The model never receives write authority. Callers must still enforce the
  * approved path, repository/worktree ownership, before/after bytes and normal
- * validation before writing the returned content.
+ * validation before writing the returned content. When expectedContent is
+ * supplied, only one exact occurrence is accepted and only those expected
+ * bytes are returned.
  */
 export function parseBoundedDocumentationContent(resultText = '', {
   maxBytes = DEFAULT_DOCUMENT_OUTPUT_MAX_BYTES,
+  expectedContent = null,
 } = {}) {
   const text = String(resultText || '');
   if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
@@ -350,18 +354,71 @@ export function parseBoundedDocumentationContent(resultText = '', {
     return { ok: false, reason: 'ollama-document-output-invalid', content: null };
   }
 
-  const prefix = `${OPENCODE_DOCUMENT_START}\n`;
-  const suffix = `\n${OPENCODE_DOCUMENT_END}`;
-  if (!text.startsWith(prefix) || !text.endsWith(suffix)) {
-    return { ok: false, reason: 'ollama-document-envelope-invalid', content: null };
+  const normalized = text.replace(/\r\n?/g, '\n').trim();
+  if (!normalized) {
+    return { ok: false, reason: 'ollama-document-output-empty', content: null };
   }
 
-  const body = text.slice(prefix.length, -suffix.length);
-  if (body.includes(OPENCODE_DOCUMENT_START) || body.includes(OPENCODE_DOCUMENT_END)) {
-    return { ok: false, reason: 'ollama-document-envelope-invalid', content: null };
+  if (expectedContent !== null && expectedContent !== undefined) {
+    const expected = String(expectedContent).replace(/\r\n?/g, '\n').trim();
+    if (!expected || expected.includes('\u0000') || Buffer.byteLength(expected, 'utf8') > maxBytes) {
+      throw new Error('parseBoundedDocumentationContent received an invalid expectedContent');
+    }
+
+    let matches = 0;
+    let offset = 0;
+    while (offset <= normalized.length) {
+      const found = normalized.indexOf(expected, offset);
+      if (found === -1) break;
+      matches += 1;
+      offset = found + Math.max(expected.length, 1);
+    }
+
+    if (matches === 1) {
+      return { ok: true, reason: null, content: expected };
+    }
+
+    return {
+      ok: false,
+      reason: matches === 0
+        ? 'ollama-document-content-mismatch'
+        : 'ollama-document-content-ambiguous',
+      content: null,
+    };
   }
 
-  return { ok: true, reason: null, content: body };
+  const startCount = normalized.split(OPENCODE_DOCUMENT_START).length - 1;
+  const endCount = normalized.split(OPENCODE_DOCUMENT_END).length - 1;
+
+  if (startCount || endCount) {
+    if (startCount !== 1 || endCount !== 1) {
+      return { ok: false, reason: 'ollama-document-envelope-invalid', content: null };
+    }
+
+    const start = normalized.indexOf(OPENCODE_DOCUMENT_START);
+    const bodyStart = start + OPENCODE_DOCUMENT_START.length;
+    const end = normalized.indexOf(OPENCODE_DOCUMENT_END, bodyStart);
+    if (end < bodyStart) {
+      return { ok: false, reason: 'ollama-document-envelope-invalid', content: null };
+    }
+
+    const body = normalized.slice(bodyStart, end).replace(/^\n/, '').replace(/\n$/, '');
+    if (!body) {
+      return { ok: false, reason: 'ollama-document-output-empty', content: null };
+    }
+    return { ok: true, reason: null, content: body };
+  }
+
+  const fenced = normalized.match(/^\`\`\`(?:markdown|md|text)?\s*\n([\s\S]*?)\n\`\`\`$/i);
+  if (fenced) {
+    const body = fenced[1].trim();
+    if (!body) {
+      return { ok: false, reason: 'ollama-document-output-empty', content: null };
+    }
+    return { ok: true, reason: null, content: body };
+  }
+
+  return { ok: true, reason: null, content: normalized };
 }
 
 /**
