@@ -205,6 +205,42 @@ test('a completed file_change with no structured changes fails closed as ambiguo
   assert.equal(result.mutatedRepository, false);
 });
 
+
+
+test('completed file_change with malformed structured change entry fails closed', () => {
+  const result = parseCodexResultEnvelope(jsonl([
+    {
+      type: 'item.completed',
+      item: {
+        type: 'file_change',
+        status: 'completed',
+        changes: [{ path: '', kind: 'update' }],
+      },
+    },
+    { type: 'turn.completed' },
+  ]));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'codex-file-change-evidence-ambiguous');
+  assert.equal(result.mutatedRepository, false);
+});
+
+test('completed file_change with unknown change kind fails closed', () => {
+  const result = parseCodexResultEnvelope(jsonl([
+    {
+      type: 'item.completed',
+      item: {
+        type: 'file_change',
+        status: 'completed',
+        changes: [{ path: 'src/foo.js', kind: 'rename' }],
+      },
+    },
+    { type: 'turn.completed' },
+  ]));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'codex-file-change-evidence-ambiguous');
+  assert.equal(result.mutatedRepository, false);
+});
+
 test('any failed file_change wins over a completed file_change in the same turn', () => {
   const result = parseCodexResultEnvelope(jsonl([
     {
