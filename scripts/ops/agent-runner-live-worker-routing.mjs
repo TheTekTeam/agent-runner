@@ -1,4 +1,8 @@
 import { buildWorkerRegistry, selectWorkerRoute } from './agent-runner-worker-pool.mjs';
+import {
+  loadLiveWorkerRegistryDocument,
+  resolveLiveWorkerRegistryPath,
+} from './agent-runner-live-worker-registry-store.mjs';
 
 export const LIVE_WORKER_REGISTRY_ENV = 'AGENT_RUNNER_WORKER_REGISTRY_JSON';
 export const REMOTE_WORKER_DISPATCH_ENV = 'AGENT_RUNNER_REMOTE_WORKER_DISPATCH_ENABLED';
@@ -26,29 +30,44 @@ function nodePreference(env = process.env) {
 
 export function parseLiveWorkerRegistry(env = process.env, { expectedControllerNodeId = null } = {}) {
   const raw = String(env[LIVE_WORKER_REGISTRY_ENV] || '').trim();
-  if (!raw) return null;
-  if (Buffer.byteLength(raw, 'utf8') > LIVE_WORKER_REGISTRY_MAX_BYTES) {
-    throw new Error(`${LIVE_WORKER_REGISTRY_ENV} exceeds ${LIVE_WORKER_REGISTRY_MAX_BYTES} bytes`);
+  let registry;
+
+  if (raw) {
+    if (Buffer.byteLength(raw, 'utf8') > LIVE_WORKER_REGISTRY_MAX_BYTES) {
+      throw new Error(`${LIVE_WORKER_REGISTRY_ENV} exceeds ${LIVE_WORKER_REGISTRY_MAX_BYTES} bytes`);
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      throw new Error(`${LIVE_WORKER_REGISTRY_ENV} must contain valid JSON`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error(`${LIVE_WORKER_REGISTRY_ENV} must contain a JSON object`);
+    }
+    registry = buildWorkerRegistry({
+      controllerNodeId: parsed.controllerNodeId,
+      nodes: parsed.nodes,
+      agentInstances: parsed.agentInstances || [],
+      providerAccountCaps: parsed.providerAccountCaps || {},
+      revision: parsed.revision || '1',
+    });
+    if (parsed.registryFingerprint && parsed.registryFingerprint !== registry.registryFingerprint) {
+      throw new Error('worker registry fingerprint mismatch');
+    }
+    registry = Object.freeze({ ...registry, registrySource: 'environment-compatibility' });
+  } else {
+    const loaded = loadLiveWorkerRegistryDocument({
+      path: resolveLiveWorkerRegistryPath(env),
+      allowMissing: true,
+    });
+    registry = loaded.registry
+      ? Object.freeze({ ...loaded.registry, registrySource: 'canonical-store', documentRevision: loaded.revision })
+      : null;
   }
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error(`${LIVE_WORKER_REGISTRY_ENV} must contain valid JSON`);
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`${LIVE_WORKER_REGISTRY_ENV} must contain a JSON object`);
-  }
-  const registry = buildWorkerRegistry({
-    controllerNodeId: parsed.controllerNodeId,
-    nodes: parsed.nodes,
-    agentInstances: parsed.agentInstances || [],
-    revision: parsed.revision || '1',
-  });
-  if (parsed.registryFingerprint && parsed.registryFingerprint !== registry.registryFingerprint) {
-    throw new Error('worker registry fingerprint mismatch');
-  }
-  if (expectedControllerNodeId && registry.controllerNodeId !== nodeId(expectedControllerNodeId, 'expectedControllerNodeId')) {
+
+  if (expectedControllerNodeId && registry
+    && registry.controllerNodeId !== nodeId(expectedControllerNodeId, 'expectedControllerNodeId')) {
     throw new Error('worker registry controller does not match the Dell controller identity');
   }
   return registry;
@@ -68,6 +87,7 @@ export function resolveLiveWorkerRoute({
   profile = null,
   requiredCapabilities = [],
   remoteDispatchAvailable = null,
+  requireHardAdmission = null,
 } = {}) {
   const local = nodeId(localNodeId, 'localNodeId');
   const adapter = String(adapterId || '').trim();
@@ -93,6 +113,9 @@ export function resolveLiveWorkerRoute({
   const preferredNodeIds = remoteEnabled
     ? configuredPreference
     : [local, ...configuredPreference.filter((value) => value !== local)];
+  const hardAdmission = requireHardAdmission === null
+    ? registry.registrySource === 'canonical-store'
+    : requireHardAdmission === true;
   const route = selectWorkerRoute(registry, {
     adapterId: adapter,
     jobClass,
@@ -100,6 +123,8 @@ export function resolveLiveWorkerRoute({
     profile,
     requiredCapabilities,
     preferredNodeIds,
+    requireZeroPaidPosture: hardAdmission,
+    enforceProviderAccountCapacity: hardAdmission,
   });
   if (!route.selected) {
     return Object.freeze({
@@ -111,6 +136,7 @@ export function resolveLiveWorkerRoute({
       remote: false,
       registryFingerprint: registry.registryFingerprint,
       routeEvidence: route,
+      hardAdmission,
     });
   }
   const selectedRemote = route.selected.nodeId !== local;
@@ -124,6 +150,7 @@ export function resolveLiveWorkerRoute({
       remote: true,
       registryFingerprint: registry.registryFingerprint,
       routeEvidence: route,
+      hardAdmission,
     });
   }
   return Object.freeze({
@@ -135,6 +162,7 @@ export function resolveLiveWorkerRoute({
     remote: selectedRemote,
     registryFingerprint: registry.registryFingerprint,
     routeEvidence: route,
+    hardAdmission,
   });
 }
 
@@ -150,5 +178,6 @@ export function safeWorkerRouteEvidence(route) {
     registryFingerprint: route.registryFingerprint || null,
     eligible: Array.isArray(route.routeEvidence?.eligible) ? route.routeEvidence.eligible : [],
     excluded: Array.isArray(route.routeEvidence?.excluded) ? route.routeEvidence.excluded : [],
+    hardAdmission: route.hardAdmission === true,
   });
 }
