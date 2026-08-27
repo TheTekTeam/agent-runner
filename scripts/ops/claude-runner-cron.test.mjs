@@ -450,13 +450,13 @@ test('parseArgs always requires canonical manager authority and rejects retired 
   assert.throws(() => parseArgs(['--no-auto-preflight'], {}), /Unknown argument/);
 });
 
-test('parseArgs accepts both Claude agent labels by default', () => {
-  assert.deepEqual(parseArgs([], {}).agentLabels, ['agent:claude', 'agent:claude-code-cli']);
+test('parseArgs accepts implemented Claude and Ollama agent labels by default', () => {
+  assert.deepEqual(parseArgs([], {}).agentLabels, ['agent:claude', 'agent:claude-code-cli', 'agent:ollama']);
 });
 
-test('parseArgs can override or append Claude agent labels', () => {
+test('parseArgs can override or append implemented agent labels', () => {
   assert.deepEqual(parseArgs([], { CLAUDE_RUNNER_CRON_AGENT_LABELS: 'agent:claude-code-cli, agent:custom' }).agentLabels, ['agent:claude-code-cli', 'agent:custom']);
-  assert.deepEqual(parseArgs(['--agent-label', 'agent:custom'], {}).agentLabels, ['agent:claude', 'agent:claude-code-cli', 'agent:custom']);
+  assert.deepEqual(parseArgs(['--agent-label', 'agent:custom'], {}).agentLabels, ['agent:claude', 'agent:claude-code-cli', 'agent:ollama', 'agent:custom']);
   assert.deepEqual(parseArgs(['--agent-labels', 'agent:custom'], {}).agentLabels, ['agent:custom']);
 });
 
