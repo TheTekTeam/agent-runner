@@ -36,7 +36,7 @@ const VALIDATED = new WeakSet();
 
 export class FleetActivationAuthorityError extends Error {
   constructor(code, message = code) {
-    super(message);
+    super(message === code ? code : `${code}: ${message}`);
     this.name = 'FleetActivationAuthorityError';
     this.code = code;
   }
