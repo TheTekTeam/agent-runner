@@ -62,13 +62,13 @@ function broaderValidationFamilyAllowed(argv = []) {
       && isSafeRelativeShellPath(subcommand);
   }
 
-  // npm/pnpm are limited to existing repository scripts. Package-management,
-  // exec/dlx and arbitrary lifecycle operations cannot be enabled by machine
-  // configuration or manager text.
+  // npm/pnpm are limited to validation/build-oriented repository scripts.
+  // Package-management, exec/dlx, deploy/release/start/lifecycle and arbitrary
+  // script names cannot be enabled by machine configuration or manager text.
   if (subcommand === 'test') return true;
-  return subcommand === 'run'
-    && typeof third === 'string'
-    && /^[A-Za-z0-9._:-]{1,80}$/.test(third);
+  if (subcommand !== 'run' || typeof third !== 'string') return false;
+  return /^(?:test|lint|typecheck|check|validate|verify|build)(?:[:._-][A-Za-z0-9._:-]{1,70})?$/.test(third)
+    || /^format:check(?:[:._-][A-Za-z0-9._:-]{1,60})?$/.test(third);
 }
 
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
