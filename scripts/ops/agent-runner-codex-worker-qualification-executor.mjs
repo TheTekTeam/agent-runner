@@ -61,9 +61,10 @@ function repositoryFromOrigin(value) {
 }
 
 export function codexWorkerQualificationStatePath({ stateRoot, jobFingerprint } = {}) {
-  const root = resolve(String(stateRoot || ''));
+  const rawRoot = String(stateRoot || '').trim();
   const match = String(jobFingerprint || '').match(/^sha256:([a-f0-9]{64})$/);
-  if (!root || !match) throw new Error('state identity is invalid');
+  if (!rawRoot || !match) throw new Error('state identity is invalid');
+  const root = resolve(rawRoot);
   return resolve(root, `${match[1]}.json`);
 }
 
@@ -289,8 +290,12 @@ export async function executeCodexWorkerQualificationRequest({
   if (!validation.valid) throw new Error(validation.reason);
   if (executingNodeId !== CODEX_WORKER_QUALIFICATION_TARGET_NODE) throw new Error('wrong-worker-node');
 
-  const sourceRoot = resolve(String(sourceRepositoryPath || ''));
-  const workRoot = resolve(String(worktreeRoot || ''));
+  const sourceRaw = String(sourceRepositoryPath || '').trim();
+  const workRaw = String(worktreeRoot || '').trim();
+  if (!sourceRaw) throw new Error('worker-source-repository-not-configured');
+  if (!workRaw) throw new Error('qualification-worktree-root-not-configured');
+  const sourceRoot = resolve(sourceRaw);
+  const workRoot = resolve(workRaw);
   const stateFile = codexWorkerQualificationStatePath({
     stateRoot,
     jobFingerprint: request.job.jobFingerprint,
@@ -330,7 +335,7 @@ export async function executeCodexWorkerQualificationRequest({
 
   const preflight = await quotaPreflightFn({
     executablePath: codexPath,
-    env,
+    env: childEnv,
     maxUsedPercent: 90,
   });
   if (!preflight?.allowed || preflight.resourceState?.blocked === true) {
@@ -389,26 +394,21 @@ export async function executeCodexWorkerQualificationRequest({
     });
     if (!sandbox?.ok) throw new Error(sandbox?.reason || 'codex-sandbox-preflight-failed');
 
-    writeState(stateFile, {
-      schemaVersion: STATE_SCHEMA,
-      jobFingerprint: request.job.jobFingerprint,
-      leaseFingerprint: request.lease.leaseFingerprint,
-      status: 'pending',
-      providerInvoked: false,
-    });
-
-    const normalized = invokeCanaryFn({
-      codexPath,
-      cwd: worktree,
-      childEnv,
-    });
-
+    // One-shot consumption is durable immediately before the provider call.
+    // Conservatively marking providerInvoked=true here means an unexpected
+    // process-wrapper exception can never make the same authority retryable.
     writeState(stateFile, {
       schemaVersion: STATE_SCHEMA,
       jobFingerprint: request.job.jobFingerprint,
       leaseFingerprint: request.lease.leaseFingerprint,
       status: 'pending',
       providerInvoked: true,
+    });
+
+    const normalized = invokeCanaryFn({
+      codexPath,
+      cwd: worktree,
+      childEnv,
     });
 
     const workspace = validateCodexWorkerCanaryWorkspace({
