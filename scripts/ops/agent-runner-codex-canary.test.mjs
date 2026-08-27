@@ -7,6 +7,7 @@ import test from 'node:test';
 
 import { AGENT_ADAPTERS } from './agent-runner-agents.mjs';
 import {
+  buildCanaryCommandArgs,
   buildCanarySelection,
   CODEX_CANARY_DEFAULT_MODEL,
   CODEX_CANARY_EXPECTED_CONTENT,
@@ -25,6 +26,26 @@ test('normal Codex catalogue remains disabled/non-routable while canary selector
 
   assert.equal(selection.selectedAgentId, 'codex-cli');
   assert.equal(selection.reason, 'explicit-assignment-retained');
+});
+
+
+test('canary command is ephemeral, ignores ambient user config, denies network and requires the bounded profile', () => {
+  const args = buildCanaryCommandArgs({
+    executablePath: '/usr/local/bin/codex',
+    cwd: '/tmp/codex-canary-worktree',
+    model: CODEX_CANARY_DEFAULT_MODEL,
+    effort: 'low',
+    prompt: 'create the bounded fixture',
+  });
+
+  assert.ok(args.includes('--ephemeral'));
+  assert.ok(args.includes('--ignore-user-config'));
+  assert.ok(args.includes('--json'));
+  assert.ok(args.includes('workspace-write'));
+  assert.ok(args.includes('approval_policy=never'));
+  assert.ok(args.includes('model_reasoning_effort=low'));
+  assert.ok(args.includes('sandbox_workspace_write.network_access=false'));
+  assert.equal(args.includes('--dangerously-bypass-approvals-and-sandbox'), false);
 });
 
 test('canary selector fails closed when current quota resource state is blocked', () => {
