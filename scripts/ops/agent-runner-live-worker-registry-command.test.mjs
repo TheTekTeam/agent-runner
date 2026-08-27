@@ -127,6 +127,21 @@ test('default CLI inspect is host-neutral while promotion/transition remain Dell
     assert.equal(missingPayload.ok, true);
     assert.equal(missingPayload.registry.found, false);
 
+    const planRun = run(['plan', '--expected-revision', '0'], {
+      env,
+      input: JSON.stringify(promotionInput()),
+    });
+    assert.equal(planRun.status, 0, planRun.stderr || planRun.stdout);
+    const planned = JSON.parse(planRun.stdout);
+    assert.equal(planned.mode, 'plan');
+    assert.equal(planned.expectedRevision, 0);
+    assert.equal(planned.targetRevision, 1);
+    assert.equal(planned.registry.instances[0].lifecycle, 'disabled');
+
+    const inspectAfterPlan = run(['inspect'], { env });
+    assert.equal(inspectAfterPlan.status, 0);
+    assert.equal(JSON.parse(inspectAfterPlan.stdout).registry.found, false);
+
     let output = '';
     const promoteExit = main(['promote', '--expected-revision', '0'], {
       env,
@@ -139,6 +154,13 @@ test('default CLI inspect is host-neutral while promotion/transition remain Dell
     assert.equal(promoted.registry.revision, 1);
     assert.equal(promoted.registry.instances[0].lifecycle, 'disabled');
     assert.equal(promoted.registry.instances[0].qualificationRevision, 'codex-z790-58e9d9edf45669ac');
+
+    const stalePlanRun = run(['plan', '--expected-revision', '0'], {
+      env,
+      input: JSON.stringify(promotionInput()),
+    });
+    assert.equal(stalePlanRun.status, 1);
+    assert.equal(JSON.parse(stalePlanRun.stdout).errorCode, 'live-worker-registry-stale-revision');
 
     output = '';
     const missingAuthorityExit = main([
