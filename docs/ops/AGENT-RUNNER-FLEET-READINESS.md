@@ -62,6 +62,7 @@ OpenAI's current Codex CLI documentation publishes the official npm package `@op
 - npm package: `@openai/codex`;
 - reviewed package spec: `@openai/codex@latest`;
 - registry: `https://registry.npmjs.org/`;
+- reviewed machine-wide npm prefix: `/usr/local`;
 - installer: `scripts/install-agent-runner-fleet-runtime.sh`.
 
 Example dry run:
@@ -74,7 +75,7 @@ bash scripts/install-agent-runner-fleet-runtime.sh \
   --dry-run
 ```
 
-This step installs/version-probes the runtime only. An explicit Codex provisioning run reconciles the reviewed `@openai/codex@latest` package even when a `codex` executable is already present; binary presence alone is not treated as proof of runtime currency. After reconciliation, the installer also requires the active `codex` command to resolve inside the machine-wide npm package root it just updated and requires `codex --version` to match that package version. This prevents an older command or a second npm-global prefix from silently defeating an authorised runtime refresh. It does not run `codex login`, inspect or copy `~/.codex` state, read `OPENAI_API_KEY`/`CODEX_API_KEY`, infer ChatGPT authentication, inspect account balance, infer quota, perform a model call, qualify the instance or activate routing.
+This step installs/version-probes the runtime only. An explicit Codex provisioning run reconciles the reviewed `@openai/codex@latest` package into the reviewed machine-wide prefix `/usr/local` even when a `codex` executable is already present; binary presence alone is not treated as proof of runtime currency. The prefix is explicit rather than inferred from root npm configuration, because root npm defaults can differ across hosts. After reconciliation, the installer requires the active `codex` command to resolve inside `/usr/local/lib/node_modules/@openai/codex` and requires `codex --version` to match that package version. This prevents a stale `/usr/local` command, a `/usr` root-global install, or a second user npm-global prefix from silently defeating an authorised runtime refresh. It does not run `codex login`, inspect or copy `~/.codex` state, read `OPENAI_API_KEY`/`CODEX_API_KEY`, infer ChatGPT authentication, inspect account balance, infer quota, perform a model call, qualify the instance or activate routing.
 
 The canonical `codex-cli` Agent Runner execution adapter remains default-disabled/non-routable until the owning #186 canary proves the intended ChatGPT-account authentication path, current quota/headroom admission and bounded task/profile qualification. Fleet evidence cannot bypass that gate: even fabricated `authAvailable:true` / `qualified:true` evidence remains non-routable while the live adapter is not qualification-eligible.
 
