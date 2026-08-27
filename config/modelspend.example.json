@@ -8,7 +8,8 @@
   "stateDbPath": "/home/gp/.local/state/agent-runner/modelspend/runner-state.sqlite",
   "acceptedAgentLabels": [
     "agent:claude",
-    "agent:claude-code-cli"
+    "agent:claude-code-cli",
+    "agent:ollama"
   ],
   "statusLabels": {
     "ready": "status:ready",
