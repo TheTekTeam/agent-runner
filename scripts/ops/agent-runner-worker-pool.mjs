@@ -5,6 +5,8 @@ export const WORKER_POOL_REVISION = 'worker-pool-v1';
 export const WORKER_NODE_STATES = Object.freeze(['enabled', 'paused', 'draining', 'disabled']);
 export const WORKER_READINESS_STATES = Object.freeze(['ready', 'degraded', 'unavailable', 'unknown']);
 export const WORKER_JOB_CLASSES = Object.freeze(['implementation', 'validation', 'build', 'test', 'local-model']);
+export const WORKER_COST_POSTURES = Object.freeze(['included-subscription', 'free', 'local-zero-cost', 'metered', 'unknown']);
+export const ZERO_PAID_ROUTE_COST_POSTURES = Object.freeze(['included-subscription', 'free', 'local-zero-cost']);
 
 const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const SHA = /^[a-f0-9]{40,64}$/i;
@@ -65,6 +67,18 @@ function positiveInteger(value, name, max = 128) {
   return number;
 }
 
+function normalizeProviderAccountCaps(raw = {}) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('providerAccountCaps is invalid');
+  const entries = Object.entries(raw);
+  if (entries.length > 64) throw new Error('providerAccountCaps is invalid');
+  return Object.freeze(Object.fromEntries(entries.map(([account, value]) => {
+    const id = token(account, 'providerAccountCaps account');
+    const cap = positiveInteger(value, `providerAccountCaps.${id}`);
+    if (cap < 1) throw new Error(`providerAccountCaps.${id} is invalid`);
+    return [id, cap];
+  }).sort(([a], [b]) => a.localeCompare(b))));
+}
+
 export function normalizeWorkerNode(raw = {}) {
   const nodeId = token(raw.nodeId, 'nodeId');
   const state = enumValue(raw.state, WORKER_NODE_STATES, 'node state');
@@ -117,7 +131,14 @@ export function normalizeAgentInstance(raw = {}) {
     authenticated: raw.authenticated === true,
     qualified: raw.qualified === true,
     qualificationRevision: token(raw.qualificationRevision || 'unqualified', 'qualificationRevision'),
+    qualificationEvidenceFingerprint: raw.qualificationEvidenceFingerprint == null
+      ? null
+      : (/^sha256:[a-f0-9]{64}$/.test(String(raw.qualificationEvidenceFingerprint))
+        ? String(raw.qualificationEvidenceFingerprint)
+        : (() => { throw new Error('qualificationEvidenceFingerprint is invalid'); })()),
     providerAccountClass: raw.providerAccountClass ? token(raw.providerAccountClass, 'providerAccountClass') : null,
+    costPosture: enumValue(raw.costPosture || 'unknown', WORKER_COST_POSTURES, 'costPosture'),
+    paid: raw.paid === false ? false : true,
     models,
     profiles,
     jobClasses,
@@ -128,7 +149,7 @@ export function normalizeAgentInstance(raw = {}) {
   return Object.freeze({ ...normalized, instanceFingerprint: digest(normalized) });
 }
 
-export function buildWorkerRegistry({ controllerNodeId, nodes = [], agentInstances = [], revision = '1' } = {}) {
+export function buildWorkerRegistry({ controllerNodeId, nodes = [], agentInstances = [], providerAccountCaps = {}, revision = '1' } = {}) {
   const controller = token(controllerNodeId, 'controllerNodeId');
   if (!Array.isArray(nodes) || nodes.length === 0 || nodes.length > 64) throw new Error('nodes must contain 1..64 entries');
   if (!Array.isArray(agentInstances) || agentInstances.length > 256) throw new Error('agentInstances is invalid');
@@ -156,11 +177,12 @@ export function buildWorkerRegistry({ controllerNodeId, nodes = [], agentInstanc
     controllerNodeId: controller,
     nodes: normalizedNodes.sort((a, b) => a.nodeId.localeCompare(b.nodeId)),
     agentInstances: normalizedInstances.sort((a, b) => a.instanceId.localeCompare(b.instanceId)),
+    providerAccountCaps: normalizeProviderAccountCaps(providerAccountCaps),
   };
   return Object.freeze({ ...payload, registryFingerprint: digest(payload) });
 }
 
-function routeReasons({ node, instance, request }) {
+function routeReasons({ node, instance, request, registry }) {
   const reasons = [];
   if (!node) return ['node-not-registered'];
   if (!instance) return ['agent-instance-not-registered'];
@@ -172,6 +194,17 @@ function routeReasons({ node, instance, request }) {
   if (!instance.authenticated) reasons.push('agent-auth-unavailable');
   if (!instance.qualified) reasons.push('agent-unqualified');
   if (instance.active >= instance.maxConcurrent) reasons.push('agent-capacity-full');
+  if (request.requireZeroPaidPosture) {
+    if (instance.costPosture === 'unknown') reasons.push('cost-posture-unknown');
+    else if (!ZERO_PAID_ROUTE_COST_POSTURES.includes(instance.costPosture) || instance.paid !== false) reasons.push('paid-route-ineligible');
+  }
+  if (request.enforceProviderAccountCapacity && instance.providerAccountClass) {
+    const cap = Number(registry?.providerAccountCaps?.[instance.providerAccountClass] ?? 1);
+    const active = (registry?.agentInstances || [])
+      .filter((entry) => entry.providerAccountClass === instance.providerAccountClass)
+      .reduce((sum, entry) => sum + Number(entry.active || 0), 0);
+    if (active >= cap) reasons.push('provider-account-cap-full');
+  }
   if (!node.jobClasses.includes(request.jobClass)) reasons.push('node-job-class-unsupported');
   if (!instance.jobClasses.includes(request.jobClass)) reasons.push('agent-job-class-unsupported');
   if (request.model && !instance.models.includes(request.model)) reasons.push('model-unsupported-on-instance');
@@ -253,6 +286,8 @@ export function selectWorkerRoute(registry, request = {}) {
     model: request.model ? token(request.model, 'model') : null,
     profile: request.profile ? token(request.profile, 'profile') : null,
     requiredCapabilities,
+    requireZeroPaidPosture: request.requireZeroPaidPosture === true,
+    enforceProviderAccountCapacity: request.enforceProviderAccountCapacity === true,
     // Preference order is semantic: the controller's first qualified node
     // must remain first rather than being alphabetically canonicalised.
     preferredNodeIds: boundedOrderedTokens(request.preferredNodeIds || [], 'preferredNodeIds'),
@@ -262,7 +297,7 @@ export function selectWorkerRoute(registry, request = {}) {
     .filter((instance) => instance.adapterId === adapterId)
     .map((instance) => {
       const node = registry.nodes.find((item) => item.nodeId === instance.nodeId);
-      const reasons = routeReasons({ node, instance, request: normalizedRequest });
+      const reasons = routeReasons({ node, instance, request: normalizedRequest, registry });
       return { node, instance, reasons };
     })
     .sort((a, b) => {
