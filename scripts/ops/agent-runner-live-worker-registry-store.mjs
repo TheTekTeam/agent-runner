@@ -528,7 +528,10 @@ export function replaceLiveWorkerRegistry({
     expectedRevision,
     controllerNodeId,
     deps,
-    mutate: ({ nextRevision, now }) => {
+    mutate: ({ current, nextRevision, now }) => {
+      if (current.registry?.agentInstances.some((instance) => instance.lifecycle !== 'disabled')) {
+        throw new LiveWorkerRegistryError('live-worker-registry-replace-live-lifecycle-refused');
+      }
       const registry = rebuildRegistry(rawRegistry, nextRevision);
       if (registry.agentInstances.some((instance) => instance.lifecycle !== 'disabled')) {
         throw new LiveWorkerRegistryError('live-worker-registry-replace-requires-disabled-instances');
