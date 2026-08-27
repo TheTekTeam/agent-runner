@@ -80,13 +80,6 @@ const FORBIDDEN_TASK_CLASSES = new Set([
   'database-migration', 'migration', 'deployment', 'deploy',
   'architecture', 'broad-architecture',
 ]);
-const SECRET_ENV = [
-  'ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','ANTHROPIC_BASE_URL',
-  'OPENAI_API_KEY','GOOGLE_API_KEY','GEMINI_API_KEY','GROQ_API_KEY',
-  'XAI_API_KEY','AZURE_OPENAI_API_KEY','OPENROUTER_API_KEY',
-  'AWS_ACCESS_KEY_ID','AWS_SECRET_ACCESS_KEY','AWS_SESSION_TOKEN','AWS_PROFILE',
-  'GOOGLE_APPLICATION_CREDENTIALS','GITHUB_TOKEN','GH_TOKEN','SSH_AUTH_SOCK',
-];
 
 function boundedText(value, max = 48000) {
   const text = String(value || '');
@@ -144,9 +137,22 @@ function settingsCurrent(settings) {
   } catch { return false; }
 }
 
-function modelEnv(env, endpointHost, root, configContent) {
-  const next = { ...env };
-  for (const key of SECRET_ENV) delete next[key];
+export function modelEnv(env, endpointHost, root, configContent) {
+  const next = {};
+  for (const key of ['PATH','LANG','LC_ALL','NODE_ENV','PNPM_HOME']) {
+    if (typeof env[key] === 'string') next[key] = env[key];
+  }
+
+  const home = join(root, 'model-home');
+  const temp = join(root, 'tmp');
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  mkdirSync(temp, { recursive: true, mode: 0o700 });
+
+  next.HOME = home;
+  next.TMPDIR = temp;
+  next.TMP = temp;
+  next.TEMP = temp;
+  next.GIT_CONFIG_GLOBAL = '/dev/null';
   next.OPENCODE_CONFIG_CONTENT = configContent;
   next.OPENCODE_DISABLE_AUTOUPDATE = '1';
   next.XDG_CONFIG_HOME = join(root, 'config');
