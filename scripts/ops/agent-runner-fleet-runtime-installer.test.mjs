@@ -62,7 +62,7 @@ test('Codex fleet runtime installer dry-run uses only the reviewed official npm 
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   assert.match(result.stdout, /worker-only mode/);
   assert.match(result.stdout, /existing reviewed Node\/npm toolchain/);
-  assert.match(result.stdout, /@openai\/codex@latest globally from https:\/\/registry\.npmjs\.org\//);
+  assert.match(result.stdout, /reconcile @openai\/codex@latest into reviewed prefix \/usr\/local from https:\/\/registry\.npmjs\.org\/ even when codex is already present/);
   assert.match(result.stdout, /verify codex --version/);
   assert.match(result.stdout, /would not run codex login/);
   assert.match(result.stdout, /would not .*inspect\/copy ~\/\.codex authentication state/);
@@ -98,7 +98,13 @@ test('fleet runtime installer source pins reviewed package inputs and excludes f
   assert.match(source, /CODEX_NPM_PACKAGE="@openai\/codex"/);
   assert.match(source, /CODEX_NPM_PACKAGE_SPEC="@openai\/codex@latest"/);
   assert.match(source, /CODEX_NPM_REGISTRY="https:\/\/registry\.npmjs\.org\/"/);
+  assert.match(source, /CODEX_NPM_PREFIX="\/usr\/local"/);
+  assert.match(source, /explicit Codex provisioning reconciles the reviewed \$CODEX_NPM_PACKAGE_SPEC package instead of accepting presence as currency/);
+  assert.doesNotMatch(source, /codex-cli runtime already installed:[^\n]*\n[ \t]*exit 0/);
   assert.match(source, /sudo "\$NPM_BIN" install --global/);
+  assert.match(source, /--prefix="\$CODEX_NPM_PREFIX"/);
+  assert.match(source, /active Codex executable does not resolve inside reconciled package root/);
+  assert.match(source, /active Codex version does not match reconciled package version/);
   assert.match(source, /--no-audit/);
   assert.match(source, /--no-fund/);
   assert.match(source, /codex --version/);

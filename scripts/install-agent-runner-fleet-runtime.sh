@@ -41,6 +41,7 @@ CLAUDE_APT_SOURCE="deb [signed-by=/etc/apt/keyrings/claude-code.asc] ${CLAUDE_AP
 CODEX_NPM_PACKAGE="@openai/codex"
 CODEX_NPM_PACKAGE_SPEC="@openai/codex@latest"
 CODEX_NPM_REGISTRY="https://registry.npmjs.org/"
+CODEX_NPM_PREFIX="/usr/local"
 OLLAMA_DOWNLOAD_BASE="https://ollama.com/download"
 OPENCODE_NPM_PACKAGE="opencode-ai"
 OPENCODE_NPM_PACKAGE_SPEC="opencode-ai@latest"
@@ -107,8 +108,8 @@ if [[ "$ADAPTER" == "claude-code-cli" ]] && command -v claude >/dev/null 2>&1; t
 fi
 
 if [[ "$ADAPTER" == "codex-cli" ]] && command -v codex >/dev/null 2>&1; then
-  info "codex-cli runtime already installed: $(codex --version 2>/dev/null || printf 'version-probe-failed')"
-  exit 0
+  info "codex-cli runtime present before reconciliation: $(codex --version 2>/dev/null || printf 'version-probe-failed')"
+  info "explicit Codex provisioning reconciles the reviewed $CODEX_NPM_PACKAGE_SPEC package instead of accepting presence as currency"
 fi
 
 if [[ "$ADAPTER" == "ollama-agent" ]]   && command -v ollama >/dev/null 2>&1   && command -v opencode >/dev/null 2>&1; then
@@ -125,7 +126,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     info '--dry-run: would install package claude-code through apt'
   elif [[ "$ADAPTER" == "codex-cli" ]]; then
     info '--dry-run: would require the existing reviewed Node/npm toolchain'
-    info "--dry-run: would install $CODEX_NPM_PACKAGE_SPEC globally from $CODEX_NPM_REGISTRY"
+    info "--dry-run: would reconcile $CODEX_NPM_PACKAGE_SPEC into reviewed prefix $CODEX_NPM_PREFIX from $CODEX_NPM_REGISTRY even when codex is already present"
     info '--dry-run: would verify codex --version'
     info '--dry-run: would not run codex login or inspect/copy ~/.codex authentication state'
   else
@@ -148,17 +149,30 @@ if [[ "$ADAPTER" == "codex-cli" ]]; then
   # OpenAI publishes `npm install -g @openai/codex` as a supported Codex CLI
   # installation path. Pin the registry host in this reviewed machine-wide
   # operation, but deliberately do not authenticate or inspect provider state.
+  EXPECTED_PACKAGE_ROOT="$CODEX_NPM_PREFIX/lib/node_modules/$CODEX_NPM_PACKAGE"
+
   sudo "$NPM_BIN" install --global \
+    --prefix="$CODEX_NPM_PREFIX" \
     --registry="$CODEX_NPM_REGISTRY" \
     --no-audit \
     --no-fund \
     "$CODEX_NPM_PACKAGE_SPEC"
 
   command -v codex >/dev/null 2>&1 || fail 'Codex package installed but executable is not on PATH'
+  ACTIVE_CODEX="$(command -v codex)"
+  ACTIVE_CODEX_REALPATH="$(readlink -f "$ACTIVE_CODEX" 2>/dev/null || true)"
+  case "$ACTIVE_CODEX_REALPATH" in
+    "$EXPECTED_PACKAGE_ROOT"/*) ;;
+    *) fail "active Codex executable does not resolve inside reconciled package root $EXPECTED_PACKAGE_ROOT" ;;
+  esac
+
+  INSTALLED_PACKAGE_VERSION="$(node -p "require(process.argv[1]).version" "$EXPECTED_PACKAGE_ROOT/package.json" 2>/dev/null || true)"
+  [[ -n "$INSTALLED_PACKAGE_VERSION" ]] || fail 'reconciled Codex package version is unavailable'
   VERSION="$(codex --version 2>/dev/null || true)"
   [[ -n "$VERSION" ]] || fail 'codex --version did not return a bounded version string'
+  [[ "$VERSION" == *"$INSTALLED_PACKAGE_VERSION"* ]] || fail "active Codex version does not match reconciled package version $INSTALLED_PACKAGE_VERSION"
 
-  info "codex-cli runtime installed from $CODEX_NPM_PACKAGE: $VERSION"
+  info "codex-cli runtime reconciled from $CODEX_NPM_PACKAGE: $VERSION"
   info 'authentication remains machine-local and unproven; no route was qualified or enabled'
   exit 0
 fi
