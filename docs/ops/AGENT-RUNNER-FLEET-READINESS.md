@@ -131,6 +131,45 @@ For per-node qualification itself, #389 adds a separate controller-only seam:
 
 This seam exists only to avoid the circular requirement that an instance must already be qualified in order to receive the one bounded job that qualifies it. The later worker canary still has to provide its own exact task, auth/quota, sandbox, validation and evidence controls before any model invocation.
 
+## Accepted qualification publication (#401)
+
+`agent-runner-fleet-qualification-publication.mjs` publishes only independently
+accepted `agent@node` qualification evidence into a deterministic fleet
+qualification registry projection for the #327/#328 readiness contract. It never
+enables normal multi-node routing.
+
+- `publishFleetQualification({ acceptedResults })` consumes the bounded accepted
+  results returned by the Claude/Codex worker qualification acceptors and emits
+  one entry per target instance (`claude-code-cli` and `codex-cli` on
+  `dev-cluster-dell` and `dev-cluster-z790`).
+- Reconciliation fails closed: an instance is published only when a supplied
+  accepted result matches the pinned per-instance revision
+  (`claude-z790-7e13ce3be223baf8`, `codex-z790-58e9d9edf45669ac`). Stale,
+  mismatched, cross-node or absent evidence becomes an explicit `evidence-gap`.
+- Dell Claude and Dell Codex have no repository- or GitHub-owned exact
+  per-instance qualification revision available here, so they are published as
+  bounded evidence gaps rather than an invented revision.
+- Every published entry is emitted `lifecycle: disabled`, `routable: false`,
+  `routingEligible: false`; `assertPublishedQualificationNonRoutable()` enforces
+  this. Qualification state is recorded independently from routability, so a
+  qualified instance stays non-routable until separate #402 field
+  lifecycle/activation acceptance.
+- `assertNoSecretFields()` rejects credential, prompt, session-id, raw provider
+  output, unrestricted environment and account credit/balance fields; usage and
+  quota percentages are never carried into the projection.
+- Publication grants Z790 no scheduler, queue-selection, manager,
+  source-activation or GitHub-management authority and enables no paid/API
+  fallback.
+- `agent-runner-fleet-accepted-qualification-evidence.mjs` is the canonical
+  repository-owned static accepted-evidence source. It holds only the two
+  independently accepted Z790 acceptance records (#389 Codex, #398 Claude) with
+  just the bounded fields the publication consumes, and performs no runtime
+  GitHub/network lookup and no machine-local credential/session/config read. The
+  default `collectFleetReadiness()` / `npm run fleet:readiness` path consumes it,
+  so real CLI output publishes both accepted Z790 instances while both Dell
+  instances stay explicit fail-closed evidence gaps. Focused tests may still
+  inject `acceptedQualificationResults` explicitly.
+
 ## Authentication and qualification
 
 Authentication is established independently per machine through the provider/runtime's accepted local flow. Never copy Claude/Codex/Grok session or credential material between Dell and Z790. Ollama is a local zero-provider-cost runtime and requires no provider credential for the fleet presence check; its model inventory remains node-local and no readiness/provisioning command may auto-download a model.
