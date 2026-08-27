@@ -6,15 +6,18 @@ import { spawnSync } from 'node:child_process';
 import test from 'node:test';
 
 import { main } from './agent-runner-live-worker-registry-command.mjs';
+import {
+  FLEET_ACTIVATION_AUTHORITY_MARKER,
+  FLEET_ACTIVATION_AUTHORITY_SCHEMA_VERSION,
+  fleetActivationAuthorityFingerprint,
+} from './agent-runner-fleet-activation-authority.mjs';
 
 const COMMAND = new URL('./agent-runner-live-worker-registry-command.mjs', import.meta.url);
+const SOURCE_SHA = '1'.repeat(40);
+const CONTROL_ISSUE = 402;
 
-const CODEX_REVISION = 'codex-z790-58e9d9edf45669ac';
-const CODEX_FINGERPRINT = 'sha256:58e9d9edf45669ac354bc400c4a7bf3ccd3b3e7bce92544f7eaba76895a43dbf';
-
-function rawRegistry() {
+function promotionInput() {
   return {
-    controllerNodeId: 'dev-cluster-dell',
     nodes: [
       {
         nodeId: 'dev-cluster-dell',
@@ -45,27 +48,57 @@ function rawRegistry() {
         healthRevision: 'z790-live-1',
       },
     ],
-    agentInstances: [
+    runtimeInstances: [
       {
         nodeId: 'dev-cluster-z790',
         adapterId: 'codex-cli',
-        lifecycle: 'disabled',
+        installedVersion: '0.146.0',
         readiness: 'ready',
         authenticated: true,
-        qualified: true,
-        qualificationRevision: CODEX_REVISION,
-        qualificationEvidenceFingerprint: CODEX_FINGERPRINT,
-        providerAccountClass: 'chatgpt',
         costPosture: 'included-subscription',
         paid: false,
-        models: ['gpt-5.6-terra'],
-        profiles: ['codex-canary-v1'],
-        jobClasses: ['implementation'],
         maxConcurrent: 1,
         active: 0,
       },
     ],
     providerAccountCaps: { chatgpt: 1 },
+  };
+}
+
+function authorityComment({ registry, id = 100, state = 'enabled', revision = 'AR402-FLEET-CLI-1' }) {
+  const material = {
+    schema_version: FLEET_ACTIVATION_AUTHORITY_SCHEMA_VERSION,
+    revision,
+    target_repository: 'TheTekTeam/agent-runner',
+    target_issue: CONTROL_ISSUE,
+    target_source_commit: SOURCE_SHA,
+    target_registry_revision: registry.revision,
+    target_registry_fingerprint: registry.registryFingerprint,
+    target_instance: 'codex-cli@dev-cluster-z790',
+    target_state: state,
+    producer_type: 'normal_chatgpt_manager_session',
+    reason: 'supervised-fleet-cli-test',
+  };
+  const fingerprint = fleetActivationAuthorityFingerprint(material);
+  return {
+    id,
+    user: { login: 'gpcola' },
+    body: `${FLEET_ACTIVATION_AUTHORITY_MARKER}
+\`\`\`yaml
+schema_version: ${material.schema_version}
+revision: ${material.revision}
+target_repository: ${material.target_repository}
+target_issue: ${material.target_issue}
+target_source_commit: ${material.target_source_commit}
+target_registry_revision: ${material.target_registry_revision}
+target_registry_fingerprint: ${material.target_registry_fingerprint}
+target_instance: ${material.target_instance}
+target_state: ${material.target_state}
+producer_type: ${material.producer_type}
+reason: ${material.reason}
+fingerprint: ${fingerprint}
+\`\`\`
+`,
   };
 }
 
@@ -77,13 +110,15 @@ function run(args, { env, input = '' } = {}) {
   });
 }
 
-test('default CLI inspect entrypoint is safe on any host and write path remains Dell-bound', () => {
+test('default CLI inspect is host-neutral while promotion/transition remain Dell-bound and GitHub-authorised', () => {
   const root = mkdtempSync(join(tmpdir(), 'agent-runner-fleet-cli-'));
   const path = join(root, 'live-worker-registry.json');
   const env = {
     ...process.env,
     HOME: root,
     AGENT_RUNNER_WORKER_REGISTRY_PATH: path,
+    AGENT_RUNNER_FLEET_ACTIVATION_CONTROL_ISSUE: String(CONTROL_ISSUE),
+    CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola',
   };
   try {
     const inspectMissing = run(['inspect'], { env });
@@ -93,20 +128,20 @@ test('default CLI inspect entrypoint is safe on any host and write path remains 
     assert.equal(missingPayload.registry.found, false);
 
     let output = '';
-    const replaceExit = main(['replace', '--expected-revision', '0'], {
+    const promoteExit = main(['promote', '--expected-revision', '0'], {
       env,
       hostnameFn: () => 'dev-cluster-dell',
-      readFn: () => JSON.stringify(rawRegistry()),
+      readFn: () => JSON.stringify(promotionInput()),
       writeFn: (value) => { output += value; },
     });
-    assert.equal(replaceExit, 0, output);
-    const replaced = JSON.parse(output);
-    assert.equal(replaced.ok, true);
-    assert.equal(replaced.registry.revision, 1);
-    assert.equal(replaced.registry.instances[0].lifecycle, 'disabled');
+    assert.equal(promoteExit, 0, output);
+    const promoted = JSON.parse(output);
+    assert.equal(promoted.registry.revision, 1);
+    assert.equal(promoted.registry.instances[0].lifecycle, 'disabled');
+    assert.equal(promoted.registry.instances[0].qualificationRevision, 'codex-z790-58e9d9edf45669ac');
 
     output = '';
-    const badTransitionExit = main([
+    const missingAuthorityExit = main([
       'transition',
       '--expected-revision', '1',
       '--instance', 'codex-cli@dev-cluster-z790',
@@ -116,27 +151,29 @@ test('default CLI inspect entrypoint is safe on any host and write path remains 
       hostnameFn: () => 'dev-cluster-dell',
       writeFn: (value) => { output += value; },
     });
-    assert.equal(badTransitionExit, 1);
-    assert.equal(JSON.parse(output).errorCode, 'live-worker-registry-activation-authority-revision-invalid');
+    assert.equal(missingAuthorityExit, 1);
+    assert.equal(JSON.parse(output).errorCode, 'live-worker-registry-command-transition-arguments-required');
 
+    const comment = authorityComment({ registry: promoted.registry });
     output = '';
     const transitionExit = main([
       'transition',
       '--expected-revision', '1',
       '--instance', 'codex-cli@dev-cluster-z790',
       '--state', 'enabled',
-      '--authority-revision', 'AR402-FLEET-ACTIVATION-CLI-1',
-      '--authority-fingerprint', `sha256:${'9'.repeat(64)}`,
+      '--authority-comment-id', String(comment.id),
     ], {
       env,
       hostnameFn: () => 'dev-cluster-dell',
+      fetchCommentsFn: () => [comment],
+      readHeadFn: () => SOURCE_SHA,
       writeFn: (value) => { output += value; },
     });
     assert.equal(transitionExit, 0, output);
     const transitioned = JSON.parse(output);
     assert.equal(transitioned.registry.revision, 2);
     assert.equal(transitioned.registry.instances[0].lifecycle, 'enabled');
-    assert.equal(transitioned.registry.instances[0].qualificationRevision, CODEX_REVISION);
+    assert.equal(transitioned.registry.activationAuthorities['codex-cli@dev-cluster-z790'].commentId, comment.id);
 
     output = '';
     const wrongHostExit = main([
@@ -144,6 +181,7 @@ test('default CLI inspect entrypoint is safe on any host and write path remains 
       '--expected-revision', '2',
       '--instance', 'codex-cli@dev-cluster-z790',
       '--state', 'disabled',
+      '--authority-comment-id', '101',
     ], {
       env,
       hostnameFn: () => 'dev-cluster-z790',
