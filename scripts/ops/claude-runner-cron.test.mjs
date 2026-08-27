@@ -17,6 +17,7 @@ import {
   claimRevisionIsCurrent,
   classifyAttemptLivenessState,
   CLAUDE_RUNNER_ENTRYPOINT,
+  OLLAMA_RUNNER_ENTRYPOINT,
   computeAttemptLivenessEvidence,
   collectRecoveryRevalidation,
   captureProcessIdentity,
@@ -4258,9 +4259,21 @@ const READY_ISSUE_701 = { number: 701, title: 'Ready issue', url: 'https://examp
 // real proven-ready `computeInstanceReadiness()` probe would produce.
 const CLAUDE_READY = Object.freeze({ 'claude-code-cli': { healthy: true, ready: true } });
 
-test('hasImplementedRoutableAlternative is false against the real committed catalogue (every non-Claude adapter stays implemented:false)', () => {
+test('hasImplementedRoutableAlternative stays false while the implemented Ollama adapter is machine-disabled', () => {
   const snapshot = testSettingsSnapshot({});
   assert.equal(hasImplementedRoutableAlternative(snapshot), false);
+});
+
+test('#377 hasImplementedRoutableAlternative becomes true only for an explicitly routable Ollama entry', () => {
+  const snapshot = testSettingsSnapshot({});
+  snapshot.agents['ollama-agent'] = {
+    lifecycle: { enabled: true, paused: false, draining: false, disabled: false },
+    routable: true,
+    runtimeModel: 'modelspend-code-local:latest',
+    qualification: { taskClasses: ['narrow'], riskClasses: ['low'], models: [], harness: 'opencode' },
+    paidUse: { paidUseApproved: false, automaticRoutingApproved: false, hasPositiveCap: false },
+  };
+  assert.equal(hasImplementedRoutableAlternative(snapshot), true);
 });
 
 test('hasImplementedRoutableAlternative reads the real frozen AGENT_ADAPTERS catalogue, not a caller-injected one', () => {
@@ -4468,11 +4481,9 @@ test('a fresh manager packet whose approved_agent matches the (post-reassignment
 
 const READY_ISSUE_CODEX_801 = { number: 801, title: 'Codex-assigned queued issue', url: 'https://example.invalid/801', labels: [{ name: 'status:ready' }, { name: 'agent:codex-cli' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' };
 
-// One case per foundation-only adapter, issue #50 review's explicit list
-// ("queued agent:codex-cli, agent:grok-cli and agent:ollama"). ollama-agent's
-// label is `agent:ollama` -- not `agent:ollama-agent` -- so it exercises a
-// distinct label-to-id resolution path the other two do not.
-for (const [agentId, agentLabel, issueNumber] of [['codex-cli', 'agent:codex-cli', 801], ['grok-cli', 'agent:grok-cli', 802], ['ollama-agent', 'agent:ollama', 803]]) {
+// Foundation-only adapters remain reconciliation-only. #377 moved Ollama
+// out of this set; it has its own live-routing tests below.
+for (const [agentId, agentLabel, issueNumber] of [['codex-cli', 'agent:codex-cli', 801], ['grok-cli', 'agent:grok-cli', 802]]) {
   test(`a queued issue explicitly assigned to foundation-only (implemented:false) ${agentId} is visible to reconciliation, but never becomes an executable selection`, async () => {
     const issue = { number: issueNumber, title: `${agentId}-assigned queued issue`, url: `https://example.invalid/${issueNumber}`, labels: [{ name: 'status:ready' }, { name: agentLabel }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' };
     const ghRunner = issueListGhRunner([issue]);
@@ -4527,18 +4538,17 @@ test('a queued issue assigned to codex-cli is never selected for execution even 
   assert.ok(codexDecision.reasons.includes('not-implemented'));
 });
 
-test('selectIssue round 3: configured acceptedAgentLabels explicitly listing every foundation label (codex-cli, grok-cli, ollama) still routes each one to reconciliation, never to execution', async () => {
+test('selectIssue round 3: configured acceptedAgentLabels listing the remaining foundation labels still routes codex-cli/grok-cli to reconciliation, never execution', async () => {
   const issues = [
     { number: 811, title: 'codex', url: 'https://example.invalid/811', labels: [{ name: 'status:ready' }, { name: 'agent:codex-cli' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' },
     { number: 812, title: 'grok', url: 'https://example.invalid/812', labels: [{ name: 'status:ready' }, { name: 'agent:grok-cli' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' },
-    { number: 813, title: 'ollama', url: 'https://example.invalid/813', labels: [{ name: 'status:ready' }, { name: 'agent:ollama' }, { name: 'task:code' }, { name: 'risk:low' }], updatedAt: '2026-07-08T10:00:00Z' },
   ];
   const ghRunner = issueListGhRunner(issues);
   // The operator explicitly configured every foundation label as "accepted"
   // alongside Claude -- exactly the misconfiguration the review calls out.
   const args = {
     repo: 'TheTekTeam/modelspend', limit: 10,
-    agentLabels: ['agent:claude-code-cli', 'agent:codex-cli', 'agent:grok-cli', 'agent:ollama'],
+    agentLabels: ['agent:claude-code-cli', 'agent:codex-cli', 'agent:grok-cli'],
     includeInProgress: true, requireManagerPreflight: true, execute: false,
   };
   const noAlternativeSnapshot = testSettingsSnapshot({ claudeOverrides: { lifecycle: { enabled: true, paused: false, draining: false, disabled: true } } });
@@ -4547,12 +4557,87 @@ test('selectIssue round 3: configured acceptedAgentLabels explicitly listing eve
     readinessByAgentId: CLAUDE_READY,
   });
   assert.equal(selected.issue, null);
-  for (const [issueNumber, agentId] of [[811, 'codex-cli'], [812, 'grok-cli'], [813, 'ollama-agent']]) {
+  for (const [issueNumber, agentId] of [[811, 'codex-cli'], [812, 'grok-cli']]) {
     const reconciled = selected.skipped.find((entry) => entry.issue === issueNumber);
     assert.ok(reconciled, `issue #${issueNumber} (${agentId}) must still be visible to reconciliation despite the misconfigured acceptedAgentLabels`);
     assert.equal(reconciled.agentId, agentId);
     assert.notEqual(reconciled.reason, 'unsupported-agent', 'must never fall through to the legacy unsupported-agent skip -- that would mean it silently reached execution discovery');
   }
+});
+
+test('#377 Ollama label is never executable when the multi-agent selector is not engaged', async () => {
+  const issue = {
+    number: 813,
+    title: 'bounded Ollama task',
+    url: 'https://example.invalid/813',
+    labels: [{ name: 'status:ready' }, { name: 'agent:ollama' }, { name: 'task:narrow' }, { name: 'risk:low' }, { name: 'harness:opencode' }],
+    updatedAt: '2026-07-08T10:00:00Z',
+  };
+  const ghRunner = issueListGhRunner([issue]);
+  const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:ollama'], includeInProgress: true, requireManagerPreflight: true, execute: false };
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(ghRunner), { settingsSnapshot: null });
+  assert.equal(selected.issue, null);
+  assert.equal(selected.skipped[0].reason, 'multi-agent-routing-disabled');
+  assert.equal(selected.skipped[0].agentId, 'ollama-agent');
+});
+
+test('#377 explicitly assigned qualified low-risk Ollama issue is selectable when lifecycle, readiness and manager authority agree', async () => {
+  const issue = {
+    number: 813,
+    title: 'bounded Ollama task',
+    url: 'https://example.invalid/813',
+    labels: [{ name: 'status:ready' }, { name: 'agent:ollama' }, { name: 'task:narrow' }, { name: 'risk:low' }, { name: 'harness:opencode' }],
+    updatedAt: '2026-07-08T10:00:00Z',
+  };
+  const preflight = {
+    id: 8131,
+    createdAt: '2026-08-27T10:00:00Z',
+    body: '<!-- agent-runner:manager-preflight -->\n\n```yaml\nschema_version: agent-runner-manager-preflight/v1\nrevision: AR377.OLLAMA.1\nfingerprint: sha256:' + 'd'.repeat(64) + '\nproducer_type: normal_chatgpt_manager_session\napproved_agent: ollama-agent\nexecution_phase: implementation\nprofile: narrow\nmodel: modelspend-code-local:latest\nscope:\n  - bounded test scope\nallowed_paths:\n  - scripts/ops/example.mjs\nrequired_validation:\n  - node --test scripts/ops/agent-runner-config.test.mjs\nstop_conditions:\n  - stop on scope expansion\n```\n',
+  };
+  const ghRunner = issueListGhRunnerWithComments([issue], [preflight]);
+  const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:ollama'], includeInProgress: true, requireManagerPreflight: true, execute: false };
+  const snapshot = testSettingsSnapshot({});
+  snapshot.agents['ollama-agent'] = {
+    lifecycle: { enabled: true, paused: false, draining: false, disabled: false },
+    routable: true,
+    runtimeModel: 'modelspend-code-local:latest',
+    qualification: { taskClasses: ['narrow'], riskClasses: ['low'], models: [], harness: 'opencode' },
+    paidUse: { paidUseApproved: false, automaticRoutingApproved: false, hasPositiveCap: false },
+  };
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(ghRunner), {
+    settingsSnapshot: snapshot,
+    readinessByAgentId: { 'ollama-agent': { healthy: true, ready: true } },
+  });
+  assert.equal(selected.issue?.number, 813);
+  assert.equal(selected.selection.managerAuthority.approvedAgent, 'ollama-agent');
+});
+
+test('#377 Ollama remains structurally excluded for non-low risk even if machine settings claim broader qualification', async () => {
+  const issue = {
+    number: 814,
+    title: 'high-risk Ollama task',
+    url: 'https://example.invalid/814',
+    labels: [{ name: 'status:ready' }, { name: 'agent:ollama' }, { name: 'task:narrow' }, { name: 'risk:high' }, { name: 'harness:opencode' }],
+    updatedAt: '2026-07-08T10:00:00Z',
+  };
+  const ghRunner = issueListGhRunner([issue]);
+  const args = { repo: 'TheTekTeam/modelspend', limit: 10, agentLabels: ['agent:ollama'], includeInProgress: true, requireManagerPreflight: true, execute: false };
+  const snapshot = testSettingsSnapshot({});
+  snapshot.agents['ollama-agent'] = {
+    lifecycle: { enabled: true, paused: false, draining: false, disabled: false },
+    routable: true,
+    runtimeModel: 'modelspend-code-local:latest',
+    qualification: { taskClasses: ['narrow'], riskClasses: ['high'], models: [], harness: 'opencode' },
+    paidUse: { paidUseApproved: false, automaticRoutingApproved: false, hasPositiveCap: false },
+  };
+  const selected = await selectIssue(args, withEmptyOpenPrInventory(ghRunner), {
+    settingsSnapshot: snapshot,
+    readinessByAgentId: { 'ollama-agent': { healthy: true, ready: true } },
+  });
+  assert.equal(selected.issue, null);
+  const skip = selected.skipped.find((entry) => entry.issue === 814);
+  assert.ok(skip);
+  assert.ok(skip.eligibilityReasons.includes('ollama-low-risk-boundary'));
 });
 
 test('selectIssue round 3: an issue carrying two distinct supported local agent labels is ambiguous -- fails closed with bounded routing-attention evidence, never executes, never silently picks one', async () => {
