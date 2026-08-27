@@ -244,14 +244,23 @@ export const OPENCODE_RUN_SUBCOMMAND = 'run';
  * The returned value is JSON text suitable for OPENCODE_CONFIG_CONTENT. It
  * contains no credential, auth, session, cloud-provider, download, refresh,
  * or fallback field. Sharing is disabled and both default/small-model
- * selections are pinned to the same local Ollama model.
+ * selections are pinned to the same local Ollama model. When
+ * `disableReasoning` is true, OpenCode 1.18.4 receives the model-level
+ * `reasoningEffort: "none"` request option; its OpenAI-compatible lowerer
+ * serializes that as `reasoning_effort: "none"`. The similarly named
+ * `--thinking` CLI flag only controls display of reasoning blocks and is
+ * deliberately not used as a generation control.
  */
 export function buildOpenCodeLocalOllamaConfig({
   model,
   endpointUrl,
   endpointAllowlistHosts = [],
+  disableReasoning = false,
 } = {}) {
   if (!model) throw new Error('buildOpenCodeLocalOllamaConfig requires a model');
+  if (typeof disableReasoning !== 'boolean') {
+    throw new Error('buildOpenCodeLocalOllamaConfig requires disableReasoning to be boolean');
+  }
   const endpoint = resolveOllamaEndpoint({
     endpoint: endpointUrl,
     endpointAllowlistHosts,
@@ -261,6 +270,9 @@ export function buildOpenCodeLocalOllamaConfig({
   }
 
   const baseURL = new URL('/v1', endpoint.url).toString().replace(/\/$/, '');
+  const modelConfig = disableReasoning
+    ? { name: model, options: { reasoningEffort: 'none' } }
+    : { name: model };
   return JSON.stringify({
     $schema: 'https://opencode.ai/config.json',
     autoupdate: false,
@@ -274,7 +286,7 @@ export function buildOpenCodeLocalOllamaConfig({
         name: 'Ollama (local)',
         options: { baseURL },
         models: {
-          [model]: { name: model },
+          [model]: modelConfig,
         },
       },
     },
