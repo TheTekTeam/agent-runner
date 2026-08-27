@@ -128,6 +128,8 @@ export const AGENT_SETTINGS_EXAMPLE = Object.freeze({
       draining: false,
       disabled: true,
       executablePath: null,
+      openCodeExecutablePath: null,
+      model: null,
       endpoint: 'http://127.0.0.1:11434',
       endpointAllowlistHosts: Object.freeze([]),
       installedModelAllowlist: Object.freeze([]),
@@ -137,7 +139,7 @@ export const AGENT_SETTINGS_EXAMPLE = Object.freeze({
       // routing logic (the selector additionally hard-clamps ollama-agent to
       // riskClasses containing only "low"; this field cannot widen that).
       qualification: Object.freeze({
-        taskClasses: Object.freeze(['docs']),
+        taskClasses: Object.freeze([]),
         riskClasses: Object.freeze(['low']),
         models: Object.freeze([]),
         harness: null,
@@ -295,6 +297,14 @@ function normalizeLifecycleForAgent(_agentId, entry) {
   };
 }
 
+const RUNTIME_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$/;
+
+export function normalizeAgentRuntimeModel(agentId, entry) {
+  if (agentId !== 'ollama-agent' || !isPlainObject(entry)) return null;
+  const model = String(entry.model || '').trim();
+  return RUNTIME_MODEL_PATTERN.test(model) ? model : null;
+}
+
 function sanitizedSnapshotEntry(agentId, entry) {
   const lifecycle = normalizeLifecycleForAgent(agentId, entry);
   return Object.freeze({
@@ -302,6 +312,7 @@ function sanitizedSnapshotEntry(agentId, entry) {
     lifecycle: Object.freeze(lifecycle),
     routable: isAgentRoutable(lifecycle),
     qualification: Object.freeze(normalizeAgentQualification(agentId, entry)),
+    runtimeModel: normalizeAgentRuntimeModel(agentId, entry),
     paidUse: Object.freeze(normalizeAgentPaidUsePolicy(entry)),
   });
 }
