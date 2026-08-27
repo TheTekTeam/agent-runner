@@ -671,8 +671,8 @@ test('#377 coding config permits bounded worktree edits and reviewed shell while
     allowedEditPaths: ['scripts/ops/*.mjs', 'scripts/ops/*.test.mjs'],
     shellAllowlist: [
       'pwd',
-      'git status *',
-      'git diff *',
+      'git status --short',
+      'git diff -- *',
       'node --test scripts/ops/*.test.mjs',
       'bash scripts/validate.sh',
     ],
@@ -685,7 +685,7 @@ test('#377 coding config permits bounded worktree edits and reviewed shell while
   assert.equal(config.permission.edit['*'], 'deny');
   assert.equal(config.permission.edit['scripts/ops/*.mjs'], 'allow');
   assert.equal(config.permission.bash['*'], 'deny');
-  assert.equal(config.permission.bash['git status *'], 'allow');
+  assert.equal(config.permission.bash['git status --short'], 'allow');
   assert.equal(config.permission.bash['node --test scripts/ops/*.test.mjs'], 'allow');
   assert.equal(config.permission.read['.env'], 'deny');
   assert.equal(config.permission.read['**/.env.*'], 'deny');
@@ -714,6 +714,11 @@ test('#377 shell policy rejects privileged, destructive, network, download and i
     'node -e console.log(1)',
     'python3 -c print(1)',
     'git status ../other-repo',
+    'git status *',
+    'git diff *',
+    'git log *',
+    'git show *',
+    'git grep pattern',
   ];
   for (const command of rejected) {
     assert.equal(isSafeOllamaShellPattern(command), false, command);
@@ -721,12 +726,10 @@ test('#377 shell policy rejects privileged, destructive, network, download and i
 
   for (const command of [
     'pwd',
-    'git status *',
-    'git diff *',
-    'git log *',
-    'git show HEAD',
-    'git grep pattern',
-    'git ls-files *',
+    'git status --short',
+    'git diff -- *',
+    'git log --oneline -n 20',
+    'git show --stat HEAD',
     'git rev-parse HEAD',
     'node --test scripts/ops/agent-runner-ollama-adapter.test.mjs',
     'bash scripts/validate.sh',
