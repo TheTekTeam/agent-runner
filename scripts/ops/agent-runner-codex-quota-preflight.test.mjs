@@ -77,9 +77,21 @@ test('threshold exhaustion or explicit reached state fails closed', () => {
   }).reason, 'codex-quota-blocked');
 });
 
-test('missing or ambiguous windows fail closed rather than inferring availability', () => {
+test('missing, null, or ambiguous usage windows fail closed rather than inferring zero usage', () => {
   assert.equal(evaluateCodexRateLimits({}).reason, 'codex-quota-evidence-unavailable');
   assert.equal(evaluateCodexRateLimits({
     result: { rateLimits: { primary: { usedPercent: 1 }, secondary: null } },
+  }).reason, 'codex-quota-evidence-ambiguous');
+  assert.equal(evaluateCodexRateLimits({
+    result: { rateLimits: {
+      primary: { usedPercent: null },
+      secondary: { usedPercent: 1 },
+    } },
+  }).reason, 'codex-quota-evidence-ambiguous');
+  assert.equal(evaluateCodexRateLimits({
+    result: { rateLimits: {
+      primary: {},
+      secondary: { usedPercent: 1 },
+    } },
   }).reason, 'codex-quota-evidence-ambiguous');
 });
