@@ -118,13 +118,38 @@ fallback field.
 <prompt>`). It emits no interactive/share/attach/session/continue/fork,
 concurrency, pull/download/refresh, or fallback-provider flag.
 
-`parseOpenCodeResultEnvelope()` still represents the foundation's assumed
-structured result shape
-(`{status: 'ok'|'no-op'|'error', output, error, mutated}`) and therefore
-remains fail-closed pending the supervised #152 live JSON-event capture.
+Supervised #152 field evidence has now verified that OpenCode 1.18.4
+`run --format json` emits newline-delimited event objects. The accepted
+successful shape contains `step_start`, one or more `text` events, and
+`step_finish`; error events are emitted separately. 
+`parseOpenCodeJsonEventStream()` parses that JSONL contract fail-closed,
+extracts only completed text payloads, never copies unbounded provider error
+messages into normalized failure output, and reports repository mutation as
+false because event parsing alone cannot prove a filesystem change.
+`parseOpenCodeResultEnvelope()` auto-detects the verified JSONL stream while
+retaining the historical single-envelope parser only for compatibility.
 `classifyOpenCodeExecutionError()` separately classifies process-level
 timeout vs. cancellation vs. a generic execution error for cases that never
 produce parseable output.
+
+### Text-only documentation contract
+
+#152 also field-proved that the local provider/model/session path succeeds
+with every OpenCode permission denied, while two otherwise-identical
+documentation canaries failed deterministically when read/edit tool access
+was introduced. Documentation qualification therefore does not rely on
+model-specific file-tool support.
+
+`buildOpenCodeTextOnlyLocalOllamaConfig()` extends the local-only provider
+configuration with a global permission deny. A documentation model generates
+one bounded full-document proposal enclosed exactly by
+`<modelspend-document>` / `</modelspend-document>`.
+`parseBoundedDocumentationContent()` rejects wrappers, nested markers, NUL
+content and oversized output. The supervising harness—not the model—owns the
+single allowlisted documentation path and applies the validated content
+deterministically only after its normal branch/worktree/source/settings gates
+have passed. This keeps filesystem authority out of the local model while
+still allowing the model to perform the documentation transformation.
 
 ## Serial execution and no paid fallback
 
@@ -136,13 +161,17 @@ a typed `machine_profile` result and nothing else.
 
 ## Known limitations
 
-- The OpenCode **run argument surface** is now verified against the installed
-  Dell OpenCode `1.18.4` help output: `--model`, `--format json`, and
-  `--dir` are supported; `--api-base`, `--non-interactive`, and
-  `--print` are not. The **JSON event/result schema** remains deliberately
-  unverified because proving it requires a real model-backed run. The first
-  supervised #152 canary must capture only bounded/redacted event-shape
-  evidence and stop on parser drift before any routing enablement.
+- The OpenCode **run argument surface and JSONL event schema** are now
+  verified against Dell OpenCode `1.18.4` by supervised #152 field
+  evidence. The accepted no-tool diagnostic emitted exactly three parseable
+  events (`step_start`, `text`, `step_finish`) with zero stderr and zero
+  provider spend. Any future OpenCode version change must revalidate both the
+  argv and JSONL contracts before qualification is carried forward.
+- The documentation profile is intentionally text-only: OpenCode permissions
+  remain denied and the deterministic harness applies only a bounded,
+  envelope-validated full-document proposal to an independently allowlisted
+  documentation path. Tool-enabled local documentation execution is not an
+  accepted qualification path.
 - The runtime Ollama provider config uses OpenCode's documented
   `OPENCODE_CONFIG_CONTENT` provider configuration with
   `enabled_providers: ["ollama"]`, local-only default/small-model choices,
