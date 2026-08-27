@@ -15,6 +15,7 @@ import {
   normalizeAgentLifecycle,
   normalizeAgentPaidUsePolicy,
   normalizeAgentQualification,
+  normalizeAgentRuntimeModel,
   normalizeSafeToken,
   QUALIFICATION_WILDCARD,
   resolveAgentSettingsPath,
@@ -374,3 +375,34 @@ test('settingsRevisionUnchanged: two "file not found" snapshots never count as u
   const missing2 = { revision: 'sha256:' + '0'.repeat(64), fileFound: false, parseError: null };
   assert.equal(settingsRevisionUnchanged(missing1, missing2), false, 'fileFound must be true on both sides, not merely equal revisions');
 });
+
+
+test('#377 runtime model identity preserves qualified Ollama aliases without widening generic qualification tokens', () => {
+  assert.equal(
+    normalizeAgentRuntimeModel('ollama-agent', { model: 'modelspend-code-local:latest' }),
+    'modelspend-code-local:latest',
+  );
+  assert.equal(normalizeAgentRuntimeModel('claude-code-cli', { model: 'sonnet' }), null);
+  assert.equal(normalizeAgentRuntimeModel('ollama-agent', { model: 'unsafe model;rm' }), null);
+});
+
+test('#377 sanitized settings snapshot carries only bounded Ollama runtime model identity', () => withTempSettings({
+  agents: {
+    'ollama-agent': {
+      enabled: true,
+      disabled: false,
+      model: 'modelspend-code-local:latest',
+      endpoint: 'http://127.0.0.1:11434',
+      executablePath: '/usr/bin/ollama',
+      openCodeExecutablePath: '/usr/local/bin/opencode',
+      qualification: { taskClasses: ['narrow'], riskClasses: ['low'], models: [], harness: 'opencode' },
+      secret: 'must-not-survive',
+    },
+  },
+}, (settingsPath) => {
+  const snapshot = snapshotAgentSettings({ settingsPath, agentIds: CATALOGUE_AGENT_IDS });
+  assert.equal(snapshot.agents['ollama-agent'].runtimeModel, 'modelspend-code-local:latest');
+  assert.equal(JSON.stringify(snapshot).includes('/usr/bin/ollama'), false);
+  assert.equal(JSON.stringify(snapshot).includes('/usr/local/bin/opencode'), false);
+  assert.equal(JSON.stringify(snapshot).includes('must-not-survive'), false);
+}));
