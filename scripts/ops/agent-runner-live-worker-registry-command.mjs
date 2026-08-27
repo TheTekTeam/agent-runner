@@ -124,6 +124,10 @@ export function main(argv = process.argv.slice(2), {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+const invokedAsScript = process.argv[1]
+  ? import.meta.url === new URL(process.argv[1], `file://${process.cwd()}/`).href
+  : false;
+
+if (invokedAsScript) {
   process.exitCode = main();
 }
