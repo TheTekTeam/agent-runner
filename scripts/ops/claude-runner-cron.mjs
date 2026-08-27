@@ -2103,12 +2103,10 @@ export function runQuotaPreflight(args, env = process.env, runner = spawnSync) {
 /**
  * Cheap, catalogue-level pre-check (issue #50, "Claude quota is agent-local"):
  * is there *any* implemented, routable agent other than Claude at all? Real
- * deployments today have zero implemented alternatives (Codex CLI/Grok
- * CLI/Ollama all stay `implemented:false`), so this is always false in
- * production and the quota-blocked global idle below is unchanged. Only
- * once a real alternative adapter is implemented and enabled does this
- * unlock the per-issue path where Claude alone is excluded by its own
- * quota block instead of idling the whole queue.
+ * Codex CLI and Grok CLI remain unimplemented. #376 makes Ollama a real
+ * alternative only when its machine-local lifecycle is explicitly routable;
+ * the selector, readiness/qualification gates and the independent pre-claim
+ * Ollama admission still decide whether any issue may actually use it.
  */
 export function hasImplementedRoutableAlternative(settingsSnapshot) {
   return Object.values(AGENT_ADAPTERS).some((adapter) => (
