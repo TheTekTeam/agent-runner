@@ -180,7 +180,6 @@ export async function runCodexQuotaPreflight({
       reason: auth.reason || 'codex-auth-failed',
       authMode: auth.mode,
       resourceState: Object.freeze({ blocked: true, reason: auth.reason || 'codex-auth-failed' }),
-      sanitizedEnv: sanitizeCodexEnvironment(env),
     });
   }
 
@@ -191,7 +190,6 @@ export async function runCodexQuotaPreflight({
       reason: quota.reason,
       authMode: auth.mode,
       resourceState: Object.freeze({ blocked: true, reason: quota.reason }),
-      sanitizedEnv: sanitizeCodexEnvironment(env),
     });
   }
 
@@ -201,6 +199,5 @@ export async function runCodexQuotaPreflight({
     reason: resourceState.reason,
     authMode: auth.mode,
     resourceState,
-    sanitizedEnv: sanitizeCodexEnvironment(env),
   });
 }
