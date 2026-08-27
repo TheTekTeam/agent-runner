@@ -142,14 +142,18 @@ model-specific file-tool support.
 
 `buildOpenCodeTextOnlyLocalOllamaConfig()` extends the local-only provider
 configuration with a global permission deny. A documentation model generates
-one bounded full-document proposal enclosed exactly by
-`<modelspend-document>` / `</modelspend-document>`.
-`parseBoundedDocumentationContent()` rejects wrappers, nested markers, NUL
-content and oversized output. The supervising harness—not the model—owns the
-single allowlisted documentation path and applies the validated content
-deterministically only after its normal branch/worktree/source/settings gates
-have passed. This keeps filesystem authority out of the local model while
-still allowing the model to perform the documentation transformation.
+one bounded full-document proposal as text only.
+`parseBoundedDocumentationContent()` treats XML-like markers, a single outer
+Markdown code fence, or raw document text as transport syntax rather than a
+security boundary. It still rejects NUL and oversized output. When the caller
+has a deterministic expected result (for example a qualification fixture), the
+parser can require that exact content to occur exactly once and returns only
+those accepted bytes, ignoring harmless surrounding prose/fences. The
+supervising harness—not the model—owns the single allowlisted documentation
+path and applies the validated content deterministically only after its normal
+branch/worktree/source/settings gates have passed. This keeps filesystem
+authority out of the local model while avoiding brittle dependence on model
+wrapper formatting.
 
 ## Serial execution and no paid fallback
 
@@ -169,9 +173,11 @@ a typed `machine_profile` result and nothing else.
   argv and JSONL contracts before qualification is carried forward.
 - The documentation profile is intentionally text-only: OpenCode permissions
   remain denied and the deterministic harness applies only a bounded,
-  envelope-validated full-document proposal to an independently allowlisted
-  documentation path. Tool-enabled local documentation execution is not an
-  accepted qualification path.
+  validated full-document proposal to an independently allowlisted
+  documentation path. Transport wrappers are not treated as authority or as a
+  qualification requirement; deterministic expected-content gates may be used
+  where exact bytes are known. Tool-enabled local documentation execution is
+  not an accepted qualification path.
 - The runtime Ollama provider config uses OpenCode's documented
   `OPENCODE_CONFIG_CONTENT` provider configuration with
   `enabled_providers: ["ollama"]`, local-only default/small-model choices,
