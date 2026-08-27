@@ -107,8 +107,8 @@ if [[ "$ADAPTER" == "claude-code-cli" ]] && command -v claude >/dev/null 2>&1; t
 fi
 
 if [[ "$ADAPTER" == "codex-cli" ]] && command -v codex >/dev/null 2>&1; then
-  info "codex-cli runtime already installed: $(codex --version 2>/dev/null || printf 'version-probe-failed')"
-  exit 0
+  info "codex-cli runtime present before reconciliation: $(codex --version 2>/dev/null || printf 'version-probe-failed')"
+  info "explicit Codex provisioning reconciles the reviewed $CODEX_NPM_PACKAGE_SPEC package instead of accepting presence as currency"
 fi
 
 if [[ "$ADAPTER" == "ollama-agent" ]]   && command -v ollama >/dev/null 2>&1   && command -v opencode >/dev/null 2>&1; then
@@ -125,7 +125,7 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
     info '--dry-run: would install package claude-code through apt'
   elif [[ "$ADAPTER" == "codex-cli" ]]; then
     info '--dry-run: would require the existing reviewed Node/npm toolchain'
-    info "--dry-run: would install $CODEX_NPM_PACKAGE_SPEC globally from $CODEX_NPM_REGISTRY"
+    info "--dry-run: would reconcile $CODEX_NPM_PACKAGE_SPEC globally from $CODEX_NPM_REGISTRY even when codex is already present"
     info '--dry-run: would verify codex --version'
     info '--dry-run: would not run codex login or inspect/copy ~/.codex authentication state'
   else
