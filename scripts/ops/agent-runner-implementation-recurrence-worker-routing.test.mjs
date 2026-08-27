@@ -103,7 +103,7 @@ test('remote-only capacity is rejected before invocation when no bounded remote 
   assert.equal(result.routeRejected[0].workerRoute.nodeId, 'dev-cluster-z790');
 });
 
-test('explicit route flag plus bounded transport availability can admit the qualified Z790 lane', () => {
+test('legacy environment registry cannot activate remote routing even with flag and transport', () => {
   const value = registry();
   const result = admitRecurrenceSelections([selection()], {
     env: registryEnv(value, {
@@ -113,11 +113,65 @@ test('explicit route flag plus bounded transport availability can admit the qual
     maxParallel: 2,
     remoteTransportAvailable: true,
   });
-  assert.equal(result.remoteRouteEnabled, true);
+  assert.equal(result.remoteActivationRequested, true);
+  assert.equal(result.remoteRouteEnabled, false);
+  assert.equal(result.registrySource, 'environment-compatibility');
   assert.equal(result.admittedSelections.length, 1);
-  assert.equal(result.admittedSelections[0].workerRoute.nodeId, 'dev-cluster-z790');
-  assert.equal(result.admittedSelections[0].workerRoute.agentInstanceId, 'claude-code-cli@dev-cluster-z790');
-  assert.equal(result.admission.admitted[0].nodeId, 'dev-cluster-z790');
+  assert.equal(result.admittedSelections[0].workerRoute.nodeId, 'dev-cluster-dell');
+  assert.equal(result.admittedSelections[0].workerRoute.remote, false);
+});
+
+test('prepared canonical store does not disturb local compatibility while remote activation is off', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-runner-recurrence-inactive-fleet-'));
+  const path = join(root, 'live-worker-registry.json');
+  try {
+    promoteLiveWorkerRegistry({
+      path,
+      expectedRevision: 0,
+      controllerNodeId: 'dev-cluster-dell',
+      nodes: [
+        {
+          nodeId: 'dev-cluster-dell', state: 'enabled', readiness: 'ready', controller: true, workerOnly: false,
+          os: 'linux', arch: 'x64', capabilities: [], toolchains: ['node-22'], jobClasses: ['implementation'],
+          capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'dell-live-1',
+        },
+        {
+          nodeId: 'dev-cluster-z790', state: 'enabled', readiness: 'ready', controller: false, workerOnly: true,
+          os: 'linux', arch: 'x64', capabilities: [], toolchains: ['node-22'], jobClasses: ['implementation'],
+          capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'z790-live-1',
+        },
+      ],
+      runtimeInstances: [{
+        nodeId: 'dev-cluster-z790',
+        adapterId: 'claude-code-cli',
+        installedVersion: '2.1.231',
+        readiness: 'ready',
+        authenticated: true,
+        costPosture: 'included-subscription',
+        paid: false,
+        maxConcurrent: 1,
+        active: 0,
+      }],
+      providerAccountCaps: { 'first-party': 1 },
+    });
+
+    const result = admitRecurrenceSelections([selection()], {
+      env: {
+        HOME: root,
+        AGENT_RUNNER_WORKER_REGISTRY_PATH: path,
+      },
+      maxParallel: 1,
+      remoteTransportAvailable: true,
+    });
+    assert.equal(result.remoteActivationRequested, false);
+    assert.equal(result.remoteRouteEnabled, false);
+    assert.equal(result.registrySource, null);
+    assert.equal(result.admittedSelections.length, 1);
+    assert.equal(result.admittedSelections[0].workerRoute.reason, 'local-compatibility-route');
+    assert.equal(result.admittedSelections[0].workerRoute.nodeId, 'dev-cluster-dell');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('worker route cannot change the adapter identity selected by candidate authority', () => {
