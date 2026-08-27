@@ -61,8 +61,8 @@ function leaseFor(reg, route, overrides = {}) {
     issueNumber: 327,
     authorityFingerprint: AUTHORITY,
     baseSha: SHA,
-    branch: 'worker-327',
-    worktree: 'worker-327',
+    branch: overrides.branch || 'worker-327',
+    worktree: overrides.worktree || 'worker-327',
     adapterId: overrides.adapterId || 'claude-code-cli',
     model: overrides.model || 'sonnet',
     profile: overrides.profile || 'narrow',
@@ -105,7 +105,7 @@ function qualificationLeaseFor(reg, route, overrides = {}) {
     issueNumber: 389,
     authorityFingerprint: AUTHORITY,
     baseSha: SHA,
-    branch: 'canary-codex-389-z790',
+    branch: overrides.branch || 'canary-codex-389-z790',
     worktree: 'canary-codex-389-z790',
     adapterId: 'codex-cli',
     model: 'gpt-5.6-terra',
@@ -257,6 +257,68 @@ test('qualification lease validates on the exact Z790 worker while preserving De
     executingNodeId: 'dev-cluster-dell',
     now: new Date('2026-08-25T00:00:00Z'),
   }).reason, 'wrong-node');
+});
+
+test('worker leases accept bounded slash-delimited Git branches without broadening generic token fields', () => {
+  const reg = registry();
+  const ordinaryRoute = selectWorkerRoute(reg, {
+    adapterId: 'claude-code-cli',
+    model: 'sonnet',
+    profile: 'narrow',
+    jobClass: 'implementation',
+    preferredNodeIds: ['dev-cluster-z790'],
+  });
+  const ordinary = leaseFor(reg, ordinaryRoute, { branch: 'feature/worker-routing/fix' });
+  assert.equal(ordinary.branch, 'feature/worker-routing/fix');
+
+  const qualificationRegistry = unqualifiedCodexRegistry();
+  const qualificationRoute = selectWorkerQualificationRoute(qualificationRegistry, {
+    nodeId: 'dev-cluster-z790',
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+    requiredCapabilities: ['git'],
+  });
+  const qualification = qualificationLeaseFor(qualificationRegistry, qualificationRoute, {
+    branch: 'canary/codex-389-z790-20260827-2',
+  });
+  assert.equal(qualification.branch, 'canary/codex-389-z790-20260827-2');
+
+  const invalidBranches = [
+    '',
+    '/leading',
+    'trailing/',
+    'double//slash',
+    'bad..range',
+    'bad branch',
+    'bad~branch',
+    'bad^branch',
+    'bad:branch',
+    'bad?branch',
+    'bad*branch',
+    'bad[branch',
+    'bad\\branch',
+    'trailing.',
+    'bad.lock',
+    'bad.lock/next',
+    '.hidden/name',
+    'good/.hidden',
+    'name@{bad',
+    '@',
+  ];
+  for (const branch of invalidBranches) {
+    assert.throws(
+      () => leaseFor(reg, ordinaryRoute, { branch }),
+      /branch is invalid/,
+      branch,
+    );
+  }
+
+  assert.throws(
+    () => leaseFor(reg, ordinaryRoute, { worktree: 'worker/327' }),
+    /worktree is invalid/,
+  );
 });
 
 test('qualification routing refuses controller targets and unauthenticated worker instances', () => {
