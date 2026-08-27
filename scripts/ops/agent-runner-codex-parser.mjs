@@ -80,8 +80,47 @@ function extractAgentMessageText(events) {
   return messageItems.join('\n').trim();
 }
 
-function extractMutatedRepository(events) {
-  return events.some((event) => event.type === 'item.completed' && isPlainObject(event.item) && event.item.type === 'file_change');
+function extractFileChangeState(events) {
+  const items = events
+    .filter((event) => event.type === 'item.completed' && isPlainObject(event.item) && event.item.type === 'file_change')
+    .map((event) => event.item);
+
+  if (!items.length) {
+    return Object.freeze({
+      present: false,
+      mutated: false,
+      failed: false,
+      ambiguous: false,
+    });
+  }
+
+  let mutated = false;
+  let failed = false;
+  let ambiguous = false;
+
+  for (const item of items) {
+    const status = String(item.status || '').trim().toLowerCase();
+    const changes = Array.isArray(item.changes) ? item.changes : null;
+
+    if (status === 'failed') {
+      failed = true;
+      continue;
+    }
+
+    if (status !== 'completed' || !changes || changes.length === 0) {
+      ambiguous = true;
+      continue;
+    }
+
+    mutated = true;
+  }
+
+  return Object.freeze({
+    present: true,
+    mutated,
+    failed,
+    ambiguous,
+  });
 }
 
 function finiteStructuredNumber(value) {
@@ -143,14 +182,43 @@ export function parseCodexResultEnvelope(stdout = '', { agentId = 'codex-cli' } 
   }
 
   if (terminal.type === 'turn.completed') {
-    const mutated = extractMutatedRepository(parsed.events);
+    const fileChanges = extractFileChangeState(parsed.events);
     const structuredUsage = extractStructuredUsage(terminal);
+
+    if (fileChanges.failed) {
+      return normalizedAdapterResult({
+        ok: false,
+        agentId,
+        reason: 'codex-file-change-failed',
+        failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
+        structuredFailure: 'file_change',
+        resultText: '',
+        mutatedRepository: false,
+        usage: legacyUsage(structuredUsage),
+        usageEfficiency: efficiencyUsage(structuredUsage),
+      });
+    }
+
+    if (fileChanges.ambiguous) {
+      return normalizedAdapterResult({
+        ok: false,
+        agentId,
+        reason: 'codex-file-change-evidence-ambiguous',
+        failureScope: FAILURE_SCOPES.TASK_ATTEMPT,
+        structuredFailure: 'file_change',
+        resultText: '',
+        mutatedRepository: false,
+        usage: legacyUsage(structuredUsage),
+        usageEfficiency: efficiencyUsage(structuredUsage),
+      });
+    }
+
     return normalizedAdapterResult({
       ok: true,
       agentId,
       resultText: extractAgentMessageText(parsed.events),
-      reason: mutated ? null : 'no-op',
-      mutatedRepository: mutated,
+      reason: fileChanges.mutated ? null : 'no-op',
+      mutatedRepository: fileChanges.mutated,
       usage: legacyUsage(structuredUsage),
       usageEfficiency: efficiencyUsage(structuredUsage),
     });
