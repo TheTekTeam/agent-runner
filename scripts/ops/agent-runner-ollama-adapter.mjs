@@ -330,11 +330,14 @@ export function buildOpenCodeTextOnlyLocalOllamaConfig(options = {}) {
 }
 
 /**
- * Accept one bounded full-document proposal and nothing else.
+ * Accept one bounded full-document proposal without making presentation
+ * wrappers part of the authority boundary.
  *
  * The model never receives write authority. Callers must still enforce the
  * approved path, repository/worktree ownership, before/after bytes and normal
- * validation before writing the returned content.
+ * validation before writing the returned content. When expectedContent is
+ * supplied, only one exact occurrence is accepted and only those expected
+ * bytes are returned.
  */
 export function parseBoundedDocumentationContent(resultText = '', {
   maxBytes = DEFAULT_DOCUMENT_OUTPUT_MAX_BYTES,
