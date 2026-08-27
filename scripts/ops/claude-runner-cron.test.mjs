@@ -4276,6 +4276,43 @@ test('#376 implemented Ollama becomes an alternative only when its machine lifec
   assert.equal(hasImplementedRoutableAlternative(snapshot), true);
 });
 
+test('#376 routable Ollama cannot suppress Claude quota block while the explicit multi-agent gate is off', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'runner-ollama-gate-off-quota-'));
+  const stateDbPath = join(dir, 'state.sqlite');
+  const lockPath = join(dir, 'cron.lock');
+  const snapshot = testSettingsSnapshot({});
+  snapshot.agents['ollama-agent'] = {
+    lifecycle: { enabled: true, paused: false, draining: false, disabled: false },
+    routable: true,
+    qualification: { taskClasses: ['narrow'], riskClasses: ['low'], models: [], harness: null },
+    paidUse: { paidUseApproved: false, automaticRoutingApproved: false, hasPositiveCap: false },
+  };
+  const originalLog = console.log;
+  try {
+    console.log = () => {};
+    const exitCode = await main([
+      '--execute', '--allow-root', '--output-dir', dir, '--state-db', stateDbPath, '--lock-path', lockPath,
+    ], { GH_TOKEN: 'test-token' }, {
+      quotaRunner: () => ({ status: 1, stdout: '', stderr: 'synthetic Claude quota block' }),
+      snapshotAgentSettings: () => snapshot,
+      ghRunner: (args) => { throw new Error(`gate-off quota block must not reach GitHub: ${args.join(' ')}`); },
+      reconcileNotifications: async () => ({ discovered: 0 }),
+      reconcileAttention: () => ({ ok: true }),
+    });
+    assert.equal(exitCode, 0);
+
+    const state = openRunnerStateStore(stateDbPath);
+    const quotaBlockedRuns = state.allRows('run_results').filter((row) => row.mode === 'quota-blocked');
+    assert.equal(quotaBlockedRuns.length, 1);
+    assert.equal(state.allRows('claims').length, 0);
+    assert.equal(state.allRows('recovery_attempts').length, 0);
+    state.close();
+  } finally {
+    console.log = originalLog;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('hasImplementedRoutableAlternative reads the real frozen AGENT_ADAPTERS catalogue, not a caller-injected one', () => {
   const snapshot = testSettingsSnapshot({});
   snapshot.agents['future-agent'] = { lifecycle: { enabled: true, paused: false, draining: false, disabled: false }, qualification: { taskClasses: [WILDCARD], riskClasses: [WILDCARD], models: [WILDCARD], harness: WILDCARD }, paidUse: { paidUseApproved: false, automaticRoutingApproved: false, hasPositiveCap: false } };
