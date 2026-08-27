@@ -17,13 +17,10 @@ const SAFE_PATH = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9][A-Za-z0-9._-]*)*$
 const FORBIDDEN_SHELL_SYNTAX = /[\0\r\n;&|><`$(){}\\'"]/;
 
 export const FIXED_OLLAMA_SHELL_COMMANDS = Object.freeze([
-  'git status',
-  'git status --short',
-  'git status --porcelain',
   'git status --porcelain=v1',
-  'git diff',
-  'git diff --check',
-  'git diff --stat',
+  'git diff --no-ext-diff',
+  'git diff --no-ext-diff --check',
+  'git diff --no-ext-diff --stat',
 ]);
 
 export function isSafeRelativeShellPath(value) {
@@ -50,12 +47,28 @@ function exactAllowlist(values = []) {
     .filter(Boolean));
 }
 
+const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+export function isShellTrustedRepository(repository, trustedRepositories = []) {
+  const repo = String(repository || '').trim();
+  if (!REPOSITORY.test(repo)) return false;
+  const normalized = new Set((Array.isArray(trustedRepositories) ? trustedRepositories : [])
+    .map((value) => String(value || '').trim().toLowerCase())
+    .filter((value) => REPOSITORY.test(value)));
+  return normalized.has(repo.toLowerCase());
+}
+
 export function classifyBoundedOllamaShellCommand(command, {
+  repository = null,
+  trustedRepositories = [],
   managerValidationCommands = [],
   machineCommandAllowlist = [],
 } = {}) {
   const parsed = tokenizeBoundedShellCommand(command);
   if (!parsed.ok) return { ...parsed, allowed: false, kind: null };
+  if (!isShellTrustedRepository(repository, trustedRepositories)) {
+    return { allowed: false, reason: 'ollama-shell-repository-not-trusted', kind: null, argv: [] };
+  }
 
   const text = parsed.argv.join(' ');
   if (FIXED_OLLAMA_SHELL_COMMANDS.includes(text)) {
@@ -88,6 +101,8 @@ export function classifyBoundedOllamaShellCommand(command, {
 }
 
 export function buildBoundedOpenCodeBashPermission({
+  repository = null,
+  trustedRepositories = [],
   managerValidationCommands = [],
   machineCommandAllowlist = [],
 } = {}) {
@@ -98,6 +113,8 @@ export function buildBoundedOpenCodeBashPermission({
   const accepted = [];
   for (const command of candidates) {
     const decision = classifyBoundedOllamaShellCommand(command, {
+      repository,
+      trustedRepositories,
       managerValidationCommands,
       machineCommandAllowlist,
     });
@@ -114,6 +131,8 @@ export function buildBoundedOpenCodeBashPermission({
 
 export function buildBoundedOllamaToolPermission({
   filePath,
+  repository = null,
+  trustedRepositories = [],
   managerValidationCommands = [],
   machineCommandAllowlist = [],
 } = {}) {
@@ -123,6 +142,8 @@ export function buildBoundedOllamaToolPermission({
     read: Object.freeze({ '*': 'deny', [filePath]: 'allow' }),
     edit: Object.freeze({ '*': 'deny', [filePath]: 'allow' }),
     bash: buildBoundedOpenCodeBashPermission({
+      repository,
+      trustedRepositories,
       managerValidationCommands,
       machineCommandAllowlist,
     }),
