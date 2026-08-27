@@ -248,7 +248,13 @@ export function admitRecurrenceSelections(selected, {
   const workerRegistry = parseLiveWorkerRegistry(env, { expectedControllerNodeId: nodeId });
   const remoteRouteEnabled = remoteTransportAvailable === true && remoteWorkerDispatchEnabled(env);
 
-  const routed = selected.map(({ entry, outcome }) => {
+  // Reserve provider/account capacity as routes are selected inside this
+  // scheduler cycle. This is intentionally conservative: a route that is later
+  // rejected by another lane cap may hold a temporary in-cycle reservation, but
+  // two new lanes can never both pass the same provider-account cap.
+  const providerAccountReservations = {};
+  const routed = [];
+  for (const { entry, outcome } of selected) {
     const adapterId = String(outcome?.selectedAgentId || 'claude-code-cli');
     const workerRoute = resolveLiveWorkerRoute({
       adapterId,
@@ -257,9 +263,15 @@ export function admitRecurrenceSelections(selected, {
       env,
       jobClass: 'implementation',
       remoteDispatchAvailable: remoteRouteEnabled,
+      providerAccountReservations,
     });
-    return { entry, outcome, workerRoute };
-  });
+    routed.push({ entry, outcome, workerRoute });
+    if (workerRoute.allowed === true && workerRegistry?.registrySource === 'canonical-store') {
+      const instance = workerRegistry.agentInstances.find((candidate) => candidate.instanceId === workerRoute.agentInstanceId);
+      const account = instance?.providerAccountClass || null;
+      if (account) providerAccountReservations[account] = Number(providerAccountReservations[account] || 0) + 1;
+    }
+  }
 
   const routeRejected = routed
     .filter(({ workerRoute }) => workerRoute.allowed !== true)
