@@ -299,15 +299,36 @@ export class QueueTriageLocalStateStore {
   }
 }
 
+const READ_ONLY_FALLBACK_REASON_CODES = Object.freeze([
+  'queue-triage-authority-absent-or-disabled',
+  'queue-triage-authority-load-failed',
+  'queue-triage-authority-source-sha-stale',
+  'queue-triage-authority-project-opt-in-mismatch',
+]);
+
+class QueueTriageReadOnlyFallbackError extends Error {
+  constructor(reasonCode, message) {
+    super(message);
+    if (!READ_ONLY_FALLBACK_REASON_CODES.includes(reasonCode)) {
+      throw new Error(`invalid queue-triage read-only fallback reason code: ${reasonCode}`);
+    }
+    this.reasonCode = reasonCode;
+  }
+}
+
 function validateAuthorityProjects(registry, authority) {
   const projects = [];
   for (const projectId of authority.projectIds) {
     const project = registry.projectsById[projectId] ?? null;
-    if (!project) throw new Error(`authority project is not enabled in registry: ${projectId}`);
-    if (project.queueTriage?.enabled !== true) throw new Error(`queueTriage is not enabled for authority project: ${projectId}`);
+    if (!project) {
+      throw new QueueTriageReadOnlyFallbackError('queue-triage-authority-project-opt-in-mismatch', `authority project is not enabled in registry: ${projectId}`);
+    }
+    if (project.queueTriage?.enabled !== true) {
+      throw new QueueTriageReadOnlyFallbackError('queue-triage-authority-project-opt-in-mismatch', `queueTriage is not enabled for authority project: ${projectId}`);
+    }
     const maxMutations = project.queueTriage.maxMutations;
     if (!Number.isInteger(maxMutations) || maxMutations < 1 || maxMutations > 3) {
-      throw new Error(`queueTriage mutation limit is invalid for authority project: ${projectId}`);
+      throw new QueueTriageReadOnlyFallbackError('queue-triage-authority-project-opt-in-mismatch', `queueTriage mutation limit is invalid for authority project: ${projectId}`);
     }
     projects.push(project);
   }
@@ -599,16 +620,32 @@ export function runQueueTriageLocalAuthorityCycle({
       schemaVersion: 1,
       observedAt: timestamp,
       status: 'disabled',
+      reasonCode: 'queue-triage-authority-absent-or-disabled',
       authority: null,
       releaseOutcomes: Object.freeze([]),
       fallbackOutcomes: Object.freeze([]),
       runControl: runControl({ status: 'disabled', sweep: false, inspected: 0, eligible: 0, processed: 0, failed: 0, writes: 0, verified: 0, fallbackPerformed: false, fallbackProjects: 0 }),
     });
   }
-  if (!SHA_PATTERN.test(sourceSha ?? '') || sourceSha.toLowerCase() !== authority.sourceSha) {
-    throw new Error('queue-triage local authority source SHA mismatch');
+  let projects;
+  try {
+    if (!SHA_PATTERN.test(sourceSha ?? '') || sourceSha.toLowerCase() !== authority.sourceSha) {
+      throw new QueueTriageReadOnlyFallbackError('queue-triage-authority-source-sha-stale', 'queue-triage local authority source SHA mismatch');
+    }
+    projects = validateAuthorityProjects(registry, authority);
+  } catch (error) {
+    if (!(error instanceof QueueTriageReadOnlyFallbackError)) throw error;
+    return Object.freeze({
+      schemaVersion: 1,
+      observedAt: timestamp,
+      status: 'read-only',
+      reasonCode: error.reasonCode,
+      authority: null,
+      releaseOutcomes: Object.freeze([]),
+      fallbackOutcomes: Object.freeze([]),
+      runControl: runControl({ status: 'read-only', sweep: false, inspected: 0, eligible: 0, processed: 0, failed: 0, writes: 0, verified: 0, fallbackPerformed: false, fallbackProjects: 0 }),
+    });
   }
-  const projects = validateAuthorityProjects(registry, authority);
   if (execute === true && allEnabled !== true) {
     throw new Error('--all-enabled is required for local-authority execution');
   }
@@ -880,21 +917,53 @@ export async function runClosedLoopCycle({
   const polling = await runPolling({ argv: options.pollingArgv, env, observedAt });
   const pollingOptions = parsePolling(options.pollingArgv, env);
   const registry = loadRegistry({ registryPath: pollingOptions.registryPath });
-  const authority = loadAuthority(options.authorityPath);
+  let authority = null;
+  let malformedAuthorityReasonCode = null;
+  try {
+    authority = loadAuthority(options.authorityPath);
+  } catch {
+    malformedAuthorityReasonCode = 'queue-triage-authority-load-failed';
+  }
   const localStateDb = options.localStateDb ?? join(dirname(pollingOptions.dbPath), 'queue-triage-local.sqlite');
-  const triage = runTriage({
-    controllerDb: pollingOptions.dbPath,
-    localStateDb,
-    registry,
-    authority,
-    sourceSha: options.sourceSha,
-    execute: options.execute,
-    allEnabled: options.allEnabled,
-    forceFallback: options.forceFallback,
-    observedAt,
-    readClient: readClientFactory(),
-    writeClient: writeClientFactory(),
-  });
+  const triage = malformedAuthorityReasonCode
+    ? Object.freeze({
+      schemaVersion: 1,
+      observedAt,
+      status: 'read-only',
+      reasonCode: malformedAuthorityReasonCode,
+      authority: null,
+      releaseOutcomes: Object.freeze([]),
+      fallbackOutcomes: Object.freeze([]),
+      runControl: Object.freeze({
+        schemaVersion: 1,
+        status: 'read-only',
+        pendingSweepPerformed: false,
+        fallbackPerformed: false,
+        fallbackProjects: 0,
+        releasesInspected: 0,
+        releasesEligible: 0,
+        releasesProcessed: 0,
+        releasesFailed: 0,
+        githubWritesPerformed: false,
+        mutationsAttempted: 0,
+        mutationsVerified: 0,
+        systemdChanged: false,
+        scheduledTaskChanged: false,
+      }),
+    })
+    : runTriage({
+      controllerDb: pollingOptions.dbPath,
+      localStateDb,
+      registry,
+      authority,
+      sourceSha: options.sourceSha,
+      execute: options.execute,
+      allEnabled: options.allEnabled,
+      forceFallback: options.forceFallback,
+      observedAt,
+      readClient: readClientFactory(),
+      writeClient: writeClientFactory(),
+    });
   return Object.freeze({
     schemaVersion: 1,
     observedAt,
