@@ -175,11 +175,23 @@ test('unknown composite-like labels still fail closed', () => {
   assert.equal(resolveAgentForLabels(['agent:either']), null);
 });
 
-test('default label registry includes Claude and future agents without implementing them', () => {
+test('#376 default label registry includes bounded live Ollama while Codex/Grok remain future-only', () => {
   assert.ok(allAgentLabels().includes('agent:claude-code-cli'));
   assert.ok(allAgentLabels().includes(SHARED_CODEX_CLAUDE_LABEL));
   assert.ok(allAgentLabels().includes('agent:codex-cli'));
-  assert.deepEqual(allAgentLabels({ includeFuture: false }), ['agent:claude', 'agent:claude-code-cli', SHARED_CODEX_CLAUDE_LABEL]);
+  assert.ok(allAgentLabels().includes('agent:ollama'));
+  assert.deepEqual(
+    allAgentLabels({ includeFuture: false }),
+    ['agent:claude', 'agent:claude-code-cli', SHARED_CODEX_CLAUDE_LABEL, 'agent:ollama'],
+  );
+});
+
+test('#376 agent:ollama resolves to the implemented local OpenCode adapter', () => {
+  const agent = resolveAgentForLabels(['agent:ollama']);
+  assert.equal(agent.agentId, 'ollama-agent');
+  assert.equal(agent.type, 'ollama');
+  assert.equal(agent.command, 'opencode');
+  assert.equal(agent.implemented, true);
 });
 
 test('agent:codex is Codex Web/manual and is not one of codex-cli\'s labels, nor any other adapter\'s', () => {
