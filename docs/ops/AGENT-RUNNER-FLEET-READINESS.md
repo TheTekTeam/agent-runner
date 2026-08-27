@@ -114,6 +114,23 @@ The installer never runs `ollama pull`, `ollama run`, OpenCode task execution, p
 
 Grok remains explicit `adapter-foundation-not-live` / owner-deferred in the current fleet installation contract. The installer refuses Grok rather than guessing a package/executable/source. Grok remains a supported future fleet adapter but is not required for the urgent Ollama addition.
 
+## Qualification-only worker leases
+
+Normal #327 worker routing remains strict: an `agent@node` instance must already be positively qualified before `selectWorkerRoute()` can choose it. That invariant is unchanged.
+
+For per-node qualification itself, #389 adds a separate controller-only seam:
+
+- Dell selects one exact worker-only node and adapter through `selectWorkerQualificationRoute()`;
+- the target must be enabled, ready, have free capacity, and expose an enabled/ready/authenticated machine-local adapter instance;
+- the instance may still have `qualified:false`;
+- the route is tagged `qualificationOnly:true` and does not alter registry qualification state;
+- Dell issues an immutable `issueWorkerQualificationLease()` bound to exact controller, worker node, agent instance, repository, base SHA, branch/worktree identity, model, profile, lane, qualification profile, capability fingerprints and expiry;
+- `validateWorkerLease()` permits the missing qualification bit only for such a qualification-only lease and only on a non-controller `workerOnly:true` node;
+- ordinary leases keep their historical fingerprint shape and continue to require `qualified:true`;
+- creating or validating a qualification lease grants no queue selection, scheduler, manager, GitHub mutation, source activation, merge/close/deploy or general routing authority.
+
+This seam exists only to avoid the circular requirement that an instance must already be qualified in order to receive the one bounded job that qualifies it. The later worker canary still has to provide its own exact task, auth/quota, sandbox, validation and evidence controls before any model invocation.
+
 ## Authentication and qualification
 
 Authentication is established independently per machine through the provider/runtime's accepted local flow. Never copy Claude/Codex/Grok session or credential material between Dell and Z790. Ollama is a local zero-provider-cost runtime and requires no provider credential for the fleet presence check; its model inventory remains node-local and no readiness/provisioning command may auto-download a model.
