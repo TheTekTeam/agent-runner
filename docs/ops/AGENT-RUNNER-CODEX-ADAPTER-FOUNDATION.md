@@ -233,3 +233,41 @@ npm test
 npm run validate
 git diff --check
 ```
+
+
+## #186 supervised quota-only qualification path
+
+Issue #186 adds a **canary-only** execution path without making Codex generally
+routable.
+
+- The committed `AGENT_ADAPTERS['codex-cli']` entry remains
+  `implemented:false`, `command:null`; normal scheduler selection therefore
+  still cannot launch Codex.
+- `agent-runner-codex-quota-preflight.mjs` strips API/token/base-URL
+  overrides, requires `codex login status` to prove ChatGPT authentication,
+  queries the supported app-server `account/rateLimits/read` RPC, and converts
+  only current primary/secondary rate-limit windows into routing
+  `resourceState`. Credit/reset-credit fields are not admission inputs.
+- `admitCodexDispatch()` now requires positively resolved current quota
+  evidence for the ChatGPT route. The historical paid-use helper remains
+  exported only for compatibility tests; it is no longer the dispatch
+  authority.
+- `agent-runner-codex-canary.mjs` consumes the existing immutable
+  manager-preflight + dispatch-authority contract, acquires the existing
+  implementation slot, creates one temporary manager-authorised worktree and
+  branch, and uses the existing serial selector plus Codex command/parser
+  modules.
+- The canary task is structurally fixed: create only `codex-canary.txt` with
+  exact content `AGENT_RUNNER_CODEX_CANARY=PASS`. Any other diff, changed
+  HEAD, auth/quota ambiguity, selector disagreement or parser failure stops the
+  run. Unexpected workspaces are preserved for forensic inspection.
+- A mode-0600 local one-shot state record is written before provider launch so
+  the same manager authority cannot be used for a second canary invocation.
+- Provider output, the fixed prompt, credentials and raw account responses are
+  never written into ordinary evidence.
+
+The qualification target is an explicit manager-authorised model/profile, not
+the CLI default. The initial #186 target is `gpt-5.6-terra` with low reasoning
+and workspace-write sandboxing. One successful canary qualifies only that
+bounded capability; it does not enable automatic routing, fallback, Z790
+scheduler authority, deployment, merge or issue-close authority.
