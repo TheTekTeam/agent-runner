@@ -148,6 +148,9 @@ if [[ "$ADAPTER" == "codex-cli" ]]; then
   # OpenAI publishes `npm install -g @openai/codex` as a supported Codex CLI
   # installation path. Pin the registry host in this reviewed machine-wide
   # operation, but deliberately do not authenticate or inspect provider state.
+  ROOT_NPM_ROOT="$(sudo "$NPM_BIN" root --global)"
+  [[ -n "$ROOT_NPM_ROOT" ]] || fail 'root npm global package path is unavailable'
+
   sudo "$NPM_BIN" install --global \
     --registry="$CODEX_NPM_REGISTRY" \
     --no-audit \
@@ -155,10 +158,21 @@ if [[ "$ADAPTER" == "codex-cli" ]]; then
     "$CODEX_NPM_PACKAGE_SPEC"
 
   command -v codex >/dev/null 2>&1 || fail 'Codex package installed but executable is not on PATH'
+  ACTIVE_CODEX="$(command -v codex)"
+  ACTIVE_CODEX_REALPATH="$(readlink -f "$ACTIVE_CODEX" 2>/dev/null || true)"
+  EXPECTED_PACKAGE_ROOT="$ROOT_NPM_ROOT/$CODEX_NPM_PACKAGE"
+  case "$ACTIVE_CODEX_REALPATH" in
+    "$EXPECTED_PACKAGE_ROOT"/*) ;;
+    *) fail "active Codex executable does not resolve inside reconciled package root $EXPECTED_PACKAGE_ROOT" ;;
+  esac
+
+  INSTALLED_PACKAGE_VERSION="$(node -p "require(process.argv[1]).version" "$EXPECTED_PACKAGE_ROOT/package.json" 2>/dev/null || true)"
+  [[ -n "$INSTALLED_PACKAGE_VERSION" ]] || fail 'reconciled Codex package version is unavailable'
   VERSION="$(codex --version 2>/dev/null || true)"
   [[ -n "$VERSION" ]] || fail 'codex --version did not return a bounded version string'
+  [[ "$VERSION" == *"$INSTALLED_PACKAGE_VERSION"* ]] || fail "active Codex version does not match reconciled package version $INSTALLED_PACKAGE_VERSION"
 
-  info "codex-cli runtime installed from $CODEX_NPM_PACKAGE: $VERSION"
+  info "codex-cli runtime reconciled from $CODEX_NPM_PACKAGE: $VERSION"
   info 'authentication remains machine-local and unproven; no route was qualified or enabled'
   exit 0
 fi
