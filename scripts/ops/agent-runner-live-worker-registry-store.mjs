@@ -20,6 +20,7 @@ import {
   ZERO_PAID_ROUTE_COST_POSTURES,
   buildWorkerRegistry,
 } from './agent-runner-worker-pool.mjs';
+import { managerAuthorityKey } from './agent-runner-manager-authority.mjs';
 
 export const LIVE_WORKER_REGISTRY_DOCUMENT_SCHEMA_VERSION = 'agent-runner-live-worker-registry/v1';
 export const LIVE_WORKER_REGISTRY_PATH_ENV = 'AGENT_RUNNER_WORKER_REGISTRY_PATH';
@@ -108,6 +109,88 @@ function publishedByInstance() {
   return new Map(canonicalPublication().instances.map((entry) => [entry.instanceId, entry]));
 }
 
+function exactKeys(value, allowed, code) {
+  if (!isPlainObject(value)) throw new LiveWorkerRegistryError(code);
+  const keys = Object.keys(value);
+  if (keys.some((key) => !allowed.includes(key))) throw new LiveWorkerRegistryError(code);
+  return value;
+}
+
+function normalizedAuthority(raw) {
+  exactKeys(raw, ['revision', 'fingerprint', 'authorityKey', 'packetDigest'], 'live-worker-registry-activation-authority-invalid');
+  const revision = String(raw.revision || '');
+  const fingerprint = String(raw.fingerprint || '');
+  const authorityKey = String(raw.authorityKey || '');
+  const packetDigest = String(raw.packetDigest || '');
+  if (!AUTHORITY_REVISION.test(revision) || !DIGEST.test(fingerprint) || !DIGEST.test(packetDigest)) {
+    throw new LiveWorkerRegistryError('live-worker-registry-activation-authority-invalid');
+  }
+  if (authorityKey !== managerAuthorityKey(revision, fingerprint)) {
+    throw new LiveWorkerRegistryError('live-worker-registry-activation-authority-key-mismatch');
+  }
+  return Object.freeze({ revision, fingerprint, authorityKey, packetDigest });
+}
+
+function normalizeActivationAuthorities(raw, registry) {
+  const source = raw == null ? {} : exactKeys(raw, Object.keys(raw), 'live-worker-registry-activation-authorities-invalid');
+  const entries = Object.entries(source);
+  if (entries.length > 256) throw new LiveWorkerRegistryError('live-worker-registry-activation-authorities-invalid');
+  const normalized = {};
+  for (const [instanceId, authority] of entries) {
+    if (!INSTANCE_ID.test(instanceId)) throw new LiveWorkerRegistryError('live-worker-registry-activation-authorities-invalid');
+    const instance = registry.agentInstances.find((entry) => entry.instanceId === instanceId);
+    if (!instance || instance.lifecycle !== 'enabled') {
+      throw new LiveWorkerRegistryError('live-worker-registry-activation-authority-without-enabled-instance');
+    }
+    normalized[instanceId] = normalizedAuthority(authority);
+  }
+  for (const instance of registry.agentInstances) {
+    if (instance.lifecycle === 'enabled' && !normalized[instance.instanceId]) {
+      throw new LiveWorkerRegistryError('live-worker-registry-enabled-instance-missing-authority');
+    }
+  }
+  return Object.freeze(Object.fromEntries(Object.entries(normalized).sort(([a], [b]) => a.localeCompare(b))));
+}
+
+function normalizeLastTransition(raw) {
+  if (raw == null) return null;
+  exactKeys(raw, [
+    'instanceId', 'targetState', 'authorityRevision', 'authorityFingerprint',
+    'authorityKey', 'authorityPacketDigest',
+  ], 'live-worker-registry-last-transition-invalid');
+  if (!INSTANCE_ID.test(String(raw.instanceId || '')) || !LIFECYCLE_STATES.includes(raw.targetState)) {
+    throw new LiveWorkerRegistryError('live-worker-registry-last-transition-invalid');
+  }
+  const enabled = raw.targetState === 'enabled';
+  if (!enabled) {
+    if ([raw.authorityRevision, raw.authorityFingerprint, raw.authorityKey, raw.authorityPacketDigest].some((value) => value !== null)) {
+      throw new LiveWorkerRegistryError('live-worker-registry-last-transition-invalid');
+    }
+    return Object.freeze({
+      instanceId: raw.instanceId,
+      targetState: raw.targetState,
+      authorityRevision: null,
+      authorityFingerprint: null,
+      authorityKey: null,
+      authorityPacketDigest: null,
+    });
+  }
+  const authority = normalizedAuthority({
+    revision: raw.authorityRevision,
+    fingerprint: raw.authorityFingerprint,
+    authorityKey: raw.authorityKey,
+    packetDigest: raw.authorityPacketDigest,
+  });
+  return Object.freeze({
+    instanceId: raw.instanceId,
+    targetState: raw.targetState,
+    authorityRevision: authority.revision,
+    authorityFingerprint: authority.fingerprint,
+    authorityKey: authority.authorityKey,
+    authorityPacketDigest: authority.packetDigest,
+  });
+}
+
 function assertCanonicalQualification(instance, publication = publishedByInstance()) {
   if (instance.qualified !== true) return;
   const accepted = publication.get(instance.instanceId);
@@ -120,11 +203,26 @@ function assertCanonicalQualification(instance, publication = publishedByInstanc
   if (instance.qualificationEvidenceFingerprint !== accepted.acceptedResultFingerprint) {
     throw new LiveWorkerRegistryError('live-worker-registry-qualification-fingerprint-mismatch');
   }
-  if (accepted.model && !instance.models.includes(accepted.model)) {
+  if (instance.installedVersion !== accepted.installedVersion) {
+    throw new LiveWorkerRegistryError('live-worker-registry-qualified-version-mismatch');
+  }
+  if (instance.qualificationContractFingerprint !== accepted.qualificationContractFingerprint) {
+    throw new LiveWorkerRegistryError('live-worker-registry-qualified-contract-mismatch');
+  }
+  if (instance.qualificationCapabilityFingerprint !== accepted.capabilityFingerprint) {
+    throw new LiveWorkerRegistryError('live-worker-registry-qualified-capability-mismatch');
+  }
+  if (instance.providerAccountClass !== accepted.providerAccountClass) {
+    throw new LiveWorkerRegistryError('live-worker-registry-provider-account-class-mismatch');
+  }
+  if (JSON.stringify(instance.models) !== JSON.stringify(accepted.model ? [accepted.model] : [])) {
     throw new LiveWorkerRegistryError('live-worker-registry-qualified-model-mismatch');
   }
-  if (accepted.profile && !instance.profiles.includes(accepted.profile)) {
+  if (JSON.stringify(instance.profiles) !== JSON.stringify(accepted.profile ? [accepted.profile] : [])) {
     throw new LiveWorkerRegistryError('live-worker-registry-qualified-profile-mismatch');
+  }
+  if (JSON.stringify(instance.jobClasses) !== JSON.stringify(accepted.jobClasses || [])) {
+    throw new LiveWorkerRegistryError('live-worker-registry-qualified-job-class-mismatch');
   }
 }
 
@@ -185,12 +283,14 @@ function validateDocument(doc) {
   }
   const registry = rebuildRegistry(doc.registry, doc.revision);
   if (doc.registry?.revision !== registry.revision) throw new LiveWorkerRegistryError('live-worker-registry-revision-mismatch');
+  const activationAuthorities = normalizeActivationAuthorities(doc.activationAuthorities || {}, registry);
+  const lastTransition = normalizeLastTransition(doc.lastTransition || null);
   return Object.freeze({
     schemaVersion: LIVE_WORKER_REGISTRY_DOCUMENT_SCHEMA_VERSION,
     revision: doc.revision,
     updatedAt: doc.updatedAt,
-    activationAuthority: doc.activationAuthority || null,
-    lastTransition: doc.lastTransition || null,
+    activationAuthorities,
+    lastTransition,
     registry,
   });
 }
@@ -309,7 +409,7 @@ export function replaceLiveWorkerRegistry({
         schemaVersion: LIVE_WORKER_REGISTRY_DOCUMENT_SCHEMA_VERSION,
         revision: nextRevision,
         updatedAt: now,
-        activationAuthority: null,
+        activationAuthorities: {},
         lastTransition: null,
         registry,
       };
@@ -317,16 +417,17 @@ export function replaceLiveWorkerRegistry({
   });
 }
 
-function normalizeAuthority({ authorityRevision, authorityFingerprint }) {
-  if (!AUTHORITY_REVISION.test(String(authorityRevision || ''))) {
-    throw new LiveWorkerRegistryError('live-worker-registry-activation-authority-revision-invalid');
-  }
-  if (!DIGEST.test(String(authorityFingerprint || ''))) {
-    throw new LiveWorkerRegistryError('live-worker-registry-activation-authority-fingerprint-invalid');
-  }
-  return Object.freeze({
-    revision: String(authorityRevision),
-    fingerprint: String(authorityFingerprint),
+function normalizeAuthority({
+  authorityRevision,
+  authorityFingerprint,
+  authorityKey,
+  authorityPacketDigest,
+}) {
+  return normalizedAuthority({
+    revision: authorityRevision,
+    fingerprint: authorityFingerprint,
+    authorityKey,
+    packetDigest: authorityPacketDigest,
   });
 }
 
@@ -338,6 +439,8 @@ export function transitionLiveWorkerInstance({
   targetState,
   authorityRevision = null,
   authorityFingerprint = null,
+  authorityKey = null,
+  authorityPacketDigest = null,
   deps = {},
 } = {}) {
   if (!INSTANCE_ID.test(String(instanceId || ''))) throw new LiveWorkerRegistryError('live-worker-registry-instance-id-invalid');
@@ -407,7 +510,7 @@ export function safeLiveWorkerRegistrySummary(loaded) {
     controllerNodeId: loaded.registry.controllerNodeId,
     registryFingerprint: loaded.registry.registryFingerprint,
     providerAccountCaps: loaded.registry.providerAccountCaps,
-    activationAuthority: loaded.document?.activationAuthority || null,
+    activationAuthorities: loaded.document?.activationAuthorities || {},
     lastTransition: loaded.document?.lastTransition || null,
     instances: loaded.registry.agentInstances.map((entry) => Object.freeze({
       instanceId: entry.instanceId,
