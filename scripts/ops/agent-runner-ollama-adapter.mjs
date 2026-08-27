@@ -338,8 +338,6 @@ export const DEFAULT_OLLAMA_CODING_SHELL_ALLOWLIST = Object.freeze([
   'git diff --check',
   'git diff --stat',
   'git diff --name-only',
-  'git diff -- *',
-  'git diff HEAD -- *',
   'git log --oneline -n 20',
   'git log --oneline -n 50',
   'git show --stat HEAD',
