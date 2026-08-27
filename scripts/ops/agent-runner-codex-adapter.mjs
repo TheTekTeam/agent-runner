@@ -14,14 +14,13 @@ import { FAILURE_SCOPES, foldProbeOutcomes, probeOutcome } from './agent-runner-
  * that registry and can never resolve to this or any local process; only
  * `agent:codex-cli` identifies this adapter.
  *
- * Unlike the #40 Ollama/OpenCode foundation, Codex CLI is not a free local
- * runtime — a real invocation is an authenticated, metered call. So this
- * adapter adds a third gate beyond the shared enabled/paused/draining/
- * disabled lifecycle: `admitCodexPaidUse()` requires ALL of (1) explicit
- * machine-local paid-use approval, (2) a positive per-run cost or token
- * ceiling, and (3) the dispatching issue/run being explicitly labelled
- * `agent:codex-cli` (and never `agent:codex`, which would mean Codex Web
- * work, not a CLI run). Missing any one of the three fails closed.
+ * The original #48 foundation carried a paid-use admission helper. Binding
+ * #184/#186 policy now treats the normal ChatGPT-authenticated route as
+ * subscription-backed: `admitCodexDispatch()` requires current positively
+ * resolved quota/headroom and does not consult account credits, paid-use
+ * approval, dollar caps, token caps, or issue labels. The historical
+ * `admitCodexPaidUse()` helper remains exported only for compatibility and
+ * tests; it is not the live dispatch authority.
  *
  * Every probe is deterministic and non-generative: `executable` is a pure
  * local filesystem check, `version` runs the configured binary's
@@ -36,7 +35,7 @@ import { FAILURE_SCOPES, foldProbeOutcomes, probeOutcome } from './agent-runner-
  * embeds the path itself). `probeVersion()`'s failure path is the same: a
  * fixed reason, never the raw `execFileFn` error message (a real
  * child-process spawn error routinely embeds the executable path too).
- * `admitCodexPaidUse()`/`admitCodexDispatch()` return only booleans,
+ * `admitCodexPaidUse()`/`admitCodexQuotaUse()`/`admitCodexDispatch()` return only booleans,
  * machine-readable reasons, and probe names — never the raw settings
  * `entry` a caller passed in, so a configured `sessionSecretRef` or
  * `executablePath` can never ride along in a serialized admission decision.
@@ -171,7 +170,7 @@ export function admitCodexQuotaUse({ resourceState = null } = {}) {
 }
 
 /**
- * Settings gate, then executable/version probes, then the paid-use gate —
+ * Settings gate, then executable/version probes, then the quota/headroom gate —
  * in strict sequence, never `Promise.all`, stopping at the first failure.
  * Returns `probes: []` and calls no injected I/O function at all when the
  * agent is not routable, which is itself the zero-process/zero-model-call
