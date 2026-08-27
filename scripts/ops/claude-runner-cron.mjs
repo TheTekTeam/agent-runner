@@ -3229,16 +3229,15 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
 
     if (
       quotaPreflight.blocked
-      && !hasImplementedRoutableAlternative(settingsSnapshot)
+      && !(multiAgentSelectorEngaged && hasImplementedRoutableAlternative(settingsSnapshot))
       // #44: a flat critical-ceiling block no longer idles the whole queue by itself --
       // only when NO profile is admissible (fails closed on untrustworthy telemetry).
       && !anyProfileQuotaAdmissible({ ...(quotaAdmissionEvidence || {}), env })
     ) {
-      // Claude is the only implemented agent in every real deployment
-      // today, so a block leaving no profile admissible is structurally a
-      // full-queue block, unchanged from before issue #50. A smaller
-      // admissible profile instead falls through to per-candidate
-      // admission inside selectIssue() rather than idling here (#44).
+      // When multi-agent routing is not explicitly engaged, a machine-local
+      // Ollama settings entry cannot weaken Claude's historical quota block.
+      // With the gate engaged, a routable implemented alternative lets the
+      // pass fall through to per-candidate qualification/admission.
       const payload = {
         dryRun: !args.execute,
         quotaBlocked: true,
