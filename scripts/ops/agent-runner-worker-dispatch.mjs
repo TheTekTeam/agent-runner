@@ -1,6 +1,11 @@
 import { createHash } from 'node:crypto';
 
-import { validateWorkerLease } from './agent-runner-worker-pool.mjs';
+import {
+  evaluateProviderAccountCapacity,
+  validateWorkerLease,
+} from './agent-runner-worker-pool.mjs';
+
+export { evaluateProviderAccountCapacity };
 
 export const WORKER_DISPATCH_SCHEMA_VERSION = 1;
 export const WORKER_DISPATCH_REVISION = 'worker-dispatch-v1';
@@ -155,25 +160,6 @@ export function validateWorkerResultEvidence({ result, job } = {}) {
   if (!SHA256.test(result.resultFingerprint || '') || digest(candidate) !== result.resultFingerprint) return refuse('result-fingerprint-mismatch');
   if (!TERMINAL_STATES.includes(result.status)) return refuse('result-status-invalid');
   return Object.freeze({ valid: true, reason: null, status: result.status, resultFingerprint: result.resultFingerprint });
-}
-
-/**
- * Shared provider/account admission is host-independent. `active` contains
- * controller-known leases that already consume the provider/account class.
- * A full account excludes only routes sharing that class.
- */
-export function evaluateProviderAccountCapacity({ providerAccountClass, active = [], caps = {} } = {}) {
-  const account = token(providerAccountClass, 'providerAccountClass');
-  const cap = Number(caps[account] ?? 1);
-  if (!Number.isSafeInteger(cap) || cap < 1 || cap > 128) throw new Error('provider account cap is invalid');
-  const consuming = active.filter((entry) => entry?.providerAccountClass === account).length;
-  return Object.freeze({
-    allowed: consuming < cap,
-    providerAccountClass: account,
-    active: consuming,
-    cap,
-    reason: consuming < cap ? null : 'provider-account-cap-full',
-  });
 }
 
 export function evaluateRecoveryNodeAffinity({
