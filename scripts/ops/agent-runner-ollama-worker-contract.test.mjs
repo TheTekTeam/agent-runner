@@ -12,24 +12,26 @@ function packet({
   scope = ['file: src/add.mjs', 'task: Correct the arithmetic operator used by add.'],
   validation = ['node --test test/add.test.mjs'],
 } = {}) {
-  return `<!-- agent-runner:manager-preflight -->
-
-```yaml
-schema_version: agent-runner-manager-preflight/v1
-revision: AR376.TEST.1
-fingerprint: sha256:${'a'.repeat(64)}
-producer_type: normal_chatgpt_manager_session
-approved_agent: ollama-agent
-execution_phase: implementation
-profile: local-low-risk
-model: modelspend-code-local:latest
-scope:
-${scope.map((item) => `  - ${item}`).join('\n')}
-required_validation:
-${validation.map((item) => `  - ${item}`).join('\n')}
-stop_conditions:
-  - stop on scope expansion
-````;
+  return [
+    '<!-- agent-runner:manager-preflight -->',
+    '',
+    '```yaml',
+    'schema_version: agent-runner-manager-preflight/v1',
+    'revision: AR376.TEST.1',
+    'fingerprint: sha256:' + 'a'.repeat(64),
+    'producer_type: normal_chatgpt_manager_session',
+    'approved_agent: ollama-agent',
+    'execution_phase: implementation',
+    'profile: local-low-risk',
+    'model: modelspend-code-local:latest',
+    'scope:',
+    ...scope.map((item) => '  - ' + item),
+    'required_validation:',
+    ...validation.map((item) => '  - ' + item),
+    'stop_conditions:',
+    '  - stop on scope expansion',
+    '```',
+  ].join('\n');
 }
 
 test('accepts one explicit file, one bounded task and bounded validation list', () => {
