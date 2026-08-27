@@ -227,6 +227,15 @@ test('executor completes one bounded canary, strips API/Git mutation env, cleans
       quotaPreflightFn: quotaSuccess(captured),
       admissionFn: () => ({ allowed: true, reason: 'adapter-admitted' }),
       sandboxProbeFn: () => ({ ok: true }),
+      acquireSlotFn: ({ env: slotEnv }) => {
+        captured.lane = slotEnv.AGENT_RUNNER_IMPLEMENTATION_LANE;
+        return {
+          held: true,
+          release() {
+            captured.slotReleases = (captured.slotReleases || 0) + 1;
+          },
+        };
+      },
       invokeCanaryFn: ({ cwd, childEnv }) => {
         invocations += 1;
         captured.childEnv = childEnv;
@@ -244,6 +253,8 @@ test('executor completes one bounded canary, strips API/Git mutation env, cleans
     assert.equal(captured.env.SSH_AUTH_SOCK, undefined);
     assert.equal(captured.childEnv.OPENAI_API_KEY, undefined);
     assert.equal(captured.childEnv.GH_TOKEN, undefined);
+    assert.equal(captured.lane, built.lease.laneId);
+    assert.equal(captured.slotReleases, 1);
 
     const acceptance = acceptCodexWorkerQualificationResult({
       request: built,
@@ -330,6 +341,51 @@ test('quota refusal happens before worktree/state/provider invocation', async ()
   }
 });
 
+test('implementation lane refusal happens before worktree/state/provider invocation', async () => {
+  const source = createRepository();
+  const reg = registry();
+  const built = request(reg, source.baseSha);
+  const worktreeRoot = mkdtempSync(join(tmpdir(), 'agent-runner-codex-worker-root-'));
+  const stateRoot = mkdtempSync(join(tmpdir(), 'agent-runner-codex-worker-state-'));
+  let invoked = false;
+  try {
+    await assert.rejects(() => executeCodexWorkerQualificationRequest({
+      request: built,
+      registry: reg,
+      executingNodeId: 'dev-cluster-z790',
+      sourceRepositoryPath: source.root,
+      worktreeRoot,
+      stateRoot,
+      clock: () => new Date('2026-08-27T06:30:00.000Z'),
+      versionProbeFn: () => ({ ok: true, version: 'codex-cli 0.150.1' }),
+      quotaPreflightFn: quotaSuccess(),
+      admissionFn: () => ({ allowed: true }),
+      acquireSlotFn: ({ env: slotEnv }) => {
+        assert.equal(slotEnv.AGENT_RUNNER_IMPLEMENTATION_LANE, built.lease.laneId);
+        return {
+          held: false,
+          failureReason: 'implementation-slot-unavailable',
+          release() {},
+        };
+      },
+      invokeCanaryFn: () => {
+        invoked = true;
+      },
+    }), /implementation-slot-unavailable/);
+
+    assert.equal(invoked, false);
+    assert.equal(git(source.root, ['branch', '--list', built.lease.branch]), '');
+    assert.equal(existsSync(codexWorkerQualificationStatePath({
+      stateRoot,
+      jobFingerprint: built.job.jobFingerprint,
+    })), false);
+  } finally {
+    rmSync(worktreeRoot, { recursive: true, force: true });
+    rmSync(stateRoot, { recursive: true, force: true });
+    rmSync(source.root, { recursive: true, force: true });
+  }
+});
+
 test('sandbox refusal cleans the temporary worktree and leaves authority unconsumed', async () => {
   const source = createRepository();
   const reg = registry();
@@ -348,6 +404,7 @@ test('sandbox refusal cleans the temporary worktree and leaves authority unconsu
       versionProbeFn: () => ({ ok: true, version: 'codex-cli 0.150.1' }),
       quotaPreflightFn: quotaSuccess(),
       admissionFn: () => ({ allowed: true }),
+      acquireSlotFn: () => ({ held: true, release() {} }),
       sandboxProbeFn: () => ({ ok: false, reason: 'codex-sandbox-write-failed' }),
     }), /codex-sandbox-write-failed/);
 
@@ -384,6 +441,7 @@ test('provider failure consumes authority once and preserves clean forensic work
       versionProbeFn: () => ({ ok: true, version: 'codex-cli 0.150.1' }),
       quotaPreflightFn: quotaSuccess(),
       admissionFn: () => ({ allowed: true }),
+      acquireSlotFn: () => ({ held: true, release() {} }),
       sandboxProbeFn: () => ({ ok: true }),
       invokeCanaryFn: () => ({
         ok: false,
