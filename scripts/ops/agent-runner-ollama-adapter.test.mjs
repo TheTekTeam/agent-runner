@@ -672,7 +672,7 @@ test('#377 coding config permits bounded worktree edits and reviewed shell while
     shellAllowlist: [
       'pwd',
       'git status --short',
-      'git diff -- *',
+      'git diff',
       'node --test scripts/ops/*.test.mjs',
       'bash scripts/validate.sh',
     ],
@@ -716,6 +716,8 @@ test('#377 shell policy rejects privileged, destructive, network, download and i
     'git status ../other-repo',
     'git status *',
     'git diff *',
+    'git diff -- *',
+    'git diff HEAD -- *',
     'git log *',
     'git show *',
     'git grep pattern',
@@ -727,7 +729,7 @@ test('#377 shell policy rejects privileged, destructive, network, download and i
   for (const command of [
     'pwd',
     'git status --short',
-    'git diff -- *',
+    'git diff',
     'git log --oneline -n 20',
     'git show --stat HEAD',
     'git rev-parse HEAD',
