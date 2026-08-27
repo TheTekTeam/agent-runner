@@ -15,7 +15,7 @@ import {
   resolveCurrentManagerAuthority,
   resolveManagerPreflightExecutionMetadata,
 } from './agent-runner-manager-authority.mjs';
-import { runCodexQuotaPreflight } from './agent-runner-codex-quota-preflight.mjs';
+import { runCodexQuotaPreflight, sanitizeCodexEnvironment } from './agent-runner-codex-quota-preflight.mjs';
 import { selectAgentForIssue } from './agent-runner-routing.mjs';
 
 export const CODEX_CANARY_ISSUE = 186;
@@ -212,12 +212,13 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     });
     if (!preflight.allowed) throw new Error(preflight.reason || 'codex-quota-evidence-unavailable');
 
+    const childEnv = sanitizeCodexEnvironment(env);
     const admission = admitCodexDispatch({
       settings: { agentId: 'codex-cli', routable: true, reason: 'canary-only', entry: { executablePath: args.codexPath } },
       resourceState: preflight.resourceState,
       accessFn: undefined,
       execFileFn: (file, fileArgs) => execFileSync(file, fileArgs, {
-        env: preflight.sanitizedEnv,
+        env: childEnv,
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
       }),
@@ -268,7 +269,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
 
     const child = spawnSync(command[0], command.slice(1), {
       cwd: worktree,
-      env: preflight.sanitizedEnv,
+      env: childEnv,
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 120_000,
@@ -288,7 +289,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     }
 
     const workspace = validateCanaryWorkspace({ cwd: worktree, baseCommit: dispatch.baseCommit });
-    if (!normalized.ok || !workspace.ok) {
+    const parserMutationAgrees = normalized.ok && normalized.mutatedRepository === true;
+    if (!parserMutationAgrees || !workspace.ok) {
       preserveForensics = true;
       writeState({
         schemaVersion: STATE_SCHEMA,
@@ -297,9 +299,17 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
         baseCommit: dispatch.baseCommit,
         branch: dispatch.branch,
         status: 'failed',
-        reason: normalized.reason || 'codex-canary-workspace-validation-failed',
+        reason: !normalized.ok
+          ? (normalized.reason || 'codex-canary-parser-failed')
+          : !parserMutationAgrees
+            ? 'codex-parser-mutation-disagreement'
+            : 'codex-canary-workspace-validation-failed',
       }, env);
-      throw new Error(normalized.reason || 'codex-canary-workspace-validation-failed');
+      throw new Error(!normalized.ok
+        ? (normalized.reason || 'codex-canary-parser-failed')
+        : !parserMutationAgrees
+          ? 'codex-parser-mutation-disagreement'
+          : 'codex-canary-workspace-validation-failed');
     }
 
     const evidence = safeEvidence({
