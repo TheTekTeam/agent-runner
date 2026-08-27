@@ -191,6 +191,125 @@ function normalizeLastTransition(raw) {
   });
 }
 
+export function planLiveWorkerRegistryPromotion({
+  expectedRevision,
+  controllerNodeId = LIVE_WORKER_REGISTRY_CONTROLLER_NODE_ID,
+  nodes = [],
+  runtimeInstances = [],
+  providerAccountCaps = {},
+} = {}) {
+  const revision = Number(expectedRevision);
+  if (!Number.isSafeInteger(revision) || revision < 0) {
+    throw new LiveWorkerRegistryError('live-worker-registry-expected-revision-invalid');
+  }
+  if (controllerNodeId !== LIVE_WORKER_REGISTRY_CONTROLLER_NODE_ID) {
+    throw new LiveWorkerRegistryError('live-worker-registry-controller-write-refused');
+  }
+  if (!Array.isArray(runtimeInstances) || runtimeInstances.length > 256) {
+    throw new LiveWorkerRegistryError('live-worker-registry-runtime-instances-invalid');
+  }
+
+  const publication = canonicalPublication();
+  const accepted = new Map(
+    publication.instances
+      .filter((entry) => entry.published === true && entry.qualified === true)
+      .map((entry) => [entry.instanceId, entry]),
+  );
+  const seen = new Set();
+  const agentInstances = runtimeInstances.map((runtime) => {
+    exactKeys(runtime, [
+      'nodeId', 'adapterId', 'installedVersion', 'readiness', 'authenticated',
+      'costPosture', 'paid', 'maxConcurrent', 'active',
+    ], 'live-worker-registry-runtime-instance-invalid');
+    const nodeId = String(runtime.nodeId || '');
+    const adapterId = String(runtime.adapterId || '');
+    const instanceId = `${adapterId}@${nodeId}`;
+    if (!INSTANCE_ID.test(instanceId) || seen.has(instanceId)) {
+      throw new LiveWorkerRegistryError('live-worker-registry-runtime-instance-invalid');
+    }
+    seen.add(instanceId);
+    const qualified = accepted.get(instanceId);
+    if (!qualified) {
+      throw new LiveWorkerRegistryError(
+        'live-worker-registry-qualification-evidence-gap',
+        `no accepted qualification for ${instanceId}`,
+      );
+    }
+    if (String(runtime.installedVersion || '') !== qualified.installedVersion) {
+      throw new LiveWorkerRegistryError('live-worker-registry-qualified-version-mismatch');
+    }
+    return {
+      nodeId,
+      adapterId,
+      lifecycle: 'disabled',
+      readiness: runtime.readiness,
+      authenticated: runtime.authenticated === true,
+      qualified: true,
+      qualificationRevision: qualified.qualificationRevision,
+      qualificationEvidenceFingerprint: qualified.acceptedResultFingerprint,
+      installedVersion: qualified.installedVersion,
+      qualificationContractFingerprint: qualified.qualificationContractFingerprint,
+      qualificationCapabilityFingerprint: qualified.capabilityFingerprint,
+      providerAccountClass: qualified.providerAccountClass || null,
+      costPosture: runtime.costPosture,
+      paid: runtime.paid === false ? false : true,
+      models: qualified.model ? [qualified.model] : [],
+      profiles: qualified.profile ? [qualified.profile] : [],
+      jobClasses: qualified.jobClasses || [],
+      maxConcurrent: runtime.maxConcurrent ?? 1,
+      active: runtime.active ?? 0,
+    };
+  });
+
+  const registry = rebuildRegistry({
+    controllerNodeId,
+    nodes,
+    agentInstances,
+    providerAccountCaps,
+  }, revision + 1);
+  if (registry.agentInstances.some((instance) => instance.lifecycle !== 'disabled')) {
+    throw new LiveWorkerRegistryError('live-worker-registry-promotion-must-start-disabled');
+  }
+  return Object.freeze({
+    schemaVersion: LIVE_WORKER_REGISTRY_DOCUMENT_SCHEMA_VERSION,
+    expectedRevision: revision,
+    targetRevision: revision + 1,
+    publicationRevision: publication.revision,
+    publicationFingerprint: publication.publicationFingerprint,
+    registry,
+  });
+}
+
+export function promoteLiveWorkerRegistry({
+  path = resolveLiveWorkerRegistryPath(),
+  expectedRevision,
+  controllerNodeId = LIVE_WORKER_REGISTRY_CONTROLLER_NODE_ID,
+  nodes = [],
+  runtimeInstances = [],
+  providerAccountCaps = {},
+  deps = {},
+} = {}) {
+  const plan = planLiveWorkerRegistryPromotion({
+    expectedRevision,
+    controllerNodeId,
+    nodes,
+    runtimeInstances,
+    providerAccountCaps,
+  });
+  return replaceLiveWorkerRegistry({
+    path,
+    expectedRevision,
+    controllerNodeId,
+    registry: {
+      controllerNodeId: plan.registry.controllerNodeId,
+      nodes: plan.registry.nodes,
+      agentInstances: plan.registry.agentInstances,
+      providerAccountCaps: plan.registry.providerAccountCaps,
+    },
+    deps,
+  });
+}
+
 function assertCanonicalQualification(instance, publication = publishedByInstance()) {
   if (instance.qualified !== true) return;
   const accepted = publication.get(instance.instanceId);
