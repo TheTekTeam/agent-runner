@@ -85,6 +85,50 @@ test('broader project validation requires manager AND machine exact allowlist', 
   assert.equal(allowed.kind, 'machine-qualified-validation');
 });
 
+test('permanent command-family boundary cannot be overridden by manager plus machine allowlists', () => {
+  for (const command of [
+    'curl https://example.com',
+    'wget https://example.com',
+    'gh pr create',
+    'sudo true',
+    'systemctl status ssh',
+    'docker ps',
+    'pnpm add lodash',
+    'pnpm exec vitest',
+    'pnpm dlx eslint',
+    'npm install lodash',
+    'npm exec vitest',
+    'npx vitest',
+    'node --eval process.exit',
+  ]) {
+    const decision = classifyBoundedOllamaShellCommand(command, {
+      ...TRUST,
+      managerValidationCommands: [command],
+      machineCommandAllowlist: [command],
+    });
+    assert.equal(decision.allowed, false, command);
+    assert.equal(decision.reason, 'ollama-shell-command-family-denied', command);
+  }
+});
+
+test('machine-qualified broader validation stays inside node script or npm/pnpm run/test families', () => {
+  for (const command of [
+    'node scripts/check-fixture.mjs',
+    'npm test',
+    'npm run typecheck',
+    'pnpm test',
+    'pnpm run lint',
+  ]) {
+    const decision = classifyBoundedOllamaShellCommand(command, {
+      ...TRUST,
+      managerValidationCommands: [command],
+      machineCommandAllowlist: [command],
+    });
+    assert.equal(decision.allowed, true, command);
+    assert.equal(decision.kind, 'machine-qualified-validation', command);
+  }
+});
+
 test('no command prefixes or wildcard-like strings broaden authority', () => {
   const manager = ['pnpm run test'];
   const machine = ['pnpm run test'];
