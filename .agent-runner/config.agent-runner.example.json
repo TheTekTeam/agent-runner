@@ -5,21 +5,12 @@
   "localRepoPath": "/workspace/agent-runner",
   "outputDir": ".var/agent-runner",
   "stateDbPath": ".var/agent-runner/runner-state.sqlite",
-  "acceptedAgentLabels": [
-    "agent:chatgpt",
-    "agent:codex-claude",
-    "agent:ollama"
-  ],
+  "acceptedAgentLabels": ["agent:chatgpt", "agent:codex-claude", "agent:ollama"],
   "statusLabels": {
     "ready": "status:ready",
     "inProgress": "status:in-progress"
   },
-  "priorityLabelRanking": [
-    "priority:P0",
-    "priority:P1",
-    "priority:P2",
-    "priority:P3"
-  ],
+  "priorityLabelRanking": ["priority:P0", "priority:P1", "priority:P2", "priority:P3"],
   "safeDefaultValidationCommands": [
     "node --test scripts/ops/agent-runner-project-registry.test.mjs",
     "bash scripts/validate.sh"
