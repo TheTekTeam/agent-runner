@@ -260,7 +260,10 @@ routable.
 - The canary task is structurally fixed: create only `codex-canary.txt` with
   exact content `AGENT_RUNNER_CODEX_CANARY=PASS`. Any other diff, changed
   HEAD, auth/quota ambiguity, selector disagreement or parser failure stops the
-  run. Unexpected workspaces are preserved for forensic inspection.
+  run. Workspace-write network access is explicitly forced off, GitHub/GitLab/
+  SSH mutation credential environment variables are removed, and interactive
+  Git credential prompting is disabled. Unexpected workspaces are preserved
+  for forensic inspection.
 - A mode-0600 local one-shot state record is written before provider launch so
   the same manager authority cannot be used for a second canary invocation.
 - Provider output, the fixed prompt, credentials and raw account responses are
