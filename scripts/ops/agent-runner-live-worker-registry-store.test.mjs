@@ -370,7 +370,7 @@ test('canonical store is consumed by live routing with hard zero-paid and provid
       AGENT_RUNNER_REMOTE_WORKER_DISPATCH_ENABLED: 'true',
       AGENT_RUNNER_WORKER_NODE_PREFERENCE: 'dev-cluster-z790',
     };
-    const registry = parseLiveWorkerRegistry(env, { expectedControllerNodeId: 'dev-cluster-dell' });
+    const registry = parseLiveWorkerRegistry(env, { expectedControllerNodeId: 'dev-cluster-dell', currentSourceCommit: SOURCE_SHA });
     assert.equal(registry.registrySource, 'canonical-store');
     const route = resolveLiveWorkerRoute({
       adapterId: 'codex-cli',
@@ -382,6 +382,43 @@ test('canonical store is consumed by live routing with hard zero-paid and provid
     assert.equal(route.allowed, true);
     assert.equal(route.hardAdmission, true);
     assert.equal(route.agentInstanceId, 'codex-cli@dev-cluster-z790');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('canonical routing refuses an enabled instance when Agent Runner source no longer matches activation authority', () => {
+  const { root, path } = tempRegistryPath();
+  try {
+    const current = replaceLiveWorkerRegistry({
+      path,
+      expectedRevision: 0,
+      controllerNodeId: 'dev-cluster-dell',
+      registry: rawRegistry(),
+    });
+    const auth = lifecycleAuthority({
+      loaded: current,
+      instanceId: 'codex-cli@dev-cluster-z790',
+      targetState: 'enabled',
+      id: 115,
+      revision: 'AR402-FLEET-SOURCE-BINDING-1',
+    });
+    transitionLiveWorkerInstance({
+      path,
+      expectedRevision: 1,
+      controllerNodeId: 'dev-cluster-dell',
+      instanceId: 'codex-cli@dev-cluster-z790',
+      targetState: 'enabled',
+      activationAuthority: auth.activationAuthority,
+    });
+    const env = { AGENT_RUNNER_WORKER_REGISTRY_PATH: path };
+    assert.throws(
+      () => parseLiveWorkerRegistry(env, {
+        expectedControllerNodeId: 'dev-cluster-dell',
+        currentSourceCommit: '2'.repeat(40),
+      }),
+      /activation source mismatch/,
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -415,7 +452,7 @@ test('provider-account cap blocks an otherwise qualified canonical route', () =>
       AGENT_RUNNER_WORKER_REGISTRY_PATH: path,
       AGENT_RUNNER_REMOTE_WORKER_DISPATCH_ENABLED: 'true',
     };
-    const registry = parseLiveWorkerRegistry(env, { expectedControllerNodeId: 'dev-cluster-dell' });
+    const registry = parseLiveWorkerRegistry(env, { expectedControllerNodeId: 'dev-cluster-dell', currentSourceCommit: SOURCE_SHA });
     const route = resolveLiveWorkerRoute({
       adapterId: 'codex-cli',
       localNodeId: 'dev-cluster-dell',
