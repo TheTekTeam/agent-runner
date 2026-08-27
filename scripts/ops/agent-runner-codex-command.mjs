@@ -56,8 +56,10 @@ function requireEnum(value, allowed, label) {
 }
 
 /**
- * Every argument is explicit and required except `reasoningEffort` and
- * `outputSchemaPath`, which are simply omitted (not defaulted) when unset.
+ * Every argument is explicit and required except `reasoningEffort`,
+ * `networkAccess` and `outputSchemaPath`, which are simply omitted (not
+ * defaulted) when unset. When `networkAccess` is supplied it is valid only
+ * for the `workspace-write` sandbox.
  * There is no code path in this function that can ever emit
  * `--dangerously-bypass-approvals-and-sandbox` or
  * `--dangerously-bypass-hook-trust` — those flags have no corresponding
@@ -98,6 +100,9 @@ export function buildCodexCommandArgs({
 
   if (networkAccess !== undefined && networkAccess !== null) {
     if (typeof networkAccess !== 'boolean') throw new Error('buildCodexCommandArgs requires networkAccess to be boolean');
+    if (resolvedSandbox !== 'workspace-write') {
+      throw new Error('buildCodexCommandArgs permits networkAccess only with workspace-write sandbox');
+    }
     args.push('-c', `${WORKSPACE_NETWORK_CONFIG_KEY}=${networkAccess}`);
   }
 
