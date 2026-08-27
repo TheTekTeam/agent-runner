@@ -126,6 +126,11 @@ export function buildCodexWorkerQualificationRequest({
 } = {}) {
   if (!DIGEST.test(String(authorityFingerprint || ''))) throw new Error('authorityFingerprint is invalid');
   if (!SHA.test(String(baseSha || ''))) throw new Error('baseSha is invalid');
+  const requestedMs = Date.parse(requestedAt);
+  const expiresMs = Date.parse(expiresAt);
+  if (!Number.isFinite(requestedMs) || !Number.isFinite(expiresMs) || requestedMs >= expiresMs) {
+    throw new Error('qualification authority window is invalid');
+  }
 
   const route = selectWorkerQualificationRoute(registry, {
     nodeId: CODEX_WORKER_QUALIFICATION_TARGET_NODE,
@@ -237,6 +242,9 @@ export function normalizeCodexWorkerQualificationEvidence(raw = {}) {
 
   const primaryRemainingPercent = boundedPercent(raw.primaryRemainingPercent, 'primaryRemainingPercent');
   const secondaryRemainingPercent = boundedPercent(raw.secondaryRemainingPercent, 'secondaryRemainingPercent');
+  if (primaryRemainingPercent < 10 || secondaryRemainingPercent < 10) {
+    throw new Error('quota headroom is below the accepted threshold');
+  }
 
   if (raw.model !== CODEX_WORKER_QUALIFICATION_MODEL) throw new Error('model is invalid');
   if (raw.profile !== CODEX_WORKER_QUALIFICATION_PROFILE) throw new Error('profile is invalid');
@@ -331,6 +339,13 @@ export function acceptCodexWorkerQualificationResult({
   if (!resultValidation.valid) return refuse(`result:${resultValidation.reason}`);
   if (result.sourceSha !== request.lease.baseSha) return refuse('result-source-sha-mismatch');
   if (result.status !== 'succeeded' || result.exitCode !== 0) return refuse(`qualification-${result.status}`);
+  const requestedMs = Date.parse(request.job.requestedAt);
+  const expiresMs = Date.parse(request.job.expiresAt);
+  const completedMs = Date.parse(result.completedAt);
+  if (!Number.isFinite(requestedMs) || !Number.isFinite(expiresMs) || !Number.isFinite(completedMs)
+    || completedMs < requestedMs || completedMs > expiresMs) {
+    return refuse('result-outside-authority-window');
+  }
   if (result.diagnosticTruncated === true || typeof result.diagnostic !== 'string') return refuse('qualification-evidence-truncated');
 
   let diagnostic;
