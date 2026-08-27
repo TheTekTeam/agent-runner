@@ -11,7 +11,13 @@ import {
   validateWorkerResultEvidence,
   workerControlSurface,
 } from './agent-runner-worker-dispatch.mjs';
-import { buildWorkerRegistry, issueWorkerLease, selectWorkerRoute } from './agent-runner-worker-pool.mjs';
+import {
+  buildWorkerRegistry,
+  issueWorkerLease,
+  issueWorkerQualificationLease,
+  selectWorkerQualificationRoute,
+  selectWorkerRoute,
+} from './agent-runner-worker-pool.mjs';
 
 const AUTHORITY = `sha256:${'a'.repeat(64)}`;
 const SOURCE = 'b'.repeat(40);
@@ -43,6 +49,77 @@ test('Dell-issued job envelope validates only on its exact worker/node/lease ide
   assert.equal(result.valid, true);
   assert.equal(validateWorkerJobEnvelope({ job, lease, registry: reg, executingNodeId: 'dev-cluster-dell', allowedProfiles: ['implementation-fixture'], now: new Date('2026-08-25T01:00:00Z') }).reason, 'lease:wrong-node');
   assert.equal(validateWorkerJobEnvelope({ job, lease, registry: reg, executingNodeId: 'dev-cluster-z790', allowedProfiles: ['different-profile'], now: new Date('2026-08-25T01:00:00Z') }).reason, 'operation-profile-not-allowlisted');
+});
+
+
+test('qualification-only lease reuses the existing bounded worker job envelope without making the instance normally routable', () => {
+  const reg = buildWorkerRegistry({
+    controllerNodeId: 'dev-cluster-dell',
+    revision: 'qualification-1',
+    nodes: [
+      { nodeId: 'dev-cluster-dell', state: 'enabled', readiness: 'ready', controller: true, workerOnly: false, os: 'linux', arch: 'x64', capabilities: ['git'], toolchains: ['node22'], jobClasses: ['implementation'], capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'dell-1' },
+      { nodeId: 'dev-cluster-z790', state: 'enabled', readiness: 'ready', controller: false, workerOnly: true, os: 'linux', arch: 'x64', capabilities: ['git'], toolchains: ['node22'], jobClasses: ['implementation'], capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'z790-1' },
+    ],
+    agentInstances: [
+      { nodeId: 'dev-cluster-z790', adapterId: 'codex-cli', lifecycle: 'enabled', readiness: 'ready', authenticated: true, qualified: false, qualificationRevision: 'unqualified', providerAccountClass: 'chatgpt-subscription-a', models: ['gpt-5.6-terra'], profiles: ['codex-canary-v1'], jobClasses: ['implementation'], maxConcurrent: 1, active: 0 },
+    ],
+  });
+
+  const normal = selectWorkerRoute(reg, {
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+    preferredNodeIds: ['dev-cluster-z790'],
+  });
+  assert.equal(normal.selected, null);
+
+  const route = selectWorkerQualificationRoute(reg, {
+    nodeId: 'dev-cluster-z790',
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+    requiredCapabilities: ['git'],
+  });
+  const lease = issueWorkerQualificationLease({
+    registry: reg,
+    route,
+    projectId: 'agent-runner',
+    repository: 'TheTekTeam/agent-runner',
+    issueNumber: 389,
+    authorityFingerprint: AUTHORITY,
+    baseSha: SOURCE,
+    branch: 'codex-389-z790',
+    worktree: 'codex-389-z790',
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+    laneId: 'qualification-codex-z790',
+    validationProfile: 'codex-canary',
+    qualificationProfile: 'codex-canary-v1',
+    expiresAt: '2026-08-26T00:00:00.000Z',
+  });
+  const job = buildWorkerJobEnvelope({
+    lease,
+    operationProfile: 'codex-qualification-canary',
+    operationRevision: '1',
+    taskFingerprint: `sha256:${'9'.repeat(64)}`,
+    requestedAt: '2026-08-25T00:00:00.000Z',
+  });
+  const validated = validateWorkerJobEnvelope({
+    job,
+    lease,
+    registry: reg,
+    executingNodeId: 'dev-cluster-z790',
+    allowedProfiles: ['codex-qualification-canary'],
+    now: new Date('2026-08-25T01:00:00Z'),
+  });
+  assert.equal(validated.valid, true);
+  assert.equal(validated.operationProfile, 'codex-qualification-canary');
+  assert.equal(workerControlSurface().scheduler, false);
+  assert.equal(workerControlSurface().managerAuthority, false);
 });
 
 test('tampered job envelope fails deterministic fingerprint validation', () => {
