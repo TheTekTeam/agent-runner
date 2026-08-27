@@ -267,6 +267,20 @@ export function resolveManagerPreflightExecutionMetadata(commentOrBody) {
  * prose -- and unknown/ambiguous identifiers fail the whole packet closed
  * rather than being silently dropped.
  */
+export function resolveManagerPreflightRequiredValidation(commentOrBody) {
+  const comment = typeof commentOrBody === 'string'
+    ? { body: commentOrBody }
+    : (commentOrBody || {});
+  return Object.freeze(yamlListValues(String(comment.body || ''), ['required_validation', 'validation']));
+}
+
+export function resolveManagerPreflightAllowedPaths(commentOrBody) {
+  const comment = typeof commentOrBody === 'string'
+    ? { body: commentOrBody }
+    : (commentOrBody || {});
+  return Object.freeze(yamlListValues(String(comment.body || ''), ['allowed_paths']));
+}
+
 export function resolveManagerPreflightRequiredCapabilities(commentOrBody) {
   const comment = typeof commentOrBody === 'string'
     ? { body: commentOrBody }
