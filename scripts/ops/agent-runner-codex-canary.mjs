@@ -264,6 +264,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       approvalMode: 'never',
       reasoningEffort: metadata.effort,
       networkAccess: false,
+      ephemeral: true,
+      ignoreUserConfig: true,
       prompt,
     });
 
