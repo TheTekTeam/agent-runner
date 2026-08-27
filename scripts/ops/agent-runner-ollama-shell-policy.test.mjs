@@ -104,6 +104,8 @@ test('permanent command-family boundary cannot be overridden by manager plus mac
     'pnpm run postinstall',
     'npx vitest',
     'node --eval process.exit',
+    'node scripts/deploy.mjs',
+    'node scripts/release.mjs',
   ]) {
     const decision = classifyBoundedOllamaShellCommand(command, {
       ...TRUST,
