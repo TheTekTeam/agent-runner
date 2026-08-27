@@ -7,11 +7,13 @@ import test from 'node:test';
 import { FAILURE_SCOPES } from './agent-runner-adapter-contract.mjs';
 import {
   admitOllamaDispatch,
+  buildOpenCodeCodingLocalOllamaConfig,
   buildOpenCodeCommandArgs,
   buildOpenCodeLocalOllamaConfig,
   buildOpenCodeTextOnlyLocalOllamaConfig,
   classifyOpenCodeExecutionError,
   isAllowlistedOllamaHost,
+  isSafeOllamaShellPattern,
   OLLAMA_AGENT_ID,
   parseBoundedDocumentationContent,
   parseBoundedDocumentationReplacement,
@@ -657,5 +659,99 @@ test('bounded documentation replacement requires exactly one non-empty replaceme
       { expectedReplacement: 'line one\nline two' },
     ),
     /one bounded non-empty replacement line/,
+  );
+});
+
+
+test('#377 coding config permits bounded worktree edits and reviewed shell while denying everything else', () => {
+  const config = JSON.parse(buildOpenCodeCodingLocalOllamaConfig({
+    model: 'modelspend-code-local:latest',
+    endpointUrl: 'http://127.0.0.1:11434',
+    disableReasoning: true,
+    allowedEditPaths: ['scripts/ops/*.mjs', 'scripts/ops/*.test.mjs'],
+    shellAllowlist: [
+      'pwd',
+      'git status *',
+      'git diff *',
+      'node --test scripts/ops/*.test.mjs',
+      'bash scripts/validate.sh',
+    ],
+  }));
+
+  assert.equal(config.permission['*'], 'deny');
+  assert.equal(config.permission.external_directory['*'], 'deny');
+  assert.equal(config.permission.webfetch, 'deny');
+  assert.equal(config.permission.task, 'deny');
+  assert.equal(config.permission.edit['*'], 'deny');
+  assert.equal(config.permission.edit['scripts/ops/*.mjs'], 'allow');
+  assert.equal(config.permission.bash['*'], 'deny');
+  assert.equal(config.permission.bash['git status *'], 'allow');
+  assert.equal(config.permission.bash['node --test scripts/ops/*.test.mjs'], 'allow');
+  assert.equal(config.permission.read['.env'], 'deny');
+  assert.equal(config.permission.read['**/.env.*'], 'deny');
+  assert.equal(config.provider.ollama.models['modelspend-code-local:latest'].options.reasoningEffort, 'none');
+  assert.deepEqual(config.enabled_providers, ['ollama']);
+});
+
+test('#377 shell policy rejects privileged, destructive, network, download and interpreter escape commands', () => {
+  const rejected = [
+    'sudo systemctl restart agent-runner',
+    'systemctl status agent-runner',
+    'docker ps',
+    'ssh host command',
+    'curl https://example.com',
+    'wget https://example.com/file',
+    'npm install lodash',
+    'pnpm add lodash',
+    'npx eslint .',
+    'git reset --hard',
+    'git clean -fd',
+    'git stash',
+    'git rebase main',
+    'git push origin HEAD',
+    'bash -c echo hi',
+    'sh -c echo hi',
+    'node -e console.log(1)',
+    'python3 -c print(1)',
+    'git status ../other-repo',
+  ];
+  for (const command of rejected) {
+    assert.equal(isSafeOllamaShellPattern(command), false, command);
+  }
+
+  for (const command of [
+    'pwd',
+    'git status *',
+    'git diff *',
+    'git log *',
+    'git show HEAD',
+    'git grep pattern',
+    'git ls-files *',
+    'git rev-parse HEAD',
+    'node --test scripts/ops/agent-runner-ollama-adapter.test.mjs',
+    'bash scripts/validate.sh',
+    'pnpm run test',
+  ]) {
+    assert.equal(isSafeOllamaShellPattern(command), true, command);
+  }
+});
+
+test('#377 coding config rejects unsafe edit paths and unsafe shell patterns before producing config', () => {
+  assert.throws(
+    () => buildOpenCodeCodingLocalOllamaConfig({
+      model: 'm',
+      endpointUrl: 'http://127.0.0.1:11434',
+      allowedEditPaths: ['../outside'],
+    }),
+    /unsafe or duplicate edit path/,
+  );
+  assert.throws(
+    () => buildOpenCodeCodingLocalOllamaConfig({
+      model: 'm',
+      endpointUrl: 'http://127.0.0.1:11434',
+      allowedEditPaths: ['src/*.mjs'],
+      shellAllowlist: ['git push origin HEAD'],
+    }),
+    /unsafe or duplicate shell pattern/,
   );
 });
