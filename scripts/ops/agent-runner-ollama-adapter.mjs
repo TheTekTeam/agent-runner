@@ -31,6 +31,8 @@ import { normalizeOllamaUsageEfficiency } from './agent-runner-usage-telemetry.m
  * tests can prove zero real process/network access.
  */
 export const OLLAMA_AGENT_ID = 'ollama-agent';
+export const QUALIFIED_OLLAMA_CODING_MODEL = 'modelspend-code-local:latest';
+export const QUALIFIED_OPENCODE_VERSION = '1.18.4';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
@@ -88,13 +90,25 @@ export function probeExecutable({ executablePath, accessFn = accessSync } = {}) 
 }
 
 /** Deterministic `--version` banner read. Never issues a generation request. */
-export function probeVersion({ executablePath, execFileFn } = {}) {
+export function probeVersion({ executablePath, execFileFn, requiredVersion = null } = {}) {
   if (typeof execFileFn !== 'function') {
     return probeOutcome({ probe: 'version', ok: false, reason: 'ollama-version-probe-unavailable' });
   }
   try {
     const stdout = String(execFileFn(executablePath, ['--version']) || '').trim();
     if (!stdout) return probeOutcome({ probe: 'version', ok: false, reason: 'ollama-version-unreadable' });
+    if (requiredVersion) {
+      const version = String(requiredVersion);
+      const tokens = stdout.split(/[^0-9.]+/).filter(Boolean);
+      if (!tokens.includes(version)) {
+        return probeOutcome({
+          probe: 'version',
+          ok: false,
+          reason: 'ollama-version-mismatch',
+          detail: `required=${version}`,
+        });
+      }
+    }
     return probeOutcome({ probe: 'version', ok: true, detail: stdout });
   } catch (error) {
     return probeOutcome({ probe: 'version', ok: false, reason: 'ollama-version-probe-failed', detail: error.message });
@@ -183,6 +197,7 @@ export async function admitOllamaDispatch({
   execFileFn,
   fetchFn,
   freeMemoryFn,
+  requiredExecutableVersion = null,
 } = {}) {
   const resolvedSettings = settings || getAgentSettings({ env, agentId: OLLAMA_AGENT_ID });
   if (!resolvedSettings.routable) {
@@ -207,7 +222,11 @@ export async function admitOllamaDispatch({
     : probeOutcome({ probe: 'executable', ok: false, reason: executable.reason }));
 
   if (outcomes.at(-1).ok) {
-    outcomes.push(probeVersion({ executablePath: executable.path, execFileFn }));
+    outcomes.push(probeVersion({
+      executablePath: executable.path,
+      execFileFn,
+      requiredVersion: requiredExecutableVersion,
+    }));
   }
 
   if (outcomes.every((outcome) => outcome.ok)) {
