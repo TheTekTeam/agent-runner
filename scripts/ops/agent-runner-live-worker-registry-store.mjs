@@ -577,7 +577,12 @@ export function transitionLiveWorkerInstance({
         throw new LiveWorkerRegistryError('live-worker-registry-active-work-conflict');
       }
       const authority = targetState === 'enabled'
-        ? normalizeAuthority({ authorityRevision, authorityFingerprint })
+        ? normalizeAuthority({
+          authorityRevision,
+          authorityFingerprint,
+          authorityKey,
+          authorityPacketDigest,
+        })
         : null;
       if (targetState === 'enabled') assertLiveInstanceActivationEligible(currentInstance, current.registry);
 
@@ -594,16 +599,22 @@ export function transitionLiveWorkerInstance({
       const nextInstance = registry.agentInstances.find((entry) => entry.instanceId === instanceId);
       if (targetState === 'enabled') assertLiveInstanceActivationEligible(nextInstance, registry);
 
+      const activationAuthorities = { ...(current.document?.activationAuthorities || {}) };
+      if (targetState === 'enabled') activationAuthorities[instanceId] = authority;
+      else delete activationAuthorities[instanceId];
+
       return {
         schemaVersion: LIVE_WORKER_REGISTRY_DOCUMENT_SCHEMA_VERSION,
         revision: nextRevision,
         updatedAt: now,
-        activationAuthority: targetState === 'enabled' ? authority : null,
+        activationAuthorities,
         lastTransition: {
           instanceId,
           targetState,
           authorityRevision: authority?.revision || null,
           authorityFingerprint: authority?.fingerprint || null,
+          authorityKey: authority?.authorityKey || null,
+          authorityPacketDigest: authority?.packetDigest || null,
         },
         registry,
       };
