@@ -28,7 +28,7 @@ function nodePreference(env = process.env) {
   return [...new Set(values)];
 }
 
-export function parseLiveWorkerRegistry(env = process.env, { expectedControllerNodeId = null } = {}) {
+export function parseLiveWorkerRegistry(env = process.env, { expectedControllerNodeId = null, currentSourceCommit = null } = {}) {
   // Canonical Dell-owned state takes precedence whenever present. The legacy
   // environment JSON remains a read-only compatibility source only while no
   // canonical store exists, so stale environment cannot bypass hard admission.
@@ -45,6 +45,22 @@ export function parseLiveWorkerRegistry(env = process.env, { expectedControllerN
       lastTransition: loaded.document?.lastTransition || null,
     })
     : null;
+
+  if (registry?.registrySource === 'canonical-store') {
+    const enabledInstances = registry.agentInstances.filter((entry) => entry.lifecycle === 'enabled');
+    if (enabledInstances.length > 0) {
+      const source = String(currentSourceCommit || '').trim().toLowerCase();
+      if (!/^[a-f0-9]{40}$/.test(source)) {
+        throw new Error('canonical worker registry requires exact current Agent Runner source commit');
+      }
+      for (const instance of enabledInstances) {
+        const authority = registry.activationAuthorities?.[instance.instanceId];
+        if (!authority || authority.targetSourceCommit !== source) {
+          throw new Error(`worker registry activation source mismatch: ${instance.instanceId}`);
+        }
+      }
+    }
+  }
 
   if (!registry) {
     const raw = String(env[LIVE_WORKER_REGISTRY_ENV] || '').trim();
