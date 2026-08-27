@@ -215,6 +215,55 @@ test('controller accepts only bounded successful qualification evidence', () => 
   }).selected, null);
 });
 
+test('qualification request rejects an invalid authority window', () => {
+  const reg = registry();
+  assert.throws(() => buildCodexWorkerQualificationRequest({
+    registry: reg,
+    authorityFingerprint: AUTHORITY,
+    baseSha: BASE,
+    branch: 'canary-codex-389-z790',
+    worktree: 'canary-codex-389-z790',
+    requestedAt: '2026-08-27T07:00:00.000Z',
+    expiresAt: '2026-08-27T06:00:00.000Z',
+  }), /qualification authority window is invalid/);
+});
+
+test('qualification evidence refuses quota below the accepted 90-percent-used threshold', () => {
+  const reg = registry();
+  const built = request(reg);
+  assert.throws(() => buildCodexWorkerQualificationResult({
+    request: built,
+    status: 'succeeded',
+    sourceSha: BASE,
+    exitCode: 0,
+    durationMs: 1234,
+    evidence: successEvidence({ primaryRemainingPercent: 9 }),
+    completedAt: '2026-08-27T06:45:00.000Z',
+  }), /quota headroom is below the accepted threshold/);
+});
+
+test('controller refuses a successful-looking result completed outside the lease window', () => {
+  const reg = registry();
+  const built = request(reg);
+  const result = buildCodexWorkerQualificationResult({
+    request: built,
+    status: 'succeeded',
+    sourceSha: BASE,
+    exitCode: 0,
+    durationMs: 1234,
+    evidence: successEvidence(),
+    completedAt: '2026-08-27T07:05:00.000Z',
+  });
+  const refused = acceptCodexWorkerQualificationResult({
+    request: built,
+    result,
+    registry: reg,
+    now: new Date('2026-08-27T06:50:00Z'),
+  });
+  assert.equal(refused.accepted, false);
+  assert.equal(refused.reason, 'result-outside-authority-window');
+});
+
 test('unsafe or incomplete success evidence is refused before qualification', () => {
   const reg = registry();
   const built = request(reg);
