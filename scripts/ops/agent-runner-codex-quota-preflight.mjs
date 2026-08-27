@@ -39,6 +39,7 @@ export function probeCodexLogin({
 }
 
 function validPercent(value) {
+  if (value === null || value === undefined || value === '') return null;
   const n = Number(value);
   return Number.isFinite(n) && n >= 0 && n <= 100 ? n : null;
 }
