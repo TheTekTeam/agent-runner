@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 
 import {
@@ -6,6 +9,16 @@ import {
   laneAdmissionCandidateForSelection,
 } from './agent-runner-implementation-recurrence.mjs';
 import { buildWorkerRegistry } from './agent-runner-worker-pool.mjs';
+import {
+  promoteLiveWorkerRegistry,
+  transitionLiveWorkerInstance,
+} from './agent-runner-live-worker-registry-store.mjs';
+import {
+  FLEET_ACTIVATION_AUTHORITY_MARKER,
+  FLEET_ACTIVATION_AUTHORITY_SCHEMA_VERSION,
+  fleetActivationAuthorityFingerprint,
+  resolveFleetActivationAuthority,
+} from './agent-runner-fleet-activation-authority.mjs';
 import {
   LIVE_WORKER_REGISTRY_ENV,
   REMOTE_WORKER_DISPATCH_ENV,
@@ -90,7 +103,7 @@ test('remote-only capacity is rejected before invocation when no bounded remote 
   assert.equal(result.routeRejected[0].workerRoute.nodeId, 'dev-cluster-z790');
 });
 
-test('explicit route flag plus bounded transport availability can admit the qualified Z790 lane', () => {
+test('legacy environment registry cannot activate remote routing even with flag and transport', () => {
   const value = registry();
   const result = admitRecurrenceSelections([selection()], {
     env: registryEnv(value, {
@@ -100,11 +113,65 @@ test('explicit route flag plus bounded transport availability can admit the qual
     maxParallel: 2,
     remoteTransportAvailable: true,
   });
-  assert.equal(result.remoteRouteEnabled, true);
+  assert.equal(result.remoteActivationRequested, true);
+  assert.equal(result.remoteRouteEnabled, false);
+  assert.equal(result.registrySource, 'environment-compatibility');
   assert.equal(result.admittedSelections.length, 1);
-  assert.equal(result.admittedSelections[0].workerRoute.nodeId, 'dev-cluster-z790');
-  assert.equal(result.admittedSelections[0].workerRoute.agentInstanceId, 'claude-code-cli@dev-cluster-z790');
-  assert.equal(result.admission.admitted[0].nodeId, 'dev-cluster-z790');
+  assert.equal(result.admittedSelections[0].workerRoute.nodeId, 'dev-cluster-dell');
+  assert.equal(result.admittedSelections[0].workerRoute.remote, false);
+});
+
+test('prepared canonical store does not disturb local compatibility while remote activation is off', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-runner-recurrence-inactive-fleet-'));
+  const path = join(root, 'live-worker-registry.json');
+  try {
+    promoteLiveWorkerRegistry({
+      path,
+      expectedRevision: 0,
+      controllerNodeId: 'dev-cluster-dell',
+      nodes: [
+        {
+          nodeId: 'dev-cluster-dell', state: 'enabled', readiness: 'ready', controller: true, workerOnly: false,
+          os: 'linux', arch: 'x64', capabilities: [], toolchains: ['node-22'], jobClasses: ['implementation'],
+          capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'dell-live-1',
+        },
+        {
+          nodeId: 'dev-cluster-z790', state: 'enabled', readiness: 'ready', controller: false, workerOnly: true,
+          os: 'linux', arch: 'x64', capabilities: [], toolchains: ['node-22'], jobClasses: ['implementation'],
+          capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'z790-live-1',
+        },
+      ],
+      runtimeInstances: [{
+        nodeId: 'dev-cluster-z790',
+        adapterId: 'claude-code-cli',
+        installedVersion: '2.1.231',
+        readiness: 'ready',
+        authenticated: true,
+        costPosture: 'included-subscription',
+        paid: false,
+        maxConcurrent: 1,
+        active: 0,
+      }],
+      providerAccountCaps: { 'first-party': 1 },
+    });
+
+    const result = admitRecurrenceSelections([selection()], {
+      env: {
+        HOME: root,
+        AGENT_RUNNER_WORKER_REGISTRY_PATH: path,
+      },
+      maxParallel: 1,
+      remoteTransportAvailable: true,
+    });
+    assert.equal(result.remoteActivationRequested, false);
+    assert.equal(result.remoteRouteEnabled, false);
+    assert.equal(result.registrySource, null);
+    assert.equal(result.admittedSelections.length, 1);
+    assert.equal(result.admittedSelections[0].workerRoute.reason, 'local-compatibility-route');
+    assert.equal(result.admittedSelections[0].workerRoute.nodeId, 'dev-cluster-dell');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test('worker route cannot change the adapter identity selected by candidate authority', () => {
@@ -117,4 +184,132 @@ test('worker route cannot change the adapter identity selected by candidate auth
   });
   assert.equal(candidate.adapterId, 'claude-code-cli');
   assert.equal(candidate.agentInstanceId, 'claude-code-cli@dev-cluster-z790');
+});
+
+
+test('recurrence consumes canonical durable registry with hard route admission before remote lane execution', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-runner-recurrence-fleet-'));
+  const path = join(root, 'live-worker-registry.json');
+  const sourceSha = '1'.repeat(40);
+  try {
+    const promoted = promoteLiveWorkerRegistry({
+      path,
+      expectedRevision: 0,
+      controllerNodeId: 'dev-cluster-dell',
+      nodes: [
+        {
+          nodeId: 'dev-cluster-dell', state: 'enabled', readiness: 'ready', controller: true, workerOnly: false,
+          os: 'linux', arch: 'x64', capabilities: [], toolchains: ['node-22'], jobClasses: ['implementation'],
+          capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'dell-live-1',
+        },
+        {
+          nodeId: 'dev-cluster-z790', state: 'enabled', readiness: 'ready', controller: false, workerOnly: true,
+          os: 'linux', arch: 'x64', capabilities: [], toolchains: ['node-22'], jobClasses: ['implementation'],
+          capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'z790-live-1',
+        },
+      ],
+      runtimeInstances: [
+        {
+          nodeId: 'dev-cluster-z790',
+          adapterId: 'claude-code-cli',
+          installedVersion: '2.1.231',
+          readiness: 'ready',
+          authenticated: true,
+          costPosture: 'included-subscription',
+          paid: false,
+          maxConcurrent: 1,
+          active: 0,
+        },
+      ],
+      providerAccountCaps: { 'first-party': 1 },
+    });
+
+    const material = {
+      schema_version: FLEET_ACTIVATION_AUTHORITY_SCHEMA_VERSION,
+      revision: 'AR402-RECURRENCE-TEST-1',
+      target_repository: 'TheTekTeam/agent-runner',
+      target_issue: 402,
+      target_source_commit: sourceSha,
+      target_registry_revision: promoted.revision,
+      target_registry_fingerprint: promoted.registry.registryFingerprint,
+      target_instance: 'claude-code-cli@dev-cluster-z790',
+      target_state: 'enabled',
+      producer_type: 'normal_chatgpt_manager_session',
+      reason: 'supervised-recurrence-routing-test',
+    };
+    const fingerprint = fleetActivationAuthorityFingerprint(material);
+    const comment = {
+      id: 100,
+      user: { login: 'gpcola' },
+      body: `${FLEET_ACTIVATION_AUTHORITY_MARKER}
+\`\`\`yaml
+schema_version: ${material.schema_version}
+revision: ${material.revision}
+target_repository: ${material.target_repository}
+target_issue: ${material.target_issue}
+target_source_commit: ${material.target_source_commit}
+target_registry_revision: ${material.target_registry_revision}
+target_registry_fingerprint: ${material.target_registry_fingerprint}
+target_instance: ${material.target_instance}
+target_state: ${material.target_state}
+producer_type: ${material.producer_type}
+reason: ${material.reason}
+fingerprint: ${fingerprint}
+\`\`\`
+`,
+    };
+    const activationAuthority = resolveFleetActivationAuthority({
+      comments: [comment],
+      env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola' },
+      controlIssue: 402,
+      requestedCommentId: 100,
+      currentSourceCommit: sourceSha,
+      registry: Object.freeze({ ...promoted.registry, documentRevision: promoted.revision }),
+      instanceId: 'claude-code-cli@dev-cluster-z790',
+      targetState: 'enabled',
+    });
+    transitionLiveWorkerInstance({
+      path,
+      expectedRevision: 1,
+      controllerNodeId: 'dev-cluster-dell',
+      instanceId: 'claude-code-cli@dev-cluster-z790',
+      targetState: 'enabled',
+      activationAuthority,
+    });
+
+    const result = admitRecurrenceSelections([selection()], {
+      env: {
+        HOME: root,
+        AGENT_RUNNER_WORKER_REGISTRY_PATH: path,
+        [REMOTE_WORKER_DISPATCH_ENV]: 'true',
+        [WORKER_NODE_PREFERENCE_ENV]: 'dev-cluster-z790',
+      },
+      maxParallel: 1,
+      remoteTransportAvailable: true,
+      currentSourceCommit: sourceSha,
+    });
+    assert.equal(result.registrySource, 'canonical-store');
+    assert.equal(result.registryDocumentRevision, 2);
+    assert.equal(result.remoteRouteEnabled, true);
+    assert.equal(result.admittedSelections.length, 1);
+    assert.equal(result.routes[0].workerRoute.hardAdmission, true);
+    assert.equal(result.routes[0].workerRoute.agentInstanceId, 'claude-code-cli@dev-cluster-z790');
+
+    assert.throws(
+      () => admitRecurrenceSelections([selection()], {
+        env: {
+          HOME: root,
+          AGENT_RUNNER_WORKER_REGISTRY_PATH: path,
+          [REMOTE_WORKER_DISPATCH_ENV]: 'true',
+          [WORKER_NODE_PREFERENCE_ENV]: 'dev-cluster-z790',
+        },
+        maxParallel: 1,
+        remoteTransportAvailable: true,
+        currentSourceCommit: '2'.repeat(40),
+      }),
+      /activation source mismatch/,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
