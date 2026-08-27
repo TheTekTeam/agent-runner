@@ -10,9 +10,15 @@ import {
 } from './agent-runner-implementation-recurrence.mjs';
 import { buildWorkerRegistry } from './agent-runner-worker-pool.mjs';
 import {
-  replaceLiveWorkerRegistry,
+  promoteLiveWorkerRegistry,
   transitionLiveWorkerInstance,
 } from './agent-runner-live-worker-registry-store.mjs';
+import {
+  FLEET_ACTIVATION_AUTHORITY_MARKER,
+  FLEET_ACTIVATION_AUTHORITY_SCHEMA_VERSION,
+  fleetActivationAuthorityFingerprint,
+  resolveFleetActivationAuthority,
+} from './agent-runner-fleet-activation-authority.mjs';
 import {
   LIVE_WORKER_REGISTRY_ENV,
   REMOTE_WORKER_DISPATCH_ENV,
@@ -130,47 +136,83 @@ test('worker route cannot change the adapter identity selected by candidate auth
 test('recurrence consumes canonical durable registry with hard route admission before remote lane execution', () => {
   const root = mkdtempSync(join(tmpdir(), 'agent-runner-recurrence-fleet-'));
   const path = join(root, 'live-worker-registry.json');
+  const sourceSha = '1'.repeat(40);
   try {
-    replaceLiveWorkerRegistry({
+    const promoted = promoteLiveWorkerRegistry({
       path,
       expectedRevision: 0,
       controllerNodeId: 'dev-cluster-dell',
-      registry: {
-        controllerNodeId: 'dev-cluster-dell',
-        nodes: [
-          {
-            nodeId: 'dev-cluster-dell', state: 'enabled', readiness: 'ready', controller: true, workerOnly: false,
-            os: 'linux', arch: 'x64', capabilities: [], toolchains: ['node-22'], jobClasses: ['implementation'],
-            capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'dell-live-1',
-          },
-          {
-            nodeId: 'dev-cluster-z790', state: 'enabled', readiness: 'ready', controller: false, workerOnly: true,
-            os: 'linux', arch: 'x64', capabilities: [], toolchains: ['node-22'], jobClasses: ['implementation'],
-            capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'z790-live-1',
-          },
-        ],
-        agentInstances: [
-          {
-            nodeId: 'dev-cluster-z790',
-            adapterId: 'claude-code-cli',
-            lifecycle: 'disabled',
-            readiness: 'ready',
-            authenticated: true,
-            qualified: true,
-            qualificationRevision: 'claude-z790-7e13ce3be223baf8',
-            qualificationEvidenceFingerprint: 'sha256:7e13ce3be223baf8967748ca5f48c96ea27fa945f3239124360f5c1395026efe',
-            providerAccountClass: 'claude-subscription',
-            costPosture: 'included-subscription',
-            paid: false,
-            models: ['sonnet'],
-            profiles: ['narrow'],
-            jobClasses: ['implementation'],
-            maxConcurrent: 1,
-            active: 0,
-          },
-        ],
-        providerAccountCaps: { 'claude-subscription': 1 },
-      },
+      nodes: [
+        {
+          nodeId: 'dev-cluster-dell', state: 'enabled', readiness: 'ready', controller: true, workerOnly: false,
+          os: 'linux', arch: 'x64', capabilities: [], toolchains: ['node-22'], jobClasses: ['implementation'],
+          capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'dell-live-1',
+        },
+        {
+          nodeId: 'dev-cluster-z790', state: 'enabled', readiness: 'ready', controller: false, workerOnly: true,
+          os: 'linux', arch: 'x64', capabilities: [], toolchains: ['node-22'], jobClasses: ['implementation'],
+          capacity: { maxConcurrent: 2, available: 2 }, healthRevision: 'z790-live-1',
+        },
+      ],
+      runtimeInstances: [
+        {
+          nodeId: 'dev-cluster-z790',
+          adapterId: 'claude-code-cli',
+          installedVersion: '2.1.231',
+          readiness: 'ready',
+          authenticated: true,
+          costPosture: 'included-subscription',
+          paid: false,
+          maxConcurrent: 1,
+          active: 0,
+        },
+      ],
+      providerAccountCaps: { 'first-party': 1 },
+    });
+
+    const material = {
+      schema_version: FLEET_ACTIVATION_AUTHORITY_SCHEMA_VERSION,
+      revision: 'AR402-RECURRENCE-TEST-1',
+      target_repository: 'TheTekTeam/agent-runner',
+      target_issue: 402,
+      target_source_commit: sourceSha,
+      target_registry_revision: promoted.revision,
+      target_registry_fingerprint: promoted.registry.registryFingerprint,
+      target_instance: 'claude-code-cli@dev-cluster-z790',
+      target_state: 'enabled',
+      producer_type: 'normal_chatgpt_manager_session',
+      reason: 'supervised-recurrence-routing-test',
+    };
+    const fingerprint = fleetActivationAuthorityFingerprint(material);
+    const comment = {
+      id: 100,
+      user: { login: 'gpcola' },
+      body: `${FLEET_ACTIVATION_AUTHORITY_MARKER}
+\`\`\`yaml
+schema_version: ${material.schema_version}
+revision: ${material.revision}
+target_repository: ${material.target_repository}
+target_issue: ${material.target_issue}
+target_source_commit: ${material.target_source_commit}
+target_registry_revision: ${material.target_registry_revision}
+target_registry_fingerprint: ${material.target_registry_fingerprint}
+target_instance: ${material.target_instance}
+target_state: ${material.target_state}
+producer_type: ${material.producer_type}
+reason: ${material.reason}
+fingerprint: ${fingerprint}
+\`\`\`
+`,
+    };
+    const activationAuthority = resolveFleetActivationAuthority({
+      comments: [comment],
+      env: { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola' },
+      controlIssue: 402,
+      requestedCommentId: 100,
+      currentSourceCommit: sourceSha,
+      registry: Object.freeze({ ...promoted.registry, documentRevision: promoted.revision }),
+      instanceId: 'claude-code-cli@dev-cluster-z790',
+      targetState: 'enabled',
     });
     transitionLiveWorkerInstance({
       path,
@@ -178,8 +220,7 @@ test('recurrence consumes canonical durable registry with hard route admission b
       controllerNodeId: 'dev-cluster-dell',
       instanceId: 'claude-code-cli@dev-cluster-z790',
       targetState: 'enabled',
-      authorityRevision: 'AR402-RECURRENCE-TEST-1',
-      authorityFingerprint: `sha256:${'8'.repeat(64)}`,
+      activationAuthority,
     });
 
     const result = admitRecurrenceSelections([selection()], {
