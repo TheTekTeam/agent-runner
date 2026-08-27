@@ -234,6 +234,9 @@ function acquireLock(path, fs) {
 
 function atomicWrite(path, document, fs) {
   const dir = resolve(path, '..');
+  // Refuse any existing symlink in the destination chain before mkdir/chmod
+  // or lock/file creation can touch a symlink target.
+  assertSafePathChain(path, fs, { requireLeaf: false });
   fs.mkdirFn(dir, { recursive: true, mode: DIR_MODE });
   fs.chmodFn(dir, DIR_MODE);
   assertSafePathChain(path, fs, { requireLeaf: false });
@@ -266,6 +269,9 @@ function writeNext({
     throw new LiveWorkerRegistryError('live-worker-registry-expected-revision-invalid');
   }
   const fs = defaultDeps(deps);
+  // The lock itself is a mutation, so path safety must be proven before it is
+  // created. This prevents a symlinked parent from redirecting even the lock.
+  assertSafePathChain(path, fs, { requireLeaf: false });
   const release = acquireLock(path, fs);
   try {
     const current = loadLiveWorkerRegistryDocument({ path, deps: fs, allowMissing: true });
