@@ -609,7 +609,7 @@ export async function evaluateSourceActivationAuthority({
 
       const latest = parsedNewer.at(-1);
       if (latest.targetCommit !== currentHead) {
-        return halt('source-activation-recovery-target-head-mismatch', { sourceCommentId: latest.commentId });
+        return halt('source-activation-authority-ambiguous', { sourceCommentId: state.sourceCommentId });
       }
 
       let activation;
