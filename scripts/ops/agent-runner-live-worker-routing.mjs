@@ -31,7 +31,7 @@ function nodePreference(env = process.env) {
 export function parseLiveWorkerRegistry(env = process.env, {
   expectedControllerNodeId = null,
   currentSourceCommit = null,
-  useCanonicalStore = true,
+  useCanonicalStore = false,
   requireActivationSource = false,
 } = {}) {
   // Canonical Dell-owned state participates only when the caller opts into the
