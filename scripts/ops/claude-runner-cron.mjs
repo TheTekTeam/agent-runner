@@ -3220,6 +3220,38 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     const dueRecovery = args.execute ? (state.invoke('dueRecoveryAttempts', args.repo, now()) || [])[0] : null;
     if (!state.healthy) return emitSystemicStatePause(args, state, 'recovery-read', { now, logger: dependencies.logger }).exitCode;
     if (dueRecovery) {
+      if (dueRecovery.agent === OLLAMA_AGENT_ID) {
+        const denied = {
+          allowed: false,
+          stage: 'pre_claim',
+          action: dueRecovery.recovery_action,
+          checkedAt: now(),
+          failedChecks: ['ollama-recovery-not-qualified'],
+          reason: 'ollama-recovery-not-qualified',
+          evidence: {},
+        };
+        const blocked = blockRecoveryBeforeLaunch(state, args, dueRecovery, denied, now, ghRunner);
+        if (!blocked.persisted) return emitSystemicStatePause(args, state, 'ollama-recovery-attention', { now, logger: dependencies.logger }).exitCode;
+        const payload = {
+          recoveryBlocked: true,
+          stage: 'pre_claim',
+          issue: dueRecovery.issue_number,
+          failedChecks: denied.failedChecks,
+          childLaunched: false,
+          agentId: OLLAMA_AGENT_ID,
+        };
+        const logPath = writeLog(args.outputDir, payload);
+        if (!state.record('recordRunResult', {
+          repo: args.repo,
+          issueNumber: dueRecovery.issue_number,
+          mode: 'ollama-recovery-not-qualified',
+          exitCode: 1,
+          logPath,
+          payload,
+        })) return emitSystemicStatePause(args, state, 'ollama-recovery-result', { now, logger: dependencies.logger }).exitCode;
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return 1;
+      }
       const revalidateRecovery = dependencies.revalidateRecovery || collectRecoveryRevalidation;
       const revalidationArgs = { ...args, currentQuotaPreflight: quotaPreflight };
       const preClaimInput = {
