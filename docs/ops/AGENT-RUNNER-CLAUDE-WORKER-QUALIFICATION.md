@@ -35,7 +35,7 @@ Dell calls `buildClaudeWorkerQualificationRequest()` with the current accepted w
 
 - exact request/lease/node/registry/source identity and clean `main` at the exact base SHA with the expected origin;
 - Claude CLI compatibility via `inspectClaudeCliVersion()` / `inspectClaudeCliHelp()` against the repository minimum (`MINIMUM_IMPLEMENTATION_CLAUDE_VERSION`);
-- machine-local first-party `claude.ai` auth for the worker `HOME`, and no inherited provider API-key/token env;
+- machine-local first-party `claude.ai` auth for the worker `HOME`, proven by bounded `/usr/bin/claude auth status --json` parsing (`loggedIn=true`, `authMethod=claude.ai`, `apiProvider=firstParty`) rather than credential-file inspection, with any inherited provider API-key/token or `CLAUDE_CODE_OAUTH_TOKEN` env rejected and stripped from every child process;
 - fresh quota parses (`parseQuotaCheckOutput()`), and narrow admission (`evaluateProfileQuotaAdmission`) is below 75% session usage;
 - prompt caching enabled (`inspectClaudePromptCachePolicy`);
 - the exact `dontAsk` bounded tool policy (`buildImplementationToolPolicy`) with empty setting sources;

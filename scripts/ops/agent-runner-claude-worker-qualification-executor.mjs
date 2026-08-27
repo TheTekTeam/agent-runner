@@ -219,32 +219,71 @@ export function probeClaudeWorkerCli({
   return Object.freeze({ ok: true, version: version.installedVersion, minimumVersion: MINIMUM_IMPLEMENTATION_CLAUDE_VERSION });
 }
 
+// Inherited first-party OAuth tokens are rejected too: qualification auth must be
+// the machine-local worker login, never a token injected into the environment.
+export const CLAUDE_WORKER_FORBIDDEN_AUTH_ENV_KEYS = Object.freeze(['CLAUDE_CODE_OAUTH_TOKEN']);
+
+export function claudeWorkerForbiddenAuthEnvKeys(env = process.env) {
+  const provider = removedClaudeProviderAuthKeys(env);
+  const oauth = CLAUDE_WORKER_FORBIDDEN_AUTH_ENV_KEYS
+    .filter((key) => Object.prototype.hasOwnProperty.call(env, key));
+  return [...provider, ...oauth];
+}
+
+export function sanitizeClaudeWorkerAuthEnv(env) {
+  const next = { ...env };
+  for (const key of CLAUDE_WORKER_FORBIDDEN_AUTH_ENV_KEYS) delete next[key];
+  return next;
+}
+
 export function inspectClaudeWorkerFirstPartyAuth({
+  claudePath = '/usr/bin/claude',
   env = process.env,
   home,
-  readFileSyncFn = readFileSync,
+  childEnv,
+  execFileSyncFn = execFileSync,
 } = {}) {
-  if (removedClaudeProviderAuthKeys(env).length > 0) {
+  if (claudeWorkerForbiddenAuthEnvKeys(env).length > 0) {
     return Object.freeze({ ok: false, reason: 'claude-provider-auth-inheritance-forbidden' });
   }
   const root = String(home || env.HOME || '').trim();
   if (!root) return Object.freeze({ ok: false, reason: 'claude-worker-home-not-configured' });
-  const credentialsPath = resolve(root, '.claude', '.credentials.json');
+
+  const statusEnv = sanitizeClaudeWorkerAuthEnv({
+    ...(childEnv || buildClaudeProcessEnv(env)),
+    HOME: root,
+  });
+  let text;
+  try {
+    text = String(execFileSyncFn(claudePath, ['auth', 'status', '--json'], {
+      env: statusEnv,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 20_000,
+      maxBuffer: 256 * 1024,
+    }) || '');
+  } catch (error) {
+    text = `${error?.stdout || ''}${error?.stderr || ''}`;
+  }
   let payload;
   try {
-    payload = JSON.parse(String(readFileSyncFn(credentialsPath, 'utf8') || ''));
+    payload = JSON.parse(text);
   } catch {
-    return Object.freeze({ ok: false, reason: 'claude-first-party-credentials-unreadable' });
+    return Object.freeze({ ok: false, reason: 'claude-auth-status-unparsed' });
   }
-  const oauth = payload?.claudeAiOauth;
-  if (!oauth || typeof oauth !== 'object' || !oauth.accessToken) {
-    return Object.freeze({ ok: false, reason: 'claude-first-party-auth-absent' });
+  if (!payload || typeof payload !== 'object' || payload.loggedIn !== true) {
+    return Object.freeze({ ok: false, reason: 'claude-worker-logged-out' });
   }
-  const providerClass = String(oauth.subscriptionType || 'subscription').toLowerCase();
+  if (String(payload.authMethod || '') !== 'claude.ai') {
+    return Object.freeze({ ok: false, reason: 'claude-worker-auth-method-unexpected' });
+  }
+  if (String(payload.apiProvider || '') !== 'firstParty') {
+    return Object.freeze({ ok: false, reason: 'claude-worker-auth-provider-unexpected' });
+  }
   return Object.freeze({
     ok: true,
     authMethod: 'claude.ai',
-    providerClass: /^[a-z][a-z0-9-]{1,32}$/.test(providerClass) ? providerClass : 'subscription',
+    providerClass: 'first-party',
   });
 }
 
@@ -411,12 +450,12 @@ export async function executeClaudeWorkerQualificationRequest({
   const resolvedBase = runGit(['rev-parse', `${request.lease.baseSha}^{commit}`], { cwd: sourceRoot, execFileSyncFn });
   if (resolvedBase !== request.lease.baseSha) throw new Error('worker-source-commit-unavailable');
 
-  const childEnv = buildClaudeProcessEnv(env);
+  const childEnv = sanitizeClaudeWorkerAuthEnv(buildClaudeProcessEnv(env));
 
   const cliProbe = cliProbeFn({ claudePath, childEnv, execFileSyncFn });
   if (!cliProbe?.ok) throw new Error(cliProbe?.reason || 'claude-version-probe-failed');
 
-  const auth = authProbeFn({ env, home: env.HOME, readFileSyncFn: readFileSync });
+  const auth = authProbeFn({ claudePath, env, home: env.HOME, childEnv, execFileSyncFn });
   if (!auth?.ok) throw new Error(auth?.reason || 'claude-first-party-auth-failed');
 
   const quota = await quotaPreflightFn({ claudePath, childEnv, env, execFileSyncFn, now: started });

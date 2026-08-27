@@ -126,7 +126,7 @@ function clockSequence(...values) {
 
 const baseGates = {
   cliProbeFn: () => ({ ok: true, version: '2.1.231', minimumVersion: '2.1.208' }),
-  authProbeFn: () => ({ ok: true, authMethod: 'claude.ai', providerClass: 'max' }),
+  authProbeFn: () => ({ ok: true, authMethod: 'claude.ai', providerClass: 'first-party' }),
   quotaPreflightFn: async () => ({ allowed: true, reason: null, sessionUsedPercent: 0, weeklyUsedPercent: 16, threshold: 75 }),
   cachePolicyFn: () => ({ enabled: true, state: 'enabled' }),
   acquireSlotFn: () => ({ held: true, release() {} }),
@@ -165,24 +165,59 @@ test('canary argv pins dontAsk / sonnet / low / empty setting sources without re
   assert.ok(args.includes('--strict-mcp-config'));
 });
 
-test('first-party auth inspector refuses provider key inheritance and missing credentials', () => {
+test('first-party auth inspector proves login via bounded claude auth status --json', () => {
+  const statusFn = (payload) => () => JSON.stringify(payload);
+
+  // Inherited provider API key.
   assert.equal(inspectClaudeWorkerFirstPartyAuth({
     env: { HOME: '/home/worker', ANTHROPIC_API_KEY: 'nope' },
-    readFileSyncFn: () => '{}',
+    execFileSyncFn: statusFn({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }),
   }).reason, 'claude-provider-auth-inheritance-forbidden');
 
+  // Inherited first-party OAuth token.
+  assert.equal(inspectClaudeWorkerFirstPartyAuth({
+    env: { HOME: '/home/worker', CLAUDE_CODE_OAUTH_TOKEN: 'inherited' },
+    execFileSyncFn: statusFn({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }),
+  }).reason, 'claude-provider-auth-inheritance-forbidden');
+
+  // Logged out.
   assert.equal(inspectClaudeWorkerFirstPartyAuth({
     env: { HOME: '/home/worker' },
-    readFileSyncFn: () => { throw new Error('missing'); },
-  }).reason, 'claude-first-party-credentials-unreadable');
+    execFileSyncFn: statusFn({ loggedIn: false }),
+  }).reason, 'claude-worker-logged-out');
 
+  // Malformed JSON.
+  assert.equal(inspectClaudeWorkerFirstPartyAuth({
+    env: { HOME: '/home/worker' },
+    execFileSyncFn: () => 'not json',
+  }).reason, 'claude-auth-status-unparsed');
+
+  // Wrong auth method.
+  assert.equal(inspectClaudeWorkerFirstPartyAuth({
+    env: { HOME: '/home/worker' },
+    execFileSyncFn: statusFn({ loggedIn: true, authMethod: 'console', apiProvider: 'firstParty' }),
+  }).reason, 'claude-worker-auth-method-unexpected');
+
+  // Wrong provider.
+  assert.equal(inspectClaudeWorkerFirstPartyAuth({
+    env: { HOME: '/home/worker' },
+    execFileSyncFn: statusFn({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'bedrock' }),
+  }).reason, 'claude-worker-auth-provider-unexpected');
+
+  // Successful first-party status; token is stripped from the status subprocess env.
+  let seenEnv = null;
   const ok = inspectClaudeWorkerFirstPartyAuth({
     env: { HOME: '/home/worker' },
-    readFileSyncFn: () => JSON.stringify({ claudeAiOauth: { accessToken: 'tok', subscriptionType: 'max' } }),
+    childEnv: { HOME: '/stale', CLAUDE_CODE_OAUTH_TOKEN: 'leak', PATH: '/usr/bin' },
+    execFileSyncFn: (_bin, _args, opts) => {
+      seenEnv = opts.env;
+      return JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' });
+    },
   });
   assert.equal(ok.ok, true);
   assert.equal(ok.authMethod, 'claude.ai');
-  assert.equal(ok.providerClass, 'max');
+  assert.equal(ok.providerClass, 'first-party');
+  assert.equal(Object.prototype.hasOwnProperty.call(seenEnv, 'CLAUDE_CODE_OAUTH_TOKEN'), false);
 });
 
 test('quota preflight parses fresh usage and admits narrow below 75 percent', () => {
@@ -244,6 +279,7 @@ test('executor completes one bounded canary, strips provider auth env, cleans wo
         PATH: process.env.PATH,
         ANTHROPIC_API_KEY: 'must-not-cross',
         ANTHROPIC_AUTH_TOKEN: 'must-not-cross',
+        CLAUDE_CODE_OAUTH_TOKEN: 'must-not-cross',
       },
       clock: clockSequence('2026-08-27T06:30:00.000Z', '2026-08-27T06:31:00.000Z'),
       ...baseGates,
@@ -264,6 +300,7 @@ test('executor completes one bounded canary, strips provider auth env, cleans wo
     assert.equal(invocations, 1);
     assert.equal(captured.childEnv.ANTHROPIC_API_KEY, undefined);
     assert.equal(captured.childEnv.ANTHROPIC_AUTH_TOKEN, undefined);
+    assert.equal(Object.prototype.hasOwnProperty.call(captured.childEnv, 'CLAUDE_CODE_OAUTH_TOKEN'), false);
     assert.equal(captured.lane, built.lease.laneId);
     assert.equal(captured.slotReleases, 1);
     assert.equal(execution.result.status, 'succeeded');
@@ -309,7 +346,7 @@ test('executor completes one bounded canary, strips provider auth env, cleans wo
 });
 
 for (const scenario of [
-  { name: 'unauthenticated', gate: { authProbeFn: () => ({ ok: false, reason: 'claude-first-party-auth-absent' }) }, match: /claude-first-party-auth-absent/ },
+  { name: 'unauthenticated', gate: { authProbeFn: () => ({ ok: false, reason: 'claude-worker-logged-out' }) }, match: /claude-worker-logged-out/ },
   { name: 'quota over threshold', gate: { quotaPreflightFn: async () => ({ allowed: false, reason: 'profile-session-usage-threshold-exceeded' }) }, match: /profile-session-usage-threshold-exceeded/ },
   { name: 'cache disabled', gate: { cachePolicyFn: () => ({ enabled: false }) }, match: /claude-prompt-cache-disabled/ },
   { name: 'cli version', gate: { cliProbeFn: () => ({ ok: false, reason: 'claude-version-too-old' }) }, match: /claude-version-too-old/ },
