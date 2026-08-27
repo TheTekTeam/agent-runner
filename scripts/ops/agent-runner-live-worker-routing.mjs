@@ -29,41 +29,50 @@ function nodePreference(env = process.env) {
 }
 
 export function parseLiveWorkerRegistry(env = process.env, { expectedControllerNodeId = null } = {}) {
-  const raw = String(env[LIVE_WORKER_REGISTRY_ENV] || '').trim();
-  let registry;
+  // Canonical Dell-owned state takes precedence whenever present. The legacy
+  // environment JSON remains a read-only compatibility source only while no
+  // canonical store exists, so stale environment cannot bypass hard admission.
+  const loaded = loadLiveWorkerRegistryDocument({
+    path: resolveLiveWorkerRegistryPath(env),
+    allowMissing: true,
+  });
+  let registry = loaded.registry
+    ? Object.freeze({
+      ...loaded.registry,
+      registrySource: 'canonical-store',
+      documentRevision: loaded.revision,
+      activationAuthorities: loaded.document?.activationAuthorities || {},
+      lastTransition: loaded.document?.lastTransition || null,
+    })
+    : null;
 
-  if (raw) {
-    if (Buffer.byteLength(raw, 'utf8') > LIVE_WORKER_REGISTRY_MAX_BYTES) {
-      throw new Error(`${LIVE_WORKER_REGISTRY_ENV} exceeds ${LIVE_WORKER_REGISTRY_MAX_BYTES} bytes`);
+  if (!registry) {
+    const raw = String(env[LIVE_WORKER_REGISTRY_ENV] || '').trim();
+    if (raw) {
+      if (Buffer.byteLength(raw, 'utf8') > LIVE_WORKER_REGISTRY_MAX_BYTES) {
+        throw new Error(`${LIVE_WORKER_REGISTRY_ENV} exceeds ${LIVE_WORKER_REGISTRY_MAX_BYTES} bytes`);
+      }
+      let parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        throw new Error(`${LIVE_WORKER_REGISTRY_ENV} must contain valid JSON`);
+      }
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error(`${LIVE_WORKER_REGISTRY_ENV} must contain a JSON object`);
+      }
+      registry = buildWorkerRegistry({
+        controllerNodeId: parsed.controllerNodeId,
+        nodes: parsed.nodes,
+        agentInstances: parsed.agentInstances || [],
+        providerAccountCaps: parsed.providerAccountCaps || {},
+        revision: parsed.revision || '1',
+      });
+      if (parsed.registryFingerprint && parsed.registryFingerprint !== registry.registryFingerprint) {
+        throw new Error('worker registry fingerprint mismatch');
+      }
+      registry = Object.freeze({ ...registry, registrySource: 'environment-compatibility' });
     }
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      throw new Error(`${LIVE_WORKER_REGISTRY_ENV} must contain valid JSON`);
-    }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error(`${LIVE_WORKER_REGISTRY_ENV} must contain a JSON object`);
-    }
-    registry = buildWorkerRegistry({
-      controllerNodeId: parsed.controllerNodeId,
-      nodes: parsed.nodes,
-      agentInstances: parsed.agentInstances || [],
-      providerAccountCaps: parsed.providerAccountCaps || {},
-      revision: parsed.revision || '1',
-    });
-    if (parsed.registryFingerprint && parsed.registryFingerprint !== registry.registryFingerprint) {
-      throw new Error('worker registry fingerprint mismatch');
-    }
-    registry = Object.freeze({ ...registry, registrySource: 'environment-compatibility' });
-  } else {
-    const loaded = loadLiveWorkerRegistryDocument({
-      path: resolveLiveWorkerRegistryPath(env),
-      allowMissing: true,
-    });
-    registry = loaded.registry
-      ? Object.freeze({ ...loaded.registry, registrySource: 'canonical-store', documentRevision: loaded.revision })
-      : null;
   }
 
   if (expectedControllerNodeId && registry
@@ -88,6 +97,7 @@ export function resolveLiveWorkerRoute({
   requiredCapabilities = [],
   remoteDispatchAvailable = null,
   requireHardAdmission = null,
+  providerAccountReservations = {},
 } = {}) {
   const local = nodeId(localNodeId, 'localNodeId');
   const adapter = String(adapterId || '').trim();
@@ -125,6 +135,7 @@ export function resolveLiveWorkerRoute({
     preferredNodeIds,
     requireZeroPaidPosture: hardAdmission,
     enforceProviderAccountCapacity: hardAdmission,
+    providerAccountReservations,
   });
   if (!route.selected) {
     return Object.freeze({
