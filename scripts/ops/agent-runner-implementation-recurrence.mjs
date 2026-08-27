@@ -280,6 +280,8 @@ export function admitRecurrenceSelections(selected, {
     caps,
     nodeId,
     registryFingerprint: workerRegistry?.registryFingerprint || null,
+    registrySource: workerRegistry?.registrySource || null,
+    registryDocumentRevision: workerRegistry?.documentRevision || null,
     remoteRouteEnabled,
     routes: routed.map(({ entry, outcome, workerRoute }) => ({
       laneId: implementationLaneForSelection(entry, outcome),
