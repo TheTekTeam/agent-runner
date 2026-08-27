@@ -40,7 +40,7 @@ const LIFECYCLE_STATES = Object.freeze(['enabled', 'paused', 'draining', 'disabl
 
 export class LiveWorkerRegistryError extends Error {
   constructor(code, message = code) {
-    super(message);
+    super(message === code ? code : `${code}: ${message}`);
     this.name = 'LiveWorkerRegistryError';
     this.code = code;
   }
