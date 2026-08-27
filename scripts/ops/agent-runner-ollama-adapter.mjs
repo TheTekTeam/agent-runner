@@ -323,6 +323,101 @@ export function buildOpenCodeCommandArgs({
 }
 
 
+const OPENCODE_WORKTREE_PATH_PATTERN = /^[A-Za-z0-9._*?/-]{1,512}$/;
+const OLLAMA_SHELL_METACHARACTERS = /[;&|><\`$(){}\n\r]/;
+const OLLAMA_DANGEROUS_SHELL = /^(?:sudo|su|systemctl|service|docker|podman|ssh|scp|sftp|curl|wget|nc|ncat|telnet|apt|apt-get|dnf|yum|pacman|snap|flatpak|npx)\b/i;
+const OLLAMA_INTERPRETER_ESCAPE = /^(?:bash|sh|zsh)\s+(?:-[^\s]*c\b|--command\b)|^(?:node|python|python3|perl|ruby)\s+(?:-e\b|-c\b|--eval\b)/i;
+const OLLAMA_DESTRUCTIVE_GIT = /^git\s+(?:reset|clean|stash|rebase|push|pull|merge|cherry-pick|revert|checkout|switch|branch|tag|remote|config|gc|prune|worktree)\b/i;
+const OLLAMA_SAFE_GIT = /^(?:pwd|git\s+(?:status|diff|log|show|grep|ls-files|rev-parse)(?:\s|$))/i;
+
+function normalizeOpenCodeWorktreePathPattern(value) {
+  const path = String(value || '').trim();
+  if (!path || !OPENCODE_WORKTREE_PATH_PATTERN.test(path)) return null;
+  if (path.startsWith('/') || path.startsWith('../') || path.includes('/../') || path === '..') return null;
+  if (path === '.git' || path.startsWith('.git/') || path.includes('/.git/')) return null;
+  return path;
+}
+
+export function isSafeOllamaShellPattern(value) {
+  const pattern = String(value || '').trim();
+  if (!pattern || pattern.length > 4096) return false;
+  if (OLLAMA_SHELL_METACHARACTERS.test(pattern)) return false;
+  if (pattern.includes('..')) return false;
+  if (OLLAMA_DANGEROUS_SHELL.test(pattern)) return false;
+  if (OLLAMA_INTERPRETER_ESCAPE.test(pattern)) return false;
+  if (OLLAMA_DESTRUCTIVE_GIT.test(pattern)) return false;
+  if (OLLAMA_SAFE_GIT.test(pattern)) return true;
+
+  const first = pattern.split(/\s+/)[0].toLowerCase();
+  if (first === 'bash') {
+    return /^bash\s+[A-Za-z0-9._/-]+(?:\s+[A-Za-z0-9._:=/@%+,-]+)*$/.test(pattern)
+      && !pattern.includes('*') && !pattern.includes('?');
+  }
+  if (first === 'node') {
+    return /^node\s+(?:--test\s+)?[A-Za-z0-9._/*?/-]+(?:\s+[A-Za-z0-9._:=/@%+,*?-]+)*$/.test(pattern);
+  }
+  if (['npm', 'pnpm', 'yarn'].includes(first)) {
+    return /^(?:npm|pnpm|yarn)\s+(?:run\s+[A-Za-z0-9:._-]+|test)(?:\s+[A-Za-z0-9._:=/@%+,*?/-]+)*$/.test(pattern);
+  }
+  return false;
+}
+
+/**
+ * OpenCode 1.x coding profile: model edits stay inside manager-authorised
+ * worktree paths while shell is default-deny with a narrow positive allowlist.
+ * This is intentionally different from the text-only documentation profile:
+ * the coding model may inspect Git state and run reviewed test/build commands,
+ * but cannot obtain arbitrary host shell, external-directory, network-download,
+ * privileged service, destructive-Git, push/merge, or interpreter-eval authority.
+ */
+export function buildOpenCodeCodingLocalOllamaConfig({
+  allowedEditPaths = [],
+  shellAllowlist = [],
+  ...providerOptions
+} = {}) {
+  if (!Array.isArray(allowedEditPaths) || allowedEditPaths.length === 0 || allowedEditPaths.length > 64) {
+    throw new Error('buildOpenCodeCodingLocalOllamaConfig requires 1..64 allowedEditPaths');
+  }
+  if (!Array.isArray(shellAllowlist) || shellAllowlist.length > 64) {
+    throw new Error('buildOpenCodeCodingLocalOllamaConfig requires <=64 shellAllowlist entries');
+  }
+
+  const normalizedPaths = allowedEditPaths.map(normalizeOpenCodeWorktreePathPattern);
+  if (normalizedPaths.some((path) => !path) || new Set(normalizedPaths).size !== normalizedPaths.length) {
+    throw new Error('buildOpenCodeCodingLocalOllamaConfig rejected an unsafe or duplicate edit path');
+  }
+  const normalizedShell = shellAllowlist.map((entry) => String(entry || '').trim());
+  if (normalizedShell.some((entry) => !isSafeOllamaShellPattern(entry)) || new Set(normalizedShell).size !== normalizedShell.length) {
+    throw new Error('buildOpenCodeCodingLocalOllamaConfig rejected an unsafe or duplicate shell pattern');
+  }
+
+  const config = JSON.parse(buildOpenCodeLocalOllamaConfig(providerOptions));
+  config.permission = {
+    '*': 'deny',
+    read: {
+      '*': 'allow',
+      '.env': 'deny',
+      '.env.*': 'deny',
+      '**/.env': 'deny',
+      '**/.env.*': 'deny',
+    },
+    glob: 'allow',
+    grep: 'allow',
+    edit: Object.fromEntries([
+      ['*', 'deny'],
+      ...normalizedPaths.map((path) => [path, 'allow']),
+    ]),
+    bash: Object.fromEntries([
+      ['*', 'deny'],
+      ...normalizedShell.map((pattern) => [pattern, 'allow']),
+    ]),
+    external_directory: { '*': 'deny' },
+    webfetch: 'deny',
+    task: 'deny',
+  };
+  return JSON.stringify(config);
+}
+
 export const OPENCODE_DOCUMENT_START = '<modelspend-document>';
 export const OPENCODE_DOCUMENT_END = '</modelspend-document>';
 export const DEFAULT_DOCUMENT_OUTPUT_MAX_BYTES = 64 * 1024;
