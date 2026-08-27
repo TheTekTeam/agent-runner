@@ -14,9 +14,7 @@
       "minFreeMemoryBytes": 2147483648,
       "qualification": {
         "taskClasses": [],
-        "riskClasses": [
-          "low"
-        ],
+        "riskClasses": ["low"],
         "models": [],
         "harness": null
       }
