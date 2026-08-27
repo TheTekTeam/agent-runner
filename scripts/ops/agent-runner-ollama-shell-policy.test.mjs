@@ -7,12 +7,18 @@ import {
   buildBoundedOpenCodeBashPermission,
   classifyBoundedOllamaShellCommand,
   isSafeRelativeShellPath,
+  isShellTrustedRepository,
   tokenizeBoundedShellCommand,
 } from './agent-runner-ollama-shell-policy.mjs';
 
+const TRUST = Object.freeze({
+  repository: 'TheTekTeam/agent-runner',
+  trustedRepositories: ['TheTekTeam/agent-runner'],
+});
+
 test('fixed read-only Git commands are always admitted exactly', () => {
   for (const command of FIXED_OLLAMA_SHELL_COMMANDS) {
-    const decision = classifyBoundedOllamaShellCommand(command);
+    const decision = classifyBoundedOllamaShellCommand(command, TRUST);
     assert.equal(decision.allowed, true, command);
     assert.equal(decision.kind, 'fixed-readonly-git');
   }
@@ -29,15 +35,16 @@ test('shell metacharacters, substitutions, redirections and quoting fail closed'
     'git status; env',
   ]) {
     assert.equal(tokenizeBoundedShellCommand(command).ok, false, command);
-    assert.equal(classifyBoundedOllamaShellCommand(command).allowed, false, command);
+    assert.equal(classifyBoundedOllamaShellCommand(command, TRUST).allowed, false, command);
   }
 });
 
 test('focused node test requires exact manager authority and one safe relative path', () => {
   const command = 'node --test test/add.test.mjs';
-  assert.equal(classifyBoundedOllamaShellCommand(command).allowed, false);
+  assert.equal(classifyBoundedOllamaShellCommand(command, TRUST).reason, 'ollama-shell-command-not-manager-approved');
 
   const allowed = classifyBoundedOllamaShellCommand(command, {
+    ...TRUST,
     managerValidationCommands: [command],
   });
   assert.equal(allowed.allowed, true);
@@ -50,6 +57,7 @@ test('focused node test requires exact manager authority and one safe relative p
     'node --test /tmp/test.mjs',
   ]) {
     const decision = classifyBoundedOllamaShellCommand(unsafe, {
+      ...TRUST,
       managerValidationCommands: [unsafe],
     });
     assert.equal(decision.allowed, false, unsafe);
@@ -59,14 +67,17 @@ test('focused node test requires exact manager authority and one safe relative p
 test('broader project validation requires manager AND machine exact allowlist', () => {
   const command = 'pnpm run typecheck';
   assert.equal(classifyBoundedOllamaShellCommand(command, {
+    ...TRUST,
     managerValidationCommands: [command],
   }).reason, 'ollama-shell-command-not-machine-allowlisted');
 
   assert.equal(classifyBoundedOllamaShellCommand(command, {
+    ...TRUST,
     machineCommandAllowlist: [command],
   }).reason, 'ollama-shell-command-not-manager-approved');
 
   const allowed = classifyBoundedOllamaShellCommand(command, {
+    ...TRUST,
     managerValidationCommands: [command],
     machineCommandAllowlist: [command],
   });
@@ -78,10 +89,12 @@ test('no command prefixes or wildcard-like strings broaden authority', () => {
   const manager = ['pnpm run test'];
   const machine = ['pnpm run test'];
   assert.equal(classifyBoundedOllamaShellCommand('pnpm run test extra', {
+    ...TRUST,
     managerValidationCommands: manager,
     machineCommandAllowlist: machine,
   }).allowed, false);
   assert.equal(classifyBoundedOllamaShellCommand('pnpm run build', {
+    ...TRUST,
     managerValidationCommands: manager,
     machineCommandAllowlist: machine,
   }).allowed, false);
@@ -90,13 +103,14 @@ test('no command prefixes or wildcard-like strings broaden authority', () => {
 test('OpenCode V1 bash permission is deny-by-default with exact allowed commands only', () => {
   const command = 'node --test test/add.test.mjs';
   const permission = buildBoundedOpenCodeBashPermission({
+    ...TRUST,
     managerValidationCommands: [command, 'pnpm run typecheck'],
     machineCommandAllowlist: ['pnpm run typecheck'],
   });
   assert.equal(permission['*'], 'deny');
   assert.equal(permission[command], 'allow');
   assert.equal(permission['pnpm run typecheck'], 'allow');
-  assert.equal(permission['git diff --check'], 'allow');
+  assert.equal(permission['git diff --no-ext-diff --check'], 'allow');
   assert.equal(permission['git push'], undefined);
   assert.equal(permission['pnpm *'], undefined);
 });
@@ -104,6 +118,7 @@ test('OpenCode V1 bash permission is deny-by-default with exact allowed commands
 test('tool policy denies everything globally, allows one file, bounded bash, and no external directory', () => {
   const command = 'node --test test/add.test.mjs';
   const permission = buildBoundedOllamaToolPermission({
+    ...TRUST,
     filePath: 'src/add.mjs',
     managerValidationCommands: [command],
   });
@@ -113,6 +128,29 @@ test('tool policy denies everything globally, allows one file, bounded bash, and
   assert.equal(permission.bash['*'], 'deny');
   assert.equal(permission.bash[command], 'allow');
   assert.deepEqual(permission.external_directory, { '*': 'deny' });
+});
+
+
+test('shell stays denied unless the exact repository is machine-trusted', () => {
+  assert.equal(isShellTrustedRepository('TheTekTeam/agent-runner', []), false);
+  assert.equal(isShellTrustedRepository('TheTekTeam/agent-runner', ['thetekteam/agent-runner']), true);
+  assert.equal(isShellTrustedRepository('../bad', ['../bad']), false);
+
+  const command = 'node --test test/add.test.mjs';
+  const denied = classifyBoundedOllamaShellCommand(command, {
+    repository: 'TheTekTeam/agent-runner',
+    trustedRepositories: ['TheTekTeam/modelspend'],
+    managerValidationCommands: [command],
+  });
+  assert.equal(denied.allowed, false);
+  assert.equal(denied.reason, 'ollama-shell-repository-not-trusted');
+
+  const permission = buildBoundedOpenCodeBashPermission({
+    repository: 'TheTekTeam/agent-runner',
+    trustedRepositories: [],
+    managerValidationCommands: [command],
+  });
+  assert.deepEqual(permission, { '*': 'deny' });
 });
 
 test('safe path grammar rejects traversal, hidden roots, absolute paths and spaces', () => {
