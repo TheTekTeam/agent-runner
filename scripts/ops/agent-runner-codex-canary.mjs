@@ -323,8 +323,6 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       },
     });
 
-    writeState({ ...evidence, status: 'completed' }, env);
-
     rmSync(join(worktree, CODEX_CANARY_EXPECTED_FILE));
     if (execFileSync('git', ['status', '--porcelain'], { cwd: worktree, encoding: 'utf8' }) !== '') {
       preserveForensics = true;
@@ -336,6 +334,11 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     execFileSync('git', ['branch', '-d', dispatch.branch], { cwd: REPO_ROOT, stdio: ['ignore', 'ignore', 'ignore'] });
     rmSync(worktreeParent, { recursive: true, force: true });
     worktreeParent = null;
+
+    // Completion is durable only after all temporary workspace/branch cleanup
+    // has succeeded. A cleanup failure leaves the already-written pending
+    // one-shot state in place, which prevents provider re-invocation.
+    writeState({ ...evidence, status: 'completed' }, env);
 
     console.log(JSON.stringify(evidence, null, 2));
     console.log('AR186_CODEX_CANARY=PASS');
