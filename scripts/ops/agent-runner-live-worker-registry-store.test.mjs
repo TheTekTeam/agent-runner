@@ -275,11 +275,17 @@ test('canonical store is consumed by live routing with hard zero-paid and provid
 test('provider-account cap blocks an otherwise qualified canonical route', () => {
   const { root, path } = tempRegistryPath();
   try {
+    const saturated = rawRegistry();
+    saturated.agentInstances[1] = {
+      ...saturated.agentInstances[1],
+      providerAccountClass: 'chatgpt',
+      active: 1,
+    };
     replaceLiveWorkerRegistry({
       path,
       expectedRevision: 0,
       controllerNodeId: 'dev-cluster-dell',
-      registry: rawRegistry({ codexActive: 1 }),
+      registry: saturated,
     });
     transitionLiveWorkerInstance({
       path,
@@ -304,6 +310,33 @@ test('provider-account cap blocks an otherwise qualified canonical route', () =>
     });
     assert.equal(route.allowed, false);
     assert.equal(route.routeEvidence.excluded[0].reasons.includes('provider-account-cap-full'), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('lifecycle transition refuses an instance that still reports active work', () => {
+  const { root, path } = tempRegistryPath();
+  try {
+    replaceLiveWorkerRegistry({
+      path,
+      expectedRevision: 0,
+      controllerNodeId: 'dev-cluster-dell',
+      registry: rawRegistry({ codexActive: 1 }),
+    });
+    assert.throws(
+      () => transitionLiveWorkerInstance({
+        path,
+        expectedRevision: 1,
+        controllerNodeId: 'dev-cluster-dell',
+        instanceId: 'codex-cli@dev-cluster-z790',
+        targetState: 'enabled',
+        authorityRevision: 'AR402-FLEET-ACTIVATION-1',
+        authorityFingerprint: `sha256:${'f'.repeat(64)}`,
+      }),
+      /active-work-conflict/,
+    );
+    assert.equal(loadLiveWorkerRegistryDocument({ path }).revision, 1);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
