@@ -7,6 +7,8 @@ import {
   LIVE_WORKER_REGISTRY_CONTROLLER_NODE_ID,
   LiveWorkerRegistryError,
   loadLiveWorkerRegistryDocument,
+  planLiveWorkerRegistryPromotion,
+  promoteLiveWorkerRegistry,
   replaceLiveWorkerRegistry,
   resolveLiveWorkerRegistryPath,
   safeLiveWorkerRegistrySummary,
@@ -24,7 +26,7 @@ function parseInteger(value, name) {
 
 function parseArgs(argv = []) {
   const mode = argv[0];
-  if (!['inspect', 'replace', 'transition'].includes(mode)) {
+  if (!['inspect', 'plan', 'promote', 'replace', 'transition'].includes(mode)) {
     throw new LiveWorkerRegistryError('live-worker-registry-command-mode-invalid');
   }
   const args = { mode };
@@ -37,6 +39,8 @@ function parseArgs(argv = []) {
     else if (flag === '--state') args.targetState = value;
     else if (flag === '--authority-revision') args.authorityRevision = value;
     else if (flag === '--authority-fingerprint') args.authorityFingerprint = value;
+    else if (flag === '--authority-key') args.authorityKey = value;
+    else if (flag === '--authority-packet-digest') args.authorityPacketDigest = value;
     else throw new LiveWorkerRegistryError('live-worker-registry-command-argument-invalid');
   }
   if (mode !== 'inspect' && args.expectedRevision === undefined) {
@@ -95,9 +99,47 @@ export function main(argv = process.argv.slice(2), {
       return 0;
     }
 
+    if (args.mode === 'plan') {
+      const raw = boundedStdin(readFn);
+      const plan = planLiveWorkerRegistryPromotion({
+        expectedRevision: args.expectedRevision,
+        controllerNodeId: LIVE_WORKER_REGISTRY_CONTROLLER_NODE_ID,
+        nodes: raw.nodes,
+        runtimeInstances: raw.runtimeInstances,
+        providerAccountCaps: raw.providerAccountCaps || {},
+      });
+      const summary = safeLiveWorkerRegistrySummary({
+        found: true,
+        revision: plan.targetRevision,
+        registry: plan.registry,
+        document: { activationAuthorities: {}, lastTransition: null },
+      });
+      writeFn(`${JSON.stringify({
+        schemaVersion: 1,
+        ok: true,
+        mode: 'plan',
+        expectedRevision: plan.expectedRevision,
+        targetRevision: plan.targetRevision,
+        publicationRevision: plan.publicationRevision,
+        publicationFingerprint: plan.publicationFingerprint,
+        registry: summary,
+      })}\n`);
+      return 0;
+    }
+
     const controllerNodeId = assertDellControllerHost(hostnameFn);
     let loaded;
-    if (args.mode === 'replace') {
+    if (args.mode === 'promote') {
+      const raw = boundedStdin(readFn);
+      loaded = promoteLiveWorkerRegistry({
+        path,
+        expectedRevision: args.expectedRevision,
+        controllerNodeId,
+        nodes: raw.nodes,
+        runtimeInstances: raw.runtimeInstances,
+        providerAccountCaps: raw.providerAccountCaps || {},
+      });
+    } else if (args.mode === 'replace') {
       const raw = boundedStdin(readFn);
       loaded = replaceLiveWorkerRegistry({
         path,
@@ -114,6 +156,8 @@ export function main(argv = process.argv.slice(2), {
         targetState: args.targetState,
         authorityRevision: args.authorityRevision || null,
         authorityFingerprint: args.authorityFingerprint || null,
+        authorityKey: args.authorityKey || null,
+        authorityPacketDigest: args.authorityPacketDigest || null,
       });
     }
     writeFn(`${JSON.stringify({ schemaVersion: 1, ok: true, registry: safeLiveWorkerRegistrySummary(loaded) })}\n`);
