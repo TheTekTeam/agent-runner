@@ -73,7 +73,12 @@ export const AGENT_ADAPTERS = Object.freeze({
   'grok-cli': Object.freeze({ agentId: 'grok-cli', type: 'grok', command: null, implemented: false, labels: Object.freeze(['agent:grok-cli']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
   'gpt-agent': Object.freeze({ agentId: 'gpt-agent', type: 'gpt', command: null, implemented: false, labels: Object.freeze(['agent:gpt', 'agent:openai']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
   'gemini-cli': Object.freeze({ agentId: 'gemini-cli', type: 'gemini', command: null, implemented: false, labels: Object.freeze(['agent:gemini', 'agent:gemini-cli']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
-  'ollama-agent': Object.freeze({ agentId: 'ollama-agent', type: 'ollama', command: null, implemented: false, labels: Object.freeze(['agent:ollama']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
+  // #377: live only through agent-runner-ollama-runner.mjs. The scheduler may
+  // select this adapter only after the ordinary lifecycle/readiness/
+  // qualification gates pass; the child independently revalidates the exact
+  // machine-local model, OpenCode/Ollama versions, manager authority,
+  // worktree scope and bounded shell policy before any model invocation.
+  'ollama-agent': Object.freeze({ agentId: 'ollama-agent', type: 'ollama', command: 'opencode', implemented: true, labels: Object.freeze(['agent:ollama']), controls: Object.freeze({ ...FUTURE_CONTROLS }) }),
 });
 
 const LABEL_TO_AGENT_ID = new Map(Object.values(AGENT_ADAPTERS).flatMap((adapter) => adapter.labels.map((label) => [label, adapter.agentId])));
