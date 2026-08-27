@@ -165,6 +165,66 @@ function routeReasons({ node, instance, request }) {
   return [...new Set(reasons)].sort();
 }
 
+function qualificationRouteReasons({ node, instance, request }) {
+  const reasons = [];
+  if (!node) return ['node-not-registered'];
+  if (!instance) return ['agent-instance-not-registered'];
+  if (node.controller || !node.workerOnly) reasons.push('qualification-target-not-worker-only');
+  if (node.state !== 'enabled') reasons.push(`node-${node.state}`);
+  if (node.readiness !== 'ready') reasons.push(`node-${node.readiness}`);
+  if (node.capacity.available < 1) reasons.push('node-capacity-full');
+  if (instance.lifecycle !== 'enabled') reasons.push(`agent-${instance.lifecycle}`);
+  if (instance.readiness !== 'ready') reasons.push(`agent-${instance.readiness}`);
+  if (!instance.authenticated) reasons.push('agent-auth-unavailable');
+  if (instance.active >= instance.maxConcurrent) reasons.push('agent-capacity-full');
+  if (!node.jobClasses.includes(request.jobClass)) reasons.push('node-job-class-unsupported');
+  if (!instance.jobClasses.includes(request.jobClass)) reasons.push('agent-job-class-unsupported');
+  if (request.model && !instance.models.includes(request.model)) reasons.push('model-unsupported-on-instance');
+  if (request.profile && !instance.profiles.includes(request.profile)) reasons.push('profile-unsupported-on-instance');
+  for (const capability of request.requiredCapabilities || []) {
+    if (!node.capabilities.includes(capability)) reasons.push(`capability-missing:${capability}`);
+  }
+  return [...new Set(reasons)].sort();
+}
+
+/**
+ * Qualification routing is deliberately separate from normal worker routing.
+ * It may target an installed/authenticated but not-yet-qualified instance only
+ * for one exact worker-only node selected by Dell. It does not change the
+ * instance's registry qualification bit and cannot make the instance eligible
+ * for selectWorkerRoute().
+ */
+export function selectWorkerQualificationRoute(registry, request = {}) {
+  if (!registry || registry.schemaVersion !== WORKER_POOL_SCHEMA_VERSION) throw new Error('valid worker registry is required');
+  const nodeId = token(request.nodeId, 'nodeId');
+  const adapterId = token(request.adapterId, 'adapterId');
+  const jobClass = enumValue(request.jobClass, WORKER_JOB_CLASSES, 'jobClass');
+  const requiredCapabilities = boundedTokens(request.requiredCapabilities || [], 'requiredCapabilities');
+  const normalizedRequest = {
+    nodeId,
+    adapterId,
+    jobClass,
+    model: request.model ? token(request.model, 'model') : null,
+    profile: request.profile ? token(request.profile, 'profile') : null,
+    requiredCapabilities,
+    qualificationOnly: true,
+  };
+  const node = registry.nodes.find((item) => item.nodeId === nodeId);
+  const instance = registry.agentInstances.find((item) => item.nodeId === nodeId && item.adapterId === adapterId);
+  const reasons = qualificationRouteReasons({ node, instance, request: normalizedRequest });
+  return Object.freeze({
+    qualificationOnly: true,
+    selected: reasons.length === 0 && node && instance
+      ? Object.freeze({ nodeId: node.nodeId, instanceId: instance.instanceId })
+      : null,
+    eligible: reasons.length === 0 && instance ? [instance.instanceId] : [],
+    excluded: reasons.length === 0 || !instance ? [] : [{ instanceId: instance.instanceId, reasons }],
+    reasons: Object.freeze(reasons),
+    requestFingerprint: digest(normalizedRequest),
+    registryFingerprint: registry.registryFingerprint,
+  });
+}
+
 export function selectWorkerRoute(registry, request = {}) {
   if (!registry || registry.schemaVersion !== WORKER_POOL_SCHEMA_VERSION) throw new Error('valid worker registry is required');
   const adapterId = token(request.adapterId, 'adapterId');
@@ -264,6 +324,78 @@ export function issueWorkerLease({
   return Object.freeze({ ...payload, leaseFingerprint: digest(payload) });
 }
 
+export function issueWorkerQualificationLease({
+  registry,
+  route,
+  projectId,
+  repository,
+  issueNumber,
+  authorityFingerprint,
+  baseSha,
+  branch,
+  worktree,
+  adapterId,
+  model,
+  profile,
+  jobClass,
+  laneId,
+  resourcePartition = null,
+  validationProfile,
+  qualificationProfile,
+  expiresAt,
+  providerAccountClass = null,
+} = {}) {
+  if (!registry || route?.qualificationOnly !== true || route?.selected == null) {
+    throw new Error('selected qualification worker route is required');
+  }
+  const node = registry.nodes.find((item) => item.nodeId === route.selected.nodeId);
+  const instance = registry.agentInstances.find((item) => item.instanceId === route.selected.instanceId);
+  if (!node || !instance) throw new Error('selected qualification route is absent from registry');
+  if (node.controller || !node.workerOnly) throw new Error('qualification target must be worker-only');
+  if (instance.adapterId !== adapterId) throw new Error('selected agent adapter mismatch');
+  if (node.state !== 'enabled' || node.readiness !== 'ready' || node.capacity.available < 1) {
+    throw new Error('qualification target node is not ready');
+  }
+  if (instance.lifecycle !== 'enabled' || instance.readiness !== 'ready' || !instance.authenticated || instance.active >= instance.maxConcurrent) {
+    throw new Error('qualification target agent is not ready');
+  }
+  if (!REPO.test(repository || '')) throw new Error('repository is invalid');
+  if (!SHA.test(baseSha || '')) throw new Error('baseSha is invalid');
+  if (!/^sha256:[a-f0-9]{64}$/.test(authorityFingerprint || '')) throw new Error('authorityFingerprint is invalid');
+  if (!Number.isSafeInteger(issueNumber) || issueNumber < 1) throw new Error('issueNumber is invalid');
+  const expiry = new Date(expiresAt);
+  if (!Number.isFinite(expiry.getTime())) throw new Error('expiresAt is invalid');
+  const payload = {
+    schemaVersion: WORKER_POOL_SCHEMA_VERSION,
+    revision: WORKER_POOL_REVISION,
+    controllerNodeId: registry.controllerNodeId,
+    registryFingerprint: registry.registryFingerprint,
+    projectId: token(projectId, 'projectId'),
+    repository,
+    issueNumber,
+    authorityFingerprint,
+    baseSha: baseSha.toLowerCase(),
+    branch: token(branch, 'branch'),
+    worktree: token(worktree, 'worktree'),
+    nodeId: node.nodeId,
+    agentInstanceId: instance.instanceId,
+    adapterId: token(adapterId, 'adapterId'),
+    model: model ? token(model, 'model') : null,
+    profile: profile ? token(profile, 'profile') : null,
+    jobClass: enumValue(jobClass, WORKER_JOB_CLASSES, 'jobClass'),
+    laneId: token(laneId, 'laneId'),
+    resourcePartition: resourcePartition ? token(resourcePartition, 'resourcePartition') : null,
+    validationProfile: token(validationProfile, 'validationProfile'),
+    qualificationProfile: token(qualificationProfile, 'qualificationProfile'),
+    qualificationOnly: true,
+    providerAccountClass: providerAccountClass ? token(providerAccountClass, 'providerAccountClass') : instance.providerAccountClass,
+    nodeCapabilityFingerprint: node.capabilityFingerprint,
+    agentInstanceFingerprint: instance.instanceFingerprint,
+    expiresAt: expiry.toISOString(),
+  };
+  return Object.freeze({ ...payload, leaseFingerprint: digest(payload) });
+}
+
 export function validateWorkerLease({ lease, registry, executingNodeId, now = new Date() } = {}) {
   const refuse = (reason) => Object.freeze({ valid: false, reason });
   if (!lease || lease.schemaVersion !== WORKER_POOL_SCHEMA_VERSION) return refuse('lease-schema-invalid');
@@ -278,7 +410,13 @@ export function validateWorkerLease({ lease, registry, executingNodeId, now = ne
   if (instance.instanceFingerprint !== lease.agentInstanceFingerprint) return refuse('agent-instance-changed');
   if (instance.adapterId !== lease.adapterId) return refuse('wrong-agent');
   if (node.state !== 'enabled' || node.readiness !== 'ready') return refuse('node-no-longer-ready');
-  if (instance.lifecycle !== 'enabled' || instance.readiness !== 'ready' || !instance.authenticated || !instance.qualified) return refuse('agent-no-longer-ready');
+  if (lease.qualificationOnly === true) {
+    if (node.controller || !node.workerOnly) return refuse('qualification-target-not-worker-only');
+    if (!TOKEN.test(String(lease.qualificationProfile || ''))) return refuse('qualification-profile-invalid');
+    if (instance.lifecycle !== 'enabled' || instance.readiness !== 'ready' || !instance.authenticated) return refuse('agent-no-longer-ready');
+  } else if (instance.lifecycle !== 'enabled' || instance.readiness !== 'ready' || !instance.authenticated || !instance.qualified) {
+    return refuse('agent-no-longer-ready');
+  }
   if (!SHA.test(lease.baseSha || '') || !REPO.test(lease.repository || '')) return refuse('source-identity-invalid');
   const expires = new Date(lease.expiresAt);
   if (!Number.isFinite(expires.getTime()) || expires.getTime() <= new Date(now).getTime()) return refuse('lease-expired');
