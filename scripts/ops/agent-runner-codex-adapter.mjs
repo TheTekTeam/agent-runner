@@ -14,14 +14,13 @@ import { FAILURE_SCOPES, foldProbeOutcomes, probeOutcome } from './agent-runner-
  * that registry and can never resolve to this or any local process; only
  * `agent:codex-cli` identifies this adapter.
  *
- * Unlike the #40 Ollama/OpenCode foundation, Codex CLI is not a free local
- * runtime — a real invocation is an authenticated, metered call. So this
- * adapter adds a third gate beyond the shared enabled/paused/draining/
- * disabled lifecycle: `admitCodexPaidUse()` requires ALL of (1) explicit
- * machine-local paid-use approval, (2) a positive per-run cost or token
- * ceiling, and (3) the dispatching issue/run being explicitly labelled
- * `agent:codex-cli` (and never `agent:codex`, which would mean Codex Web
- * work, not a CLI run). Missing any one of the three fails closed.
+ * The original #48 foundation carried a paid-use admission helper. Binding
+ * #184/#186 policy now treats the normal ChatGPT-authenticated route as
+ * subscription-backed: `admitCodexDispatch()` requires current positively
+ * resolved quota/headroom and does not consult account credits, paid-use
+ * approval, dollar caps, token caps, or issue labels. The historical
+ * `admitCodexPaidUse()` helper remains exported only for compatibility and
+ * tests; it is not the live dispatch authority.
  *
  * Every probe is deterministic and non-generative: `executable` is a pure
  * local filesystem check, `version` runs the configured binary's
@@ -36,7 +35,7 @@ import { FAILURE_SCOPES, foldProbeOutcomes, probeOutcome } from './agent-runner-
  * embeds the path itself). `probeVersion()`'s failure path is the same: a
  * fixed reason, never the raw `execFileFn` error message (a real
  * child-process spawn error routinely embeds the executable path too).
- * `admitCodexPaidUse()`/`admitCodexDispatch()` return only booleans,
+ * `admitCodexPaidUse()`/`admitCodexQuotaUse()`/`admitCodexDispatch()` return only booleans,
  * machine-readable reasons, and probe names — never the raw settings
  * `entry` a caller passed in, so a configured `sessionSecretRef` or
  * `executablePath` can never ride along in a serialized admission decision.
@@ -132,7 +131,46 @@ export function admitCodexPaidUse({ entry = {}, labels = [] } = {}) {
 }
 
 /**
- * Settings gate, then executable/version probes, then the paid-use gate —
+ * Binding #184/#186 quota-only admission for the normal ChatGPT-authenticated
+ * Codex route. A current, positively resolved resource state is mandatory.
+ * Account credits, balances, paid-use approval and dollar/token caps are not
+ * inputs. Ambiguous/missing quota fails closed before provider launch.
+ */
+export function admitCodexQuotaUse({ resourceState = null } = {}) {
+  if (!isPlainObject(resourceState) || typeof resourceState.blocked !== 'boolean') {
+    const outcome = probeOutcome({
+      probe: 'quota-headroom',
+      ok: false,
+      reason: 'codex-quota-evidence-unavailable',
+    });
+    return {
+      ...foldProbeOutcomes([outcome], {
+        safeNextAction: 'Obtain current supported Codex quota/headroom evidence before provider launch.',
+      }),
+      probes: [outcome],
+    };
+  }
+
+  const outcome = resourceState.blocked
+    ? probeOutcome({
+      probe: 'quota-headroom',
+      ok: false,
+      reason: resourceState.reason || 'codex-quota-blocked',
+    })
+    : probeOutcome({ probe: 'quota-headroom', ok: true });
+
+  return {
+    ...foldProbeOutcomes([outcome], {
+      safeNextAction: resourceState.blocked
+        ? 'Wait for current Codex quota/headroom to become available before retrying.'
+        : null,
+    }),
+    probes: [outcome],
+  };
+}
+
+/**
+ * Settings gate, then executable/version probes, then the quota/headroom gate —
  * in strict sequence, never `Promise.all`, stopping at the first failure.
  * Returns `probes: []` and calls no injected I/O function at all when the
  * agent is not routable, which is itself the zero-process/zero-model-call
@@ -142,6 +180,7 @@ export function admitCodexDispatch({
   env = process.env,
   labels = [],
   settings,
+  resourceState = null,
   accessFn,
   execFileFn,
 } = {}) {
@@ -175,8 +214,9 @@ export function admitCodexDispatch({
     return { ...readinessDecision, probes: outcomes };
   }
 
-  const paidUseDecision = admitCodexPaidUse({ entry, labels });
-  return { ...paidUseDecision, probes: [...outcomes, ...paidUseDecision.probes] };
+  void labels;
+  const quotaDecision = admitCodexQuotaUse({ resourceState });
+  return { ...quotaDecision, probes: [...outcomes, ...quotaDecision.probes] };
 }
 
 export { classifyCodexExecutionError, codexUsageEnvelope, parseCodexResultEnvelope } from './agent-runner-codex-parser.mjs';

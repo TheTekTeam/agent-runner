@@ -10,6 +10,7 @@ import { AGENT_ADAPTERS, resolveAgentForLabels } from './agent-runner-agents.mjs
 import {
   admitCodexDispatch,
   admitCodexPaidUse,
+  admitCodexQuotaUse,
   buildCodexCommandArgs,
   CODEX_AGENT_ID,
   probeExecutable,
@@ -238,27 +239,38 @@ test('paid-use gate allows only when all three parts are simultaneously satisfie
   assert.ok(decision.probes.every((probe) => probe.ok));
 });
 
-test('full admission fails at the paid-use gate when executable/version pass but approval is missing', () => withTempRoot((dir) => {
+test('quota-only dispatch fails closed when executable/version pass but current quota evidence is missing', () => withTempRoot((dir) => {
   const execPath = writeFakeExecutable(dir);
   const decision = admitCodexDispatch({
-    settings: fakeSettings({ executablePath: execPath, maxCostUsdPerRun: 5 }),
+    settings: fakeSettings({ executablePath: execPath }),
     labels: CLI_LABELS,
     execFileFn: () => 'codex-cli 0.144.6',
   });
   assert.equal(decision.allowed, false);
-  assert.equal(decision.failedProbe, 'paid-use-approval');
-  assert.equal(decision.probes.length, 5);
+  assert.equal(decision.failedProbe, 'quota-headroom');
+  assert.equal(decision.reason, 'codex-quota-evidence-unavailable');
+  assert.equal(decision.probes.length, 3);
 }));
 
-test('full admission succeeds end-to-end when settings, executable, version, and all three paid-use conditions pass', () => withTempRoot((dir) => {
+test('quota-only dispatch refuses a positively blocked current resource state', () => {
+  const decision = admitCodexQuotaUse({
+    resourceState: { blocked: true, reason: 'codex-quota-threshold-exceeded' },
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.failedProbe, 'quota-headroom');
+  assert.equal(decision.reason, 'codex-quota-threshold-exceeded');
+});
+
+test('full admission succeeds end-to-end with current positive quota evidence and no paid-use approval', () => withTempRoot((dir) => {
   const execPath = writeFakeExecutable(dir);
   const decision = admitCodexDispatch({
-    settings: fakeSettings({ executablePath: execPath, ...PAID_USE_APPROVED }),
-    labels: CLI_LABELS,
+    settings: fakeSettings({ executablePath: execPath, paidUseApproved: false, maxCostUsdPerRun: 0, maxTokensPerRun: 0 }),
+    labels: [{ name: 'agent:codex-claude' }],
+    resourceState: { blocked: false },
     execFileFn: () => 'codex-cli 0.144.6',
   });
   assert.equal(decision.allowed, true);
-  assert.equal(decision.probes.length, 5);
+  assert.equal(decision.probes.length, 3);
   assert.ok(decision.probes.every((probe) => probe.ok));
 }));
 
@@ -288,6 +300,7 @@ test('command construction and admission against an isolated worktree never muta
     const decision = admitCodexDispatch({
       settings: fakeSettings({ executablePath: execPath, ...PAID_USE_APPROVED }),
       labels: CLI_LABELS,
+      resourceState: { blocked: false },
       execFileFn: () => 'codex-cli 0.144.6',
     });
     assert.equal(decision.allowed, true);
@@ -352,6 +365,7 @@ test('adversarial: a fully serialized admitCodexDispatch success decision carrie
   const decision = admitCodexDispatch({
     settings: fakeSettings(secretBearingEntry),
     labels: CLI_LABELS,
+    resourceState: { blocked: false },
     execFileFn: () => 'codex-cli 0.144.6',
   });
   assert.equal(decision.allowed, true);

@@ -39,6 +39,7 @@ export const CODEX_REASONING_EFFORTS = Object.freeze(['minimal', 'low', 'medium'
  */
 const APPROVAL_POLICY_CONFIG_KEY = 'approval_policy';
 const REASONING_EFFORT_CONFIG_KEY = 'model_reasoning_effort';
+const WORKSPACE_NETWORK_CONFIG_KEY = 'sandbox_workspace_write.network_access';
 
 function requireNonEmptyString(value, label) {
   const raw = typeof value === 'string' ? value.trim() : '';
@@ -55,8 +56,10 @@ function requireEnum(value, allowed, label) {
 }
 
 /**
- * Every argument is explicit and required except `reasoningEffort` and
- * `outputSchemaPath`, which are simply omitted (not defaulted) when unset.
+ * Every argument is explicit and required except `reasoningEffort`,
+ * `networkAccess` and `outputSchemaPath`, which are simply omitted (not
+ * defaulted) when unset. When `networkAccess` is supplied it is valid only
+ * for the `workspace-write` sandbox.
  * There is no code path in this function that can ever emit
  * `--dangerously-bypass-approvals-and-sandbox` or
  * `--dangerously-bypass-hook-trust` — those flags have no corresponding
@@ -69,6 +72,7 @@ export function buildCodexCommandArgs({
   sandboxMode,
   approvalMode,
   reasoningEffort,
+  networkAccess,
   outputSchemaPath,
   prompt,
 } = {}) {
@@ -92,6 +96,14 @@ export function buildCodexCommandArgs({
   if (reasoningEffort !== undefined && reasoningEffort !== null) {
     const resolvedEffort = requireEnum(reasoningEffort, CODEX_REASONING_EFFORTS, 'a reasoning effort');
     args.push('-c', `${REASONING_EFFORT_CONFIG_KEY}=${resolvedEffort}`);
+  }
+
+  if (networkAccess !== undefined && networkAccess !== null) {
+    if (typeof networkAccess !== 'boolean') throw new Error('buildCodexCommandArgs requires networkAccess to be boolean');
+    if (resolvedSandbox !== 'workspace-write') {
+      throw new Error('buildCodexCommandArgs permits networkAccess only with workspace-write sandbox');
+    }
+    args.push('-c', `${WORKSPACE_NETWORK_CONFIG_KEY}=${networkAccess}`);
   }
 
   if (typeof outputSchemaPath === 'string' && outputSchemaPath.trim()) {
