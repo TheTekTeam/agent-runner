@@ -86,7 +86,7 @@ import {
 import { inspectWorkspaceOwnership } from './agent-runner-workspace-ownership.mjs';
 import { withWorkspaceIdentitySupport } from './agent-runner-workspace-identity-store.mjs';
 import { withRecoveryIdentityGuard } from './agent-runner-recovery-identity-guard.mjs';
-import { EXECUTION_PHASE_IMPLEMENTATION, inferProfile, isSupportedModelId, parseKeyValueBlock, resolveImplementationDispatchIdentity, resolveProfile } from './claude-runner.mjs';
+import { EXECUTION_PHASE_IMPLEMENTATION, findPrFollowUpCandidates, inferProfile, isSupportedModelId, parseKeyValueBlock, resolveImplementationDispatchIdentity, resolveProfile } from './claude-runner.mjs';
 import { anyProfileQuotaAdmissible, evaluateProfileQuotaAdmission, quotaAdmissionEvidenceFromPreflight } from './claude-runner-quota.mjs';
 import {
   decorateIssueWithMetadata,
@@ -401,6 +401,100 @@ export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeS
   // Never set for a recovery re-invocation or a non-implementation dispatch.
   if (model) out.push('--model', String(model));
   return out;
+}
+
+const SHA40_PATTERN = /^[0-9a-f]{40}$/i;
+
+/**
+ * Canonical child invocation for routing one safely-bound unresolved linked
+ * PR through the accepted #238/#242 write-capable `--pr <n> --execute`
+ * continuation path (#239). Deliberately mirrors `runnerArgs()` for
+ * `--config`/`--output-dir`/`--execute` so the follow-up child runs under the
+ * exact same project config/output/auth boundary as an ordinary `--issue`
+ * launch. `--pr` and `--issue` are never combined in one recurrence: the
+ * caller returns immediately after this dispatch.
+ */
+export function prFollowUpArgs(prNumber, args) {
+  const out = [CLAUDE_RUNNER_ENTRYPOINT];
+  if (args.configPath) out.push('--config', args.configPath);
+  out.push('--pr', String(prNumber), '--output-dir', args.outputDir);
+  if (args.execute) out.push('--execute');
+  return out;
+}
+
+/**
+ * Pure selection over already-fetched #188 follow-up candidates (#239):
+ * - non-array (thread state unavailable) => fail closed, no dispatch;
+ * - zero candidates => preserve ordinary issue dispatch unchanged;
+ * - exactly one candidate => route it through `--pr` continuation;
+ * - more than one candidate => genuinely ambiguous follow-up authority,
+ *   fail closed (no dispatch at all, not even ordinary issue work).
+ * Failing closed never falls through to a fresh `--issue` launch.
+ */
+export function selectPrFollowUpDispatch({ candidates } = {}) {
+  if (!Array.isArray(candidates)) return { mode: 'unavailable', reason: 'thread-state-unavailable' };
+  if (candidates.length === 0) return { mode: 'issue', reason: null };
+  if (candidates.length > 1) {
+    return { mode: 'ambiguous', reason: 'multiple-linked-prs-with-unresolved-followup' };
+  }
+  return { mode: 'pr-followup', reason: candidates[0].unresolved.reasons.join(','), candidate: candidates[0] };
+}
+
+/**
+ * Resolve the scheduler's pr-followup dispatch decision for the selected
+ * issue (#239). A cheap `gh pr list` pass runs first: with no linked open PR
+ * at all, ordinary issue dispatch is preserved without a review-thread fetch.
+ * Any fetch error fails closed (`mode: 'unavailable'`) so an unreadable
+ * review-thread / stale-PR state never falls through to an ordinary issue
+ * launch by accident. This reuses the accepted #188 detector
+ * (`findPrFollowUpCandidates`) and does not reimplement review detection,
+ * manager parsing, PR continuation security or worktree preparation -- the
+ * `--pr --execute` child owns the #238/#242 continuation admission/binding
+ * and itself fails closed on any binding refusal.
+ */
+export async function resolvePrFollowUpDispatch({
+  repo, issueNumber, token, ghRunner = gh,
+  listPullRequests = listOpenPullRequests, fetchCandidates = findPrFollowUpCandidates,
+}) {
+  let openPrs;
+  try {
+    openPrs = listPullRequests(repo, ghRunner);
+  } catch (error) {
+    return { mode: 'unavailable', reason: 'linked-pr-list-fetch-failed', error: String(error?.message || error) };
+  }
+  const linked = findLinkedOpenPullRequests({ issueNumber, pullRequests: openPrs });
+  if (linked.length === 0) return { mode: 'issue', reason: null };
+
+  let candidates;
+  try {
+    candidates = await fetchCandidates({ repo, issue: issueNumber, token });
+  } catch (error) {
+    return { mode: 'unavailable', reason: 'thread-state-fetch-failed', error: String(error?.message || error) };
+  }
+  return selectPrFollowUpDispatch({ candidates });
+}
+
+/**
+ * Re-read the exact same PR number directly after the continuation child
+ * returns (#239 requirement 8). Returns an actual proven 40-hex head SHA or
+ * `null` -- never a scheduler mode/reason string, and never inferred from the
+ * pre-run value.
+ */
+export function readPullRequestHeadSha(repo, prNumber, ghRunner = gh) {
+  let raw;
+  try {
+    raw = ghRunner(['pr', 'view', String(prNumber), '--repo', repo, '--json', 'headRefOid,state']);
+  } catch {
+    return null;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw || '{}');
+  } catch {
+    return null;
+  }
+  const sha = typeof parsed.headRefOid === 'string' ? parsed.headRefOid.trim() : '';
+  return SHA40_PATTERN.test(sha) ? sha : null;
 }
 
 const OLLAMA_FORBIDDEN_TASK_CLASSES = new Set([
@@ -3523,6 +3617,140 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       })) return emitSystemicStatePause(args, state, 'dry-run-result-persistence', { now, logger: dependencies.logger }).exitCode;
       console.log(JSON.stringify({ ...payload, logPath }, null, 2));
       return 0;
+    }
+
+    // #239: at the selected-issue boundary, before any fresh recovery
+    // attempt, manager-packet claim/start mutation, issue status mutation,
+    // new worktree creation or ordinary `--issue` launch, route genuine
+    // unresolved #188 feedback on exactly one safely-bound linked PR through
+    // the accepted #238/#242 write-capable `--pr <n> --execute` continuation
+    // path. A recovery re-invocation (`recoveryClaim` truthy) already owns an
+    // active attempt/branch and is not re-selected here.
+    //
+    // This is scheduler selection/invocation only: the `--pr --execute` child
+    // owns continuation admission/binding, review-thread resolution refusal
+    // and tool policy, and itself fails closed on any binding refusal. The
+    // run is represented as `pr-followup` -- no manager packet consumption,
+    // no issue claim row / start marker, no new implementation branch or
+    // replacement PR, and the same global one-slot semantics (one child, then
+    // return) are preserved with no new lock, timer or service.
+    if (!recoveryClaim) {
+      const prFollowUpDispatch = await resolvePrFollowUpDispatch({
+        repo: args.repo,
+        issueNumber: selected.issue.number,
+        token: authEnv.GITHUB_TOKEN || authEnv.GH_TOKEN,
+        ghRunner,
+      });
+      if (prFollowUpDispatch.mode === 'unavailable' || prFollowUpDispatch.mode === 'ambiguous') {
+        // Handled fail-closed: thread state unavailable, ambiguous multiple
+        // linked PRs, or stale/unreadable PR state. Zero child launch, zero
+        // recovery attempt, zero claim, zero workspace/status mutation, and
+        // no fall-through to an ordinary `--issue` launch. This is a handled
+        // task-local no-op (accepted systemd handled semantics), not a
+        // service failure -- only genuine persistence failure fails here.
+        const prFollowUpStartedAt = now();
+        const finishedAt = now();
+        const payload = {
+          ...plan,
+          dispatchMode: 'pr-followup',
+          project: args.project?.repo || args.repo,
+          repository: args.repo,
+          issue: selected.issue.number,
+          pr: null,
+          preRunHeadSha: null,
+          failClosed: true,
+          failClosedReason: prFollowUpDispatch.reason,
+          childLaunched: false,
+          normalizedResult: 'fail-closed',
+          postRunHeadSha: null,
+          headChanged: false,
+          samePr: false,
+          claim: null,
+          startedAt: prFollowUpStartedAt,
+          finishedAt,
+          exitCode: 0,
+        };
+        const logPath = writeLog(args.outputDir, payload);
+        if (!state.record('recordRunResult', {
+          repo: args.repo, issueNumber: selected.issue.number, mode: 'pr-followup', exitCode: 0, logPath, payload,
+          startedAt: prFollowUpStartedAt, finishedAt,
+        })) return emitSystemicStatePause(args, state, 'pr-followup-fail-closed-result', { now, logger: dependencies.logger }).exitCode;
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return 0;
+      }
+      if (prFollowUpDispatch.mode === 'pr-followup') {
+        const prNumber = prFollowUpDispatch.candidate.pr.number;
+        const preRunHeadSha = SHA40_PATTERN.test(String(prFollowUpDispatch.candidate.pr.headSha || ''))
+          ? prFollowUpDispatch.candidate.pr.headSha
+          : null;
+        const prFollowUpStartedAt = now();
+        const prNodeArgs = prFollowUpArgs(prNumber, args);
+        if (!state.ensureWritable('pre-pr-followup-child-launch-write-probe')) {
+          return emitSystemicStatePause(args, state, 'pre-pr-followup-child-launch', { now, logger: dependencies.logger }).exitCode;
+        }
+        const runChild = dependencies.runChild || runChildWithWatchdog;
+        const result = await runChild({
+          command: process.execPath,
+          commandArgs: prNodeArgs,
+          options: { encoding: 'utf8', maxBuffer: 20 * 1024 * 1024, env: authEnv },
+          state,
+          args,
+          attemptId: null,
+          ghRunner,
+          spawnRunner: dependencies.spawnRunner || spawn,
+          processProbe: dependencies.processProbe || probeProcessIdentity,
+          progressProbe: dependencies.progressProbe || probeProcessProgress,
+          now,
+          watchdogIntervalMs: dependencies.watchdogIntervalMs || args.watchdogIntervalMs,
+          stalledPassLimit: dependencies.stalledPassLimit || args.stalledPassLimit,
+        });
+        const finishedAt = now();
+        const childPayload = parseChildRunnerOutput(result.stdout);
+        const childCheck = evaluateChildRunResult({ execute: args.execute, exitCode: result.status, childPayload });
+        // Re-read the *same PR number directly* after the child returns. This
+        // is an actual proven head SHA or null -- never a scheduler mode or
+        // reason string, and never inferred from the pre-run value.
+        const postRunHeadSha = readPullRequestHeadSha(args.repo, prNumber, ghRunner);
+        const childBlocked = Boolean(childPayload?.blocked) || childPayload?.failureReason != null;
+        const normalizedResult = childCheck.failed
+          ? (childBlocked ? `blocked:${childPayload?.reason || childPayload?.failureReason || childCheck.reason}` : `failed:${childCheck.reason}`)
+          : 'completed';
+        const payload = {
+          ...plan,
+          dispatchMode: 'pr-followup',
+          project: args.project?.repo || args.repo,
+          repository: args.repo,
+          issue: selected.issue.number,
+          pr: prNumber,
+          prHeadBranch: prFollowUpDispatch.candidate.pr.headRefName || null,
+          preRunHeadSha,
+          unresolvedFollowUpReasons: prFollowUpDispatch.candidate.unresolved.reasons,
+          childLaunched: true,
+          normalizedResult,
+          postRunHeadSha,
+          headChanged: Boolean(preRunHeadSha && postRunHeadSha && preRunHeadSha !== postRunHeadSha),
+          samePr: true,
+          claim: null,
+          runnerArgs: redactExecutableArgs(prNodeArgs),
+          childExitCode: result.status,
+          childSignal: result.signal,
+          childPayload,
+          startedAt: prFollowUpStartedAt,
+          finishedAt,
+          // A handled task-local continuation refusal (binding/admission
+          // fail-closed reported by the child) is not a service failure.
+          exitCode: childBlocked ? 0 : (childCheck.failed ? 1 : (result.status ?? 1)),
+        };
+        const logPath = writeLog(args.outputDir, payload);
+        if (!state.record('recordRunResult', {
+          repo: args.repo, issueNumber: selected.issue.number, mode: 'pr-followup', exitCode: payload.exitCode, logPath, payload,
+          startedAt: prFollowUpStartedAt, finishedAt,
+        })) return emitSystemicStatePause(args, state, 'pr-followup-result-persistence', { now, logger: dependencies.logger }).exitCode;
+        console.log(JSON.stringify({ ...payload, logPath }, null, 2));
+        return payload.exitCode;
+      }
+      // mode === 'issue': no linked-PR follow-up applies; preserve current
+      // ordinary issue execution exactly, unchanged below.
     }
 
     const startedAt = now();
