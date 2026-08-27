@@ -78,7 +78,7 @@ function packet({
   revision = 'AR389-Z790-CODEX-1',
   fingerprint = `sha256:${'a'.repeat(64)}`,
   agent = 'codex-cli',
-  branch = 'canary-codex-389-z790',
+  branch = 'canary/codex-389-z790',
   bodySuffix = '',
 } = {}) {
   const body = [
@@ -176,7 +176,7 @@ test('Dell build binds the exact current immutable manager packet to the Z790 qu
   assert.equal(built.request.lease.nodeId, 'dev-cluster-z790');
   assert.equal(built.request.lease.agentInstanceId, 'codex-cli@dev-cluster-z790');
   assert.equal(built.request.lease.baseSha, BASE);
-  assert.equal(built.request.lease.branch, 'canary-codex-389-z790');
+  assert.equal(built.request.lease.branch, 'canary/codex-389-z790');
   assert.equal(built.request.lease.qualificationOnly, true);
 });
 

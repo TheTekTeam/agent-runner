@@ -27,6 +27,23 @@ function token(value, name) {
   return value;
 }
 
+function validGitBranchName(value) {
+  const name = String(value || '');
+  if (!name || name.length > 255) return false;
+  if (name.startsWith('/') || name.endsWith('/') || name.includes('//')) return false;
+  if (name.includes('..') || name.includes('@{') || name === '@') return false;
+  if (/[\s~^:?*[\]\\\x00-\x1f\x7f]/.test(name)) return false;
+  if (name.endsWith('.')) return false;
+  const segments = name.split('/');
+  if (segments.some((segment) => !segment || segment.startsWith('.') || segment.endsWith('.lock'))) return false;
+  return true;
+}
+
+function gitBranch(value, name = 'branch') {
+  if (!validGitBranchName(value)) throw new Error(`${name} is invalid`);
+  return value;
+}
+
 function enumValue(value, allowed, name) {
   if (!allowed.includes(value)) throw new Error(`${name} is invalid`);
   return value;
@@ -305,7 +322,7 @@ export function issueWorkerLease({
     issueNumber,
     authorityFingerprint,
     baseSha: baseSha.toLowerCase(),
-    branch: token(branch, 'branch'),
+    branch: gitBranch(branch),
     worktree: token(worktree, 'worktree'),
     nodeId: node.nodeId,
     agentInstanceId: instance.instanceId,
@@ -375,7 +392,7 @@ export function issueWorkerQualificationLease({
     issueNumber,
     authorityFingerprint,
     baseSha: baseSha.toLowerCase(),
-    branch: token(branch, 'branch'),
+    branch: gitBranch(branch),
     worktree: token(worktree, 'worktree'),
     nodeId: node.nodeId,
     agentInstanceId: instance.instanceId,
@@ -417,7 +434,9 @@ export function validateWorkerLease({ lease, registry, executingNodeId, now = ne
   } else if (instance.lifecycle !== 'enabled' || instance.readiness !== 'ready' || !instance.authenticated || !instance.qualified) {
     return refuse('agent-no-longer-ready');
   }
-  if (!SHA.test(lease.baseSha || '') || !REPO.test(lease.repository || '')) return refuse('source-identity-invalid');
+  if (!SHA.test(lease.baseSha || '') || !REPO.test(lease.repository || '') || !validGitBranchName(lease.branch)) {
+    return refuse('source-identity-invalid');
+  }
   const expires = new Date(lease.expiresAt);
   if (!Number.isFinite(expires.getTime()) || expires.getTime() <= new Date(now).getTime()) return refuse('lease-expired');
   const candidate = { ...lease };
