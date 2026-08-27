@@ -115,3 +115,16 @@ test('networkAccess must be boolean when supplied', () => {
     prompt: 'create the bounded fixture',
   }), /networkAccess to be boolean/);
 });
+
+
+test('networkAccess override is refused outside workspace-write sandbox', () => {
+  assert.throws(() => buildCodexCommandArgs({
+    executablePath: '/usr/local/bin/codex',
+    cwd: '/tmp/worktree',
+    model: 'gpt-5.6-terra',
+    sandboxMode: 'read-only',
+    approvalMode: 'never',
+    networkAccess: false,
+    prompt: 'inspect only',
+  }), /only with workspace-write sandbox/);
+});
