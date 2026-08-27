@@ -422,6 +422,66 @@ export function parseBoundedDocumentationContent(resultText = '', {
 }
 
 /**
+ * Accept one bounded documentation replacement directive while keeping all
+ * filesystem authority in the deterministic supervising harness.
+ *
+ * The expected replacement is programme/harness-owned. The model may surround
+ * it with harmless prose or Markdown; qualification succeeds only when the
+ * exact replacement occurs once in bounded, NUL-free model output.
+ */
+export function parseBoundedDocumentationReplacement(resultText = '', {
+  expectedReplacement,
+  maxBytes = DEFAULT_DOCUMENT_OUTPUT_MAX_BYTES,
+} = {}) {
+  const text = String(resultText || '');
+  if (!Number.isInteger(maxBytes) || maxBytes <= 0) {
+    throw new Error('parseBoundedDocumentationReplacement requires a positive integer maxBytes');
+  }
+  if (Buffer.byteLength(text, 'utf8') > maxBytes) {
+    return { ok: false, reason: 'ollama-document-replacement-output-too-large', replacement: null };
+  }
+  if (text.includes('\u0000')) {
+    return { ok: false, reason: 'ollama-document-replacement-output-invalid', replacement: null };
+  }
+
+  const expected = String(expectedReplacement ?? '').replace(/\r\n?/g, '\n').trim();
+  if (
+    !expected
+    || expected.includes('\u0000')
+    || expected.includes('\n')
+    || Buffer.byteLength(expected, 'utf8') > maxBytes
+  ) {
+    throw new Error('parseBoundedDocumentationReplacement requires one bounded non-empty replacement line');
+  }
+
+  const normalized = text.replace(/\r\n?/g, '\n').trim();
+  if (!normalized) {
+    return { ok: false, reason: 'ollama-document-replacement-output-empty', replacement: null };
+  }
+
+  let matches = 0;
+  let offset = 0;
+  while (offset <= normalized.length) {
+    const found = normalized.indexOf(expected, offset);
+    if (found === -1) break;
+    matches += 1;
+    offset = found + expected.length;
+  }
+
+  if (matches === 1) {
+    return { ok: true, reason: null, replacement: expected };
+  }
+
+  return {
+    ok: false,
+    reason: matches === 0
+      ? 'ollama-document-replacement-mismatch'
+      : 'ollama-document-replacement-ambiguous',
+    replacement: null,
+  };
+}
+
+/**
  * OpenCode 1.18.4 `run --format json` emits newline-delimited event objects,
  * not the foundation's historical single result envelope. Keep the legacy
  * envelope parser for compatibility, but prefer the verified JSONL contract.
