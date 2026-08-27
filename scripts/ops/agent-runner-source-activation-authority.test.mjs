@@ -401,6 +401,170 @@ test('pending authority retries only the same immutable comment and newer simult
   assert.equal(blocked.calls.activate, 0);
 });
 
+
+test('#307 pending recovery reconciles only when canonical HEAD exactly proves the newest valid approved authority', async () => {
+  const old = authorityComment();
+  const pending = stateFor(old, { status: 'pending', finalHead: null });
+  const historical = authorityComment({
+    id: 101,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+  });
+  const current = authorityComment({
+    id: 102,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.3',
+      target_commit: THIRD,
+    },
+  });
+
+  const h = harness({
+    comments: [old, historical, current],
+    state: pending,
+    head: THIRD,
+    activation: { ok: true, result: 'already-active', finalHead: THIRD },
+  });
+
+  const result = await evaluateSourceActivationAuthority(h.options);
+  assert.deepEqual(result, {
+    action: 'reexec',
+    reason: 'source-activation-pending-head-reconciled',
+    sourceCommentId: 102,
+    previousSourceCommentId: 100,
+    targetCommit: THIRD,
+  });
+  assert.equal(h.calls.readHead, 1);
+  assert.equal(h.calls.activate, 1);
+  assert.equal(h.writes.length, 1);
+  assert.equal(h.writes[0].status, 'applied');
+  assert.equal(h.writes[0].sourceCommentId, 102);
+  assert.equal(h.writes[0].targetCommit, THIRD);
+  assert.equal(h.writes[0].finalHead, THIRD);
+});
+
+test('#307 pending recovery preserves ambiguity when HEAD is unchanged or does not prove newest target', async () => {
+  const old = authorityComment();
+  const pending = stateFor(old, { status: 'pending', finalHead: null });
+  const newer = authorityComment({
+    id: 101,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+  });
+
+  for (const head of [TARGET, THIRD]) {
+    const h = harness({ comments: [old, newer], state: pending, head });
+    const result = await evaluateSourceActivationAuthority(h.options);
+    assert.equal(result.action, 'halt');
+    assert.equal(result.reason, 'source-activation-authority-ambiguous');
+    assert.equal(result.sourceCommentId, 100);
+    assert.equal(h.calls.activate, 0);
+    assert.equal(h.writes.length, 0);
+  }
+});
+
+test('#307 pending recovery rejects malformed or unapproved intervening authority without mutating pending state', async () => {
+  const old = authorityComment();
+  const pending = stateFor(old, { status: 'pending', finalHead: null });
+  const malformed = authorityComment({
+    id: 101,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+    fingerprint: `sha256:${'f'.repeat(64)}`,
+  });
+  const current = authorityComment({
+    id: 102,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.3',
+      target_commit: THIRD,
+    },
+  });
+  const invalid = harness({ comments: [old, malformed, current], state: pending, head: THIRD });
+  const invalidResult = await evaluateSourceActivationAuthority(invalid.options);
+  assert.equal(invalidResult.action, 'halt');
+  assert.equal(invalidResult.reason, 'source-activation-recovery-authority-invalid');
+  assert.equal(invalid.calls.activate, 0);
+  assert.equal(invalid.writes.length, 0);
+
+  const unapproved = authorityComment({
+    id: 101,
+    login: 'worker-bot',
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+  });
+  const denied = harness({ comments: [old, unapproved, current], state: pending, head: THIRD });
+  const deniedResult = await evaluateSourceActivationAuthority(denied.options);
+  assert.equal(deniedResult.action, 'halt');
+  assert.equal(deniedResult.reason, 'source-activation-recovery-author-unapproved');
+  assert.equal(denied.calls.activate, 0);
+  assert.equal(denied.writes.length, 0);
+});
+
+test('#307 pending recovery preserves pending state on lock, source refusal or non-already-active result and replays idempotently after success', async () => {
+  const old = authorityComment();
+  const pending = stateFor(old, { status: 'pending', finalHead: null });
+  const current = authorityComment({
+    id: 101,
+    overrides: {
+      revision: 'AR-SOURCE-ACTIVATE-2026-08-17.2',
+      target_commit: NEXT,
+    },
+  });
+
+  const lock = new Error('held');
+  lock.code = 'AGENT_RUNNER_LOCKED';
+  const locked = harness({ comments: [old, current], state: pending, head: NEXT, activation: lock });
+  const lockedResult = await evaluateSourceActivationAuthority(locked.options);
+  assert.equal(lockedResult.action, 'halt');
+  assert.equal(lockedResult.reason, 'implementation-lock-unavailable');
+  assert.equal(locked.writes.length, 0);
+
+  const refused = harness({
+    comments: [old, current],
+    state: pending,
+    head: NEXT,
+    activation: new SourceActivationRefusal('dirty-checkout'),
+  });
+  const refusedResult = await evaluateSourceActivationAuthority(refused.options);
+  assert.equal(refusedResult.action, 'halt');
+  assert.equal(refusedResult.reason, 'dirty-checkout');
+  assert.equal(refused.writes.length, 0);
+
+  const wrongResult = harness({
+    comments: [old, current],
+    state: pending,
+    head: NEXT,
+    activation: { ok: true, result: 'activated', finalHead: NEXT },
+  });
+  await assert.rejects(
+    evaluateSourceActivationAuthority(wrongResult.options),
+    /already active/,
+  );
+  assert.equal(wrongResult.writes.length, 0);
+
+  const success = harness({
+    comments: [old, current],
+    state: pending,
+    head: NEXT,
+    activation: { ok: true, result: 'already-active', finalHead: NEXT },
+  });
+  assert.equal((await evaluateSourceActivationAuthority(success.options)).action, 'reexec');
+  const reconciled = success.writes.at(-1);
+
+  const replay = harness({ comments: [old, current], state: reconciled, head: NEXT });
+  const replayResult = await evaluateSourceActivationAuthority(replay.options);
+  assert.deepEqual(replayResult, { action: 'continue', reason: 'source-activation-authority-already-applied' });
+  assert.equal(replay.calls.activate, 0);
+  assert.equal(replay.writes.length, 0);
+});
+
 test('refused authority is durably deduped and blocks worker progression until a newer authority exists', async () => {
   const comment = authorityComment({ login: 'worker-bot' });
   const first = harness({ comments: [comment], head: '0'.repeat(40) });
