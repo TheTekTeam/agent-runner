@@ -55,11 +55,14 @@ function broaderValidationFamilyAllowed(argv = []) {
 
   if (executable === 'node') {
     // Focused --test is handled separately. Broader node execution is only
-    // acceptable when it names one repository-relative script; flags that
-    // change loader/import/eval behaviour are not accepted in this profile.
-    return argv.length >= 2
-      && !String(subcommand || '').startsWith('-')
-      && isSafeRelativeShellPath(subcommand);
+    // acceptable for an explicitly validation-oriented repository script;
+    // flags that change loader/import/eval behaviour and deploy/release-style
+    // arbitrary scripts are not accepted in this profile.
+    if (argv.length < 2
+      || String(subcommand || '').startsWith('-')
+      || !isSafeRelativeShellPath(subcommand)) return false;
+    const basename = String(subcommand).split('/').at(-1) || '';
+    return /(?:^|[._-])(?:test|check|validate|verify|lint|typecheck|build)(?:[._-]|$)/i.test(basename);
   }
 
   // npm/pnpm are limited to validation/build-oriented repository scripts.
