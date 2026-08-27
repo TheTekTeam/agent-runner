@@ -584,7 +584,70 @@ export async function evaluateSourceActivationAuthority({
   if (state?.status === 'pending') {
     const newer = markerComments.filter((comment) => commentId(comment) > state.sourceCommentId);
     if (newer.length > 0) {
-      return halt('source-activation-authority-ambiguous', { sourceCommentId: state.sourceCommentId });
+      const currentHead = readHead();
+
+      // Preserve the historical fail-closed ambiguity behaviour unless the
+      // canonical checkout positively proves that an external exact-head
+      // activation moved beyond the pending target.
+      if (currentHead === state.targetCommit) {
+        return halt('source-activation-authority-ambiguous', { sourceCommentId: state.sourceCommentId });
+      }
+
+      const parsedNewer = [];
+      for (const comment of newer) {
+        const parsed = parseSourceActivationAuthority(comment);
+        if (!parsed.valid) {
+          return halt('source-activation-recovery-authority-invalid', {
+            sourceCommentId: parsed.commentId || state.sourceCommentId,
+          });
+        }
+        if (!approvers.includes(parsed.author)) {
+          return halt('source-activation-recovery-author-unapproved', { sourceCommentId: parsed.commentId });
+        }
+        parsedNewer.push(parsed);
+      }
+
+      const latest = parsedNewer.at(-1);
+      if (latest.targetCommit !== currentHead) {
+        return halt('source-activation-recovery-target-head-mismatch', { sourceCommentId: latest.commentId });
+      }
+
+      let activation;
+      try {
+        activation = await activateSource({ target: latest.targetCommit, env });
+      } catch (error) {
+        if (error?.code === 'AGENT_RUNNER_LOCKED' || error?.reason === 'implementation-lock-unavailable') {
+          return halt('implementation-lock-unavailable', { sourceCommentId: latest.commentId });
+        }
+        if (error instanceof SourceActivationRefusal) {
+          return halt(error.reason, { sourceCommentId: latest.commentId });
+        }
+        throw error;
+      }
+
+      if (!activation?.ok || activation.result !== 'already-active' || activation.finalHead !== latest.targetCommit) {
+        authorityError(
+          'source-activation-recovery-result-invalid',
+          'Source activator did not prove the pending recovery target was already active.',
+        );
+      }
+
+      const applied = stateFromAuthority({
+        issueNumber,
+        parsed: latest,
+        status: 'applied',
+        refusalReason: null,
+        appliedAt: now(),
+        finalHead: activation.finalHead,
+      });
+      writeState(applied);
+      return {
+        action: 'reexec',
+        reason: 'source-activation-pending-head-reconciled',
+        sourceCommentId: latest.commentId,
+        previousSourceCommentId: state.sourceCommentId,
+        targetCommit: latest.targetCommit,
+      };
     }
     eligible = boundComment ? [boundComment] : [];
   } else if (state) {
