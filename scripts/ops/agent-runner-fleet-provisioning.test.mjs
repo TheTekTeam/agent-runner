@@ -19,7 +19,7 @@ test('fleet adapter set covers the initial owner-requested runtime set', () => {
   ]);
 });
 
-test('Claude, Codex and Ollama expose reviewed runtime contracts while only Claude is qualification-eligible', () => {
+test('Claude and Ollama expose qualification-eligible live runtime contracts while Codex remains foundation-only', () => {
   const claude = fleetAdapterRuntimeContract('claude-code-cli');
   assert.equal(claude.sourceSupported, true);
   assert.equal(claude.executable, 'claude');
@@ -65,8 +65,8 @@ test('Claude, Codex and Ollama expose reviewed runtime contracts while only Clau
   assert.equal(ollama.sourceSupported, true);
   assert.equal(ollama.executable, 'opencode');
   assert.equal(ollama.authenticationRequired, false);
-  assert.equal(ollama.liveDispatchImplemented, false);
-  assert.equal(ollama.qualificationEligible, false);
+  assert.equal(ollama.liveDispatchImplemented, true);
+  assert.equal(ollama.qualificationEligible, true);
   assert.deepEqual(ollama.versionProbe, { command: 'opencode', args: ['--version'] });
   assert.deepEqual(ollama.componentProbes, [
     {
@@ -275,7 +275,7 @@ test('Ollama runtime absence keeps local auth unavailable and cannot imply readi
   assert.equal(instance.authenticated, false);
 });
 
-test('Ollama runtime evidence remains non-routable until #152 qualification enables the live adapter', () => {
+test('Ollama accepts explicit per-node qualification evidence once the live adapter exists', () => {
   const evaluated = evaluateFleetAdapterEvidence({
     nodeId: 'dev-cluster-z790',
     adapterId: 'ollama-agent',
@@ -284,25 +284,25 @@ test('Ollama runtime evidence remains non-routable until #152 qualification enab
       version: '1.2.3',
       authAvailable: false,
       qualified: true,
-      qualificationRevision: 'fabricated',
+      qualificationRevision: 'ollama-z790-test-1',
       models: ['modelspend-code-local'],
       profiles: ['narrow'],
       jobClasses: ['implementation'],
     },
   });
-  assert.equal(evaluated.state, 'authenticated');
-  assert.equal(evaluated.reason, 'adapter-qualification-not-live');
+  assert.equal(evaluated.state, 'qualified');
+  assert.equal(evaluated.reason, null);
   assert.equal(evaluated.runtimeInstalled, true);
   assert.equal(evaluated.authAvailable, true);
-  assert.equal(evaluated.qualified, false);
-  assert.equal(evaluated.qualificationRevision, null);
+  assert.equal(evaluated.qualified, true);
+  assert.equal(evaluated.qualificationRevision, 'ollama-z790-test-1');
   assert.deepEqual(evaluated.models, ['modelspend-code-local']);
 
   const instance = buildFleetAgentInstance(evaluated);
-  assert.equal(instance.lifecycle, 'disabled');
-  assert.equal(instance.readiness, 'degraded');
+  assert.equal(instance.lifecycle, 'enabled');
+  assert.equal(instance.readiness, 'ready');
   assert.equal(instance.authenticated, true);
-  assert.equal(instance.qualified, false);
+  assert.equal(instance.qualified, true);
 });
 
 test('qualified evidence requires a bounded installed version and qualification revision', () => {
