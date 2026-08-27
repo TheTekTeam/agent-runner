@@ -263,6 +263,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       sandboxMode: 'workspace-write',
       approvalMode: 'never',
       reasoningEffort: metadata.effort,
+      networkAccess: false,
       prompt,
     });
 
