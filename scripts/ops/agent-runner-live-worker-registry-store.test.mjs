@@ -25,6 +25,12 @@ import {
 import { parseLiveWorkerRegistry, resolveLiveWorkerRoute } from './agent-runner-live-worker-routing.mjs';
 import { canonicalAcceptedQualificationResults } from './agent-runner-fleet-accepted-qualification-evidence.mjs';
 import { publishFleetQualification } from './agent-runner-fleet-qualification-publication.mjs';
+import {
+  FLEET_ACTIVATION_AUTHORITY_MARKER,
+  FLEET_ACTIVATION_AUTHORITY_SCHEMA_VERSION,
+  fleetActivationAuthorityFingerprint,
+  resolveFleetActivationAuthority,
+} from './agent-runner-fleet-activation-authority.mjs';
 
 const PUBLICATION = publishFleetQualification({ acceptedResults: canonicalAcceptedQualificationResults() });
 const CODEX_PUBLISHED = PUBLICATION.instances.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790');
@@ -34,14 +40,65 @@ const CODEX_FINGERPRINT = CODEX_PUBLISHED.acceptedResultFingerprint;
 const CLAUDE_REVISION = CLAUDE_PUBLISHED.qualificationRevision;
 const CLAUDE_FINGERPRINT = CLAUDE_PUBLISHED.acceptedResultFingerprint;
 
-function authority(seed, revision) {
-  const fingerprint = `sha256:${seed.repeat(64)}`;
-  return {
-    authorityRevision: revision,
-    authorityFingerprint: fingerprint,
-    authorityKey: `manager-preflight:${revision}:${fingerprint}`,
-    authorityPacketDigest: `sha256:${(seed === 'f' ? 'e' : 'f').repeat(64)}`,
+const SOURCE_SHA = '1'.repeat(40);
+const CONTROL_ISSUE = 402;
+const AUTH_ENV = { CLAUDE_RUNNER_IMPLEMENTATION_APPROVERS: 'gpcola' };
+
+function lifecycleAuthority({
+  loaded,
+  instanceId,
+  targetState,
+  id,
+  revision,
+  priorComments = [],
+}) {
+  const material = {
+    schema_version: FLEET_ACTIVATION_AUTHORITY_SCHEMA_VERSION,
+    revision,
+    target_repository: 'TheTekTeam/agent-runner',
+    target_issue: CONTROL_ISSUE,
+    target_source_commit: SOURCE_SHA,
+    target_registry_revision: loaded.revision,
+    target_registry_fingerprint: loaded.registry.registryFingerprint,
+    target_instance: instanceId,
+    target_state: targetState,
+    producer_type: 'normal_chatgpt_manager_session',
+    reason: 'supervised-fleet-lifecycle-test',
   };
+  const fingerprint = fleetActivationAuthorityFingerprint(material);
+  const comment = {
+    id,
+    user: { login: 'gpcola' },
+    body: `${FLEET_ACTIVATION_AUTHORITY_MARKER}
+\`\`\`yaml
+schema_version: ${material.schema_version}
+revision: ${material.revision}
+target_repository: ${material.target_repository}
+target_issue: ${material.target_issue}
+target_source_commit: ${material.target_source_commit}
+target_registry_revision: ${material.target_registry_revision}
+target_registry_fingerprint: ${material.target_registry_fingerprint}
+target_instance: ${material.target_instance}
+target_state: ${material.target_state}
+producer_type: ${material.producer_type}
+reason: ${material.reason}
+fingerprint: ${fingerprint}
+\`\`\`
+`,
+  };
+  const comments = [...priorComments, comment];
+  const activationAuthority = resolveFleetActivationAuthority({
+    comments,
+    env: AUTH_ENV,
+    controlIssue: CONTROL_ISSUE,
+    requestedCommentId: id,
+    currentSourceCommit: SOURCE_SHA,
+    registry: Object.freeze({ ...loaded.registry, documentRevision: loaded.revision }),
+    instanceId,
+    targetState,
+    previousTransition: loaded.document?.lastTransition || null,
+  });
+  return { activationAuthority, comments };
 }
 
 function tempRegistryPath() {
@@ -173,11 +230,18 @@ test('replace creates a mode-0600 canonical registry and reload is deterministic
 test('stale expected revision is rejected before mutation', () => {
   const { root, path } = tempRegistryPath();
   try {
-    replaceLiveWorkerRegistry({
+    const current = replaceLiveWorkerRegistry({
       path,
       expectedRevision: 0,
       controllerNodeId: 'dev-cluster-dell',
       registry: rawRegistry(),
+    });
+    const auth = lifecycleAuthority({
+      loaded: current,
+      instanceId: 'codex-cli@dev-cluster-z790',
+      targetState: 'disabled',
+      id: 100,
+      revision: 'AR402-FLEET-DISABLE-STALE-1',
     });
     assert.throws(
       () => transitionLiveWorkerInstance({
@@ -186,6 +250,7 @@ test('stale expected revision is rejected before mutation', () => {
         controllerNodeId: 'dev-cluster-dell',
         instanceId: 'codex-cli@dev-cluster-z790',
         targetState: 'disabled',
+        activationAuthority: auth.activationAuthority,
       }),
       LiveWorkerRegistryStaleRevisionError,
     );
@@ -207,13 +272,20 @@ test('one exact agent@node can be enabled, disabled and restored without changin
     const beforeCodex = initial.registry.agentInstances.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790');
     const beforeClaude = initial.registry.agentInstances.find((entry) => entry.instanceId === 'claude-code-cli@dev-cluster-z790');
 
+    const enableAuth = lifecycleAuthority({
+      loaded: initial,
+      instanceId: 'codex-cli@dev-cluster-z790',
+      targetState: 'enabled',
+      id: 100,
+      revision: 'AR402-FLEET-ACTIVATION-1',
+    });
     const enabled = transitionLiveWorkerInstance({
       path,
       expectedRevision: 1,
       controllerNodeId: 'dev-cluster-dell',
       instanceId: 'codex-cli@dev-cluster-z790',
       targetState: 'enabled',
-      ...authority('a', 'AR402-FLEET-ACTIVATION-1'),
+      activationAuthority: enableAuth.activationAuthority,
     });
     const enabledCodex = enabled.registry.agentInstances.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790');
     const enabledClaude = enabled.registry.agentInstances.find((entry) => entry.instanceId === 'claude-code-cli@dev-cluster-z790');
@@ -224,23 +296,40 @@ test('one exact agent@node can be enabled, disabled and restored without changin
     assert.equal(enabledClaude.qualificationRevision, beforeClaude.qualificationRevision);
     assert.equal(enabledClaude.qualificationEvidenceFingerprint, beforeClaude.qualificationEvidenceFingerprint);
 
+    const disableAuth = lifecycleAuthority({
+      loaded: enabled,
+      instanceId: 'codex-cli@dev-cluster-z790',
+      targetState: 'disabled',
+      id: 101,
+      revision: 'AR402-FLEET-DISABLE-1',
+      priorComments: enableAuth.comments,
+    });
     const disabled = transitionLiveWorkerInstance({
       path,
       expectedRevision: 2,
       controllerNodeId: 'dev-cluster-dell',
       instanceId: 'codex-cli@dev-cluster-z790',
       targetState: 'disabled',
+      activationAuthority: disableAuth.activationAuthority,
     });
     assert.equal(disabled.registry.agentInstances.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790').lifecycle, 'disabled');
     assert.deepEqual(disabled.document.activationAuthorities, {});
 
+    const restoreAuth = lifecycleAuthority({
+      loaded: disabled,
+      instanceId: 'codex-cli@dev-cluster-z790',
+      targetState: 'enabled',
+      id: 102,
+      revision: 'AR402-FLEET-ACTIVATION-2',
+      priorComments: disableAuth.comments,
+    });
     const restored = transitionLiveWorkerInstance({
       path,
       expectedRevision: 3,
       controllerNodeId: 'dev-cluster-dell',
       instanceId: 'codex-cli@dev-cluster-z790',
       targetState: 'enabled',
-      ...authority('b', 'AR402-FLEET-ACTIVATION-2'),
+      activationAuthority: restoreAuth.activationAuthority,
     });
     const restoredCodex = restored.registry.agentInstances.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790');
     assert.equal(restoredCodex.qualificationRevision, CODEX_REVISION);
@@ -254,11 +343,18 @@ test('one exact agent@node can be enabled, disabled and restored without changin
 test('canonical store is consumed by live routing with hard zero-paid and provider-account admission', () => {
   const { root, path } = tempRegistryPath();
   try {
-    replaceLiveWorkerRegistry({
+    const current = replaceLiveWorkerRegistry({
       path,
       expectedRevision: 0,
       controllerNodeId: 'dev-cluster-dell',
       registry: rawRegistry(),
+    });
+    const auth = lifecycleAuthority({
+      loaded: current,
+      instanceId: 'codex-cli@dev-cluster-z790',
+      targetState: 'enabled',
+      id: 110,
+      revision: 'AR402-FLEET-ACTIVATION-ROUTING-1',
     });
     transitionLiveWorkerInstance({
       path,
@@ -266,7 +362,7 @@ test('canonical store is consumed by live routing with hard zero-paid and provid
       controllerNodeId: 'dev-cluster-dell',
       instanceId: 'codex-cli@dev-cluster-z790',
       targetState: 'enabled',
-      ...authority('c', 'AR402-FLEET-ACTIVATION-1'),
+      activationAuthority: auth.activationAuthority,
     });
     const env = {
       HOME: root,
@@ -294,11 +390,18 @@ test('canonical store is consumed by live routing with hard zero-paid and provid
 test('provider-account cap blocks an otherwise qualified canonical route', () => {
   const { root, path } = tempRegistryPath();
   try {
-    replaceLiveWorkerRegistry({
+    const current = replaceLiveWorkerRegistry({
       path,
       expectedRevision: 0,
       controllerNodeId: 'dev-cluster-dell',
       registry: rawRegistry(),
+    });
+    const auth = lifecycleAuthority({
+      loaded: current,
+      instanceId: 'codex-cli@dev-cluster-z790',
+      targetState: 'enabled',
+      id: 120,
+      revision: 'AR402-FLEET-ACTIVATION-CAP-1',
     });
     transitionLiveWorkerInstance({
       path,
@@ -306,7 +409,7 @@ test('provider-account cap blocks an otherwise qualified canonical route', () =>
       controllerNodeId: 'dev-cluster-dell',
       instanceId: 'codex-cli@dev-cluster-z790',
       targetState: 'enabled',
-      ...authority('d', 'AR402-FLEET-ACTIVATION-1'),
+      activationAuthority: auth.activationAuthority,
     });
     const env = {
       AGENT_RUNNER_WORKER_REGISTRY_PATH: path,
@@ -331,11 +434,18 @@ test('provider-account cap blocks an otherwise qualified canonical route', () =>
 test('lifecycle transition refuses an instance that still reports active work', () => {
   const { root, path } = tempRegistryPath();
   try {
-    replaceLiveWorkerRegistry({
+    const current = replaceLiveWorkerRegistry({
       path,
       expectedRevision: 0,
       controllerNodeId: 'dev-cluster-dell',
       registry: rawRegistry({ codexActive: 1 }),
+    });
+    const auth = lifecycleAuthority({
+      loaded: current,
+      instanceId: 'codex-cli@dev-cluster-z790',
+      targetState: 'enabled',
+      id: 130,
+      revision: 'AR402-FLEET-ACTIVE-CONFLICT-1',
     });
     assert.throws(
       () => transitionLiveWorkerInstance({
@@ -344,8 +454,7 @@ test('lifecycle transition refuses an instance that still reports active work', 
         controllerNodeId: 'dev-cluster-dell',
         instanceId: 'codex-cli@dev-cluster-z790',
         targetState: 'enabled',
-        authorityRevision: 'AR402-FLEET-ACTIVATION-1',
-        authorityFingerprint: `sha256:${'f'.repeat(64)}`,
+        activationAuthority: auth.activationAuthority,
       }),
       /active-work-conflict/,
     );
@@ -362,11 +471,20 @@ test('unknown or paid cost posture cannot be activated', () => {
   ]) {
     const { root, path } = tempRegistryPath();
     try {
-      replaceLiveWorkerRegistry({
+      const current = replaceLiveWorkerRegistry({
         path,
         expectedRevision: 0,
         controllerNodeId: 'dev-cluster-dell',
         registry: rawRegistry(fixture),
+      });
+      const auth = lifecycleAuthority({
+        loaded: current,
+        instanceId: 'codex-cli@dev-cluster-z790',
+        targetState: 'enabled',
+        id: fixture.codexCostPosture === 'unknown' ? 140 : 141,
+        revision: fixture.codexCostPosture === 'unknown'
+          ? 'AR402-FLEET-COST-UNKNOWN-1'
+          : 'AR402-FLEET-COST-PAID-1',
       });
       assert.throws(
         () => transitionLiveWorkerInstance({
@@ -375,8 +493,7 @@ test('unknown or paid cost posture cannot be activated', () => {
           controllerNodeId: 'dev-cluster-dell',
           instanceId: 'codex-cli@dev-cluster-z790',
           targetState: 'enabled',
-          authorityRevision: 'AR402-FLEET-ACTIVATION-1',
-          authorityFingerprint: `sha256:${'e'.repeat(64)}`,
+          activationAuthority: auth.activationAuthority,
         }),
         fixture.expected,
       );
