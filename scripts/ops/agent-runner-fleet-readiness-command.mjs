@@ -12,6 +12,9 @@ import {
 import {
   publishFleetQualification,
 } from './agent-runner-fleet-qualification-publication.mjs';
+import {
+  canonicalAcceptedQualificationResults,
+} from './agent-runner-fleet-accepted-qualification-evidence.mjs';
 
 export const FLEET_READINESS_COMMAND_SCHEMA_VERSION = 1;
 const NODE_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
@@ -193,7 +196,7 @@ export function probeFleetRuntime(adapterId, { runner = spawnSync } = {}) {
   });
 }
 
-export function collectFleetReadiness({ nodeId, workerOnly = false, runner = spawnSync, platform = process.platform, arch = process.arch, acceptedQualificationResults = [] } = {}) {
+export function collectFleetReadiness({ nodeId, workerOnly = false, runner = spawnSync, platform = process.platform, arch = process.arch, acceptedQualificationResults = canonicalAcceptedQualificationResults() } = {}) {
   if (typeof nodeId !== 'string' || !NODE_ID.test(nodeId)) throw new Error('nodeId is invalid');
   if (!Array.isArray(acceptedQualificationResults)) throw new Error('acceptedQualificationResults must be an array');
   if (workerOnly) {

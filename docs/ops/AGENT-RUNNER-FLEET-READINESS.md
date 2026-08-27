@@ -160,6 +160,15 @@ enables normal multi-node routing.
 - Publication grants Z790 no scheduler, queue-selection, manager,
   source-activation or GitHub-management authority and enables no paid/API
   fallback.
+- `agent-runner-fleet-accepted-qualification-evidence.mjs` is the canonical
+  repository-owned static accepted-evidence source. It holds only the two
+  independently accepted Z790 acceptance records (#389 Codex, #398 Claude) with
+  just the bounded fields the publication consumes, and performs no runtime
+  GitHub/network lookup and no machine-local credential/session/config read. The
+  default `collectFleetReadiness()` / `npm run fleet:readiness` path consumes it,
+  so real CLI output publishes both accepted Z790 instances while both Dell
+  instances stay explicit fail-closed evidence gaps. Focused tests may still
+  inject `acceptedQualificationResults` explicitly.
 
 ## Authentication and qualification
 

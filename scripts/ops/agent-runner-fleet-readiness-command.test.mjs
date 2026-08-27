@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
 import {
   collectFleetReadiness,
   probeFleetRuntime,
 } from './agent-runner-fleet-readiness-command.mjs';
+
+const COMMAND_PATH = fileURLToPath(new URL('./agent-runner-fleet-readiness-command.mjs', import.meta.url));
 
 test('runtime probes execute only reviewed Claude/Codex/Ollama/OpenCode version commands', () => {
   const calls = [];
@@ -337,12 +342,73 @@ test('live readiness projection consumes accepted qualification evidence without
   assert.equal(result.controllerAuthorityGranted, false);
 });
 
-test('readiness without accepted evidence publishes all four instances as non-routable evidence gaps', () => {
-  const result = collectFleetReadiness({ nodeId: 'dev-cluster-z790', workerOnly: true, runner: installedRunner });
+test('explicit empty accepted evidence publishes all four instances as non-routable evidence gaps', () => {
+  const result = collectFleetReadiness({
+    nodeId: 'dev-cluster-z790', workerOnly: true, runner: installedRunner, acceptedQualificationResults: [],
+  });
   const pub = result.qualificationPublication;
   assert.equal(pub.normalRoutingEnabled, false);
   assert.equal(pub.instances.length, 4);
   assert.equal(pub.instances.every((entry) => entry.published === false && entry.routable === false), true);
+});
+
+test('default readiness path consumes the canonical accepted Z790 evidence without enabling routing', () => {
+  const result = collectFleetReadiness({ nodeId: 'dev-cluster-z790', workerOnly: true, runner: installedRunner });
+  const pub = result.qualificationPublication;
+  assert.equal(pub.normalRoutingEnabled, false);
+
+  const published = pub.instances.filter((entry) => entry.published === true);
+  assert.deepEqual(published.map((entry) => entry.instanceId).sort(), [
+    'claude-code-cli@dev-cluster-z790',
+    'codex-cli@dev-cluster-z790',
+  ]);
+  for (const entry of published) {
+    assert.equal(entry.qualified, true);
+    assert.equal(entry.routable, false);
+    assert.equal(entry.routingEligible, false);
+    assert.equal(entry.normalRoutingEnabled, false);
+    assert.equal(entry.lifecycle, 'disabled');
+  }
+  const z790Claude = published.find((entry) => entry.instanceId === 'claude-code-cli@dev-cluster-z790');
+  assert.equal(z790Claude.qualificationRevision, 'claude-z790-7e13ce3be223baf8');
+  assert.equal(z790Claude.installedVersion, '2.1.231');
+  const z790Codex = published.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790');
+  assert.equal(z790Codex.qualificationRevision, 'codex-z790-58e9d9edf45669ac');
+  assert.equal(z790Codex.installedVersion, '0.146.0');
+
+  for (const instanceId of ['claude-code-cli@dev-cluster-dell', 'codex-cli@dev-cluster-dell']) {
+    const dell = pub.instances.find((entry) => entry.instanceId === instanceId);
+    assert.equal(dell.published, false);
+    assert.equal(dell.state, 'evidence-gap');
+  }
+});
+
+test('default CLI entrypoint publishes accepted Z790 evidence and keeps Dell fail-closed', () => {
+  const stdout = execFileSync(process.execPath, [COMMAND_PATH, '--node', 'dev-cluster-z790', '--worker-only'], {
+    encoding: 'utf8',
+    env: { PATH: process.env.PATH || '' },
+  });
+  const parsed = JSON.parse(stdout);
+  const pub = parsed.qualificationPublication;
+  assert.equal(pub.normalRoutingEnabled, false);
+  assert.equal(parsed.controllerAuthorityGranted, false);
+
+  const z790Claude = pub.instances.find((entry) => entry.instanceId === 'claude-code-cli@dev-cluster-z790');
+  const z790Codex = pub.instances.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790');
+  assert.equal(z790Claude.published, true);
+  assert.equal(z790Codex.published, true);
+  assert.equal(z790Claude.qualificationRevision, 'claude-z790-7e13ce3be223baf8');
+  assert.equal(z790Codex.qualificationRevision, 'codex-z790-58e9d9edf45669ac');
+  for (const entry of [z790Claude, z790Codex]) {
+    assert.equal(entry.routable, false);
+    assert.equal(entry.routingEligible, false);
+    assert.equal(entry.lifecycle, 'disabled');
+  }
+  for (const instanceId of ['claude-code-cli@dev-cluster-dell', 'codex-cli@dev-cluster-dell']) {
+    const dell = pub.instances.find((entry) => entry.instanceId === instanceId);
+    assert.equal(dell.published, false);
+    assert.equal(dell.state, 'evidence-gap');
+  }
 });
 
 test('bounded readiness output contains no environment, credential, session or filesystem path fields', () => {
