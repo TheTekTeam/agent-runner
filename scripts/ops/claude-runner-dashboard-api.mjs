@@ -736,6 +736,6 @@ export function run(argv = process.argv.slice(2), env = process.env, io = { stdo
   return args.strict && !dashboard.ok ? 1 : 0;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   process.exitCode = run();
 }
