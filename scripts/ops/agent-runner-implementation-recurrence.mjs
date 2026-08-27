@@ -36,6 +36,7 @@ import {
 const HERE = dirname(fileURLToPath(import.meta.url));
 const CANDIDATE_PROBE_SCRIPT = resolve(HERE, 'claude-runner-candidate-probe.mjs');
 const RUN_PROJECT_WRAPPER = resolve(HERE, '../../bin/run-project.sh');
+const REPOSITORY_ROOT = resolve(HERE, '../..');
 
 export const NO_RUNNABLE_CANDIDATE_EXIT_CODE = 3;
 export const EVIDENCE_DIR_ENV = 'AGENT_RUNNER_IMPLEMENTATION_EVIDENCE_DIR';
@@ -96,6 +97,19 @@ export function resolveLocalWorkerNodeId(env = process.env) {
     throw new Error(`${LOCAL_WORKER_NODE_ID_ENV} is invalid`);
   }
   return value;
+}
+
+export function resolveCurrentRunnerSourceCommit(spawnFn = spawnSync) {
+  const result = spawnFn('git', ['rev-parse', '--verify', 'HEAD^{commit}'], {
+    cwd: REPOSITORY_ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'ignore'],
+  });
+  const head = String(result?.stdout || '').trim().toLowerCase();
+  if (result?.status !== 0 || !/^[a-f0-9]{40}$/.test(head)) {
+    throw new Error('current Agent Runner source commit is unavailable');
+  }
+  return head;
 }
 
 export function loadEnabledProjectsWithConfigPaths({ argv = [], env = process.env, registryPath } = {}) {
@@ -242,10 +256,11 @@ export function admitRecurrenceSelections(selected, {
   env = process.env,
   maxParallel,
   remoteTransportAvailable = false,
+  currentSourceCommit = null,
 } = {}) {
   const caps = resolveRecurrenceLaneCaps(env, maxParallel);
   const nodeId = resolveLocalWorkerNodeId(env);
-  const workerRegistry = parseLiveWorkerRegistry(env, { expectedControllerNodeId: nodeId });
+  const workerRegistry = parseLiveWorkerRegistry(env, { expectedControllerNodeId: nodeId, currentSourceCommit });
   const remoteRouteEnabled = remoteTransportAvailable === true && remoteWorkerDispatchEnabled(env);
 
   // Reserve provider/account capacity as routes are selected inside this
@@ -294,6 +309,7 @@ export function admitRecurrenceSelections(selected, {
     registryFingerprint: workerRegistry?.registryFingerprint || null,
     registrySource: workerRegistry?.registrySource || null,
     registryDocumentRevision: workerRegistry?.documentRevision || null,
+    currentSourceCommit: currentSourceCommit || null,
     remoteRouteEnabled,
     routes: routed.map(({ entry, outcome, workerRoute }) => ({
       laneId: implementationLaneForSelection(entry, outcome),
@@ -331,6 +347,7 @@ export async function runImplementationRecurrence({
   now = () => new Date().toISOString(),
   writeEvidenceFile = writeEvidence,
   computeProfileShadow = computeManagerProfileShadow,
+  readSourceCommit = resolveCurrentRunnerSourceCommit,
 } = {}) {
   const { registryPath: resolvedRegistryPath, projects } = loadEnabledProjectsWithConfigPaths({ argv, env, registryPath });
   const maxParallel = resolveMaxParallel(env, projects.length);
@@ -344,15 +361,20 @@ export async function runImplementationRecurrence({
   try {
     ({ selected, probed } = selectRunnableProjects(projects, { probeProject, argv, env, maxParallel }));
     profileShadow = computeProfileShadow(projects);
+    const currentSourceCommit = readSourceCommit();
     const admitted = admitRecurrenceSelections(selected, {
       env,
       maxParallel,
       remoteTransportAvailable: typeof invokeRemoteProject === 'function',
+      currentSourceCommit,
     });
     selected = admitted.admittedSelections;
     laneAdmission = {
       nodeId: admitted.nodeId,
       registryFingerprint: admitted.registryFingerprint,
+      registrySource: admitted.registrySource,
+      registryDocumentRevision: admitted.registryDocumentRevision,
+      currentSourceCommit: admitted.currentSourceCommit,
       remoteRouteEnabled: admitted.remoteRouteEnabled,
       caps: admitted.caps,
       routes: admitted.routes,
