@@ -145,7 +145,7 @@ export const AGENT_SETTINGS_EXAMPLE = Object.freeze({
       // routing logic (the selector additionally hard-clamps ollama-agent to
       // riskClasses containing only "low"; this field cannot widen that).
       qualification: Object.freeze({
-        taskClasses: Object.freeze(['docs']),
+        taskClasses: Object.freeze([]),
         riskClasses: Object.freeze(['low']),
         models: Object.freeze([]),
         harness: null,

@@ -5,7 +5,7 @@
   "localRepoPath": "/workspace/agent-runner",
   "outputDir": ".var/agent-runner",
   "stateDbPath": ".var/agent-runner/runner-state.sqlite",
-  "acceptedAgentLabels": ["agent:chatgpt", "agent:codex-claude"],
+  "acceptedAgentLabels": ["agent:chatgpt", "agent:codex-claude", "agent:ollama"],
   "statusLabels": {
     "ready": "status:ready",
     "inProgress": "status:in-progress"

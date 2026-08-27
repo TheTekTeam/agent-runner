@@ -11,7 +11,7 @@ export const DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG = Object.freeze({
   localRepoPath: '/workspace/modelspend',
   outputDir: '.var/claude-runner',
   stateDbPath: '.var/claude-runner/runner-state.sqlite',
-  acceptedAgentLabels: ['agent:claude', 'agent:claude-code-cli'],
+  acceptedAgentLabels: ['agent:claude', 'agent:claude-code-cli', 'agent:ollama'],
   statusLabels: {
     ready: 'status:ready',
     inProgress: 'status:in-progress',

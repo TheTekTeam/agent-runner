@@ -44,7 +44,7 @@ test('loadAgentRunnerConfig returns default ModelSpend config without an explici
   assert.equal(config.projectId, 'modelspend');
   assert.equal(config.githubRepo, 'TheTekTeam/modelspend');
   assert.equal(config.outputDir, '.var/claude-runner');
-  assert.deepEqual(config.acceptedAgentLabels, ['agent:claude', 'agent:claude-code-cli']);
+  assert.deepEqual(config.acceptedAgentLabels, ['agent:claude', 'agent:claude-code-cli', 'agent:ollama']);
   assert.equal(config.queueTriage.enabled, false);
   assert.equal(config.queueTriage.maxMutations, 3);
 });

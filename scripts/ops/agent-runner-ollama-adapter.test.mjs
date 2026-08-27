@@ -659,3 +659,50 @@ test('bounded documentation replacement requires exactly one non-empty replaceme
     /one bounded non-empty replacement line/,
   );
 });
+
+
+test('#376 exact OpenCode version mismatch fails before endpoint access', async () => withTempRoot(async (dir) => {
+  const execPath = writeFakeExecutable(dir);
+  const decision = await admitOllamaDispatch({
+    settings: fakeSettings({
+      executablePath: execPath,
+      endpoint: 'http://127.0.0.1:11434',
+      installedModelAllowlist: ['modelspend-code-local:latest'],
+    }),
+    model: 'modelspend-code-local:latest',
+    execFileFn: () => 'opencode 1.18.3',
+    fetchFn: neverCalled('fetchFn'),
+    freeMemoryFn: neverCalled('freeMemoryFn'),
+    requiredExecutableVersion: '1.18.4',
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'ollama-version-mismatch');
+  assert.equal(decision.failedProbe, 'version');
+}));
+
+test('#376 exact Ollama runtime version is checked through metadata before model execution', async () => withTempRoot(async (dir) => {
+  const execPath = writeFakeExecutable(dir);
+  const calls = [];
+  const fetchFn = async (url) => {
+    calls.push(url);
+    if (url.endsWith('/api/version')) return { ok: true, json: async () => ({ version: '0.32.0' }) };
+    return { ok: true, json: async () => ({ models: [{ name: 'modelspend-code-local:latest' }] }) };
+  };
+  const decision = await admitOllamaDispatch({
+    settings: fakeSettings({
+      executablePath: execPath,
+      endpoint: 'http://127.0.0.1:11434',
+      installedModelAllowlist: ['modelspend-code-local:latest'],
+    }),
+    model: 'modelspend-code-local:latest',
+    execFileFn: () => 'opencode 1.18.4',
+    fetchFn,
+    freeMemoryFn: neverCalled('freeMemoryFn'),
+    requiredExecutableVersion: '1.18.4',
+    requiredOllamaVersion: '0.32.1',
+  });
+  assert.equal(decision.allowed, false);
+  assert.equal(decision.reason, 'ollama-runtime-version-mismatch');
+  assert.equal(decision.failedProbe, 'ollama-version');
+  assert.ok(calls.some((url) => url.endsWith('/api/version')));
+}));

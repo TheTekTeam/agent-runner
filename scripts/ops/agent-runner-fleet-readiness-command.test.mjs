@@ -258,7 +258,7 @@ test('worker-only readiness projection grants no scheduler/controller authority 
 
   const ollama = result.provisioningProjection.adapters.find((entry) => entry.adapterId === 'ollama-agent');
   assert.equal(ollama.state, 'authenticated');
-  assert.equal(ollama.reason, 'adapter-qualification-not-live');
+  assert.equal(ollama.reason, 'per-node-qualification-required');
   assert.equal(ollama.authAvailable, true);
   assert.equal(ollama.qualified, false);
 
