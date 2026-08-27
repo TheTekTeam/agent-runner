@@ -31,6 +31,9 @@ import { normalizeOllamaUsageEfficiency } from './agent-runner-usage-telemetry.m
  * tests can prove zero real process/network access.
  */
 export const OLLAMA_AGENT_ID = 'ollama-agent';
+export const QUALIFIED_OLLAMA_CODING_MODEL = 'modelspend-code-local:latest';
+export const QUALIFIED_OPENCODE_VERSION = '1.18.4';
+export const QUALIFIED_OLLAMA_VERSION = '0.32.1';
 
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
 
@@ -88,13 +91,25 @@ export function probeExecutable({ executablePath, accessFn = accessSync } = {}) 
 }
 
 /** Deterministic `--version` banner read. Never issues a generation request. */
-export function probeVersion({ executablePath, execFileFn } = {}) {
+export function probeVersion({ executablePath, execFileFn, requiredVersion = null } = {}) {
   if (typeof execFileFn !== 'function') {
     return probeOutcome({ probe: 'version', ok: false, reason: 'ollama-version-probe-unavailable' });
   }
   try {
     const stdout = String(execFileFn(executablePath, ['--version']) || '').trim();
     if (!stdout) return probeOutcome({ probe: 'version', ok: false, reason: 'ollama-version-unreadable' });
+    if (requiredVersion) {
+      const version = String(requiredVersion);
+      const tokens = stdout.split(/[^0-9.]+/).filter(Boolean);
+      if (!tokens.includes(version)) {
+        return probeOutcome({
+          probe: 'version',
+          ok: false,
+          reason: 'ollama-version-mismatch',
+          detail: `required=${version}`,
+        });
+      }
+    }
     return probeOutcome({ probe: 'version', ok: true, detail: stdout });
   } catch (error) {
     return probeOutcome({ probe: 'version', ok: false, reason: 'ollama-version-probe-failed', detail: error.message });
@@ -183,6 +198,8 @@ export async function admitOllamaDispatch({
   execFileFn,
   fetchFn,
   freeMemoryFn,
+  requiredExecutableVersion = null,
+  requiredOllamaVersion = null,
 } = {}) {
   const resolvedSettings = settings || getAgentSettings({ env, agentId: OLLAMA_AGENT_ID });
   if (!resolvedSettings.routable) {
@@ -207,13 +224,34 @@ export async function admitOllamaDispatch({
     : probeOutcome({ probe: 'executable', ok: false, reason: executable.reason }));
 
   if (outcomes.at(-1).ok) {
-    outcomes.push(probeVersion({ executablePath: executable.path, execFileFn }));
+    outcomes.push(probeVersion({
+      executablePath: executable.path,
+      execFileFn,
+      requiredVersion: requiredExecutableVersion,
+    }));
   }
 
   if (outcomes.every((outcome) => outcome.ok)) {
     outcomes.push(endpoint.ok
       ? await probeEndpoint({ endpointUrl: endpoint.url, fetchFn })
       : probeOutcome({ probe: 'endpoint', ok: false, reason: endpoint.reason }));
+  }
+
+  if (outcomes.every((outcome) => outcome.ok) && requiredOllamaVersion) {
+    try {
+      const response = await fetchFn(new URL('/api/version', endpoint.url).toString(), { method: 'GET' });
+      if (!response || response.ok !== true) {
+        outcomes.push(probeOutcome({ probe: 'ollama-version', ok: false, reason: 'ollama-runtime-version-unavailable' }));
+      } else {
+        const payload = await response.json();
+        const actual = String(payload?.version || '').trim();
+        outcomes.push(actual === String(requiredOllamaVersion)
+          ? probeOutcome({ probe: 'ollama-version', ok: true, detail: actual })
+          : probeOutcome({ probe: 'ollama-version', ok: false, reason: 'ollama-runtime-version-mismatch', detail: `required=${requiredOllamaVersion}` }));
+      }
+    } catch (error) {
+      outcomes.push(probeOutcome({ probe: 'ollama-version', ok: false, reason: 'ollama-runtime-version-probe-failed', detail: error.message }));
+    }
   }
 
   if (outcomes.every((outcome) => outcome.ok)) {
