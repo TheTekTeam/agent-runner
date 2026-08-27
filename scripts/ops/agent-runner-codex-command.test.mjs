@@ -68,6 +68,25 @@ test('outputSchemaPath is a plain file path passed through only when provided', 
   assert.equal(withSchema[schemaIndex + 1], '/tmp/schema.json');
 });
 
+
+test('ephemeral and ignoreUserConfig flags are explicit booleans and emitted only when enabled', () => {
+  const isolated = buildCodexCommandArgs({
+    ...BASE,
+    ephemeral: true,
+    ignoreUserConfig: true,
+  });
+
+  assert.ok(isolated.includes('--ephemeral'));
+  assert.ok(isolated.includes('--ignore-user-config'));
+
+  const defaulted = buildCodexCommandArgs(BASE);
+  assert.equal(defaulted.includes('--ephemeral'), false);
+  assert.equal(defaulted.includes('--ignore-user-config'), false);
+
+  assert.throws(() => buildCodexCommandArgs({ ...BASE, ephemeral: 'true' }), /ephemeral to be boolean/);
+  assert.throws(() => buildCodexCommandArgs({ ...BASE, ignoreUserConfig: 'true' }), /ignoreUserConfig to be boolean/);
+});
+
 test('the command never emits a bypass-approvals/sandbox or bypass-hook-trust flag under any input', () => {
   const args = buildCodexCommandArgs({ ...BASE, sandboxMode: 'danger-full-access', approvalMode: 'never' });
   const joined = args.join(' ');
