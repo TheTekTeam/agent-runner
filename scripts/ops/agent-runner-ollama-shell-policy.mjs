@@ -47,6 +47,30 @@ function exactAllowlist(values = []) {
     .filter(Boolean));
 }
 
+const BROADER_VALIDATION_EXECUTABLES = new Set(['node', 'npm', 'pnpm']);
+
+function broaderValidationFamilyAllowed(argv = []) {
+  const [executable, subcommand, third] = argv;
+  if (!BROADER_VALIDATION_EXECUTABLES.has(executable)) return false;
+
+  if (executable === 'node') {
+    // Focused --test is handled separately. Broader node execution is only
+    // acceptable when it names one repository-relative script; flags that
+    // change loader/import/eval behaviour are not accepted in this profile.
+    return argv.length >= 2
+      && !String(subcommand || '').startsWith('-')
+      && isSafeRelativeShellPath(subcommand);
+  }
+
+  // npm/pnpm are limited to existing repository scripts. Package-management,
+  // exec/dlx and arbitrary lifecycle operations cannot be enabled by machine
+  // configuration or manager text.
+  if (subcommand === 'test') return true;
+  return subcommand === 'run'
+    && typeof third === 'string'
+    && /^[A-Za-z0-9._:-]{1,80}$/.test(third);
+}
+
 const REPOSITORY = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
 export function isShellTrustedRepository(repository, trustedRepositories = []) {
@@ -89,9 +113,15 @@ export function classifyBoundedOllamaShellCommand(command, {
     return { allowed: true, reason: null, kind: 'focused-node-test', argv: parsed.argv, command: text };
   }
 
-  // Everything broader (pnpm/npm/tsx/vitest/tsc/etc.) requires BOTH the
-  // manager packet and machine-local exact-command allowlist to name the
-  // identical command. No prefix/wildcard interpretation is permitted here.
+  // Everything broader requires BOTH the manager packet and machine-local
+  // exact-command allowlist, AND must remain inside a closed validation
+  // executable/subcommand family. This permanent code boundary means a
+  // mistaken machine allowlist can never enable curl/ssh/gh/sudo/systemctl,
+  // package installation, pnpm dlx/exec, npm exec, or another arbitrary
+  // executable. No prefix/wildcard interpretation is permitted here.
+  if (!broaderValidationFamilyAllowed(parsed.argv)) {
+    return { allowed: false, reason: 'ollama-shell-command-family-denied', kind: null, argv: [] };
+  }
   const machine = exactAllowlist(machineCommandAllowlist);
   if (!machine.has(text)) {
     return { allowed: false, reason: 'ollama-shell-command-not-machine-allowlisted', kind: null, argv: [] };
