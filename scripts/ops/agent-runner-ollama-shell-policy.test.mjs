@@ -98,6 +98,10 @@ test('permanent command-family boundary cannot be overridden by manager plus mac
     'pnpm dlx eslint',
     'npm install lodash',
     'npm exec vitest',
+    'npm run deploy',
+    'npm run release',
+    'pnpm run start',
+    'pnpm run postinstall',
     'npx vitest',
     'node --eval process.exit',
   ]) {
@@ -118,6 +122,8 @@ test('machine-qualified broader validation stays inside node script or npm/pnpm 
     'npm run typecheck',
     'pnpm test',
     'pnpm run lint',
+    'pnpm run build:types',
+    'npm run format:check',
   ]) {
     const decision = classifyBoundedOllamaShellCommand(command, {
       ...TRUST,
