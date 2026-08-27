@@ -281,6 +281,70 @@ test('missing runtime is explicit and remains non-routable', () => {
   }
 });
 
+function installedRunner(command) {
+  if (command === 'claude') return { status: 0, stdout: '2.1.233\n', stderr: '' };
+  if (command === 'codex') return { status: 0, stdout: 'codex-cli 0.128.0\n', stderr: '' };
+  if (command === 'ollama') return { status: 0, stdout: 'ollama version is 0.32.1\n', stderr: '' };
+  if (command === 'opencode') return { status: 0, stdout: 'opencode 1.18.4\n', stderr: '' };
+  return { status: 1, stdout: '', stderr: '' };
+}
+
+test('live readiness projection consumes accepted qualification evidence without enabling routing', () => {
+  const accepted = [{
+    accepted: true,
+    qualified: true,
+    nodeId: 'dev-cluster-z790',
+    agentInstanceId: 'claude-code-cli@dev-cluster-z790',
+    baseSha: 'a'.repeat(40),
+    jobFingerprint: `sha256:${'1'.repeat(64)}`,
+    resultFingerprint: `sha256:${'2'.repeat(64)}`,
+    qualificationRevision: 'claude-z790-7e13ce3be223baf8',
+    evidence: {
+      claudeVersion: '2.0.14',
+      providerClass: 'anthropic',
+      model: 'sonnet',
+      profile: 'narrow',
+      effort: 'low',
+      permissionMode: 'dontAsk',
+      toolPolicyFingerprint: `sha256:${'3'.repeat(64)}`,
+    },
+  }];
+
+  const result = collectFleetReadiness({
+    nodeId: 'dev-cluster-z790',
+    workerOnly: true,
+    runner: installedRunner,
+    acceptedQualificationResults: accepted,
+  });
+
+  const pub = result.qualificationPublication;
+  assert.equal(pub.normalRoutingEnabled, false);
+  assert.equal(pub.controllerNodeId, 'dev-cluster-dell');
+
+  const z790Claude = pub.instances.find((entry) => entry.instanceId === 'claude-code-cli@dev-cluster-z790');
+  assert.equal(z790Claude.published, true);
+  assert.equal(z790Claude.qualified, true);
+  assert.equal(z790Claude.routable, false);
+  assert.equal(z790Claude.normalRoutingEnabled, false);
+  assert.equal(z790Claude.qualificationRevision, 'claude-z790-7e13ce3be223baf8');
+
+  const dellClaude = pub.instances.find((entry) => entry.instanceId === 'claude-code-cli@dev-cluster-dell');
+  assert.equal(dellClaude.published, false);
+  assert.equal(dellClaude.state, 'evidence-gap');
+
+  // Runtime probes remain unqualified regardless of published evidence.
+  assert.equal(result.provisioningProjection.adapters.every((entry) => entry.qualified === false), true);
+  assert.equal(result.controllerAuthorityGranted, false);
+});
+
+test('readiness without accepted evidence publishes all four instances as non-routable evidence gaps', () => {
+  const result = collectFleetReadiness({ nodeId: 'dev-cluster-z790', workerOnly: true, runner: installedRunner });
+  const pub = result.qualificationPublication;
+  assert.equal(pub.normalRoutingEnabled, false);
+  assert.equal(pub.instances.length, 4);
+  assert.equal(pub.instances.every((entry) => entry.published === false && entry.routable === false), true);
+});
+
 test('bounded readiness output contains no environment, credential, session or filesystem path fields', () => {
   const result = collectFleetReadiness({
     nodeId: 'dev-cluster-z790',

@@ -9,6 +9,9 @@ import {
   fleetAdapterRuntimeContract,
   supportedFleetAdapterIds,
 } from './agent-runner-fleet-provisioning.mjs';
+import {
+  publishFleetQualification,
+} from './agent-runner-fleet-qualification-publication.mjs';
 
 export const FLEET_READINESS_COMMAND_SCHEMA_VERSION = 1;
 const NODE_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
@@ -190,8 +193,9 @@ export function probeFleetRuntime(adapterId, { runner = spawnSync } = {}) {
   });
 }
 
-export function collectFleetReadiness({ nodeId, workerOnly = false, runner = spawnSync, platform = process.platform, arch = process.arch } = {}) {
+export function collectFleetReadiness({ nodeId, workerOnly = false, runner = spawnSync, platform = process.platform, arch = process.arch, acceptedQualificationResults = [] } = {}) {
   if (typeof nodeId !== 'string' || !NODE_ID.test(nodeId)) throw new Error('nodeId is invalid');
+  if (!Array.isArray(acceptedQualificationResults)) throw new Error('acceptedQualificationResults must be an array');
   if (workerOnly) {
     assertWorkerOnlyFleetNode({
       nodeId,
@@ -218,6 +222,12 @@ export function collectFleetReadiness({ nodeId, workerOnly = false, runner = spa
   });
   const agentInstances = projection.adapters.map((adapter) => buildFleetAgentInstance(adapter, { maxConcurrent: 1, active: 0 }));
 
+  // Fold independently-accepted per-instance qualification evidence (#389/#398)
+  // into the canonical readiness surface. This never enables routing: the
+  // publication is emitted with normalRoutingEnabled:false, Dell instances stay
+  // explicit evidence gaps, and runtime probes above still report qualified:false.
+  const qualificationPublication = publishFleetQualification({ acceptedResults: acceptedQualificationResults });
+
   return Object.freeze({
     schemaVersion: FLEET_READINESS_COMMAND_SCHEMA_VERSION,
     nodeId,
@@ -228,6 +238,7 @@ export function collectFleetReadiness({ nodeId, workerOnly = false, runner = spa
     probes: Object.values(probes),
     provisioningProjection: projection,
     agentInstances,
+    qualificationPublication,
     // This command is an evidence probe only. It deliberately cannot install,
     // authenticate, qualify, download models, mutate the worker registry or
     // start scheduler/controller services.
