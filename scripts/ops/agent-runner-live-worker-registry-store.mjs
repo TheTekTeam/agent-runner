@@ -20,7 +20,10 @@ import {
   ZERO_PAID_ROUTE_COST_POSTURES,
   buildWorkerRegistry,
 } from './agent-runner-worker-pool.mjs';
-import { managerAuthorityKey } from './agent-runner-manager-authority.mjs';
+import {
+  assertValidatedFleetActivationAuthority,
+  fleetActivationAuthorityKey,
+} from './agent-runner-fleet-activation-authority.mjs';
 
 export const LIVE_WORKER_REGISTRY_DOCUMENT_SCHEMA_VERSION = 'agent-runner-live-worker-registry/v1';
 export const LIVE_WORKER_REGISTRY_PATH_ENV = 'AGENT_RUNNER_WORKER_REGISTRY_PATH';
@@ -30,7 +33,8 @@ export const LIVE_WORKER_REGISTRY_CONTROLLER_NODE_ID = 'dev-cluster-dell';
 const FILE_MODE = 0o600;
 const DIR_MODE = 0o700;
 const DIGEST = /^sha256:[a-f0-9]{64}$/;
-const AUTHORITY_REVISION = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
+const FULL_SHA = /^[a-f0-9]{40}$/;
+const AUTHORITY_REVISION = /^[A-Za-z0-9][A-Za-z0-9._:/-]{2,160}$/;
 const INSTANCE_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}@[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
 const LIFECYCLE_STATES = Object.freeze(['enabled', 'paused', 'draining', 'disabled']);
 
@@ -117,22 +121,28 @@ function exactKeys(value, allowed, code) {
 }
 
 function normalizedAuthority(raw) {
-  exactKeys(raw, ['revision', 'fingerprint', 'authorityKey', 'packetDigest'], 'live-worker-registry-activation-authority-invalid');
+  exactKeys(raw, [
+    'revision', 'fingerprint', 'authorityKey', 'bodyDigest', 'commentId', 'targetSourceCommit',
+  ], 'live-worker-registry-activation-authority-invalid');
   const revision = String(raw.revision || '');
   const fingerprint = String(raw.fingerprint || '');
   const authorityKey = String(raw.authorityKey || '');
-  const packetDigest = String(raw.packetDigest || '');
-  if (!AUTHORITY_REVISION.test(revision) || !DIGEST.test(fingerprint) || !DIGEST.test(packetDigest)) {
+  const bodyDigest = String(raw.bodyDigest || '');
+  const targetSourceCommit = String(raw.targetSourceCommit || '').toLowerCase();
+  const commentId = Number(raw.commentId);
+  if (!AUTHORITY_REVISION.test(revision) || !DIGEST.test(fingerprint) || !DIGEST.test(bodyDigest)
+    || !FULL_SHA.test(targetSourceCommit) || !Number.isSafeInteger(commentId) || commentId < 1) {
     throw new LiveWorkerRegistryError('live-worker-registry-activation-authority-invalid');
   }
-  if (authorityKey !== managerAuthorityKey(revision, fingerprint)) {
+  if (authorityKey !== fleetActivationAuthorityKey(revision, fingerprint)) {
     throw new LiveWorkerRegistryError('live-worker-registry-activation-authority-key-mismatch');
   }
-  return Object.freeze({ revision, fingerprint, authorityKey, packetDigest });
+  return Object.freeze({ revision, fingerprint, authorityKey, bodyDigest, commentId, targetSourceCommit });
 }
 
 function normalizeActivationAuthorities(raw, registry) {
-  const source = raw == null ? {} : exactKeys(raw, Object.keys(raw), 'live-worker-registry-activation-authorities-invalid');
+  const source = raw == null ? {} : raw;
+  if (!isPlainObject(source)) throw new LiveWorkerRegistryError('live-worker-registry-activation-authorities-invalid');
   const entries = Object.entries(source);
   if (entries.length > 256) throw new LiveWorkerRegistryError('live-worker-registry-activation-authorities-invalid');
   const normalized = {};
@@ -156,30 +166,18 @@ function normalizeLastTransition(raw) {
   if (raw == null) return null;
   exactKeys(raw, [
     'instanceId', 'targetState', 'authorityRevision', 'authorityFingerprint',
-    'authorityKey', 'authorityPacketDigest',
+    'authorityKey', 'authorityBodyDigest', 'authorityCommentId', 'targetSourceCommit',
   ], 'live-worker-registry-last-transition-invalid');
   if (!INSTANCE_ID.test(String(raw.instanceId || '')) || !LIFECYCLE_STATES.includes(raw.targetState)) {
     throw new LiveWorkerRegistryError('live-worker-registry-last-transition-invalid');
-  }
-  const enabled = raw.targetState === 'enabled';
-  if (!enabled) {
-    if ([raw.authorityRevision, raw.authorityFingerprint, raw.authorityKey, raw.authorityPacketDigest].some((value) => value !== null)) {
-      throw new LiveWorkerRegistryError('live-worker-registry-last-transition-invalid');
-    }
-    return Object.freeze({
-      instanceId: raw.instanceId,
-      targetState: raw.targetState,
-      authorityRevision: null,
-      authorityFingerprint: null,
-      authorityKey: null,
-      authorityPacketDigest: null,
-    });
   }
   const authority = normalizedAuthority({
     revision: raw.authorityRevision,
     fingerprint: raw.authorityFingerprint,
     authorityKey: raw.authorityKey,
-    packetDigest: raw.authorityPacketDigest,
+    bodyDigest: raw.authorityBodyDigest,
+    commentId: raw.authorityCommentId,
+    targetSourceCommit: raw.targetSourceCommit,
   });
   return Object.freeze({
     instanceId: raw.instanceId,
@@ -187,7 +185,9 @@ function normalizeLastTransition(raw) {
     authorityRevision: authority.revision,
     authorityFingerprint: authority.fingerprint,
     authorityKey: authority.authorityKey,
-    authorityPacketDigest: authority.packetDigest,
+    authorityBodyDigest: authority.bodyDigest,
+    authorityCommentId: authority.commentId,
+    targetSourceCommit: authority.targetSourceCommit,
   });
 }
 
@@ -536,34 +536,21 @@ export function replaceLiveWorkerRegistry({
   });
 }
 
-function normalizeAuthority({
-  authorityRevision,
-  authorityFingerprint,
-  authorityKey,
-  authorityPacketDigest,
-}) {
-  return normalizedAuthority({
-    revision: authorityRevision,
-    fingerprint: authorityFingerprint,
-    authorityKey,
-    packetDigest: authorityPacketDigest,
-  });
-}
-
 export function transitionLiveWorkerInstance({
   path = resolveLiveWorkerRegistryPath(),
   expectedRevision,
   controllerNodeId,
   instanceId,
   targetState,
-  authorityRevision = null,
-  authorityFingerprint = null,
-  authorityKey = null,
-  authorityPacketDigest = null,
+  activationAuthority,
   deps = {},
 } = {}) {
   if (!INSTANCE_ID.test(String(instanceId || ''))) throw new LiveWorkerRegistryError('live-worker-registry-instance-id-invalid');
   if (!LIFECYCLE_STATES.includes(targetState)) throw new LiveWorkerRegistryError('live-worker-registry-lifecycle-invalid');
+  const authority = assertValidatedFleetActivationAuthority(activationAuthority);
+  if (authority.targetInstanceId !== instanceId || authority.targetState !== targetState) {
+    throw new LiveWorkerRegistryError('live-worker-registry-activation-authority-target-mismatch');
+  }
   return writeNext({
     path,
     expectedRevision,
@@ -571,19 +558,15 @@ export function transitionLiveWorkerInstance({
     deps,
     mutate: ({ current, nextRevision, now }) => {
       if (!current.registry) throw new LiveWorkerRegistryError('live-worker-registry-missing');
+      if (authority.targetRegistryRevision !== current.revision
+        || authority.targetRegistryFingerprint !== current.registry.registryFingerprint) {
+        throw new LiveWorkerRegistryError('live-worker-registry-activation-authority-registry-mismatch');
+      }
       const currentInstance = current.registry.agentInstances.find((entry) => entry.instanceId === instanceId);
       if (!currentInstance) throw new LiveWorkerRegistryError('live-worker-registry-instance-not-found');
       if (currentInstance.active > 0 && targetState !== currentInstance.lifecycle) {
         throw new LiveWorkerRegistryError('live-worker-registry-active-work-conflict');
       }
-      const authority = targetState === 'enabled'
-        ? normalizeAuthority({
-          authorityRevision,
-          authorityFingerprint,
-          authorityKey,
-          authorityPacketDigest,
-        })
-        : null;
       if (targetState === 'enabled') assertLiveInstanceActivationEligible(currentInstance, current.registry);
 
       const agentInstances = current.registry.agentInstances.map((entry) => ({
@@ -600,8 +583,18 @@ export function transitionLiveWorkerInstance({
       if (targetState === 'enabled') assertLiveInstanceActivationEligible(nextInstance, registry);
 
       const activationAuthorities = { ...(current.document?.activationAuthorities || {}) };
-      if (targetState === 'enabled') activationAuthorities[instanceId] = authority;
-      else delete activationAuthorities[instanceId];
+      if (targetState === 'enabled') {
+        activationAuthorities[instanceId] = {
+          revision: authority.revision,
+          fingerprint: authority.fingerprint,
+          authorityKey: authority.authorityKey,
+          bodyDigest: authority.bodyDigest,
+          commentId: authority.commentId,
+          targetSourceCommit: authority.targetSourceCommit,
+        };
+      } else {
+        delete activationAuthorities[instanceId];
+      }
 
       return {
         schemaVersion: LIVE_WORKER_REGISTRY_DOCUMENT_SCHEMA_VERSION,
@@ -611,10 +604,12 @@ export function transitionLiveWorkerInstance({
         lastTransition: {
           instanceId,
           targetState,
-          authorityRevision: authority?.revision || null,
-          authorityFingerprint: authority?.fingerprint || null,
-          authorityKey: authority?.authorityKey || null,
-          authorityPacketDigest: authority?.packetDigest || null,
+          authorityRevision: authority.revision,
+          authorityFingerprint: authority.fingerprint,
+          authorityKey: authority.authorityKey,
+          authorityBodyDigest: authority.bodyDigest,
+          authorityCommentId: authority.commentId,
+          targetSourceCommit: authority.targetSourceCommit,
         },
         registry,
       };
