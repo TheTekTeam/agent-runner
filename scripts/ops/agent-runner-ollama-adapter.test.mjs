@@ -358,6 +358,48 @@ test('buildOpenCodeLocalOllamaConfig creates a loopback-only Ollama provider all
   assert.equal(/api.?key|credential|secret|token|fallback|download|refresh|cloud/i.test(serialized), false);
 });
 
+test('buildOpenCodeLocalOllamaConfig can explicitly disable reasoning for the selected local model only', () => {
+  const content = buildOpenCodeLocalOllamaConfig({
+    model: 'modelspend-code-local:latest',
+    endpointUrl: 'http://127.0.0.1:11434',
+    disableReasoning: true,
+  });
+  const config = JSON.parse(content);
+  const model = config.provider.ollama.models['modelspend-code-local:latest'];
+
+  assert.deepEqual(model, {
+    name: 'modelspend-code-local:latest',
+    options: { reasoningEffort: 'none' },
+  });
+  assert.deepEqual(config.provider.ollama.options, {
+    baseURL: 'http://127.0.0.1:11434/v1',
+  });
+  assert.deepEqual(config.enabled_providers, ['ollama']);
+
+  const serialized = JSON.stringify(config);
+  assert.equal(/api.?key|credential|secret|token|fallback|download|refresh|cloud/i.test(serialized), false);
+});
+
+test('buildOpenCodeLocalOllamaConfig leaves reasoning control absent by default and rejects non-boolean controls', () => {
+  const config = JSON.parse(buildOpenCodeLocalOllamaConfig({
+    model: 'modelspend-code-local:latest',
+    endpointUrl: 'http://127.0.0.1:11434',
+  }));
+
+  assert.deepEqual(config.provider.ollama.models['modelspend-code-local:latest'], {
+    name: 'modelspend-code-local:latest',
+  });
+
+  assert.throws(
+    () => buildOpenCodeLocalOllamaConfig({
+      model: 'modelspend-code-local:latest',
+      endpointUrl: 'http://127.0.0.1:11434',
+      disableReasoning: 'true',
+    }),
+    /disableReasoning to be boolean/,
+  );
+});
+
 test('buildOpenCodeLocalOllamaConfig rejects a non-allowlisted remote endpoint and accepts an explicitly allowlisted one', () => {
   assert.throws(
     () => buildOpenCodeLocalOllamaConfig({
