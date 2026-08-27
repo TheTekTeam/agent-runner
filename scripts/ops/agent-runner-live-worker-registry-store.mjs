@@ -78,18 +78,26 @@ function defaultDeps(overrides = {}) {
   };
 }
 
-function assertNotSymlink(path, fs, { allowMissing = true } = {}) {
-  if (!fs.existsFn(path)) {
-    if (allowMissing) return;
+function assertSafePathChain(path, fs, { requireLeaf = false } = {}) {
+  const leaf = resolve(path);
+  if (requireLeaf && !fs.existsFn(leaf)) {
     throw new LiveWorkerRegistryError('live-worker-registry-missing');
   }
-  let stat;
-  try {
-    stat = fs.lstatFn(path);
-  } catch (error) {
-    throw new LiveWorkerRegistryError('live-worker-registry-stat-failed', error?.message || 'stat failed');
+  let cursor = leaf;
+  while (true) {
+    if (fs.existsFn(cursor)) {
+      let stat;
+      try {
+        stat = fs.lstatFn(cursor);
+      } catch (error) {
+        throw new LiveWorkerRegistryError('live-worker-registry-stat-failed', error?.message || 'stat failed');
+      }
+      if (stat.isSymbolicLink()) throw new LiveWorkerRegistryError('live-worker-registry-symlink-refused');
+    }
+    const parent = resolve(cursor, '..');
+    if (parent === cursor) break;
+    cursor = parent;
   }
-  if (stat.isSymbolicLink()) throw new LiveWorkerRegistryError('live-worker-registry-symlink-refused');
 }
 
 function canonicalPublication() {
@@ -191,7 +199,7 @@ export function loadLiveWorkerRegistryDocument({
     if (!allowMissing) throw new LiveWorkerRegistryError('live-worker-registry-missing');
     return Object.freeze({ path, found: false, revision: 0, document: null, registry: null });
   }
-  assertNotSymlink(path, fs, { allowMissing: false });
+  assertSafePathChain(path, fs, { requireLeaf: true });
   let parsed;
   try {
     parsed = JSON.parse(fs.readFn(path, 'utf8'));
@@ -222,7 +230,7 @@ function atomicWrite(path, document, fs) {
   const dir = resolve(path, '..');
   fs.mkdirFn(dir, { recursive: true, mode: DIR_MODE });
   fs.chmodFn(dir, DIR_MODE);
-  assertNotSymlink(path, fs, { allowMissing: true });
+  assertSafePathChain(path, fs, { requireLeaf: false });
   const tmpPath = join(dir, `.${randomBytes(8).toString('hex')}.live-worker-registry.tmp`);
   let fd;
   try {
@@ -353,7 +361,7 @@ export function transitionLiveWorkerInstance({
         schemaVersion: LIVE_WORKER_REGISTRY_DOCUMENT_SCHEMA_VERSION,
         revision: nextRevision,
         updatedAt: now,
-        activationAuthority: authority || current.document?.activationAuthority || null,
+        activationAuthority: targetState === 'enabled' ? authority : null,
         lastTransition: {
           instanceId,
           targetState,
