@@ -84,3 +84,34 @@ test('cwd must be an explicit worktree path, never defaulted', () => {
   assert.throws(() => buildCodexCommandArgs({ ...BASE, cwd: '' }), /worktree cwd/);
   assert.throws(() => buildCodexCommandArgs({ ...BASE, cwd: undefined }), /worktree cwd/);
 });
+
+
+test('workspace-write network access can be explicitly denied through the supported config override', () => {
+  const args = buildCodexCommandArgs({
+    executablePath: '/usr/local/bin/codex',
+    cwd: '/tmp/worktree',
+    model: 'gpt-5.6-terra',
+    sandboxMode: 'workspace-write',
+    approvalMode: 'never',
+    reasoningEffort: 'low',
+    networkAccess: false,
+    prompt: 'create the bounded fixture',
+  });
+
+  const pairs = args.flatMap((value, index) => value === '-c' ? [args[index + 1]] : []);
+  assert.ok(pairs.includes('sandbox_workspace_write.network_access=false'));
+  assert.ok(pairs.includes('approval_policy=never'));
+  assert.ok(pairs.includes('model_reasoning_effort=low'));
+});
+
+test('networkAccess must be boolean when supplied', () => {
+  assert.throws(() => buildCodexCommandArgs({
+    executablePath: '/usr/local/bin/codex',
+    cwd: '/tmp/worktree',
+    model: 'gpt-5.6-terra',
+    sandboxMode: 'workspace-write',
+    approvalMode: 'never',
+    networkAccess: 'false',
+    prompt: 'create the bounded fixture',
+  }), /networkAccess to be boolean/);
+});
