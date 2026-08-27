@@ -260,8 +260,16 @@ export function admitRecurrenceSelections(selected, {
 } = {}) {
   const caps = resolveRecurrenceLaneCaps(env, maxParallel);
   const nodeId = resolveLocalWorkerNodeId(env);
-  const workerRegistry = parseLiveWorkerRegistry(env, { expectedControllerNodeId: nodeId, currentSourceCommit });
-  const remoteRouteEnabled = remoteTransportAvailable === true && remoteWorkerDispatchEnabled(env);
+  const remoteActivationRequested = remoteWorkerDispatchEnabled(env);
+  const workerRegistry = parseLiveWorkerRegistry(env, {
+    expectedControllerNodeId: nodeId,
+    currentSourceCommit,
+    useCanonicalStore: remoteActivationRequested,
+    requireActivationSource: remoteActivationRequested,
+  });
+  const remoteRouteEnabled = remoteTransportAvailable === true
+    && remoteActivationRequested
+    && workerRegistry?.registrySource === 'canonical-store';
 
   // Reserve provider/account capacity as routes are selected inside this
   // scheduler cycle. This is intentionally conservative: a route that is later
@@ -310,6 +318,7 @@ export function admitRecurrenceSelections(selected, {
     registrySource: workerRegistry?.registrySource || null,
     registryDocumentRevision: workerRegistry?.documentRevision || null,
     currentSourceCommit: currentSourceCommit || null,
+    remoteActivationRequested,
     remoteRouteEnabled,
     routes: routed.map(({ entry, outcome, workerRoute }) => ({
       laneId: implementationLaneForSelection(entry, outcome),
@@ -375,6 +384,7 @@ export async function runImplementationRecurrence({
       registrySource: admitted.registrySource,
       registryDocumentRevision: admitted.registryDocumentRevision,
       currentSourceCommit: admitted.currentSourceCommit,
+      remoteActivationRequested: admitted.remoteActivationRequested,
       remoteRouteEnabled: admitted.remoteRouteEnabled,
       caps: admitted.caps,
       routes: admitted.routes,
