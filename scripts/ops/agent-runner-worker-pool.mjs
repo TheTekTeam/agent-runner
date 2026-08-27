@@ -79,6 +79,47 @@ function normalizeProviderAccountCaps(raw = {}) {
   }).sort(([a], [b]) => a.localeCompare(b))));
 }
 
+function normalizeProviderAccountReservations(raw = {}) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('providerAccountReservations is invalid');
+  const entries = Object.entries(raw);
+  if (entries.length > 64) throw new Error('providerAccountReservations is invalid');
+  return Object.freeze(Object.fromEntries(entries.map(([account, value]) => {
+    const id = token(account, 'providerAccountReservations account');
+    return [id, positiveInteger(value, `providerAccountReservations.${id}`)];
+  }).sort(([a], [b]) => a.localeCompare(b))));
+}
+
+/**
+ * Canonical provider/account concurrency admission. Existing callers may pass
+ * controller-known active leases; live routing may pass an already-normalized
+ * active count plus reservations made earlier in the same scheduler cycle.
+ */
+export function evaluateProviderAccountCapacity({
+  providerAccountClass,
+  active = [],
+  activeCount = null,
+  reserved = 0,
+  caps = {},
+} = {}) {
+  const account = token(providerAccountClass, 'providerAccountClass');
+  const cap = Number(caps[account] ?? 1);
+  if (!Number.isSafeInteger(cap) || cap < 1 || cap > 128) throw new Error('provider account cap is invalid');
+  const consuming = activeCount === null
+    ? (Array.isArray(active) ? active.filter((entry) => entry?.providerAccountClass === account).length : NaN)
+    : Number(activeCount);
+  const held = Number(reserved);
+  if (!Number.isSafeInteger(consuming) || consuming < 0 || consuming > 128) throw new Error('provider account active count is invalid');
+  if (!Number.isSafeInteger(held) || held < 0 || held > 128) throw new Error('provider account reservation count is invalid');
+  return Object.freeze({
+    allowed: consuming + held < cap,
+    providerAccountClass: account,
+    active: consuming,
+    reserved: held,
+    cap,
+    reason: consuming + held < cap ? null : 'provider-account-cap-full',
+  });
+}
+
 export function normalizeWorkerNode(raw = {}) {
   const nodeId = token(raw.nodeId, 'nodeId');
   const state = enumValue(raw.state, WORKER_NODE_STATES, 'node state');
@@ -136,6 +177,17 @@ export function normalizeAgentInstance(raw = {}) {
       : (/^sha256:[a-f0-9]{64}$/.test(String(raw.qualificationEvidenceFingerprint))
         ? String(raw.qualificationEvidenceFingerprint)
         : (() => { throw new Error('qualificationEvidenceFingerprint is invalid'); })()),
+    installedVersion: raw.installedVersion ? token(raw.installedVersion, 'installedVersion') : null,
+    qualificationContractFingerprint: raw.qualificationContractFingerprint == null
+      ? null
+      : (/^sha256:[a-f0-9]{64}$/.test(String(raw.qualificationContractFingerprint))
+        ? String(raw.qualificationContractFingerprint)
+        : (() => { throw new Error('qualificationContractFingerprint is invalid'); })()),
+    qualificationCapabilityFingerprint: raw.qualificationCapabilityFingerprint == null
+      ? null
+      : (/^sha256:[a-f0-9]{64}$/.test(String(raw.qualificationCapabilityFingerprint))
+        ? String(raw.qualificationCapabilityFingerprint)
+        : (() => { throw new Error('qualificationCapabilityFingerprint is invalid'); })()),
     providerAccountClass: raw.providerAccountClass ? token(raw.providerAccountClass, 'providerAccountClass') : null,
     costPosture: enumValue(raw.costPosture || 'unknown', WORKER_COST_POSTURES, 'costPosture'),
     paid: raw.paid === false ? false : true,
@@ -199,11 +251,16 @@ function routeReasons({ node, instance, request, registry }) {
     else if (!ZERO_PAID_ROUTE_COST_POSTURES.includes(instance.costPosture) || instance.paid !== false) reasons.push('paid-route-ineligible');
   }
   if (request.enforceProviderAccountCapacity && instance.providerAccountClass) {
-    const cap = Number(registry?.providerAccountCaps?.[instance.providerAccountClass] ?? 1);
-    const active = (registry?.agentInstances || [])
+    const activeCount = (registry?.agentInstances || [])
       .filter((entry) => entry.providerAccountClass === instance.providerAccountClass)
       .reduce((sum, entry) => sum + Number(entry.active || 0), 0);
-    if (active >= cap) reasons.push('provider-account-cap-full');
+    const capacity = evaluateProviderAccountCapacity({
+      providerAccountClass: instance.providerAccountClass,
+      activeCount,
+      reserved: request.providerAccountReservations?.[instance.providerAccountClass] || 0,
+      caps: registry?.providerAccountCaps || {},
+    });
+    if (!capacity.allowed) reasons.push(capacity.reason);
   }
   if (!node.jobClasses.includes(request.jobClass)) reasons.push('node-job-class-unsupported');
   if (!instance.jobClasses.includes(request.jobClass)) reasons.push('agent-job-class-unsupported');
@@ -288,6 +345,7 @@ export function selectWorkerRoute(registry, request = {}) {
     requiredCapabilities,
     requireZeroPaidPosture: request.requireZeroPaidPosture === true,
     enforceProviderAccountCapacity: request.enforceProviderAccountCapacity === true,
+    providerAccountReservations: normalizeProviderAccountReservations(request.providerAccountReservations || {}),
     // Preference order is semantic: the controller's first qualified node
     // must remain first rather than being alphabetically canonicalised.
     preferredNodeIds: boundedOrderedTokens(request.preferredNodeIds || [], 'preferredNodeIds'),
