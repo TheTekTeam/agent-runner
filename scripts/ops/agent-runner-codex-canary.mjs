@@ -135,7 +135,7 @@ function safeEvidence({ authority, dispatch, execution, workspace, preflight }) 
     issue: CODEX_CANARY_ISSUE,
     repository: CODEX_CANARY_REPOSITORY,
     authorityKey: authority.authorityKey,
-    authorityCommentId: authority.commentIdentity?.id || null,
+    authorityCommentId: authority.commentIdentity?.databaseId || null,
     baseCommit: dispatch.baseCommit,
     branch: dispatch.branch,
     agentId: 'codex-cli',
@@ -232,7 +232,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     writeState({
       schemaVersion: STATE_SCHEMA,
       authorityKey: authority.authorityKey,
-      authorityCommentId: authority.commentIdentity?.id || null,
+      authorityCommentId: authority.commentIdentity?.databaseId || null,
       baseCommit: dispatch.baseCommit,
       branch: dispatch.branch,
       status: 'pending',
@@ -295,7 +295,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
       writeState({
         schemaVersion: STATE_SCHEMA,
         authorityKey: authority.authorityKey,
-        authorityCommentId: authority.commentIdentity?.id || null,
+        authorityCommentId: authority.commentIdentity?.databaseId || null,
         baseCommit: dispatch.baseCommit,
         branch: dispatch.branch,
         status: 'failed',
