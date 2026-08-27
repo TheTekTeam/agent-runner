@@ -80,6 +80,13 @@ function extractAgentMessageText(events) {
   return messageItems.join('\n').trim();
 }
 
+function validFileChangeEntry(change) {
+  if (!isPlainObject(change)) return false;
+  const path = String(change.path || '').trim();
+  const kind = String(change.kind || '').trim().toLowerCase();
+  return Boolean(path && ['add', 'delete', 'update'].includes(kind));
+}
+
 function extractFileChangeState(events) {
   const items = events
     .filter((event) => event.type === 'item.completed' && isPlainObject(event.item) && event.item.type === 'file_change')
@@ -107,7 +114,12 @@ function extractFileChangeState(events) {
       continue;
     }
 
-    if (status !== 'completed' || !changes || changes.length === 0) {
+    if (
+      status !== 'completed'
+      || !changes
+      || changes.length === 0
+      || !changes.every(validFileChangeEntry)
+    ) {
       ambiguous = true;
       continue;
     }
