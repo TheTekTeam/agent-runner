@@ -121,7 +121,7 @@ concurrency, pull/download/refresh, or fallback-provider flag.
 Supervised #152 field evidence has now verified that OpenCode 1.18.4
 `run --format json` emits newline-delimited event objects. The accepted
 successful shape contains `step_start`, one or more `text` events, and
-`step_finish`; error events are emitted separately. 
+`step_finish`; error events are emitted separately.
 `parseOpenCodeJsonEventStream()` parses that JSONL contract fail-closed,
 extracts only completed text payloads, never copies unbounded provider error
 messages into normalized failure output, and reports repository mutation as
