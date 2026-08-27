@@ -126,6 +126,13 @@ export function main(argv = process.argv.slice(2), {
     }
 
     if (args.mode === 'plan') {
+      const current = loadLiveWorkerRegistryDocument({ path, allowMissing: true });
+      if (current.revision !== args.expectedRevision) {
+        throw new LiveWorkerRegistryError(
+          'live-worker-registry-stale-revision',
+          `expected revision ${args.expectedRevision}, current ${current.revision}`,
+        );
+      }
       const raw = boundedStdin(readFn);
       const plan = planLiveWorkerRegistryPromotion({
         expectedRevision: args.expectedRevision,
