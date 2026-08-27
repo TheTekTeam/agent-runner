@@ -11,6 +11,10 @@ import {
 import { dirname, join, resolve } from 'node:path';
 
 import { AGENT_ADAPTERS } from './agent-runner-agents.mjs';
+import {
+  acquireImplementationSlot,
+  IMPLEMENTATION_LANE_ENV,
+} from './agent-runner-implementation-slot.mjs';
 import { admitCodexDispatch } from './agent-runner-codex-adapter.mjs';
 import { buildCodexCommandArgs } from './agent-runner-codex-command.mjs';
 import { classifyCodexExecutionError, parseCodexResultEnvelope } from './agent-runner-codex-parser.mjs';
@@ -279,6 +283,7 @@ export async function executeCodexWorkerQualificationRequest({
   admissionFn = admitCodexDispatch,
   sandboxProbeFn = runCodexWorkerSandboxProbe,
   invokeCanaryFn = invokeCodexWorkerCanary,
+  acquireSlotFn = acquireImplementationSlot,
 } = {}) {
   const started = clock();
   const validation = validateCodexWorkerQualificationRequest({
@@ -368,11 +373,17 @@ export async function executeCodexWorkerQualificationRequest({
   }
 
   mkdirSync(workRoot, { recursive: true });
-  let worktreeParent = mkdtempSync(join(workRoot, 'codex-qualification-'));
-  let worktree = join(worktreeParent, 'worktree');
+  const laneEnv = { ...env, [IMPLEMENTATION_LANE_ENV]: request.lease.laneId };
+  const slot = acquireSlotFn({ env: laneEnv });
+  if (!slot?.held) throw new Error(slot?.failureReason || 'implementation-slot-unavailable');
+
+  let worktreeParent = null;
+  let worktree = null;
   let preserveForensics = false;
 
   try {
+    worktreeParent = mkdtempSync(join(workRoot, 'codex-qualification-'));
+    worktree = join(worktreeParent, 'worktree');
     execFileSyncFn('git', ['worktree', 'add', '-b', request.lease.branch, worktree, request.lease.baseSha], {
       cwd: sourceRoot,
       stdio: ['ignore', 'ignore', 'ignore'],
@@ -560,5 +571,6 @@ export async function executeCodexWorkerQualificationRequest({
         // stash/rebase/force path exists here.
       }
     }
+    slot.release();
   }
 }
