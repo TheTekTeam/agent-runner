@@ -274,3 +274,29 @@ the CLI default. The initial #186 target is `gpt-5.6-terra` with low reasoning
 and workspace-write sandboxing. One successful canary qualifies only that
 bounded capability; it does not enable automatic routing, fallback, Z790
 scheduler authority, deployment, merge or issue-close authority.
+
+
+### File-change apply status is authoritative
+
+The first #186 supervised field canary exposed an important Codex JSONL detail:
+an `item.completed` / `file_change` item is emitted after patch application
+**succeeds or fails** and carries its own `status`.
+
+Agent Runner must therefore never infer repository mutation from the mere
+presence of a `file_change` item.
+
+For a terminal `turn.completed`:
+
+- `file_change.status=completed` with at least one structured `changes`
+  entry is positive parser-level mutation evidence;
+- `file_change.status=failed` is a bounded task-attempt failure
+  (`codex-file-change-failed`);
+- missing/unknown status or a completed item with no structured changes is
+  ambiguous evidence and fails closed
+  (`codex-file-change-evidence-ambiguous`);
+- authoritative filesystem/worktree validation remains mandatory after parser
+  success and can still override parser-level mutation evidence.
+
+The failed first canary produced a parser-level file-change event while the
+preserved worktree remained completely clean. This correction prevents a failed
+patch event from being misclassified as a successful mutation.
