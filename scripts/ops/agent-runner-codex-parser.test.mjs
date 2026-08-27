@@ -103,7 +103,7 @@ test('no-op: turn.completed with no file_change item is a success with no reposi
 
 test('#194: Codex conditionally maps cached/reasoning evidence from a structured terminal usage record', () => {
   const result = parseCodexResultEnvelope(jsonl([
-    { type: 'item.completed', item: { type: 'file_change', path: 'src/foo.js' } },
+    { type: 'item.completed', item: { type: 'file_change', status: 'completed', changes: [{ path: 'src/foo.js', kind: 'update' }] } },
     {
       type: 'turn.completed',
       usage: {
@@ -132,16 +132,102 @@ test('#194: absent Codex API-style detail remains unknown rather than fabricated
   assert.equal(result.usageEfficiency.reasoningTokens, null);
 });
 
-test('a turn.completed with a file_change item records mutatedRepository true', () => {
+test('a completed file_change with structured changes records mutatedRepository true', () => {
   const result = parseCodexResultEnvelope(jsonl([
     { type: 'item.completed', item: { type: 'agent_message', text: 'Fixed the failing test.' } },
-    { type: 'item.completed', item: { type: 'file_change', path: 'src/foo.js' } },
+    {
+      type: 'item.completed',
+      item: {
+        type: 'file_change',
+        status: 'completed',
+        changes: [{ path: 'src/foo.js', kind: 'update' }],
+      },
+    },
     { type: 'turn.completed', usage: { input_tokens: 500, output_tokens: 150 } },
   ]));
   assert.equal(result.ok, true);
   assert.equal(result.reason, null);
   assert.equal(result.mutatedRepository, true);
   assert.equal(result.resultText, 'Fixed the failing test.');
+});
+
+test('a failed file_change under turn.completed is a bounded task-attempt failure, not mutation evidence', () => {
+  const result = parseCodexResultEnvelope(jsonl([
+    {
+      type: 'item.completed',
+      item: {
+        type: 'file_change',
+        status: 'failed',
+        changes: [{ path: SYNTHETIC_SECRETS[3], kind: 'add' }],
+      },
+    },
+    { type: 'turn.completed', usage: { input_tokens: 50, output_tokens: 10 } },
+  ]));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'codex-file-change-failed');
+  assert.equal(result.failureScope, FAILURE_SCOPES.TASK_ATTEMPT);
+  assert.equal(result.structuredFailure, 'file_change');
+  assert.equal(result.mutatedRepository, false);
+  assert.equal(result.resultText, '');
+  assertNoLeak(result, 'failed file_change');
+});
+
+test('a file_change with missing status fails closed as ambiguous evidence', () => {
+  const result = parseCodexResultEnvelope(jsonl([
+    {
+      type: 'item.completed',
+      item: {
+        type: 'file_change',
+        changes: [{ path: 'src/foo.js', kind: 'update' }],
+      },
+    },
+    { type: 'turn.completed' },
+  ]));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'codex-file-change-evidence-ambiguous');
+  assert.equal(result.mutatedRepository, false);
+});
+
+test('a completed file_change with no structured changes fails closed as ambiguous evidence', () => {
+  const result = parseCodexResultEnvelope(jsonl([
+    {
+      type: 'item.completed',
+      item: {
+        type: 'file_change',
+        status: 'completed',
+        changes: [],
+      },
+    },
+    { type: 'turn.completed' },
+  ]));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'codex-file-change-evidence-ambiguous');
+  assert.equal(result.mutatedRepository, false);
+});
+
+test('any failed file_change wins over a completed file_change in the same turn', () => {
+  const result = parseCodexResultEnvelope(jsonl([
+    {
+      type: 'item.completed',
+      item: {
+        type: 'file_change',
+        status: 'completed',
+        changes: [{ path: 'src/a.js', kind: 'update' }],
+      },
+    },
+    {
+      type: 'item.completed',
+      item: {
+        type: 'file_change',
+        status: 'failed',
+        changes: [{ path: 'src/b.js', kind: 'update' }],
+      },
+    },
+    { type: 'turn.completed' },
+  ]));
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, 'codex-file-change-failed');
+  assert.equal(result.mutatedRepository, false);
 });
 
 test('turn.failed with a generic message is a typed task_attempt failure, and the raw message is not returned', () => {
