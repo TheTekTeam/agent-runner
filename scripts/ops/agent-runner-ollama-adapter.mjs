@@ -328,7 +328,7 @@ const OLLAMA_SHELL_METACHARACTERS = /[;&|><\`$(){}\n\r]/;
 const OLLAMA_DANGEROUS_SHELL = /^(?:sudo|su|systemctl|service|docker|podman|ssh|scp|sftp|curl|wget|nc|ncat|telnet|apt|apt-get|dnf|yum|pacman|snap|flatpak|npx)\b/i;
 const OLLAMA_INTERPRETER_ESCAPE = /^(?:bash|sh|zsh)\s+(?:-[^\s]*c\b|--command\b)|^(?:node|python|python3|perl|ruby)\s+(?:-e\b|-c\b|--eval\b)/i;
 const OLLAMA_DESTRUCTIVE_GIT = /^git\s+(?:reset|clean|stash|rebase|push|pull|merge|cherry-pick|revert|checkout|switch|branch|tag|remote|config|gc|prune|worktree)\b/i;
-const OLLAMA_FIXED_INSPECTION_SHELL = new Set([
+export const DEFAULT_OLLAMA_CODING_SHELL_ALLOWLIST = Object.freeze([
   'pwd',
   'git status',
   'git status --short',
@@ -346,6 +346,7 @@ const OLLAMA_FIXED_INSPECTION_SHELL = new Set([
   'git rev-parse HEAD',
   'git rev-parse --show-toplevel',
 ]);
+const OLLAMA_FIXED_INSPECTION_SHELL = new Set(DEFAULT_OLLAMA_CODING_SHELL_ALLOWLIST);
 
 function normalizeOpenCodeWorktreePathPattern(value) {
   const path = String(value || '').trim();
