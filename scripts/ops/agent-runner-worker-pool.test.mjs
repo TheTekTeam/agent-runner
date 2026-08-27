@@ -5,8 +5,10 @@ import {
   buildWorkerRegistry,
   buildWorkerStatusProjection,
   issueWorkerLease,
+  issueWorkerQualificationLease,
   normalizeAgentInstance,
   normalizeWorkerNode,
+  selectWorkerQualificationRoute,
   selectWorkerRoute,
   validateWorkerLease,
 } from './agent-runner-worker-pool.mjs';
@@ -68,6 +70,50 @@ function leaseFor(reg, route, overrides = {}) {
     laneId: overrides.laneId || 'agent-runner-327-a',
     resourcePartition: overrides.resourcePartition || 'repo-agent-runner-327',
     validationProfile: 'canonical',
+    expiresAt: overrides.expiresAt || '2026-08-26T00:00:00.000Z',
+  });
+}
+
+
+function unqualifiedCodexRegistry(overrides = {}) {
+  const base = registry();
+  const agentInstances = base.agentInstances.map(({ instanceFingerprint, ...instance }) => {
+    if (instance.instanceId !== 'codex-cli@dev-cluster-z790') return instance;
+    return {
+      ...instance,
+      authenticated: overrides.authenticated ?? true,
+      qualified: false,
+      qualificationRevision: 'unqualified',
+      models: ['gpt-5.6-terra'],
+      profiles: ['codex-canary-v1'],
+    };
+  });
+  return buildWorkerRegistry({
+    controllerNodeId: 'dev-cluster-dell',
+    revision: overrides.revision || 'qualification-1',
+    nodes: base.nodes.map(({ capabilityFingerprint, ...node }) => node),
+    agentInstances,
+  });
+}
+
+function qualificationLeaseFor(reg, route, overrides = {}) {
+  return issueWorkerQualificationLease({
+    registry: reg,
+    route,
+    projectId: 'agent-runner',
+    repository: 'TheTekTeam/agent-runner',
+    issueNumber: 389,
+    authorityFingerprint: AUTHORITY,
+    baseSha: SHA,
+    branch: 'canary-codex-389-z790',
+    worktree: 'canary-codex-389-z790',
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+    laneId: 'qualification-codex-z790',
+    validationProfile: 'codex-canary',
+    qualificationProfile: 'codex-canary-v1',
     expiresAt: overrides.expiresAt || '2026-08-26T00:00:00.000Z',
   });
 }
@@ -142,6 +188,122 @@ test('unqualified or unauthenticated agent instance is never selected', () => {
   const route = selectWorkerRoute(reg, { adapterId: 'codex-cli', model: 'gpt-5.6', profile: 'narrow', jobClass: 'implementation' });
   assert.equal(route.selected, null);
   assert.deepEqual(route.excluded[0].reasons.filter((reason) => reason.startsWith('agent-')), ['agent-auth-unavailable', 'agent-unqualified']);
+});
+
+
+test('normal routing still rejects an authenticated but unqualified Codex instance', () => {
+  const reg = unqualifiedCodexRegistry();
+  const route = selectWorkerRoute(reg, {
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+    preferredNodeIds: ['dev-cluster-z790'],
+  });
+  assert.equal(route.selected, null);
+  assert.ok(route.excluded[0].reasons.includes('agent-unqualified'));
+});
+
+test('qualification routing can select only the exact ready authenticated worker-only instance without changing qualification state', () => {
+  const reg = unqualifiedCodexRegistry();
+  const route = selectWorkerQualificationRoute(reg, {
+    nodeId: 'dev-cluster-z790',
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+    requiredCapabilities: ['git'],
+  });
+  assert.equal(route.qualificationOnly, true);
+  assert.deepEqual(route.selected, {
+    nodeId: 'dev-cluster-z790',
+    instanceId: 'codex-cli@dev-cluster-z790',
+  });
+  assert.equal(reg.agentInstances.find((item) => item.instanceId === route.selected.instanceId).qualified, false);
+  assert.equal(selectWorkerRoute(reg, {
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+    preferredNodeIds: ['dev-cluster-z790'],
+  }).selected, null);
+});
+
+test('qualification lease validates on the exact Z790 worker while preserving Dell as sole controller', () => {
+  const reg = unqualifiedCodexRegistry();
+  const route = selectWorkerQualificationRoute(reg, {
+    nodeId: 'dev-cluster-z790',
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+    requiredCapabilities: ['git'],
+  });
+  const lease = qualificationLeaseFor(reg, route);
+  assert.equal(lease.qualificationOnly, true);
+  assert.equal(lease.qualificationProfile, 'codex-canary-v1');
+  assert.equal(lease.controllerNodeId, 'dev-cluster-dell');
+  assert.equal(lease.nodeId, 'dev-cluster-z790');
+  assert.equal(lease.agentInstanceId, 'codex-cli@dev-cluster-z790');
+  assert.equal(validateWorkerLease({
+    lease,
+    registry: reg,
+    executingNodeId: 'dev-cluster-z790',
+    now: new Date('2026-08-25T00:00:00Z'),
+  }).valid, true);
+  assert.equal(validateWorkerLease({
+    lease,
+    registry: reg,
+    executingNodeId: 'dev-cluster-dell',
+    now: new Date('2026-08-25T00:00:00Z'),
+  }).reason, 'wrong-node');
+});
+
+test('qualification routing refuses controller targets and unauthenticated worker instances', () => {
+  const base = unqualifiedCodexRegistry();
+  const withDellCodex = buildWorkerRegistry({
+    controllerNodeId: 'dev-cluster-dell',
+    revision: 'qualification-controller-refusal',
+    nodes: base.nodes.map(({ capabilityFingerprint, ...node }) => node),
+    agentInstances: [
+      ...base.agentInstances.map(({ instanceFingerprint, ...instance }) => instance),
+      {
+        nodeId: 'dev-cluster-dell',
+        adapterId: 'codex-cli',
+        lifecycle: 'enabled',
+        readiness: 'ready',
+        authenticated: true,
+        qualified: false,
+        qualificationRevision: 'unqualified',
+        providerAccountClass: 'chatgpt-subscription-a',
+        models: ['gpt-5.6-terra'],
+        profiles: ['codex-canary-v1'],
+        jobClasses: ['implementation'],
+        maxConcurrent: 1,
+        active: 0,
+      },
+    ],
+  });
+  const controllerRoute = selectWorkerQualificationRoute(withDellCodex, {
+    nodeId: 'dev-cluster-dell',
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+  });
+  assert.equal(controllerRoute.selected, null);
+  assert.ok(controllerRoute.reasons.includes('qualification-target-not-worker-only'));
+
+  const unauthenticated = unqualifiedCodexRegistry({ authenticated: false, revision: 'qualification-no-auth' });
+  const authRoute = selectWorkerQualificationRoute(unauthenticated, {
+    nodeId: 'dev-cluster-z790',
+    adapterId: 'codex-cli',
+    model: 'gpt-5.6-terra',
+    profile: 'codex-canary-v1',
+    jobClass: 'implementation',
+  });
+  assert.equal(authRoute.selected, null);
+  assert.ok(authRoute.reasons.includes('agent-auth-unavailable'));
 });
 
 test('immutable lease binds controller, exact source, node, agent, lane and capability fingerprints', () => {
