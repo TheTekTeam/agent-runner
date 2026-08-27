@@ -1,10 +1,12 @@
-# OpenCode/Ollama adapter foundation (issue #40)
+# OpenCode/Ollama adapter foundation and bounded live profile
 
-Status: **foundation only — disabled and non-routable by default.** Nothing
-in this document authorises live Ollama execution, queue routing, label
-activation, concurrency, or timer enablement. See `TheTekTeam/agent-runner#5`
-for the separate reliability/live-activation gate and `#41` for the MVP
-sequencing this slice belongs to.
+The #40 foundation remains the configuration/admission base. **Current source
+status after #378/#376:** the catalogue has a bounded implemented Ollama
+adapter, but committed machine settings remain disabled and unqualified.
+Source capability does not by itself enable a machine. Live selection requires
+the explicit multi-agent-routing gate plus machine-local lifecycle,
+qualification, trusted-repository shell policy, exact runtime/model admission,
+and the separately accepted field gates owned by #378/#152.
 
 ## What this adds
 
@@ -28,14 +30,13 @@ sequencing this slice belongs to.
   bounded OpenCode command construction, and structured-result/error
   classification.
 
-The existing `ollama-agent` entry in `scripts/ops/agent-runner-agents.mjs`
-(`agentId: 'ollama-agent'`, label `agent:ollama`) is unchanged:
-`implemented: false`. That flag is what the live scheduler
-(`claude-runner-cron.mjs`) checks before routing an issue, so this slice is
-non-routable purely by not touching that registry — no scheduler code was
-modified. `agent:ollama` also remains outside
-`DEFAULT_MODELSPEND_AGENT_RUNNER_CONFIG.acceptedAgentLabels` in
-`agent-runner-config.mjs`, which was likewise not modified.
+The original foundation was deliberately registered as `implemented:false`.
+#376 changes that catalogue capability to `implemented:true` and adds
+`agent:ollama` to accepted project labels only because a dedicated bounded
+child now exists. A structural scheduler guard still refuses Ollama when
+machine-local multi-agent routing is not engaged, and the ordinary selector,
+readiness, qualification and independent pre-claim admission must all pass
+before any claim.
 
 ## Machine-local agent lifecycle settings
 
@@ -157,13 +158,14 @@ The local model therefore contributes the documentation decision but never
 receives filesystem authority or responsibility for byte-perfect whole-file
 reproduction.
 
-## Serial execution and no paid fallback
+## Execution lanes and no paid fallback
 
-Every probe and the eventual command run one at a time; nothing here spawns
-concurrent Ollama/OpenCode work, matching the runner's existing single
-global execution slot. There is no automatic fallback to Claude, Codex, or
-any other paid agent anywhere in this module — an admission failure returns
-a typed `machine_profile` result and nothing else.
+Dell remains the sole scheduler/controller. Write-capable work executes under
+the accepted post-#51 issue-lane locking model; #376 does not restore the old
+one-global-slot programme assumption. The Ollama child acquires/inherits the
+same implementation-lane contract as other workers. There is no automatic
+fallback from an Ollama refusal/failure to Claude, Codex or any paid/API
+provider.
 
 ## Known limitations
 
@@ -194,9 +196,10 @@ a typed `machine_profile` result and nothing else.
 - `endpointAllowlistHosts`/`installedModelAllowlist` are plain string
   arrays; there is no CIDR-range or wildcard model matching by design (an
   explicit, boring allowlist is the safety property this slice needs).
-- No scheduler, dashboard, or cron wiring reads any of these new modules
-  yet. Live routing, `agent:ollama` label activation, and timer changes are
-  explicitly out of scope for this issue.
+- #376 wires the qualified one-file coding profile into the scheduler through
+  a dedicated child. This is source capability only: machine-local enablement
+  and supervised field acceptance remain separate gates, and no new timer or
+  scheduler is introduced.
 
 ## Validation
 
