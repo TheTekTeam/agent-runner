@@ -21,6 +21,7 @@ import {
 } from './agent-runner-agent-settings.mjs';
 import { executionLabelAuthority } from './agent-runner-label-authority.mjs';
 import { classifyIssueTaskRisk } from './agent-runner-qualification.mjs';
+import { OLLAMA_AGENT_ID } from './agent-runner-ollama-adapter.mjs';
 import { selectAgentForIssue } from './agent-runner-routing.mjs';
 import { computeInstanceReadiness } from './agent-runner-control-readiness.mjs';
 import {
@@ -102,6 +103,7 @@ const DEFAULT_OUTPUT = '.var/claude-runner';
 // changed to the configured project's checkout -- silently running that
 // checkout's own vendored copy instead of this canonical implementation.
 export const CLAUDE_RUNNER_ENTRYPOINT = fileURLToPath(new URL('./claude-runner.mjs', import.meta.url));
+export const OLLAMA_RUNNER_ENTRYPOINT = fileURLToPath(new URL('./agent-runner-ollama-runner.mjs', import.meta.url));
 const DEFAULT_AGENT_LABELS = allAgentLabels({ includeFuture: false });
 // Issue #50 review round 3: the fixed, catalogue-derived label partition
 // execution discovery and reconciliation discovery each read from --
@@ -305,7 +307,7 @@ Default: dry-run. New claims require exactly one current canonical ChatGPT manag
 
 Eligible labels:
   status:ready or status:in-progress
-  agent:claude or agent:claude-code-cli
+  agent:claude, agent:claude-code-cli, or agent:ollama (only when machine-local multi-agent routing and qualification are enabled)
 
 Options:
   --config <path>          Agent Runner project config JSON (or AGENT_RUNNER_CONFIG).
@@ -365,8 +367,9 @@ export function evaluateChildRunResult({ execute, exitCode, childPayload }) {
   return { failed: false, reason: null };
 }
 
-export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeSessionId, model } = {}) {
-  const out = [CLAUDE_RUNNER_ENTRYPOINT];
+export function runnerArgs(issueNumber, args, { attemptId, recoveryMode, resumeSessionId, model, agentId = CLAUDE_AGENT_ID } = {}) {
+  const entrypoint = agentId === OLLAMA_AGENT_ID ? OLLAMA_RUNNER_ENTRYPOINT : CLAUDE_RUNNER_ENTRYPOINT;
+  const out = [entrypoint];
   if (args.configPath) out.push('--config', args.configPath);
   out.push('--issue', String(issueNumber), '--output-dir', args.outputDir);
   if (args.execute) out.push('--execute');
@@ -2255,6 +2258,15 @@ export async function selectIssue(args, ghRunner = gh, {
     if (skipIfAmbiguous(issue)) continue;
 
     const agent = resolveAgentForLabels([...(issue.labels || []), issue.agentLabel]);
+    if (agent?.agentId !== CLAUDE_AGENT_ID && !settingsSnapshot) {
+      skipped.push({
+        issue: issue.number,
+        statusLabel: issue.statusLabel,
+        reason: 'multi-agent-routing-disabled',
+        agentId: agent?.agentId || null,
+      });
+      continue;
+    }
     if (!agent?.implemented) {
       skipped.push({
         ...unsupportedAgentSkip(agent, { issueNumber: issue.number }),
@@ -3257,7 +3269,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       if (!persistRecoveryRevalidation(state, recoveryClaim, recoveryPreLaunch, recoveryLeaseId)) {
         return emitSystemicStatePause(args, state, 'pre-launch-revalidation-persistence', { now, logger: dependencies.logger }).exitCode;
       }
-      const ordinaryInvocation = { command: process.execPath, args: runnerArgs(recoveryClaim.issue_number, args, { attemptId: recoveryClaim.attempt_id }), env: authEnv };
+      const ordinaryInvocation = { command: process.execPath, args: runnerArgs(recoveryClaim.issue_number, args, { attemptId: recoveryClaim.attempt_id, agentId: recoveryClaim.agent }), env: authEnv };
       const restrictedDispatch = buildRestrictedRecoveryDispatch({
         recoveryPreLaunch, issueNumber: recoveryClaim.issue_number, attemptId: recoveryClaim.attempt_id, args, authEnv, dependencies,
       });
@@ -3462,14 +3474,27 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     // non-implementation dispatch (recovery, plan phase, unauthorized): this
     // issue's forward-fix scope is limited to fresh implementation attempts,
     // and those keep their prior `plan.agent?.model` behavior below.
-    const resolvedProfile = freshImplementationDispatch
+    const freshAgentId = freshImplementationDispatch ? plan.agent?.agentId : null;
+    const freshOllamaDispatch = freshAgentId === OLLAMA_AGENT_ID;
+    const resolvedProfile = freshImplementationDispatch && !freshOllamaDispatch
       ? resolveProfile(dispatchIdentity.profileName, {
         model: dispatchIdentity.managerExecutionMeta?.model,
         effort: dispatchIdentity.managerExecutionMeta?.effort,
       }, authEnv)
       : null;
-    const resolvedModel = freshImplementationDispatch ? (resolvedProfile?.model ?? null) : null;
-    const modelResolutionValid = !freshImplementationDispatch || isSupportedModelId(resolvedModel);
+    const resolvedModel = !freshImplementationDispatch
+      ? null
+      : freshOllamaDispatch
+        ? (settingsSnapshot?.agents?.[OLLAMA_AGENT_ID]?.runtimeModel ?? null)
+        : (resolvedProfile?.model ?? null);
+    const modelResolutionValid = !freshImplementationDispatch
+      || (freshOllamaDispatch
+        ? Boolean(
+          resolvedModel
+          && dispatchIdentity.managerExecutionMeta?.model === resolvedModel
+          && settingsSnapshot?.agents?.[OLLAMA_AGENT_ID]?.routable === true
+        )
+        : isSupportedModelId(resolvedModel));
 
     // Every invocation — the first attempt and every recovery re-invocation
     // of the same attempt row — passes the same attemptId so the child can
@@ -3477,7 +3502,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
     // identity) keyed consistently for a later native_resume/
     // same_agent_continuation to read back (#698 finding 2).
     let nodeArgs = recoveryInvocation?.args
-      || runnerArgs(selected.issue.number, args, { attemptId, model: resolvedModel });
+      || runnerArgs(selected.issue.number, args, { attemptId, model: resolvedModel, agentId: plan.agent?.agentId });
 
     // Issue #50 review, requirement 7: this settings-revision check must run
     // before any new attempt/ownership row, claim, GitHub mutation,
@@ -3751,7 +3776,7 @@ export async function main(argv = process.argv.slice(2), env = process.env, depe
       const redispatch = (dependencies.dispatchRecovery || dispatchRecoveryAction)({
         action: recoveryClaim.claimed_recovery_action,
         revalidation: immediate,
-        ordinaryInvocation: { command: process.execPath, args: runnerArgs(selected.issue.number, args, { attemptId: recoveryClaim.attempt_id }), env: authEnv },
+        ordinaryInvocation: { command: process.execPath, args: runnerArgs(selected.issue.number, args, { attemptId: recoveryClaim.attempt_id, agentId: recoveryClaim.agent }), env: authEnv },
         quota: {
           knownResetReached: Boolean(currentAttempt.retry_at) && Date.parse(now()) >= Date.parse(currentAttempt.retry_at),
           freshPreflightPassed: quotaPreflight.blocked === false && quotaPreflight.skipped === false,
