@@ -425,6 +425,10 @@ export function loadLiveWorkerRegistryDocument({
     return Object.freeze({ path, found: false, revision: 0, document: null, registry: null });
   }
   assertSafePathChain(path, fs, { requireLeaf: true });
+  const mode = fs.lstatFn(resolve(path)).mode & 0o777;
+  if (mode !== FILE_MODE) {
+    throw new LiveWorkerRegistryError('live-worker-registry-file-mode-invalid');
+  }
   let parsed;
   try {
     parsed = JSON.parse(fs.readFn(path, 'utf8'));
@@ -489,7 +493,12 @@ function writeNext({
   }
   const fs = defaultDeps(deps);
   // The lock itself is a mutation, so path safety must be proven before it is
-  // created. This prevents a symlinked parent from redirecting even the lock.
+  // created. Prepare the parent only after proving the current path chain is
+  // symlink-free, then re-check before lock creation.
+  assertSafePathChain(path, fs, { requireLeaf: false });
+  const dir = resolve(path, '..');
+  fs.mkdirFn(dir, { recursive: true, mode: DIR_MODE });
+  fs.chmodFn(dir, DIR_MODE);
   assertSafePathChain(path, fs, { requireLeaf: false });
   const release = acquireLock(path, fs);
   try {
