@@ -17,16 +17,32 @@ import {
   LIVE_WORKER_REGISTRY_CONTROLLER_NODE_ID,
   LiveWorkerRegistryStaleRevisionError,
   loadLiveWorkerRegistryDocument,
+  planLiveWorkerRegistryPromotion,
   replaceLiveWorkerRegistry,
   safeLiveWorkerRegistrySummary,
   transitionLiveWorkerInstance,
 } from './agent-runner-live-worker-registry-store.mjs';
 import { parseLiveWorkerRegistry, resolveLiveWorkerRoute } from './agent-runner-live-worker-routing.mjs';
+import { canonicalAcceptedQualificationResults } from './agent-runner-fleet-accepted-qualification-evidence.mjs';
+import { publishFleetQualification } from './agent-runner-fleet-qualification-publication.mjs';
 
-const CODEX_REVISION = 'codex-z790-58e9d9edf45669ac';
-const CODEX_FINGERPRINT = 'sha256:58e9d9edf45669ac354bc400c4a7bf3ccd3b3e7bce92544f7eaba76895a43dbf';
-const CLAUDE_REVISION = 'claude-z790-7e13ce3be223baf8';
-const CLAUDE_FINGERPRINT = 'sha256:7e13ce3be223baf8967748ca5f48c96ea27fa945f3239124360f5c1395026efe';
+const PUBLICATION = publishFleetQualification({ acceptedResults: canonicalAcceptedQualificationResults() });
+const CODEX_PUBLISHED = PUBLICATION.instances.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790');
+const CLAUDE_PUBLISHED = PUBLICATION.instances.find((entry) => entry.instanceId === 'claude-code-cli@dev-cluster-z790');
+const CODEX_REVISION = CODEX_PUBLISHED.qualificationRevision;
+const CODEX_FINGERPRINT = CODEX_PUBLISHED.acceptedResultFingerprint;
+const CLAUDE_REVISION = CLAUDE_PUBLISHED.qualificationRevision;
+const CLAUDE_FINGERPRINT = CLAUDE_PUBLISHED.acceptedResultFingerprint;
+
+function authority(seed, revision) {
+  const fingerprint = `sha256:${seed.repeat(64)}`;
+  return {
+    authorityRevision: revision,
+    authorityFingerprint: fingerprint,
+    authorityKey: `manager-preflight:${revision}:${fingerprint}`,
+    authorityPacketDigest: `sha256:${(seed === 'f' ? 'e' : 'f').repeat(64)}`,
+  };
+}
 
 function tempRegistryPath() {
   const root = mkdtempSync(join(tmpdir(), 'agent-runner-fleet-registry-'));
@@ -84,12 +100,15 @@ function acceptedInstances({
       qualified: true,
       qualificationRevision: CODEX_REVISION,
       qualificationEvidenceFingerprint: CODEX_FINGERPRINT,
-      providerAccountClass: 'chatgpt',
+      installedVersion: CODEX_PUBLISHED.installedVersion,
+      qualificationContractFingerprint: CODEX_PUBLISHED.qualificationContractFingerprint,
+      qualificationCapabilityFingerprint: CODEX_PUBLISHED.capabilityFingerprint,
+      providerAccountClass: CODEX_PUBLISHED.providerAccountClass,
       costPosture: codexCostPosture,
       paid: codexPaid,
-      models: ['gpt-5.6-terra'],
-      profiles: ['codex-canary-v1'],
-      jobClasses: ['implementation'],
+      models: [CODEX_PUBLISHED.model],
+      profiles: [CODEX_PUBLISHED.profile],
+      jobClasses: CODEX_PUBLISHED.jobClasses,
       maxConcurrent: 1,
       active: codexActive,
     },
@@ -102,12 +121,15 @@ function acceptedInstances({
       qualified: true,
       qualificationRevision: CLAUDE_REVISION,
       qualificationEvidenceFingerprint: CLAUDE_FINGERPRINT,
-      providerAccountClass: 'claude-subscription',
+      installedVersion: CLAUDE_PUBLISHED.installedVersion,
+      qualificationContractFingerprint: CLAUDE_PUBLISHED.qualificationContractFingerprint,
+      qualificationCapabilityFingerprint: CLAUDE_PUBLISHED.capabilityFingerprint,
+      providerAccountClass: CLAUDE_PUBLISHED.providerAccountClass,
       costPosture: 'included-subscription',
       paid: false,
-      models: ['sonnet'],
-      profiles: ['narrow'],
-      jobClasses: ['implementation'],
+      models: [CLAUDE_PUBLISHED.model],
+      profiles: [CLAUDE_PUBLISHED.profile],
+      jobClasses: CLAUDE_PUBLISHED.jobClasses,
       maxConcurrent: 1,
       active: claudeActive,
     },
@@ -121,7 +143,7 @@ function rawRegistry(options = {}) {
     agentInstances: acceptedInstances(options),
     providerAccountCaps: {
       chatgpt: 1,
-      'claude-subscription': 1,
+      [CLAUDE_PUBLISHED.providerAccountClass]: 1,
     },
   };
 }
@@ -191,8 +213,7 @@ test('one exact agent@node can be enabled, disabled and restored without changin
       controllerNodeId: 'dev-cluster-dell',
       instanceId: 'codex-cli@dev-cluster-z790',
       targetState: 'enabled',
-      authorityRevision: 'AR402-FLEET-ACTIVATION-1',
-      authorityFingerprint: `sha256:${'a'.repeat(64)}`,
+      ...authority('a', 'AR402-FLEET-ACTIVATION-1'),
     });
     const enabledCodex = enabled.registry.agentInstances.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790');
     const enabledClaude = enabled.registry.agentInstances.find((entry) => entry.instanceId === 'claude-code-cli@dev-cluster-z790');
@@ -211,7 +232,7 @@ test('one exact agent@node can be enabled, disabled and restored without changin
       targetState: 'disabled',
     });
     assert.equal(disabled.registry.agentInstances.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790').lifecycle, 'disabled');
-    assert.equal(disabled.document.activationAuthority, null);
+    assert.deepEqual(disabled.document.activationAuthorities, {});
 
     const restored = transitionLiveWorkerInstance({
       path,
@@ -219,8 +240,7 @@ test('one exact agent@node can be enabled, disabled and restored without changin
       controllerNodeId: 'dev-cluster-dell',
       instanceId: 'codex-cli@dev-cluster-z790',
       targetState: 'enabled',
-      authorityRevision: 'AR402-FLEET-ACTIVATION-2',
-      authorityFingerprint: `sha256:${'b'.repeat(64)}`,
+      ...authority('b', 'AR402-FLEET-ACTIVATION-2'),
     });
     const restoredCodex = restored.registry.agentInstances.find((entry) => entry.instanceId === 'codex-cli@dev-cluster-z790');
     assert.equal(restoredCodex.qualificationRevision, CODEX_REVISION);
@@ -246,8 +266,7 @@ test('canonical store is consumed by live routing with hard zero-paid and provid
       controllerNodeId: 'dev-cluster-dell',
       instanceId: 'codex-cli@dev-cluster-z790',
       targetState: 'enabled',
-      authorityRevision: 'AR402-FLEET-ACTIVATION-1',
-      authorityFingerprint: `sha256:${'c'.repeat(64)}`,
+      ...authority('c', 'AR402-FLEET-ACTIVATION-1'),
     });
     const env = {
       HOME: root,
@@ -275,17 +294,11 @@ test('canonical store is consumed by live routing with hard zero-paid and provid
 test('provider-account cap blocks an otherwise qualified canonical route', () => {
   const { root, path } = tempRegistryPath();
   try {
-    const saturated = rawRegistry();
-    saturated.agentInstances[1] = {
-      ...saturated.agentInstances[1],
-      providerAccountClass: 'chatgpt',
-      active: 1,
-    };
     replaceLiveWorkerRegistry({
       path,
       expectedRevision: 0,
       controllerNodeId: 'dev-cluster-dell',
-      registry: saturated,
+      registry: rawRegistry(),
     });
     transitionLiveWorkerInstance({
       path,
@@ -293,8 +306,7 @@ test('provider-account cap blocks an otherwise qualified canonical route', () =>
       controllerNodeId: 'dev-cluster-dell',
       instanceId: 'codex-cli@dev-cluster-z790',
       targetState: 'enabled',
-      authorityRevision: 'AR402-FLEET-ACTIVATION-1',
-      authorityFingerprint: `sha256:${'d'.repeat(64)}`,
+      ...authority('d', 'AR402-FLEET-ACTIVATION-1'),
     });
     const env = {
       AGENT_RUNNER_WORKER_REGISTRY_PATH: path,
@@ -307,6 +319,7 @@ test('provider-account cap blocks an otherwise qualified canonical route', () =>
       registry,
       env,
       remoteDispatchAvailable: true,
+      providerAccountReservations: { chatgpt: 1 },
     });
     assert.equal(route.allowed, false);
     assert.equal(route.routeEvidence.excluded[0].reasons.includes('provider-account-cap-full'), true);
@@ -401,7 +414,10 @@ test('stale or fabricated qualification evidence cannot enter the live registry'
       qualified: true,
       qualificationRevision: 'claude-dell-1111111111111111',
       qualificationEvidenceFingerprint: `sha256:${'1'.repeat(64)}`,
-      providerAccountClass: 'claude-subscription',
+      installedVersion: '2.1.231',
+      qualificationContractFingerprint: `sha256:${'2'.repeat(64)}`,
+      qualificationCapabilityFingerprint: `sha256:${'3'.repeat(64)}`,
+      providerAccountClass: 'first-party',
       costPosture: 'included-subscription',
       paid: false,
       models: ['sonnet'],
