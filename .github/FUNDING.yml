@@ -6,17 +6,10 @@ github: [TheTekTeam]
 
 # Community & Crypto / Custom Links (up to 4 custom URLs)
 custom:
-  - "https://thetekteam.com/donate"
-  - "https://opencollective.com/thetekteam"
-  - "https://ko-fi.com/thetekteam"
-  - "https://buymeacoffee.com/thetekteam"
+#   - "https://thetekteam.com/donate"
+#   - "https://opencollective.com/thetekteam"
+#   - "https://ko-fi.com/thetekteam"
+#   - "https://buymeacoffee.com/thetekteam"
 
 # Supported Open Source Platforms
-patreon: thetekteam
-open_collective: thetekteam
-ko_fi: thetekteam
-buy_me_a_coffee: thetekteam
-polar: thetekteam
-thanks_dev: u/gh/TheTekTeam
-issuehunt: thetekteam
-liberapay: thetekteam
+buy_me_a_coffee: gp1lg
