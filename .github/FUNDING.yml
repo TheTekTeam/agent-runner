@@ -1,27 +1,22 @@
 # .github/FUNDING.yml
+# Official GitHub Funding Configuration for TheTekTeam
 
-# Link to your custom funding page.
-# Using the custom: field with an image URL is the most effective way
-# to display a non-standard button (like our custom graphic with the logo).
+# GitHub Sponsors (up to 4 usernames or organization)
+github: [TheTekTeam]
 
+# Community & Crypto / Custom Links (up to 4 custom URLs)
 custom:
-  # The text that will appear next to your custom button/image.
-  - title: "Support This Project"
-    # Specify the URL where people can donate.
-    url: "https://your-donation-page.com/support"
-    # Link to the custom button image you have hosted.
-    # Replace the placeholder URL below with the actual URL
-    # of the hosted 'image_1.png' graphic.
-    image: "https://avatars.githubusercontent.com/u/278831585?s=200&v=4"
+  - "https://thetekteam.com/donate"
+  - "https://opencollective.com/thetekteam"
+  - "https://ko-fi.com/thetekteam"
+  - "https://buymeacoffee.com/thetekteam"
 
-# Optional standard platforms can still be used and will appear below.
-# github: [your-github-username]
-# patreon: [your-patreon-username]
-# open_collective: [your-collective]
-# ko_fi: [your-kofi-username]
-# tidelift: [your-platform]/[your-package-name]
-# community_bridge: [your-project-name]
-# liberapay: [your-username]
-# issuehunt: [your-username]
-# otechie: [your-username]
-# custom: [] # Keep as custom: above
+# Supported Open Source Platforms
+patreon: thetekteam
+open_collective: thetekteam
+ko_fi: thetekteam
+buy_me_a_coffee: thetekteam
+polar: thetekteam
+thanks_dev: u/gh/TheTekTeam
+issuehunt: thetekteam
+liberapay: thetekteam
