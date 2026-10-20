@@ -2,17 +2,13 @@
 
 Private standalone GitHub-issue-driven agent runner for monorepo projects.
 
-The canonical runner implementation has been imported from the proven portable boundary in `TheTekTeam/modelspend` at source commit `c6e18c00f17b92f5ac27ba2dbe37c6ba768c4dc0`. `MIGRATION-MANIFEST.json` records the exact 68-file closure, including captured regression fixtures, source commit, file modes and SHA-256 provenance.
-
-The standalone extraction and Dell cutover remain tracked by `TheTekTeam/modelspend#686`. Source ownership has moved here; live execution is not cut over until dry-run equivalence, state migration, independent systemd installation and rollback validation pass.
-
-## Intended Dell layout
+## Intended layout
 
 ```text
-/home/gp/projects/agent-runner/             # this checkout
-/home/gp/.config/agent-runner/              # project configs and secret references
-/home/gp/.local/state/agent-runner/          # SQLite state, logs, locks and delivery state
-/var/www/agent-runner/dashboard/             # generated read-only dashboard
+/projects/agent-runner/             # this checkout
+.config/agent-runner/               # project configs and secret references
+.local/state/agent-runner/          # SQLite state, logs, locks and delivery state
+/var/www/agent-runner/dashboard/    # generated read-only dashboard
 ```
 
 ## Dispatch authority
