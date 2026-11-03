@@ -1,5 +1,7 @@
 import { timingSafeEqual } from 'node:crypto';
 
+import { readTrustedProxyOrigin } from './agent-runner-control-trusted-origin.mjs';
+
 /**
  * CSRF protection and strict origin validation (issue #46).
  *
@@ -9,11 +11,12 @@ import { timingSafeEqual } from 'node:crypto';
  * automatically attaching the session cookie but cannot read that body —
  * has no way to learn the token to echo back in the required header.
  *
- * Origin validation is a second, independent layer: every mutating request
- * must present an `Origin` (or, failing that, `Referer`) header that
- * exactly matches one of the loopback origins this service is actually
- * bound to. There is no wildcard and no "same host, different port"
- * leniency — a mismatch or an absent header both fail closed.
+ * Origin validation is a second, independent layer. The normal allowlist is
+ * derived from the exact loopback listener. Issue #277 adds one optional,
+ * repository-managed HTTPS proxy origin loaded from the fixed control config
+ * path. It is validated and normalized at process startup, then compared by
+ * exact string equality just like the loopback origins. There is no wildcard,
+ * forwarded-header trust, or "same host, different port" leniency.
  */
 
 function timingSafeEqualStrings(a, b) {
@@ -27,6 +30,7 @@ function timingSafeEqualStrings(a, b) {
 }
 
 const CSRF_HEADER_NAME = 'x-csrf-token';
+const CONFIGURED_TRUSTED_PROXY_ORIGIN = readTrustedProxyOrigin();
 
 export function validateCsrfToken({ headerToken, sessionCsrfToken } = {}) {
   if (!headerToken || !sessionCsrfToken) return { ok: false, reason: 'csrf-token-missing' };
@@ -45,15 +49,22 @@ function originFromReferer(refererHeader) {
 }
 
 /**
- * `allowedOrigins` must be supplied explicitly by the caller (the server
- * knows exactly which loopback host:port it bound to) — there is no
- * built-in default and no environment-derived allowlist here, so this
- * module cannot itself be tricked into trusting an unexpected origin.
+ * `allowedOrigins` must be supplied explicitly by the caller for the bound
+ * loopback listener. `trustedProxyOrigin` defaults to the single validated
+ * fixed-path configuration loaded at startup and may be injected only by
+ * tests. Both paths use exact string membership; missing/foreign origins fail
+ * closed.
  */
-export function validateOrigin({ originHeader, refererHeader, allowedOrigins = [] } = {}) {
+export function validateOrigin({
+  originHeader,
+  refererHeader,
+  allowedOrigins = [],
+  trustedProxyOrigin = CONFIGURED_TRUSTED_PROXY_ORIGIN,
+} = {}) {
   const candidate = originHeader || originFromReferer(refererHeader);
   if (!candidate) return { ok: false, reason: 'origin-missing' };
-  if (!allowedOrigins.includes(candidate)) return { ok: false, reason: 'origin-not-allowed' };
+  const accepted = trustedProxyOrigin ? [...allowedOrigins, trustedProxyOrigin] : allowedOrigins;
+  if (!accepted.includes(candidate)) return { ok: false, reason: 'origin-not-allowed' };
   return { ok: true, reason: null };
 }
 
